@@ -36,9 +36,11 @@
 
         #auth-error { color: var(--error); font-size: 0.85rem; text-align: center; margin-top: 1rem; min-height: 20px; font-weight: 500; }
 
-        /* Servers Sidebar */
-        #servers-sidebar { width: 72px; background: #202225; display: flex; flex-direction: column; align-items: center; padding: 12px 0; gap: 8px; overflow-y: auto; flex-shrink: 0; }
-        .server-icon { width: 48px; height: 48px; border-radius: 50%; background: #36393f; color: white; display: flex; justify-content: center; align-items: center; cursor: pointer; font-weight: bold; transition: 0.2s; font-size: 1.2rem; position: relative;}
+        /* Servers Sidebar (SCROLLBAR COMPLETELY HIDDEN) */
+        #servers-sidebar { width: 72px; background: #202225; display: flex; flex-direction: column; align-items: center; padding: 12px 0; gap: 8px; overflow-y: scroll; flex-shrink: 0; scrollbar-width: none; -ms-overflow-style: none; }
+        #servers-sidebar::-webkit-scrollbar { display: none; }
+        
+        .server-icon { width: 48px; height: 48px; border-radius: 50%; background: #36393f; color: white; display: flex; justify-content: center; align-items: center; cursor: pointer; font-weight: bold; transition: 0.2s; font-size: 1.2rem; position: relative; flex-shrink: 0; }
         .server-icon:hover { border-radius: 16px; background: var(--primary); opacity: 1 !important; border: none !important; }
         .server-icon.active { border-radius: 16px; background: var(--primary); opacity: 1 !important; border: none !important; }
         .server-icon.add-btn { background: #36393f; color: #3ba55c; font-weight: 300; font-size: 1.5rem; }
@@ -56,15 +58,24 @@
         .header-btn { font-size: 0.8rem; padding: 6px 12px; border-radius: 4px; color: white; cursor: pointer; transition: 0.2s; font-weight: 600; border: none; display: none; }
         .header-btn.primary { background: var(--primary); }
         .header-btn.primary:hover { background: #4752c4; }
-        .header-btn.danger { background: var(--error); }
-        .header-btn.danger:hover { background: #c92a2a; }
+        .header-btn.danger { background: #4f545c; }
+        .header-btn.danger:hover { background: var(--error); }
+        .header-btn.delete { background: var(--error); }
+        .header-btn.delete:hover { background: #c92a2a; }
         .header-btn.success { background: #3ba55c; }
         .header-btn.success:hover { background: #2d7d46; }
 
         #chat-window { flex: 1; overflow-y: auto; padding: 1rem; display: flex; flex-direction: column; gap: 1rem; background: var(--surface); }
-        .msg { display: flex; flex-direction: column; animation: fadeIn 0.2s ease-out; position: relative; padding: 0.2rem 1rem; }
+        
+        .msg { display: flex; flex-direction: column; animation: fadeIn 0.2s ease-out; position: relative; padding: 0.2rem 1rem; border-left: 2px solid transparent; }
         .msg:hover { background: rgba(4, 4, 5, 0.07); }
         
+        /* PING / MENTION HIGHLIGHTS */
+        .msg.pinged { background: rgba(250, 166, 26, 0.1) !important; border-left: 2px solid var(--warning) !important; }
+        .ping-tag { background: rgba(88, 101, 242, 0.4); color: #eef; padding: 0 4px; border-radius: 3px; font-weight: 600; }
+        .ping-tag.everyone { background: rgba(250, 166, 26, 0.4); color: #fff; }
+        .ping-tag.other { background: transparent; color: var(--primary); padding: 0; }
+
         .msg-header { display: flex; align-items: baseline; gap: 8px; margin-bottom: 0.25rem; }
         .msg-author { font-size: 1rem; color: white; font-weight: 500; }
         .msg-time-header { font-size: 0.75rem; color: var(--text-muted); }
@@ -182,7 +193,7 @@
             G<div class="tooltip">Global Chat</div>
         </div>
         <div id="dynamic-servers" style="width: 100%; display: flex; flex-direction: column; align-items: center; gap: 8px;"></div>
-        <div style="width: 32px; height: 2px; background: #2f3136; border-radius: 1px; margin: 4px 0;"></div>
+        <div style="width: 32px; height: 2px; background: #2f3136; border-radius: 1px; margin: 4px 0; flex-shrink: 0;"></div>
         <div class="server-icon add-btn" onclick="openServerModal()">
             +<div class="tooltip">Add a Server</div>
         </div>
@@ -194,6 +205,7 @@
             <div class="header-actions">
                 <button class="header-btn primary" id="invite-code-btn" onclick="copyCode()" style="display: none;">Copy Code</button>
                 <button class="header-btn danger" id="leave-server-btn" onclick="leaveServer()" style="display: none;">Leave Server</button>
+                <button class="header-btn delete" id="delete-server-btn" onclick="deleteServer()" style="display: none;">Delete Server</button>
                 <button class="header-btn success" id="join-server-btn" onclick="joinFromSnoop()" style="display: none;">Join (Become Visible)</button>
             </div>
         </header>
@@ -209,7 +221,7 @@
             </div>
             <form id="compose">
                 <div class="input-wrapper">
-                    <input type="text" id="msg-input" placeholder="Message..." autocomplete="off" disabled>
+                    <input type="text" id="msg-input" placeholder="Message... (Use @username to ping)" autocomplete="off" disabled>
                     <button type="submit" id="send-btn" class="btn-primary submit-btn" disabled>Send</button>
                 </div>
             </form>
@@ -217,7 +229,7 @@
     </div>
 
     <div id="online-sidebar">
-        <div class="sidebar-header">Online — <span id="online-count">0</span></div>
+        <div class="sidebar-header">Global Online — <span id="online-count">0</span></div>
         <ul id="online-list"></ul>
     </div>
 </div>
@@ -227,8 +239,8 @@
     let myUsername = "";
     let myRole = "user"; 
     let currentServerCode = 'global';
-    let myJoinedServers = []; // Tracks strictly what we are officially joined to
-    let serverNamesCache = { 'global': 'Global Chat' }; // Memorize names
+    let myJoinedServers = []; 
+    let serversCache = { 'global': { name: 'Global Chat', owner: 'System' } }; 
     
     let isLoginMode = true;
     let typingTimeout;
@@ -248,6 +260,7 @@
 
     const inviteBtn = document.getElementById('invite-code-btn');
     const leaveBtn = document.getElementById('leave-server-btn');
+    const deleteBtn = document.getElementById('delete-server-btn');
     const joinBtn = document.getElementById('join-server-btn');
 
     if (localStorage.getItem('pro_chat_url')) document.getElementById('url-input').value = localStorage.getItem('pro_chat_url');
@@ -255,6 +268,45 @@
 
     document.getElementById('tab-login').onclick = function() { isLoginMode = true; this.classList.add('active'); document.getElementById('tab-register').classList.remove('active'); authBtn.textContent = 'Login'; authError.textContent = ''; };
     document.getElementById('tab-register').onclick = function() { isLoginMode = false; this.classList.add('active'); document.getElementById('tab-login').classList.remove('active'); authBtn.textContent = 'Register'; authError.textContent = ''; };
+
+    // Built-in DOM XSS Protector for parsing ping tags safely
+    function createMessageTextElement(text, author, authorRole) {
+        const span = document.createElement('span');
+        span.className = 'msg-text-content';
+        let isPinged = false;
+        
+        const parts = text.split(/(@[a-zA-Z0-9_]+)/g);
+        
+        parts.forEach(part => {
+            if (part.startsWith('@')) {
+                const name = part.substring(1).toLowerCase();
+                const tag = document.createElement('span');
+                
+                const isAdmin = authorRole === 'admin' || author.toLowerCase() === 'nyzhang1';
+                
+                if (name === 'everyone' && isAdmin) {
+                    tag.className = 'ping-tag everyone'; 
+                    tag.textContent = part;
+                    isPinged = true; 
+                    span.appendChild(tag);
+                } 
+                else if (name === myUsername.toLowerCase()) {
+                    tag.className = 'ping-tag'; 
+                    tag.textContent = part;
+                    isPinged = true; 
+                    span.appendChild(tag);
+                } 
+                else {
+                    tag.className = 'ping-tag other'; 
+                    tag.textContent = part;
+                    span.appendChild(tag);
+                }
+            } else if (part) {
+                span.appendChild(document.createTextNode(part));
+            }
+        });
+        return { element: span, isPinged };
+    }
 
     // --- AUTHENTICATION ---
     authBtn.addEventListener('click', () => {
@@ -292,11 +344,10 @@
                     myJoinedServers = res.joinedServers || ['global'];
                     
                     authModal.classList.remove('active');
-                    msgInput.disabled = false;
-                    sendBtn.disabled = false;
+                    msgInput.disabled = false; sendBtn.disabled = false;
                     
                     renderServers(res.servers || []);
-                    switchServer('global', 'Global Chat');
+                    switchServer('global');
                     if (res.history) loadHistory(res.history);
                 }
             });
@@ -315,20 +366,21 @@
         socket.on('message_edited', (data) => {
             const el = document.querySelector(`.msg[data-id="${data.id}"]`);
             if (el) {
-                let textSpan = el.querySelector('.msg-text-content');
-                if (!textSpan) {
-                     const msgTextDiv = el.querySelector('.msg-text');
-                     msgTextDiv.innerHTML = `<span class="msg-text-content">${data.text.replace(/</g, "&lt;")}</span>`;
-                     textSpan = msgTextDiv.querySelector('.msg-text-content');
-                } else { textSpan.textContent = data.text; }
+                el.setAttribute('data-raw-text', data.text); // Save raw data for fast edit opening
+                el.classList.remove('pinged'); 
+                
+                const { element, isPinged } = createMessageTextElement(data.text, data.username, data.role || 'user');
+                
+                const oldSpan = el.querySelector('.msg-text-content');
+                if (oldSpan) oldSpan.replaceWith(element);
+                
+                if (isPinged && data.username !== myUsername) el.classList.add('pinged');
 
                 if (!el.querySelector('.edited-tag')) {
-                    const tag = document.createElement('span');
-                    tag.className = 'edited-tag'; tag.textContent = '(edited)';
-                    const isMe = el.querySelector('.msg-author').textContent === myUsername;
-                    if (isMe || myRole === 'admin') {
-                        tag.title = "View edit history"; tag.onclick = () => viewHistory(data.id);
-                    } else { tag.style.cursor = 'default'; tag.style.textDecoration = 'none'; }
+                    const tag = document.createElement('span'); tag.className = 'edited-tag'; tag.textContent = '(edited)';
+                    const isMe = data.username === myUsername;
+                    if (isMe || myRole === 'admin') { tag.title = "View edit history"; tag.onclick = () => viewHistory(data.id); } 
+                    else { tag.style.cursor = 'default'; tag.style.textDecoration = 'none'; }
                     el.querySelector('.msg-text').appendChild(tag);
                 }
             }
@@ -336,15 +388,25 @@
 
         socket.on('message_deleted', (id) => { const el = document.querySelector(`.msg[data-id="${id}"]`); if (el) el.remove(); });
         
-        socket.on('admin_new_server', (srv) => { if (myRole === 'admin') addServerToList(srv.code, srv.name); });
+        socket.on('admin_new_server', (srv) => { if (myRole === 'admin') addServerToList(srv.code, srv.name, srv.owner); });
+
+        // Handle Real-Time Server Deletion Globally
+        socket.on('server_deleted', (code) => {
+            myJoinedServers = myJoinedServers.filter(c => c !== code);
+            const icon = document.getElementById(`srv-${code}`);
+            if (icon) icon.remove();
+            
+            if (currentServerCode === code) {
+                switchServer('global', 'Global Chat');
+                alert("The server you were viewing was permanently deleted by its Owner or an Admin.");
+            }
+        });
 
         socket.on('online_users', (users) => {
             const list = document.getElementById('online-list');
             list.innerHTML = '';
             
-            // Check if Admin is in stealth (snooping) mode
-            const isHiddenAdmin = myRole === 'admin' && !users.includes(myUsername) && currentServerCode !== 'global';
-
+            const isHiddenAdmin = myRole === 'admin' && !users.includes(myUsername);
             document.getElementById('online-count').textContent = users.length + (isHiddenAdmin ? 1 : 0);
 
             if (isHiddenAdmin) {
@@ -376,11 +438,12 @@
     function renderServers(servers) {
         if (!servers || !Array.isArray(servers)) return; 
         dynamicServers.innerHTML = '';
-        servers.forEach(s => { if (s && s.code && s.code !== 'global') addServerToList(s.code, s.name); });
+        servers.forEach(s => { if (s && s.code && s.code !== 'global') addServerToList(s.code, s.name, s.owner); });
     }
 
-    function addServerToList(code, name) {
-        serverNamesCache[code] = name;
+    function addServerToList(code, name, owner) {
+        serversCache[code] = { code, name, owner };
+        
         if(document.getElementById(`srv-${code}`)) return;
         
         const icon = document.createElement('div');
@@ -388,20 +451,18 @@
         icon.id = `srv-${code}`;
         icon.textContent = name.substring(0, 2).toUpperCase();
         icon.innerHTML += `<div class="tooltip">${name}</div>`;
-        icon.onclick = () => switchServer(code, name);
+        icon.onclick = () => switchServer(code);
         
-        // Dims the icon if Admin is just spying and hasn't explicitly joined
         if (myRole === 'admin' && !myJoinedServers.includes(code) && code !== 'global') {
-            icon.style.opacity = '0.4';
-            icon.style.border = '1px dashed #8e9297';
+            icon.style.opacity = '0.4'; icon.style.border = '1px dashed #8e9297';
         }
         dynamicServers.appendChild(icon);
     }
 
-    function switchServer(code, name) {
+    function switchServer(code) {
         if (currentServerCode === code && document.getElementById('chat-window').innerHTML !== '') return; 
         currentServerCode = code;
-        const srvName = name || serverNamesCache[code] || 'Unknown';
+        const srv = serversCache[code] || { name: 'Unknown', owner: '' };
         
         document.querySelectorAll('.server-icon').forEach(el => el.classList.remove('active'));
         const activeIcon = document.getElementById(`srv-${code}`);
@@ -409,38 +470,35 @@
 
         const isStealth = myRole === 'admin' && !myJoinedServers.includes(code) && code !== 'global';
         
-        document.getElementById('server-title').innerHTML = srvName + (myRole === 'admin' ? ' <span class="admin-badge" title="Admin">Admin</span>' : '') + (isStealth ? ' <span style="color:var(--warning); font-size:0.8rem; font-style:italic;">(Ghost)</span>' : '');
+        document.getElementById('server-title').innerHTML = srv.name + (myRole === 'admin' ? ' <span class="admin-badge" title="Admin">Admin</span>' : '') + (isStealth ? ' <span style="color:var(--warning); font-size:0.8rem; font-style:italic;">(Ghost)</span>' : '');
         
         if (code === 'global') {
-            inviteBtn.style.display = 'none';
-            leaveBtn.style.display = 'none';
-            joinBtn.style.display = 'none';
+            inviteBtn.style.display = 'none'; leaveBtn.style.display = 'none'; joinBtn.style.display = 'none'; deleteBtn.style.display = 'none';
             msgInput.placeholder = `Message Global Chat`;
         } else {
             inviteBtn.style.display = 'block';
             inviteBtn.textContent = `Copy Code: ${code}`;
+            
+            if (myRole === 'admin' || srv.owner === myUsername) deleteBtn.style.display = 'block';
+            else deleteBtn.style.display = 'none';
+
             if (myJoinedServers.includes(code)) {
-                leaveBtn.style.display = 'block';
-                joinBtn.style.display = 'none';
+                leaveBtn.style.display = 'block'; joinBtn.style.display = 'none';
             } else {
-                leaveBtn.style.display = 'none';
-                joinBtn.style.display = 'block';
+                leaveBtn.style.display = 'none'; joinBtn.style.display = 'block';
             }
-            msgInput.placeholder = `Message ${srvName}`;
+            msgInput.placeholder = `Message ${srv.name}`;
         }
         
         chatWindow.innerHTML = '';
         cancelEdit();
         
-        socket.emit('switch_server', code, (res) => {
-            if (res && res.history) loadHistory(res.history);
-        });
+        socket.emit('switch_server', code, (res) => { if (res && res.history) loadHistory(res.history); });
     }
 
     function copyCode() {
         navigator.clipboard.writeText(currentServerCode);
-        const old = inviteBtn.textContent;
-        inviteBtn.textContent = "Copied!";
+        const old = inviteBtn.textContent; inviteBtn.textContent = "Copied!";
         setTimeout(() => inviteBtn.textContent = old, 1500);
     }
 
@@ -454,17 +512,22 @@
             
             const icon = document.getElementById(`srv-${currentServerCode}`);
             if (myRole !== 'admin' && icon) {
-                icon.remove(); 
-                switchServer('global', 'Global Chat');
-            } else {
-                // Admins stay but visually swap to Ghost mode
-                if (icon) {
-                    icon.style.opacity = '0.4'; 
-                    icon.style.border = '1px dashed #8e9297';
-                }
-                switchServer(currentServerCode, serverNamesCache[currentServerCode]);
+                icon.remove(); switchServer('global');
+            } else if (icon) {
+                icon.style.opacity = '0.4'; icon.style.border = '1px dashed #8e9297';
+                switchServer(currentServerCode);
             }
         });
+    }
+
+    function deleteServer() {
+        if (currentServerCode === 'global') return;
+        const srvName = serversCache[currentServerCode].name;
+        if (confirm(`🚨 PERMANENT WARNING 🚨\n\nAre you sure you want to completely destroy "${srvName}"? All messages will be wiped forever.`)) {
+            socket.emit('delete_server', currentServerCode, (res) => {
+                if (res && res.error) alert(res.error);
+            });
+        }
     }
 
     function joinFromSnoop() {
@@ -473,7 +536,7 @@
             if (!myJoinedServers.includes(res.server.code)) myJoinedServers.push(res.server.code);
             const icon = document.getElementById(`srv-${res.server.code}`);
             if (icon) { icon.style.opacity = '1'; icon.style.border = 'none'; }
-            switchServer(res.server.code, res.server.name);
+            switchServer(res.server.code);
         });
     }
 
@@ -482,15 +545,14 @@
         if(!name) return;
         socket.emit('create_server', name, (res) => {
             if (res.error) return alert(res.error);
-            document.getElementById('server-modal').classList.remove('active');
-            document.getElementById('create-name').value = '';
+            document.getElementById('server-modal').classList.remove('active'); document.getElementById('create-name').value = '';
             myJoinedServers.push(res.server.code);
             
             const existingIcon = document.getElementById(`srv-${res.server.code}`);
             if (existingIcon) { existingIcon.style.opacity = '1'; existingIcon.style.border = 'none'; }
-            else { addServerToList(res.server.code, res.server.name); }
+            else { addServerToList(res.server.code, res.server.name, socket.username); }
             
-            switchServer(res.server.code, res.server.name);
+            switchServer(res.server.code);
         });
     };
 
@@ -499,15 +561,14 @@
         if(!code) return;
         socket.emit('join_server', code, (res) => {
             if (res.error) return alert(res.error);
-            document.getElementById('server-modal').classList.remove('active');
-            document.getElementById('join-code').value = '';
+            document.getElementById('server-modal').classList.remove('active'); document.getElementById('join-code').value = '';
             if (!myJoinedServers.includes(res.server.code)) myJoinedServers.push(res.server.code);
             
             const existingIcon = document.getElementById(`srv-${res.server.code}`);
             if (existingIcon) { existingIcon.style.opacity = '1'; existingIcon.style.border = 'none'; }
-            else { addServerToList(res.server.code, res.server.name); }
+            else { addServerToList(res.server.code, res.server.name, res.server.owner); }
             
-            switchServer(res.server.code, res.server.name);
+            switchServer(res.server.code);
         });
     };
 
@@ -553,7 +614,16 @@
             else {
                 res.history.forEach((item, index) => {
                     const el = document.createElement('div'); el.className = 'hist-item';
-                    el.innerHTML = `<div class="hist-time">Version ${index + 1} • ${new Date(item.timestamp).toLocaleString()}</div><div class="hist-text">${item.text.replace(/</g, "&lt;")}</div>`;
+                    
+                    const timeDiv = document.createElement('div');
+                    timeDiv.className = 'hist-time';
+                    timeDiv.textContent = `Version ${index + 1} • ${new Date(item.timestamp).toLocaleString()}`;
+                    
+                    const textDiv = document.createElement('div');
+                    textDiv.className = 'hist-text';
+                    textDiv.appendChild(createMessageTextElement(item.text, '', 'user').element);
+                    
+                    el.appendChild(timeDiv); el.appendChild(textDiv);
                     list.appendChild(el);
                 });
             }
@@ -569,12 +639,13 @@
     function appendMessage(data, isMe) {
         const wrapper = document.createElement('div');
         wrapper.className = `msg`; wrapper.setAttribute('data-id', data._id); 
+        wrapper.setAttribute('data-raw-text', data.text); // Save raw data for fast edit opening
 
         const header = document.createElement('div'); header.className = 'msg-header';
         const author = document.createElement('div'); author.className = 'msg-author';
         author.textContent = data.username; header.appendChild(author);
 
-        if (data.username.toLowerCase() === 'nyzhang1') {
+        if (data.role === 'admin' || data.username.toLowerCase() === 'nyzhang1') {
             const badge = document.createElement('span'); badge.className = 'admin-badge'; badge.textContent = 'ADMIN'; header.appendChild(badge);
         }
 
@@ -585,7 +656,7 @@
         if (isMe || myRole === 'admin') {
             const actions = document.createElement('div'); actions.className = 'msg-actions';
             const editBtn = document.createElement('button'); editBtn.className = 'action-btn'; editBtn.textContent = '✏️ Edit';
-            editBtn.onclick = () => initiateEdit(data._id, wrapper.querySelector('.msg-text-content').textContent);
+            editBtn.onclick = () => initiateEdit(data._id, wrapper.getAttribute('data-raw-text'));
             const delBtn = document.createElement('button'); delBtn.className = 'action-btn del'; delBtn.textContent = '🗑️ Delete';
             delBtn.onclick = () => { if (confirm("Delete this message?")) socket.emit('delete_message', data._id); };
 
@@ -593,8 +664,12 @@
         }
 
         const textDiv = document.createElement('div'); textDiv.className = 'msg-text';
-        const textSpan = document.createElement('span'); textSpan.className = 'msg-text-content';
-        textSpan.textContent = data.text; textDiv.appendChild(textSpan);
+        
+        // --- XSS SAFE DOM PING INJECTOR ---
+        const { element, isPinged } = createMessageTextElement(data.text, data.username, data.role || 'user');
+        textDiv.appendChild(element);
+        
+        if (isPinged && !isMe) wrapper.classList.add('pinged');
 
         if (data.edited) {
             const tag = document.createElement('span'); tag.className = 'edited-tag'; tag.textContent = '(edited)';
@@ -619,3 +694,5 @@
         else ind.textContent = 'Multiple people are typing...';
     }
 </script>
+</body>
+</html>
