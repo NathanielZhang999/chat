@@ -40,6 +40,7 @@
         #online-list { list-style: none; padding: 1rem; flex: 1; overflow-y: auto; }
         #online-list li { display: flex; align-items: center; gap: 0.5rem; font-size: 0.9rem; margin-bottom: 0.8rem; color: var(--text); }
         #online-list li::before { content: ''; display: block; width: 8px; height: 8px; border-radius: 50%; background: #10b981; }
+        .list-admin-badge { font-size: 0.75rem; }
 
         #chat-area { flex: 1; display: flex; flex-direction: column; background: var(--surface); position: relative; }
         header { padding: 1rem 1.5rem; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; background: #0f172a; }
@@ -52,11 +53,25 @@
         .msg.me { align-self: flex-end; align-items: flex-end; }
         .msg.other { align-self: flex-start; align-items: flex-start; }
         
-        .msg-author { font-size: 0.75rem; color: var(--text-muted); margin-bottom: 0.25rem; margin-left: 0.25rem; font-weight: 500; }
+        .msg-header { display: flex; align-items: center; gap: 8px; margin-bottom: 0.25rem; width: 100%; }
+        .msg.me .msg-header { justify-content: flex-end; }
+        .msg-author { font-size: 0.75rem; color: var(--text-muted); font-weight: 600; }
+        .admin-badge { background: #ef4444; color: white; font-size: 0.55rem; padding: 2px 5px; border-radius: 4px; font-weight: bold; letter-spacing: 0.5px;}
+
+        /* Edit and Delete Buttons (Hidden until Hover) */
+        .msg-actions { display: none; gap: 6px; }
+        .msg:hover .msg-actions { display: flex; }
+        .action-btn { background: none; border: none; color: var(--text-muted); font-size: 0.65rem; cursor: pointer; padding: 0; text-decoration: underline; }
+        .action-btn:hover { color: var(--text); }
+        .action-btn.del:hover { color: var(--error); }
+
         .msg-bubble { padding: 0.75rem 1rem; border-radius: 1rem; font-size: 0.95rem; line-height: 1.4; word-break: break-word; }
         .msg.me .msg-bubble { background: var(--primary); color: white; border-bottom-right-radius: 0.25rem; }
         .msg.other .msg-bubble { background: #334155; color: white; border-bottom-left-radius: 0.25rem; }
-        .msg-time { font-size: 0.65rem; color: var(--text-muted); margin-top: 0.25rem; }
+        
+        .msg-time { font-size: 0.65rem; color: var(--text-muted); margin-top: 0.25rem; display: flex; gap: 5px; }
+        .edited-tag { font-style: italic; opacity: 0.8; }
+        
         .system-msg { text-align: center; font-size: 0.8rem; color: var(--text-muted); margin: 0.5rem 0; font-style: italic; }
 
         /* Compose */
@@ -119,21 +134,19 @@
 <script>
     let socket;
     let myUsername = "";
+    let myRole = "user"; // Tracks if I am an admin or user
     let isLoginMode = true;
     let typingTimeout;
     const typingUsers = new Set();
 
-    // DOM Elements
     const authModal = document.getElementById('auth-modal');
     const tabLogin = document.getElementById('tab-login');
     const tabRegister = document.getElementById('tab-register');
     const authBtn = document.getElementById('auth-btn');
     const authError = document.getElementById('auth-error');
-    
     const urlInput = document.getElementById('url-input');
     const usernameInput = document.getElementById('username-input');
     const passwordInput = document.getElementById('password-input');
-    
     const chatWindow = document.getElementById('chat-window');
     const typingIndicator = document.getElementById('typing-indicator');
     const onlineList = document.getElementById('online-list');
@@ -141,11 +154,9 @@
     const statusEl = document.getElementById('status');
     const msgInput = document.getElementById('msg-input');
 
-    // Auto-fill memory
     if (localStorage.getItem('pro_chat_url')) urlInput.value = localStorage.getItem('pro_chat_url');
     if (localStorage.getItem('pro_chat_user')) usernameInput.value = localStorage.getItem('pro_chat_user');
 
-    // Tab Logic
     tabLogin.onclick = () => { isLoginMode = true; tabLogin.classList.add('active'); tabRegister.classList.remove('active'); authBtn.textContent = 'Login'; authError.textContent = ''; };
     tabRegister.onclick = () => { isLoginMode = false; tabRegister.classList.add('active'); tabLogin.classList.remove('active'); authBtn.textContent = 'Register'; authError.textContent = ''; };
 
@@ -172,7 +183,6 @@
 
         const action = isLoginMode ? 'login' : 'register';
 
-        // Wait for connect event, then ask server to verify password
         const emitAuth = () => {
             authError.textContent = `Attempting to ${action}...`;
             socket.emit(action, { username, password }, (response) => {
@@ -185,11 +195,15 @@
                     setTimeout(() => tabLogin.click(), 1500);
                 } else if (action === 'login') {
                     myUsername = response.username;
+                    myRole = response.role; // Save role from DB
+                    
                     authModal.style.display = 'none';
+                    // Update header if admin
+                    if (myRole === 'admin') document.querySelector('header h2').innerHTML = 'Global Chat <span class="admin-badge">ADMIN</span>';
+                    
                     statusEl.textContent = '🟢 Online';
                     statusEl.style.color = '#10b981';
                     
-                    // Load message history
                     chatWindow.innerHTML = '';
                     if(response.history) {
                         response.history.forEach(msg => appendMessage(msg, msg.username === myUsername));
@@ -204,97 +218,156 @@
     }
 
     function setupSocketListeners() {
-        socket.on('connect_error', () => {
-            authError.textContent = 'Waking server up... (~50s on free tier)';
-            authBtn.disabled = false;
-        });
-
-        socket.on('disconnect', () => {
-            statusEl.textContent = '🔴 Offline';
-            statusEl.style.color = 'var(--text)';
-            appendSystemMessage("Connection lost. Reconnecting...");
-        });
+        socket.on('connect_error', () => { authError.textContent = 'Waking server up... (~50s on free tier)'; authBtn.disabled = false; });
+        socket.on('disconnect', () => { statusEl.textContent = '🔴 Offline'; statusEl.style.color = 'var(--text)'; });
         
         socket.on('chat_message', (data) => {
             appendMessage(data, data.username === myUsername);
             typingUsers.delete(data.username);
             updateTypingUI();
         });
+
+        // LIVE EDITS
+        socket.on('message_edited', (data) => {
+            const msgEl = document.querySelector(`.msg[data-id="${data.id}"]`);
+            if (msgEl) {
+                const textSpan = msgEl.querySelector('.msg-text');
+                if (textSpan) textSpan.textContent = data.text;
+                
+                let editedTag = msgEl.querySelector('.edited-tag');
+                if (!editedTag) {
+                    editedTag = document.createElement('span');
+                    editedTag.className = 'edited-tag';
+                    editedTag.textContent = '(edited)';
+                    msgEl.querySelector('.msg-time').appendChild(editedTag);
+                }
+            }
+        });
+
+        // LIVE DELETES
+        socket.on('message_deleted', (id) => {
+            const msgEl = document.querySelector(`.msg[data-id="${id}"]`);
+            if (msgEl) msgEl.remove();
+        });
         
         socket.on('system_message', (text) => appendSystemMessage(text));
 
-        // Update Online Users Sidebar
         socket.on('online_users', (users) => {
             onlineCount.textContent = users.length;
             onlineList.innerHTML = '';
             users.forEach(u => {
                 const li = document.createElement('li');
                 li.textContent = u + (u === myUsername ? " (You)" : "");
+                if (u.toLowerCase() === 'nyzhang1') li.innerHTML += ' <span class="list-admin-badge">👑</span>';
                 onlineList.appendChild(li);
             });
         });
 
-        // Typing event handler
         socket.on('typing', (data) => {
-            if (data.isTyping) typingUsers.add(data.username);
-            else typingUsers.delete(data.username);
+            if (data.isTyping) typingUsers.add(data.username); else typingUsers.delete(data.username);
             updateTypingUI();
         });
     }
 
     authBtn.addEventListener('click', connectAndAuthenticate);
 
-    // Handle sending message
     document.getElementById('compose').addEventListener('submit', (e) => {
         e.preventDefault();
         const text = msgInput.value.trim();
         if (text && socket?.connected) {
             socket.emit('chat_message', text);
             msgInput.value = '';
-            socket.emit('typing', false); // Stop typing immediately
+            socket.emit('typing', false); 
         }
     });
 
-    // Detect user keystrokes for typing indicator
     msgInput.addEventListener('input', () => {
         if (!socket?.connected) return;
         socket.emit('typing', true);
-        
         clearTimeout(typingTimeout);
-        typingTimeout = setTimeout(() => {
-            socket.emit('typing', false);
-        }, 1500); // Stop typing indicator if no keystrokes for 1.5s
+        typingTimeout = setTimeout(() => socket.emit('typing', false), 1500); 
     });
 
-    // UI Helpers
-    function showError(msg, isSuccess) {
-        authError.style.color = isSuccess ? "#10b981" : "var(--error)";
-        authError.textContent = msg;
-    }
+    function showError(msg, isSuccess) { authError.style.color = isSuccess ? "#10b981" : "var(--error)"; authError.textContent = msg; }
 
     function appendMessage(data, isMe) {
         const wrapper = document.createElement('div');
         wrapper.className = `msg ${isMe ? 'me' : 'other'}`;
+        wrapper.setAttribute('data-id', data._id); // Assign DB ID to HTML Element
+
+        const header = document.createElement('div');
+        header.className = 'msg-header';
 
         if (!isMe) {
             const author = document.createElement('div');
             author.className = 'msg-author';
             author.textContent = data.username;
-            wrapper.appendChild(author);
+            header.appendChild(author);
+
+            // Add Admin Tag to messages from NYZhang1
+            if (data.username.toLowerCase() === 'nyzhang1') {
+                const badge = document.createElement('span');
+                badge.className = 'admin-badge';
+                badge.textContent = 'ADMIN';
+                header.appendChild(badge);
+            }
+        }
+
+        // --- THE MAGIC: SHOW BUTTONS IF AUTHOR OR ADMIN ---
+        if (isMe || myRole === 'admin') {
+            const actions = document.createElement('div');
+            actions.className = 'msg-actions';
+
+            const editBtn = document.createElement('button');
+            editBtn.className = 'action-btn';
+            editBtn.textContent = 'Edit';
+            editBtn.onclick = () => {
+                const textSpan = wrapper.querySelector('.msg-text');
+                const newText = prompt("Edit your message:", textSpan.textContent);
+                if (newText && newText.trim() !== textSpan.textContent) {
+                    socket.emit('edit_message', { id: data._id, text: newText });
+                }
+            };
+
+            const delBtn = document.createElement('button');
+            delBtn.className = 'action-btn del';
+            delBtn.textContent = 'Delete';
+            delBtn.onclick = () => {
+                if (confirm("Are you sure you want to delete this message?")) {
+                    socket.emit('delete_message', data._id);
+                }
+            };
+
+            actions.appendChild(editBtn);
+            actions.appendChild(delBtn);
+            header.appendChild(actions);
         }
 
         const bubble = document.createElement('div');
         bubble.className = 'msg-bubble';
-        bubble.textContent = data.text; // Bug Prevention: TextContent natively blocks XSS attacks
+        
+        const textSpan = document.createElement('span');
+        textSpan.className = 'msg-text';
+        textSpan.textContent = data.text; // TextContent blocks XSS
+        bubble.appendChild(textSpan);
 
-        const time = document.createElement('div');
-        time.className = 'msg-time';
-        time.textContent = new Date(data.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        const timeRow = document.createElement('div');
+        timeRow.className = 'msg-time';
+        timeRow.textContent = new Date(data.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        
+        if (data.edited) {
+            const editedTag = document.createElement('span');
+            editedTag.className = 'edited-tag';
+            editedTag.textContent = '(edited)';
+            timeRow.appendChild(editedTag);
+        }
 
+        if(header.children.length > 0) wrapper.appendChild(header);
         wrapper.appendChild(bubble);
-        wrapper.appendChild(time);
+        wrapper.appendChild(timeRow);
+        
         chatWindow.appendChild(wrapper);
-        chatWindow.scrollTop = chatWindow.scrollHeight; // Auto-scroll
+        chatWindow.scrollTop = chatWindow.scrollHeight; 
     }
 
     function appendSystemMessage(text) {
