@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Global Chat Room</title>
+    <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+    <style>
+        :root { --primary: #4F46E5; --bg: #F3F4F6; --surface: #FFFFFF; --text: #1F2937; --text-muted: #6B7280; }
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: system-ui, -apple-system, sans-serif; }
+        body { background: var(--bg); color: var(--text); height: 100vh; display: flex; align-items: center; justify-content: center; }
+        
+        #app { width: 100%; max-width: 600px; height: 100vh; background: var(--surface); display: flex; flex-direction: column; position: relative; box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1); }
+        @media (min-width: 640px) { #app { height: 90vh; border-radius: 12px; overflow: hidden; } }
+
+        /* Setup Modal */
+        #setup-modal { position: absolute; inset: 0; background: var(--surface); z-index: 100; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 2rem; }
+        .setup-container { width: 100%; max-width: 320px; }
+        .setup-container h1 { font-size: 1.5rem; margin-bottom: 0.5rem; text-align: center; }
+        .setup-container p { font-size: 0.85rem; color: var(--text-muted); text-align: center; margin-bottom: 1.5rem; }
+        .input-group { margin-bottom: 1rem; }
+        .input-group label { display: block; font-size: 0.85rem; margin-bottom: 0.4rem; font-weight: 500; }
+        input.text-input { width: 100%; padding: 0.8rem; border: 1px solid #D1D5DB; border-radius: 6px; outline: none; font-size: 1rem; transition: border-color 0.2s; }
+        input.text-input:focus { border-color: var(--primary); }
+        button.primary-btn { width: 100%; padding: 0.8rem; background: var(--primary); color: white; border: none; border-radius: 6px; font-size: 1rem; font-weight: 600; cursor: pointer; transition: background 0.2s; }
+        button.primary-btn:hover:not(:disabled) { background: #4338CA; }
+        button.primary-btn:disabled { opacity: 0.7; cursor: not-allowed; }
+
+        /* Chat UI */
+        header { background: var(--primary); color: white; padding: 1rem; display: flex; justify-content: space-between; align-items: center; }
+        header h2 { font-size: 1.1rem; font-weight: 600; }
+        #status { font-size: 0.75rem; padding: 0.3rem 0.6rem; border-radius: 12px; background: rgba(255,255,255,0.2); font-weight: 500; }
+
+        #chat-window { flex: 1; overflow-y: auto; padding: 1rem; display: flex; flex-direction: column; gap: 1rem; background: #F9FAFB; }
+        .msg { max-width: 80%; display: flex; flex-direction: column; animation: fadeIn 0.2s ease-out; }
+        .msg.me { align-self: flex-end; align-items: flex-end; }
+        .msg.other { align-self: flex-start; align-items: flex-start; }
+        
+        .msg-author { font-size: 0.75rem; color: var(--text-muted); margin-bottom: 0.25rem; margin-left: 0.25rem; }
+        .msg-bubble { padding: 0.75rem 1rem; border-radius: 1rem; font-size: 0.95rem; line-height: 1.4; word-break: break-word; box-shadow: 0 1px 2px rgba(0,0,0,0.05); }
+        .msg.me .msg-bubble { background: var(--primary); color: white; border-bottom-right-radius: 0.25rem; }
+        .msg.other .msg-bubble { background: white; border: 1px solid #E5E7EB; border-bottom-left-radius: 0.25rem; }
+        .msg-time { font-size: 0.65rem; color: var(--text-muted); margin-top: 0.25rem; }
+        .system-msg { text-align: center; font-size: 0.75rem; color: var(--text-muted); margin: 0.5rem 0; }
+
+        /* Compose Area */
+        form#compose { display: flex; padding: 1rem; background: white; border-top: 1px solid #E5E7EB; gap: 0.5rem; }
+        form#compose input { flex: 1; border-radius: 20px; }
+        form#compose button { width: auto; padding: 0.75rem 1.5rem; border-radius: 20px; }
+
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
+    </style>
+</head>
+<body>
+
+<div id="app">
+    <div id="setup-modal">
+        <div class="setup-container">
+            <h1>Join Server</h1>
+            <p>Enter your display name and the Render URL.</p>
+            <div class="input-group">
+                <label>Render Backend URL</label>
+                <input type="text" id="url-input" class="text-input" placeholder="https://your-app.onrender.com" autocomplete="off">
+            </div>
+            <div class="input-group">
+                <label>Display Name</label>
+                <input type="text" id="name-input" class="text-input" placeholder="Your Name" maxlength="20" autocomplete="off">
+            </div>
+            <button id="connect-btn" class="primary-btn">Connect</button>
+        </div>
+    </div>
+
+    <header>
+        <h2>Global Chat</h2>
+        <span id="status">Disconnected</span>
+    </header>
+    <div id="chat-window"></div>
+    <form id="compose">
+        <input type="text" id="msg-input" class="text-input" placeholder="Type a message..." autocomplete="off" disabled>
+        <button type="submit" id="send-btn" class="primary-btn" disabled>Send</button>
+    </form>
+</div>
+
+<script>
+    let socket;
+    let currentUsername = "";
+
+    // DOM Elements
+    const setupModal = document.getElementById('setup-modal');
+    const connectBtn = document.getElementById('connect-btn');
+    const urlInput = document.getElementById('url-input');
+    const nameInput = document.getElementById('name-input');
+    const statusEl = document.getElementById('status');
+    const chatWindow = document.getElementById('chat-window');
+    const composeForm = document.getElementById('compose');
+    const msgInput = document.getElementById('msg-input');
+    const sendBtn = document.getElementById('send-btn');
+
+    // Auto-fill from local storage to prevent typing it every time
+    if (localStorage.getItem('chat_url')) urlInput.value = localStorage.getItem('chat_url');
+    if (localStorage.getItem('chat_name')) nameInput.value = localStorage.getItem('chat_name');
+
+    // Handle Connection
+    connectBtn.addEventListener('click', () => {
+        let url = urlInput.value.trim();
+        const name = nameInput.value.trim();
+
+        if (!url || !name) return alert('Please provide both a URL and a Name.');
+        
+        // Bug Fixes: Auto-format URL 
+        if (!url.startsWith('http')) url = 'https://' + url;
+        url = url.replace(/\/$/, ''); // Remove trailing slash
+
+        // Save for next time
+        localStorage.setItem('chat_url', url);
+        localStorage.setItem('chat_name', name);
+        currentUsername = name;
+
+        connectBtn.textContent = 'Connecting...';
+        connectBtn.disabled = true;
+
+        // Initialize Socket
+        socket = io(url, { reconnectionAttempts: Infinity });
+
+        socket.on('connect', () => {
+            setupModal.style.display = 'none';
+            statusEl.textContent = '🟢 Online';
+            msgInput.disabled = false;
+            sendBtn.disabled = false;
+            msgInput.focus();
+            appendSystemMessage('Securely connected to server.');
+        });
+
+        socket.on('connect_error', () => {
+            // Free Render servers go to sleep after 15 mins of inactivity and take ~50 seconds to wake up.
+            connectBtn.textContent = 'Waking server up... (~50s)';
+            statusEl.textContent = '🟡 Reconnecting...';
+        });
+
+        socket.on('disconnect', () => {
+            statusEl.textContent = '🔴 Offline';
+            msgInput.disabled = true;
+            sendBtn.disabled = true;
+            appendSystemMessage('Connection lost. Reconnecting...');
+        });
+
+        socket.on('chat_message', (data) => {
+            const isMe = data.id === socket.id;
+            appendMessage(data, isMe);
+        });
+    });
+
+    // Handle Sending Messages
+    composeForm.addEventListener('submit', (e) => {
+        e.preventDefault();
+        if (!socket || !socket.connected) return;
+
+        const text = msgInput.value.trim();
+        if (text) {
+            socket.emit('chat_message', { username: currentUsername, text: text });
+            msgInput.value = '';
+        }
+    });
+
+    // Handle Rendering UI 
+    function appendMessage(data, isMe) {
+        const wrapper = document.createElement('div');
+        wrapper.className = `msg ${isMe ? 'me' : 'other'}`;
+
+        if (!isMe) {
+            const author = document.createElement('div');
+            author.className = 'msg-author';
+            author.textContent = data.username; // Bug Prevention: textContent stops XSS
+            wrapper.appendChild(author);
+        }
+
+        const bubble = document.createElement('div');
+        bubble.className = 'msg-bubble';
+        bubble.textContent = data.text; // Bug Prevention: textContent stops XSS
+
+        const time = document.createElement('div');
+        time.className = 'msg-time';
+        time.textContent = new Date(data.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+        wrapper.appendChild(bubble);
+        wrapper.appendChild(time);
+        chatWindow.appendChild(wrapper);
+        chatWindow.scrollTop = chatWindow.scrollHeight; // Auto-scroll to bottom
+    }
+
+    function appendSystemMessage(text) {
+        const el = document.createElement('div');
+        el.className = 'system-msg';
+        el.textContent = text;
+        chatWindow.appendChild(el);
+        chatWindow.scrollTop = chatWindow.scrollHeight;
+    }
+</script>
+</body>
+</html>
