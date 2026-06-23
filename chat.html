@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Pro Global Chat</title>
+    <title>Chat V1.3.1</title>
     <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
     <style>
         :root { --primary: #5865F2; --bg: #202225; --surface: #36393f; --surface-dark: #2f3136; --text: #dcddde; --text-muted: #8e9297; --border: #202225; --error: #ed4245; --warning: #faa61a; }
@@ -220,8 +220,6 @@
     let isLoginMode = true;
     let typingTimeout;
     const typingUsers = new Set();
-    
-    // Edit State
     let editingMsgId = null;
 
     const authModal = document.getElementById('auth-modal');
@@ -257,7 +255,11 @@
         
         authError.style.color = "var(--text)"; authError.textContent = "Connecting to server..."; authBtn.disabled = true;
 
-        if (!socket) { socket = io(url, { reconnectionAttempts: Infinity }); setupSocket(); }
+        if (!socket) { 
+            // FIX: Force 'websocket' to bypass Chrome's local iframe security warning!
+            socket = io(url, { transports: ['websocket'], reconnectionAttempts: Infinity }); 
+            setupSocket(); 
+        }
 
         const action = isLoginMode ? 'login' : 'register';
         const doAuth = () => {
@@ -271,14 +273,17 @@
                     setTimeout(() => document.getElementById('tab-login').click(), 1000);
                 } else {
                     myUsername = res.username;
-                    myRole = res.role;
+                    myRole = res.role || 'user'; // Fallback
                     authModal.classList.remove('active');
                     msgInput.disabled = false;
                     sendBtn.disabled = false;
                     
-                    renderServers(res.servers);
+                    // FIX: Safe array rendering so it doesn't crash on missing variables
+                    renderServers(res.servers || []);
                     switchServer('global', 'Global Chat');
-                    loadHistory(res.history);
+                    
+                    // If the backend hands over history immediately, load it!
+                    if (res.history) loadHistory(res.history);
                 }
             });
         };
@@ -296,10 +301,8 @@
         socket.on('message_edited', (data) => {
             const el = document.querySelector(`.msg[data-id="${data.id}"]`);
             if (el) {
-                // Find or create the text span inside the message
                 let textSpan = el.querySelector('.msg-text-content');
                 if (!textSpan) {
-                     // If it's old structure without wrapper
                      const msgTextDiv = el.querySelector('.msg-text');
                      msgTextDiv.innerHTML = `<span class="msg-text-content">${data.text.replace(/</g, "&lt;")}</span>`;
                      textSpan = msgTextDiv.querySelector('.msg-text-content');
@@ -326,16 +329,12 @@
 
         socket.on('message_deleted', (id) => { const el = document.querySelector(`.msg[data-id="${id}"]`); if (el) el.remove(); });
         
-        // Admin dynamically receives new servers
-        socket.on('admin_new_server', (srv) => {
-            if (myRole === 'admin') addServerToList(srv.code, srv.name);
-        });
+        socket.on('admin_new_server', (srv) => { if (myRole === 'admin') addServerToList(srv.code, srv.name); });
 
         socket.on('online_users', (users) => {
             const list = document.getElementById('online-list');
             list.innerHTML = '';
             
-            // Client-side injection so Admin knows they are online but hidden
             if (myRole === 'admin') {
                 document.getElementById('online-count').textContent = users.length + 1;
                 const li = document.createElement('li'); 
@@ -365,9 +364,11 @@
         document.getElementById('sm-title').textContent = mode === 'join' ? 'Join a Server' : 'Create a Server';
     }
 
+    // FIX: Null check so missing data gracefully exits instead of breaking the app
     function renderServers(servers) {
+        if (!servers || !Array.isArray(servers)) return; 
         dynamicServers.innerHTML = '';
-        servers.forEach(s => { if (s.code !== 'global') addServerToList(s.code, s.name); });
+        servers.forEach(s => { if (s && s.code && s.code !== 'global') addServerToList(s.code, s.name); });
     }
 
     function addServerToList(code, name) {
@@ -404,7 +405,7 @@
         cancelEdit();
         
         socket.emit('switch_server', code, (res) => {
-            loadHistory(res.history);
+            if (res && res.history) loadHistory(res.history);
         });
     }
 
@@ -486,24 +487,26 @@
             const list = document.getElementById('history-list');
             list.innerHTML = '';
             
-            if (res.history.length === 0) { list.innerHTML = '<div class="hist-item" style="border-left-color: var(--text-muted);">No previous edits.</div>'; }
-            
-            res.history.forEach((item, index) => {
-                const el = document.createElement('div');
-                el.className = 'hist-item';
-                el.innerHTML = `
-                    <div class="hist-time">Version ${index + 1} • ${new Date(item.timestamp).toLocaleString()}</div>
-                    <div class="hist-text">${item.text.replace(/</g, "&lt;")}</div>
-                `;
-                list.appendChild(el);
-            });
+            if (!res.history || res.history.length === 0) { list.innerHTML = '<div class="hist-item" style="border-left-color: var(--text-muted);">No previous edits.</div>'; }
+            else {
+                res.history.forEach((item, index) => {
+                    const el = document.createElement('div');
+                    el.className = 'hist-item';
+                    el.innerHTML = `
+                        <div class="hist-time">Version ${index + 1} • ${new Date(item.timestamp).toLocaleString()}</div>
+                        <div class="hist-text">${item.text.replace(/</g, "&lt;")}</div>
+                    `;
+                    list.appendChild(el);
+                });
+            }
             document.getElementById('history-modal').classList.add('active');
         });
     }
 
     // --- MESSAGE RENDERING ---
     function loadHistory(msgs) {
-        if(msgs) msgs.forEach(m => appendMessage(m, m.username === myUsername));
+        if (!msgs || !Array.isArray(msgs)) return; // FIX: Null Safety Check
+        msgs.forEach(m => appendMessage(m, m.username === myUsername));
     }
 
     function appendMessage(data, isMe) {
