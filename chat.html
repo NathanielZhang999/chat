@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Chat V1.3.1</title>
+    <title>Pro Global Chat</title>
     <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
     <style>
         :root { --primary: #5865F2; --bg: #202225; --surface: #36393f; --surface-dark: #2f3136; --text: #dcddde; --text-muted: #8e9297; --border: #202225; --error: #ed4245; --warning: #faa61a; }
@@ -36,23 +36,30 @@
 
         #auth-error { color: var(--error); font-size: 0.85rem; text-align: center; margin-top: 1rem; min-height: 20px; font-weight: 500; }
 
-        /* Servers Sidebar (Far Left) */
+        /* Servers Sidebar */
         #servers-sidebar { width: 72px; background: #202225; display: flex; flex-direction: column; align-items: center; padding: 12px 0; gap: 8px; overflow-y: auto; flex-shrink: 0; }
         .server-icon { width: 48px; height: 48px; border-radius: 50%; background: #36393f; color: white; display: flex; justify-content: center; align-items: center; cursor: pointer; font-weight: bold; transition: 0.2s; font-size: 1.2rem; position: relative;}
-        .server-icon:hover { border-radius: 16px; background: var(--primary); }
-        .server-icon.active { border-radius: 16px; background: var(--primary); }
+        .server-icon:hover { border-radius: 16px; background: var(--primary); opacity: 1 !important; border: none !important; }
+        .server-icon.active { border-radius: 16px; background: var(--primary); opacity: 1 !important; border: none !important; }
         .server-icon.add-btn { background: #36393f; color: #3ba55c; font-weight: 300; font-size: 1.5rem; }
         .server-icon.add-btn:hover { background: #3ba55c; color: white; }
         .tooltip { position: absolute; left: 60px; background: black; color: white; padding: 6px 10px; border-radius: 4px; font-size: 0.8rem; white-space: nowrap; pointer-events: none; opacity: 0; transform: scale(0.9); transition: 0.1s; transform-origin: left; z-index: 100; font-weight: 600; }
         .server-icon:hover .tooltip { opacity: 1; transform: scale(1); }
 
-        /* Chat Area (Middle) */
+        /* Chat Area */
         #chat-area { flex: 1; display: flex; flex-direction: column; position: relative; min-width: 0; }
-        header { padding: 0 1rem; height: 48px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; background: var(--surface); box-shadow: 0 1px 2px rgba(0,0,0,0.2); z-index: 10; }
+        header { padding: 0 1rem; height: 50px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; background: var(--surface); box-shadow: 0 1px 2px rgba(0,0,0,0.2); z-index: 10; }
         #server-title { font-weight: 600; font-size: 1rem; color: white; display: flex; align-items: center; gap: 8px; }
         .admin-badge { background: var(--error); color: white; font-size: 0.6rem; padding: 2px 5px; border-radius: 4px; font-weight: bold; text-transform: uppercase; }
-        #invite-code-btn { font-size: 0.8rem; background: var(--primary); padding: 4px 12px; border-radius: 4px; color: white; cursor: pointer; transition: 0.2s; font-weight: 600; }
-        #invite-code-btn:hover { background: #4752c4; }
+        
+        .header-actions { display: flex; gap: 8px; align-items: center; }
+        .header-btn { font-size: 0.8rem; padding: 6px 12px; border-radius: 4px; color: white; cursor: pointer; transition: 0.2s; font-weight: 600; border: none; display: none; }
+        .header-btn.primary { background: var(--primary); }
+        .header-btn.primary:hover { background: #4752c4; }
+        .header-btn.danger { background: var(--error); }
+        .header-btn.danger:hover { background: #c92a2a; }
+        .header-btn.success { background: #3ba55c; }
+        .header-btn.success:hover { background: #2d7d46; }
 
         #chat-window { flex: 1; overflow-y: auto; padding: 1rem; display: flex; flex-direction: column; gap: 1rem; background: var(--surface); }
         .msg { display: flex; flex-direction: column; animation: fadeIn 0.2s ease-out; position: relative; padding: 0.2rem 1rem; }
@@ -88,7 +95,7 @@
         form#compose input { flex: 1; background: transparent; border: none; padding: 12px 16px; color: var(--text); outline: none; font-size: 1rem; }
         form#compose button.submit-btn { width: auto; padding: 8px 16px; border-radius: 4px; font-weight: 600; font-size: 0.9rem; }
 
-        /* Online Users Sidebar (Right) */
+        /* Online Users Sidebar */
         #online-sidebar { width: 240px; background: #2f3136; display: flex; flex-direction: column; flex-shrink: 0; }
         @media (max-width: 800px) { #online-sidebar { display: none; } }
         .sidebar-header { padding: 1.2rem 1rem 0.5rem 1rem; font-weight: 600; color: var(--text-muted); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.5px; }
@@ -100,7 +107,6 @@
         .stealth-admin { color: var(--warning) !important; font-style: italic; }
         .stealth-admin .status-dot { background: var(--warning); }
 
-        /* History Modal Elements */
         #history-list { max-height: 350px; overflow-y: auto; margin-top: 1rem; text-align: left; }
         .hist-item { background: var(--surface-dark); padding: 1rem; border-radius: 4px; margin-bottom: 0.5rem; border-left: 3px solid var(--primary); }
         .hist-time { font-size: 0.75rem; color: var(--text-muted); margin-bottom: 0.5rem; font-weight: 600;}
@@ -185,7 +191,11 @@
     <div id="chat-area">
         <header>
             <div id="server-title">Loading...</div>
-            <div id="invite-code-btn" onclick="copyCode()" style="display: none;">Copy Invite Code</div>
+            <div class="header-actions">
+                <button class="header-btn primary" id="invite-code-btn" onclick="copyCode()" style="display: none;">Copy Code</button>
+                <button class="header-btn danger" id="leave-server-btn" onclick="leaveServer()" style="display: none;">Leave Server</button>
+                <button class="header-btn success" id="join-server-btn" onclick="joinFromSnoop()" style="display: none;">Join (Become Visible)</button>
+            </div>
         </header>
         
         <div id="chat-window"></div>
@@ -217,6 +227,9 @@
     let myUsername = "";
     let myRole = "user"; 
     let currentServerCode = 'global';
+    let myJoinedServers = []; // Tracks strictly what we are officially joined to
+    let serverNamesCache = { 'global': 'Global Chat' }; // Memorize names
+    
     let isLoginMode = true;
     let typingTimeout;
     const typingUsers = new Set();
@@ -231,8 +244,11 @@
     const msgInput = document.getElementById('msg-input');
     const sendBtn = document.getElementById('send-btn');
     const cancelEditBtn = document.getElementById('cancel-edit-btn');
-    const inviteBtn = document.getElementById('invite-code-btn');
     const editBar = document.getElementById('edit-bar');
+
+    const inviteBtn = document.getElementById('invite-code-btn');
+    const leaveBtn = document.getElementById('leave-server-btn');
+    const joinBtn = document.getElementById('join-server-btn');
 
     if (localStorage.getItem('pro_chat_url')) document.getElementById('url-input').value = localStorage.getItem('pro_chat_url');
     if (localStorage.getItem('pro_chat_user')) document.getElementById('username-input').value = localStorage.getItem('pro_chat_user');
@@ -256,7 +272,6 @@
         authError.style.color = "var(--text)"; authError.textContent = "Connecting to server..."; authBtn.disabled = true;
 
         if (!socket) { 
-            // FIX: Force 'websocket' to bypass Chrome's local iframe security warning!
             socket = io(url, { transports: ['websocket'], reconnectionAttempts: Infinity }); 
             setupSocket(); 
         }
@@ -273,16 +288,15 @@
                     setTimeout(() => document.getElementById('tab-login').click(), 1000);
                 } else {
                     myUsername = res.username;
-                    myRole = res.role || 'user'; // Fallback
+                    myRole = res.role || 'user';
+                    myJoinedServers = res.joinedServers || ['global'];
+                    
                     authModal.classList.remove('active');
                     msgInput.disabled = false;
                     sendBtn.disabled = false;
                     
-                    // FIX: Safe array rendering so it doesn't crash on missing variables
                     renderServers(res.servers || []);
                     switchServer('global', 'Global Chat');
-                    
-                    // If the backend hands over history immediately, load it!
                     if (res.history) loadHistory(res.history);
                 }
             });
@@ -306,22 +320,15 @@
                      const msgTextDiv = el.querySelector('.msg-text');
                      msgTextDiv.innerHTML = `<span class="msg-text-content">${data.text.replace(/</g, "&lt;")}</span>`;
                      textSpan = msgTextDiv.querySelector('.msg-text-content');
-                } else {
-                     textSpan.textContent = data.text;
-                }
+                } else { textSpan.textContent = data.text; }
 
                 if (!el.querySelector('.edited-tag')) {
                     const tag = document.createElement('span');
-                    tag.className = 'edited-tag';
-                    tag.textContent = '(edited)';
+                    tag.className = 'edited-tag'; tag.textContent = '(edited)';
                     const isMe = el.querySelector('.msg-author').textContent === myUsername;
                     if (isMe || myRole === 'admin') {
-                        tag.title = "View edit history";
-                        tag.onclick = () => viewHistory(data.id);
-                    } else {
-                        tag.style.cursor = 'default';
-                        tag.style.textDecoration = 'none';
-                    }
+                        tag.title = "View edit history"; tag.onclick = () => viewHistory(data.id);
+                    } else { tag.style.cursor = 'default'; tag.style.textDecoration = 'none'; }
                     el.querySelector('.msg-text').appendChild(tag);
                 }
             }
@@ -335,14 +342,16 @@
             const list = document.getElementById('online-list');
             list.innerHTML = '';
             
-            if (myRole === 'admin') {
-                document.getElementById('online-count').textContent = users.length + 1;
+            // Check if Admin is in stealth (snooping) mode
+            const isHiddenAdmin = myRole === 'admin' && !users.includes(myUsername) && currentServerCode !== 'global';
+
+            document.getElementById('online-count').textContent = users.length + (isHiddenAdmin ? 1 : 0);
+
+            if (isHiddenAdmin) {
                 const li = document.createElement('li'); 
                 li.className = "user-item stealth-admin"; 
-                li.innerHTML = `<div class="avatar">A<div class="status-dot"></div></div><div>${myUsername} (Hidden)</div>`;
+                li.innerHTML = `<div class="avatar">A<div class="status-dot" style="background:var(--warning);"></div></div><div style="color:var(--warning); font-style:italic;">${myUsername} (Hidden)</div>`;
                 list.appendChild(li);
-            } else {
-                document.getElementById('online-count').textContent = users.length;
             }
 
             users.forEach(u => {
@@ -364,7 +373,6 @@
         document.getElementById('sm-title').textContent = mode === 'join' ? 'Join a Server' : 'Create a Server';
     }
 
-    // FIX: Null check so missing data gracefully exits instead of breaking the app
     function renderServers(servers) {
         if (!servers || !Array.isArray(servers)) return; 
         dynamicServers.innerHTML = '';
@@ -372,33 +380,53 @@
     }
 
     function addServerToList(code, name) {
+        serverNamesCache[code] = name;
         if(document.getElementById(`srv-${code}`)) return;
+        
         const icon = document.createElement('div');
         icon.className = 'server-icon';
         icon.id = `srv-${code}`;
         icon.textContent = name.substring(0, 2).toUpperCase();
         icon.innerHTML += `<div class="tooltip">${name}</div>`;
         icon.onclick = () => switchServer(code, name);
+        
+        // Dims the icon if Admin is just spying and hasn't explicitly joined
+        if (myRole === 'admin' && !myJoinedServers.includes(code) && code !== 'global') {
+            icon.style.opacity = '0.4';
+            icon.style.border = '1px dashed #8e9297';
+        }
         dynamicServers.appendChild(icon);
     }
 
     function switchServer(code, name) {
         if (currentServerCode === code && document.getElementById('chat-window').innerHTML !== '') return; 
         currentServerCode = code;
+        const srvName = name || serverNamesCache[code] || 'Unknown';
         
         document.querySelectorAll('.server-icon').forEach(el => el.classList.remove('active'));
         const activeIcon = document.getElementById(`srv-${code}`);
         if(activeIcon) activeIcon.classList.add('active');
 
-        document.getElementById('server-title').innerHTML = name + (myRole === 'admin' ? ' <span class="admin-badge" title="Ghost Admin Mode">Admin</span>' : '');
+        const isStealth = myRole === 'admin' && !myJoinedServers.includes(code) && code !== 'global';
+        
+        document.getElementById('server-title').innerHTML = srvName + (myRole === 'admin' ? ' <span class="admin-badge" title="Admin">Admin</span>' : '') + (isStealth ? ' <span style="color:var(--warning); font-size:0.8rem; font-style:italic;">(Ghost)</span>' : '');
         
         if (code === 'global') {
             inviteBtn.style.display = 'none';
+            leaveBtn.style.display = 'none';
+            joinBtn.style.display = 'none';
             msgInput.placeholder = `Message Global Chat`;
         } else {
             inviteBtn.style.display = 'block';
-            inviteBtn.textContent = `Invite Code: ${code}`;
-            msgInput.placeholder = `Message ${name}`;
+            inviteBtn.textContent = `Copy Code: ${code}`;
+            if (myJoinedServers.includes(code)) {
+                leaveBtn.style.display = 'block';
+                joinBtn.style.display = 'none';
+            } else {
+                leaveBtn.style.display = 'none';
+                joinBtn.style.display = 'block';
+            }
+            msgInput.placeholder = `Message ${srvName}`;
         }
         
         chatWindow.innerHTML = '';
@@ -416,6 +444,39 @@
         setTimeout(() => inviteBtn.textContent = old, 1500);
     }
 
+    function leaveServer() {
+        if (currentServerCode === 'global') return;
+        if (!confirm("Are you sure you want to leave this server?")) return;
+        
+        socket.emit('leave_server', currentServerCode, (res) => {
+            if (res.error) return alert(res.error);
+            myJoinedServers = myJoinedServers.filter(c => c !== currentServerCode);
+            
+            const icon = document.getElementById(`srv-${currentServerCode}`);
+            if (myRole !== 'admin' && icon) {
+                icon.remove(); 
+                switchServer('global', 'Global Chat');
+            } else {
+                // Admins stay but visually swap to Ghost mode
+                if (icon) {
+                    icon.style.opacity = '0.4'; 
+                    icon.style.border = '1px dashed #8e9297';
+                }
+                switchServer(currentServerCode, serverNamesCache[currentServerCode]);
+            }
+        });
+    }
+
+    function joinFromSnoop() {
+        socket.emit('join_server', currentServerCode, (res) => {
+            if (res.error) return alert(res.error);
+            if (!myJoinedServers.includes(res.server.code)) myJoinedServers.push(res.server.code);
+            const icon = document.getElementById(`srv-${res.server.code}`);
+            if (icon) { icon.style.opacity = '1'; icon.style.border = 'none'; }
+            switchServer(res.server.code, res.server.name);
+        });
+    }
+
     document.getElementById('submit-create-btn').onclick = () => {
         const name = document.getElementById('create-name').value.trim();
         if(!name) return;
@@ -423,7 +484,12 @@
             if (res.error) return alert(res.error);
             document.getElementById('server-modal').classList.remove('active');
             document.getElementById('create-name').value = '';
-            if (myRole !== 'admin') addServerToList(res.server.code, res.server.name);
+            myJoinedServers.push(res.server.code);
+            
+            const existingIcon = document.getElementById(`srv-${res.server.code}`);
+            if (existingIcon) { existingIcon.style.opacity = '1'; existingIcon.style.border = 'none'; }
+            else { addServerToList(res.server.code, res.server.name); }
+            
             switchServer(res.server.code, res.server.name);
         });
     };
@@ -435,7 +501,12 @@
             if (res.error) return alert(res.error);
             document.getElementById('server-modal').classList.remove('active');
             document.getElementById('join-code').value = '';
-            addServerToList(res.server.code, res.server.name);
+            if (!myJoinedServers.includes(res.server.code)) myJoinedServers.push(res.server.code);
+            
+            const existingIcon = document.getElementById(`srv-${res.server.code}`);
+            if (existingIcon) { existingIcon.style.opacity = '1'; existingIcon.style.border = 'none'; }
+            else { addServerToList(res.server.code, res.server.name); }
+            
             switchServer(res.server.code, res.server.name);
         });
     };
@@ -464,20 +535,12 @@
     });
 
     function initiateEdit(id, currentText) {
-        editingMsgId = id;
-        editBar.style.display = 'flex';
-        msgInput.value = currentText;
-        msgInput.focus();
-        sendBtn.textContent = 'Save';
-        sendBtn.style.background = '#4752c4';
+        editingMsgId = id; editBar.style.display = 'flex'; msgInput.value = currentText;
+        msgInput.focus(); sendBtn.textContent = 'Save'; sendBtn.style.background = '#4752c4';
     }
-
     function cancelEdit() {
-        editingMsgId = null;
-        editBar.style.display = 'none';
-        msgInput.value = '';
-        sendBtn.textContent = 'Send';
-        sendBtn.style.background = 'var(--primary)';
+        editingMsgId = null; editBar.style.display = 'none'; msgInput.value = '';
+        sendBtn.textContent = 'Send'; sendBtn.style.background = 'var(--primary)';
     }
     cancelEditBtn.onclick = cancelEdit;
 
@@ -486,16 +549,11 @@
             if (res.error) return alert(res.error);
             const list = document.getElementById('history-list');
             list.innerHTML = '';
-            
             if (!res.history || res.history.length === 0) { list.innerHTML = '<div class="hist-item" style="border-left-color: var(--text-muted);">No previous edits.</div>'; }
             else {
                 res.history.forEach((item, index) => {
-                    const el = document.createElement('div');
-                    el.className = 'hist-item';
-                    el.innerHTML = `
-                        <div class="hist-time">Version ${index + 1} • ${new Date(item.timestamp).toLocaleString()}</div>
-                        <div class="hist-text">${item.text.replace(/</g, "&lt;")}</div>
-                    `;
+                    const el = document.createElement('div'); el.className = 'hist-item';
+                    el.innerHTML = `<div class="hist-time">Version ${index + 1} • ${new Date(item.timestamp).toLocaleString()}</div><div class="hist-text">${item.text.replace(/</g, "&lt;")}</div>`;
                     list.appendChild(el);
                 });
             }
@@ -503,81 +561,50 @@
         });
     }
 
-    // --- MESSAGE RENDERING ---
     function loadHistory(msgs) {
-        if (!msgs || !Array.isArray(msgs)) return; // FIX: Null Safety Check
+        if (!msgs || !Array.isArray(msgs)) return; 
         msgs.forEach(m => appendMessage(m, m.username === myUsername));
     }
 
     function appendMessage(data, isMe) {
         const wrapper = document.createElement('div');
-        wrapper.className = `msg`;
-        wrapper.setAttribute('data-id', data._id); 
+        wrapper.className = `msg`; wrapper.setAttribute('data-id', data._id); 
 
-        const header = document.createElement('div');
-        header.className = 'msg-header';
-
-        const author = document.createElement('div');
-        author.className = 'msg-author';
-        author.textContent = data.username;
-        header.appendChild(author);
+        const header = document.createElement('div'); header.className = 'msg-header';
+        const author = document.createElement('div'); author.className = 'msg-author';
+        author.textContent = data.username; header.appendChild(author);
 
         if (data.username.toLowerCase() === 'nyzhang1') {
-            const badge = document.createElement('span');
-            badge.className = 'admin-badge'; badge.textContent = 'ADMIN'; header.appendChild(badge);
+            const badge = document.createElement('span'); badge.className = 'admin-badge'; badge.textContent = 'ADMIN'; header.appendChild(badge);
         }
 
-        const time = document.createElement('div');
-        time.className = 'msg-time-header';
+        const time = document.createElement('div'); time.className = 'msg-time-header';
         time.textContent = new Date(data.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
         header.appendChild(time);
 
         if (isMe || myRole === 'admin') {
-            const actions = document.createElement('div');
-            actions.className = 'msg-actions';
-
-            const editBtn = document.createElement('button');
-            editBtn.className = 'action-btn'; editBtn.textContent = '✏️ Edit';
-            editBtn.onclick = () => {
-                let cleanText = wrapper.querySelector('.msg-text-content').textContent;
-                initiateEdit(data._id, cleanText);
-            }
-
-            const delBtn = document.createElement('button');
-            delBtn.className = 'action-btn del'; delBtn.textContent = '🗑️ Delete';
+            const actions = document.createElement('div'); actions.className = 'msg-actions';
+            const editBtn = document.createElement('button'); editBtn.className = 'action-btn'; editBtn.textContent = '✏️ Edit';
+            editBtn.onclick = () => initiateEdit(data._id, wrapper.querySelector('.msg-text-content').textContent);
+            const delBtn = document.createElement('button'); delBtn.className = 'action-btn del'; delBtn.textContent = '🗑️ Delete';
             delBtn.onclick = () => { if (confirm("Delete this message?")) socket.emit('delete_message', data._id); };
 
-            actions.appendChild(editBtn);
-            actions.appendChild(delBtn);
-            wrapper.appendChild(actions);
+            actions.appendChild(editBtn); actions.appendChild(delBtn); wrapper.appendChild(actions);
         }
 
-        const textDiv = document.createElement('div');
-        textDiv.className = 'msg-text';
-        
-        const textSpan = document.createElement('span');
-        textSpan.className = 'msg-text-content';
-        textSpan.textContent = data.text; 
-        textDiv.appendChild(textSpan);
+        const textDiv = document.createElement('div'); textDiv.className = 'msg-text';
+        const textSpan = document.createElement('span'); textSpan.className = 'msg-text-content';
+        textSpan.textContent = data.text; textDiv.appendChild(textSpan);
 
         if (data.edited) {
-            const tag = document.createElement('span');
-            tag.className = 'edited-tag';
-            tag.textContent = '(edited)';
-            if (isMe || myRole === 'admin') {
-                tag.title = "View edit history";
-                tag.onclick = () => viewHistory(data._id);
-            } else {
-                tag.style.cursor = 'default';
-            }
+            const tag = document.createElement('span'); tag.className = 'edited-tag'; tag.textContent = '(edited)';
+            if (isMe || myRole === 'admin') { tag.title = "View edit history"; tag.onclick = () => viewHistory(data._id); } 
+            else { tag.style.cursor = 'default'; }
             textDiv.appendChild(tag);
         }
 
-        wrapper.appendChild(header);
-        wrapper.appendChild(textDiv);
-        
-        chatWindow.appendChild(wrapper);
-        chatWindow.scrollTop = chatWindow.scrollHeight; 
+        wrapper.appendChild(header); wrapper.appendChild(textDiv);
+        chatWindow.appendChild(wrapper); chatWindow.scrollTop = chatWindow.scrollHeight; 
     }
 
     function appendSystemMessage(txt) {
@@ -592,5 +619,3 @@
         else ind.textContent = 'Multiple people are typing...';
     }
 </script>
-</body>
-</html>

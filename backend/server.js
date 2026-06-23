@@ -17,7 +17,7 @@ const UserSchema = new mongoose.Schema({
   username: { type: String, required: true, unique: true },
   password: { type: String, required: true },
   role: { type: String, default: 'user' },
-  servers: { type: [String], default: ['global'] } // Tracks joined server codes
+  servers: { type: [String], default: ['global'] } 
 });
 const User = mongoose.model('User', UserSchema);
 
@@ -66,8 +66,10 @@ const onlineUsers = new Map();
 function broadcastOnlineUsers(serverCode) {
   const users = [];
   for (const [id, info] of onlineUsers.entries()) {
-    if (info.serverCode === serverCode && info.role !== 'admin') {
-      users.push(info.username);
+    if (info.serverCode === serverCode) {
+      // If user is an Admin, ONLY show them if they explicitly joined this server or are in Global.
+      const isVisible = info.role !== 'admin' || info.joinedServers.includes(serverCode) || serverCode === 'global';
+      if (isVisible) users.push(info.username);
     }
   }
   io.to(serverCode).emit('online_users', [...new Set(users)]);
@@ -75,6 +77,7 @@ function broadcastOnlineUsers(serverCode) {
 
 io.on('connection', (socket) => {
   socket.serverCode = null;
+  socket.joinedServers = [];
 
   socket.on('register', async (data, callback) => {
     try {
@@ -95,7 +98,6 @@ io.on('connection', (socket) => {
       if (!user) return callback({ error: 'User not found.' });
       if (!(await bcrypt.compare(data.password, user.password))) return callback({ error: 'Incorrect password.' });
 
-      // FIX FOR OLD ACCOUNTS: If an account was made before servers existed, automatically repair it
       if (!user.servers || user.servers.length === 0) {
           user.servers = ['global'];
           await user.save();
@@ -104,20 +106,19 @@ io.on('connection', (socket) => {
       socket.username = user.username;
       socket.role = user.role || 'user';
       socket.serverCode = 'global'; 
+      socket.joinedServers = user.servers;
       
       socket.join('global');
-      onlineUsers.set(socket.id, { username: user.username, role: socket.role, serverCode: 'global' });
+      onlineUsers.set(socket.id, { username: user.username, role: socket.role, serverCode: 'global', joinedServers: user.servers });
       broadcastOnlineUsers('global');
 
-      if (socket.role !== 'admin') {
-        socket.to('global').emit('system_message', `${user.username} joined.`);
-      }
+      const isVisible = socket.role !== 'admin' || socket.joinedServers.includes('global');
+      if (isVisible) socket.to('global').emit('system_message', `${user.username} joined.`);
 
       const servers = socket.role === 'admin' 
         ? await ChatServer.find() 
         : await ChatServer.find({ code: { $in: user.servers } });
 
-      // FIX FOR OLD MESSAGES: Global chat now loads missing serverCodes from old messages as well
       const history = await Message.find({ 
           $or: [{ serverCode: 'global' }, { serverCode: { $exists: false } }, { serverCode: null }] 
       }).sort({ timestamp: -1 }).limit(100);
@@ -127,9 +128,10 @@ io.on('connection', (socket) => {
           username: user.username, 
           role: socket.role, 
           servers: servers || [], 
+          joinedServers: user.servers, 
           history: history.reverse() 
       });
-    } catch (err) { console.error(err); callback({ error: 'Login failed.' }); }
+    } catch (err) { callback({ error: 'Login failed.' }); }
   });
 
   // --- SERVER MANAGEMENT ---
@@ -144,6 +146,8 @@ io.on('connection', (socket) => {
       if (!user.servers.includes(code)) {
         user.servers.push(code);
         await user.save();
+        socket.joinedServers = user.servers;
+        if(onlineUsers.has(socket.id)) onlineUsers.get(socket.id).joinedServers = user.servers;
       }
 
       callback({ success: true, server: srv });
@@ -164,9 +168,36 @@ io.on('connection', (socket) => {
       if (!user.servers.includes(srv.code)) {
         user.servers.push(srv.code);
         await user.save();
+        socket.joinedServers = user.servers;
+        if(onlineUsers.has(socket.id)) onlineUsers.get(socket.id).joinedServers = user.servers;
+        
+        // Notify others if they joined while looking at the channel
+        if (socket.serverCode === srv.code) {
+           socket.to(srv.code).emit('system_message', `${socket.username} joined.`);
+           broadcastOnlineUsers(srv.code);
+        }
       }
       callback({ success: true, server: srv });
     } catch (err) { callback({ error: 'Join failed.' }); }
+  });
+
+  socket.on('leave_server', async (code, callback) => {
+    if (!socket.username || code === 'global') return callback({ error: 'Cannot leave global.' });
+    try {
+      const user = await User.findOne({ username: socket.username });
+      if (user.servers.includes(code)) {
+        user.servers = user.servers.filter(s => s !== code);
+        await user.save();
+        socket.joinedServers = user.servers;
+        if(onlineUsers.has(socket.id)) onlineUsers.get(socket.id).joinedServers = user.servers;
+
+        if (socket.serverCode === code) {
+           socket.to(code).emit('system_message', `${socket.username} left the server.`);
+           broadcastOnlineUsers(code);
+        }
+      }
+      callback({ success: true });
+    } catch (err) { callback({ error: 'Failed to leave.' }); }
   });
 
   socket.on('switch_server', async (code, callback) => {
@@ -175,16 +206,22 @@ io.on('connection', (socket) => {
       const oldCode = socket.serverCode;
       if (oldCode) {
          socket.leave(oldCode);
-         if (socket.role !== 'admin') socket.to(oldCode).emit('system_message', `${socket.username} left.`);
+         const oldVisible = socket.role !== 'admin' || socket.joinedServers.includes(oldCode) || oldCode === 'global';
+         if (oldVisible) socket.to(oldCode).emit('system_message', `${socket.username} left.`);
          broadcastOnlineUsers(oldCode);
       }
 
       socket.serverCode = code;
       socket.join(code);
-      onlineUsers.set(socket.id, { username: socket.username, role: socket.role, serverCode: code });
+      if (onlineUsers.has(socket.id)) {
+          let session = onlineUsers.get(socket.id);
+          session.serverCode = code;
+          session.joinedServers = socket.joinedServers;
+      }
       
       broadcastOnlineUsers(code);
-      if (socket.role !== 'admin') socket.to(code).emit('system_message', `${socket.username} joined.`);
+      const newVisible = socket.role !== 'admin' || socket.joinedServers.includes(code) || code === 'global';
+      if (newVisible) socket.to(code).emit('system_message', `${socket.username} joined.`);
 
       let query = { serverCode: code };
       if (code === 'global') query = { $or: [{ serverCode: 'global' }, { serverCode: { $exists: false } }, { serverCode: null }] };
@@ -245,7 +282,9 @@ io.on('connection', (socket) => {
   });
 
   socket.on('typing', (isTyping) => {
-    if (socket.username && socket.serverCode && socket.role !== 'admin') {
+    if (!socket.username || !socket.serverCode) return;
+    const isVisible = socket.role !== 'admin' || socket.joinedServers.includes(socket.serverCode) || socket.serverCode === 'global';
+    if (isVisible) {
       socket.to(socket.serverCode).emit('typing', { username: socket.username, isTyping });
     }
   });
@@ -254,7 +293,8 @@ io.on('connection', (socket) => {
     if (socket.username && socket.serverCode) {
       onlineUsers.delete(socket.id);
       broadcastOnlineUsers(socket.serverCode);
-      if (socket.role !== 'admin') io.to(socket.serverCode).emit('system_message', `${socket.username} left.`);
+      const isVisible = socket.role !== 'admin' || socket.joinedServers.includes(socket.serverCode) || socket.serverCode === 'global';
+      if (isVisible) io.to(socket.serverCode).emit('system_message', `${socket.username} left.`);
     }
   });
 });
