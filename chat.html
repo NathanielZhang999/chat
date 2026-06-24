@@ -57,6 +57,7 @@
         .header-btn.primary { background: var(--primary); }
         .header-btn.delete, .header-btn.logout { background: var(--error); }
         .header-btn.success { background: #3ba55c; }
+        .header-btn.danger { background: #4f545c; }
         .header-btn.settings { background: #4f545c; display: block; }
         .header-btn.settings:hover { background: #686d73; }
         .header-btn.logout { display: block; }
@@ -121,7 +122,7 @@
         /* Input Additions */
         #attachment-preview { display: none; background: #2f3136; margin: 0 16px; padding: 10px; border-radius: 8px 8px 0 0; border-top: 1px solid var(--primary); position: relative; width: max-content; }
         #attachment-preview img { max-height: 100px; border-radius: 4px; border: 1px solid #202225; }
-        #clear-attachment { position: absolute; top: -5px; right: -5px; background: var(--error); color: white; border: none; border-radius: 50%; width: 20px; height: 20px; cursor: pointer; font-weight: bold; }
+        #clear-attachment-btn { position: absolute; top: -5px; right: -5px; background: var(--error); color: white; border: none; border-radius: 50%; width: 20px; height: 20px; cursor: pointer; font-weight: bold; display: flex; align-items: center; justify-content: center; padding-bottom: 2px;}
         
         #emoji-picker-container { display: none; position: absolute; bottom: 45px; right: 0; width: 280px; background: var(--surface-dark); border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); padding: 10px; z-index: 100; }
         .emoji-grid { display: grid; grid-template-columns: repeat(8, 1fr); gap: 5px; max-height: 180px; overflow-y: auto; }
@@ -269,7 +270,7 @@
             <div id="attachment-preview">
                 <div style="position:relative;">
                     <img id="preview-img" src="">
-                    <button type="button" id="clear-attachment" title="Remove Attachment">&times;</button>
+                    <button type="button" id="clear-attachment-btn" title="Remove Attachment">&times;</button>
                 </div>
             </div>
 
@@ -278,7 +279,7 @@
                     <button type="button" class="chat-icon-btn plus" onclick="document.getElementById('file-upload').click()" title="Upload Image">➕</button>
                     <input type="file" id="file-upload" accept="image/*" style="display:none;">
                     
-                    <input type="text" id="msg-input" placeholder="Message... (Markdown allowed: **bold** *italic* `code`)" autocomplete="off" disabled>
+                    <input type="text" id="msg-input" placeholder="Message... (Use @username to ping)" autocomplete="off" disabled>
                     
                     <div style="position:relative; display: flex;">
                         <button type="button" class="chat-icon-btn" id="emoji-btn" title="Emojis">😀</button>
@@ -299,6 +300,18 @@
 </div>
 
 <script>
+    // --- ATTACHMENT CLEAR LOGIC FIX ---
+    let pendingAttachmentBase64 = null; 
+    
+    function clearAttachment() {
+        pendingAttachmentBase64 = null;
+        document.getElementById('attachment-preview').style.display = 'none';
+        document.getElementById('preview-img').src = '';
+        document.getElementById('file-upload').value = ''; 
+    }
+
+    document.getElementById('clear-attachment-btn').onclick = clearAttachment;
+
     // --- AUDIO ---
     const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     function playSound(type) {
@@ -340,7 +353,6 @@
         return `hsl(${Math.abs(hash % 360)}, 70%, 55%)`;
     }
 
-    // Exact Date format matching the prompt's image: "6/19/2026 8:32 PM"
     function formatExactDate(timestamp) {
         const d = new Date(timestamp);
         const dateStr = `${d.getMonth()+1}/${d.getDate()}/${d.getFullYear()}`;
@@ -364,7 +376,6 @@
     
     let editingMsgId = null;
     let replyingToData = null; 
-    let pendingAttachmentBase64 = null; 
 
     const authModal = document.getElementById('auth-modal');
     const authBtn = document.getElementById('auth-btn');
@@ -402,7 +413,6 @@
         const file = e.target.files[0]; if (!file) return;
         if (!file.type.startsWith('image/')) return showAppAlert("Error", "Only image files are allowed.");
         
-        // 10MB max pre-compression
         if(file.size > 10 * 1024 * 1024) return showAppAlert("Error", "File too large. Max 10MB before compression.");
         
         const reader = new FileReader();
@@ -426,14 +436,8 @@
             img.src = event.target.result;
         };
         reader.readAsDataURL(file);
-        e.target.value = ''; // Reset input
     });
 
-    document.getElementById('clear-attachment').onclick = () => {
-        pendingAttachmentBase64 = null;
-        document.getElementById('attachment-preview').style.display = 'none';
-        document.getElementById('preview-img').src = '';
-    };
 
     // --- SETTINGS LOGIC ---
     document.getElementById('setting-color-picker').addEventListener('input', (e) => { document.getElementById('setting-color-text').value = e.target.value; });
@@ -571,6 +575,8 @@
         socket.on('profile_updated', (data) => {
             if (data.username === myUsername) { myColor = data.color; myAvatarUrl = data.avatarUrl; }
             document.querySelectorAll(`.msg[data-author="${data.username}"]`).forEach(el => {
+                if (el.classList.contains('deleted-compact')) return;
+                
                 const authorDiv = el.querySelector('.msg-author');
                 const avatarDiv = el.querySelector('.msg-avatar');
                 if(!authorDiv || !avatarDiv) return;
@@ -605,10 +611,12 @@
 
                 if (!el.querySelector('.edited-tag')) {
                     const textDiv = el.querySelector('.msg-text');
-                    const tag = document.createElement('span'); tag.className = 'edited-tag'; tag.textContent = '(edited)';
-                    if (data.username === myUsername || myRole === 'admin') { tag.title = "View edit history"; tag.onclick = () => viewHistory(data.id); } 
-                    else { tag.style.cursor = 'default'; tag.style.textDecoration = 'none'; }
-                    if (textDiv) textDiv.appendChild(tag);
+                    if (textDiv) {
+                        const tag = document.createElement('span'); tag.className = 'edited-tag'; tag.textContent = '(edited)';
+                        if (data.username === myUsername || myRole === 'admin') { tag.title = "View edit history"; tag.onclick = () => viewHistory(data.id); } 
+                        else { tag.style.cursor = 'default'; tag.style.textDecoration = 'none'; }
+                        textDiv.appendChild(tag);
+                    }
                 }
             });
         });
@@ -618,7 +626,6 @@
                 const authorName = el.getAttribute('data-author') || 'Someone';
                 const isMe = authorName === myUsername;
                 
-                // Morph entire object into Compact gray line
                 el.className = 'msg deleted-compact is-deleted';
                 el.innerHTML = `<span style="margin-right: 6px; font-size:0.9rem;">🗑️</span> <span class="deleted-text">${authorName} deleted a message.</span>`;
                 
@@ -744,28 +751,43 @@
         }
         
         chatWindow.innerHTML = ''; cancelAction();
-        socket.emit('switch_server', code, (res) => { chatWindow.innerHTML = ''; if (res && res.history) loadHistory(res.history); });
+        socket.emit('switch_server', code, (res) => { 
+            chatWindow.innerHTML = '';
+            if (res && res.history) loadHistory(res.history); 
+        });
     }
 
-    function copyCode() { navigator.clipboard.writeText(currentServerCode); showAppAlert("Copied", `Invite Code copied to clipboard: ${currentServerCode}`); }
+    function copyCode() {
+        navigator.clipboard.writeText(currentServerCode);
+        showAppAlert("Copied", `Invite Code copied to clipboard: ${currentServerCode}`);
+    }
 
     async function leaveServer() {
         if (currentServerCode === 'global') return;
         if (!(await showAppConfirm("Leave Server", "Are you sure you want to leave this server?", "Leave", true))) return;
+        
         socket.emit('leave_server', currentServerCode, (res) => {
             if (res.error) return showAppAlert("Error", res.error);
             myJoinedServers = myJoinedServers.filter(c => c !== currentServerCode);
+            
             const icon = document.getElementById(`srv-${currentServerCode}`);
-            if (myRole !== 'admin' && icon) { icon.remove(); switchServer('global'); } 
-            else if (icon) { icon.style.opacity = '0.4'; icon.style.border = '1px dashed #8e9297'; switchServer(currentServerCode); }
+            if (myRole !== 'admin' && icon) {
+                icon.remove(); switchServer('global');
+            } else if (icon) {
+                icon.style.opacity = '0.4'; icon.style.border = '1px dashed #8e9297';
+                switchServer(currentServerCode);
+            }
         });
     }
 
     async function deleteServer() {
         if (currentServerCode === 'global') return;
         const srvName = serversCache[currentServerCode].name;
-        if (await showAppConfirm("Delete Server", `🚨 WARNING 🚨\n\nCompletely destroy "${srvName}"? All messages will be wiped forever.`, "Delete Permanently", true)) {
-            socket.emit('delete_server', currentServerCode, (res) => { if (res && res.error) showAppAlert("Error", res.error); });
+        
+        if (await showAppConfirm("Delete Server", `🚨 PERMANENT WARNING 🚨\n\nAre you sure you want to completely destroy "${srvName}"?\n\nAll messages will be wiped forever.`, "Delete Permanently", true)) {
+            socket.emit('delete_server', currentServerCode, (res) => {
+                if (res && res.error) showAppAlert("Error", res.error);
+            });
         }
     }
 
@@ -780,54 +802,61 @@
     }
 
     document.getElementById('submit-create-btn').onclick = () => {
-        const name = document.getElementById('create-name').value.trim(); if(!name) return;
+        const name = document.getElementById('create-name').value.trim();
+        if(!name) return;
         socket.emit('create_server', name, (res) => {
             if (res.error) return showAppAlert("Error", res.error);
             document.getElementById('server-modal').classList.remove('active'); document.getElementById('create-name').value = '';
             myJoinedServers.push(res.server.code);
+            
             const existingIcon = document.getElementById(`srv-${res.server.code}`);
             if (existingIcon) { existingIcon.style.opacity = '1'; existingIcon.style.border = 'none'; }
             else { addServerToList(res.server.code, res.server.name, myUsername); } 
+            
             switchServer(res.server.code);
         });
     };
 
     document.getElementById('submit-join-btn').onclick = () => {
-        const code = document.getElementById('join-code').value.trim(); if(!code) return;
+        const code = document.getElementById('join-code').value.trim();
+        if(!code) return;
         socket.emit('join_server', code, (res) => {
             if (res.error) return showAppAlert("Error", res.error);
             document.getElementById('server-modal').classList.remove('active'); document.getElementById('join-code').value = '';
             if (!myJoinedServers.includes(res.server.code)) myJoinedServers.push(res.server.code);
+            
             const existingIcon = document.getElementById(`srv-${res.server.code}`);
             if (existingIcon) { existingIcon.style.opacity = '1'; existingIcon.style.border = 'none'; }
             else { addServerToList(res.server.code, res.server.name, res.server.owner); }
+            
             switchServer(res.server.code);
         });
     };
 
-    // --- COMPOSE / EDIT / REPLY LOGIC ---
+    // --- COMPOSE & EDIT LOGIC ---
     document.getElementById('compose').addEventListener('submit', (e) => {
-        e.preventDefault(); const text = msgInput.value.trim();
+        e.preventDefault();
+        const text = msgInput.value.trim();
         
-        // Prevent empty messages unless there's an image
         if (!text && !pendingAttachmentBase64) return;
         if (!socket?.connected) return;
 
         if (editingMsgId) {
             socket.emit('edit_message', { id: editingMsgId, text });
+            cancelAction();
         } else {
             const payload = { text: text, attachment: pendingAttachmentBase64 };
             if (replyingToData) payload.replyTo = replyingToData;
             socket.emit('chat_message', payload);
+            cancelAction();
         }
         
-        clearAttachment();
-        cancelAction();
         socket.emit('typing', false); msgInput.focus();
     });
 
     msgInput.addEventListener('input', () => {
-        socket.emit('typing', true); clearTimeout(typingTimeout);
+        socket.emit('typing', true);
+        clearTimeout(typingTimeout);
         typingTimeout = setTimeout(() => socket.emit('typing', false), 1500); 
     });
 
@@ -835,22 +864,28 @@
         if (!currentTextElement) return;
         cancelAction();
         editingMsgId = id; infoBar.style.display = 'flex'; 
+        
         let rawText = "";
         currentTextElement.childNodes.forEach(n => { if(n.nodeName === '#text' || n.nodeName === 'SPAN') rawText += n.textContent; });
+        
         document.getElementById('info-bar-text').innerHTML = `✏️ Editing Message`;
-        msgInput.value = rawText; msgInput.focus(); sendBtn.textContent = 'Save'; sendBtn.style.background = '#4752c4';
+        msgInput.value = rawText;
+        msgInput.focus(); sendBtn.textContent = 'Save'; sendBtn.style.background = '#4752c4';
     }
 
     function initiateReply(id, username, rawTextElement) {
         if (!rawTextElement) return;
         cancelAction(); 
+        
         let rawText = "";
         rawTextElement.childNodes.forEach(n => { if(n.nodeName === '#text' || n.nodeName === 'SPAN') rawText += n.textContent; });
+
         let shortText = rawText.length > 50 ? rawText.substring(0, 50) + '...' : rawText;
         if (!shortText) shortText = "Image Attachment";
         
         replyingToData = { id, username, text: shortText };
-        infoBar.style.display = 'flex'; document.getElementById('info-bar-text').innerHTML = `↳ Replying to <strong>@${username}</strong>`;
+        infoBar.style.display = 'flex'; 
+        document.getElementById('info-bar-text').innerHTML = `↳ Replying to <strong>@${username}</strong>`;
         msgInput.focus();
     }
     
@@ -867,7 +902,7 @@
             const list = document.getElementById('history-list'); list.innerHTML = '';
             document.getElementById('history-modal-title').textContent = "Message Edit History";
 
-            if (!res.history || res.history.length === 0) list.innerHTML = '<div class="hist-item">No previous edits.</div>';
+            if (!res.history || res.history.length === 0) { list.innerHTML = '<div class="hist-item" style="border-left-color: var(--text-muted);">No previous edits.</div>'; }
             else {
                 res.history.forEach((item, index) => {
                     const el = document.createElement('div'); el.className = 'hist-item';
@@ -887,6 +922,7 @@
             if (res.error) return showAppAlert("Error", res.error);
             const list = document.getElementById('history-list'); list.innerHTML = '';
             document.getElementById('history-modal-title').textContent = "Deleted Message";
+
             const el = document.createElement('div'); el.className = 'hist-item';
             
             const timeDiv = document.createElement('div'); timeDiv.className = 'hist-time';
@@ -907,7 +943,10 @@
         });
     }
 
-    function loadHistory(msgs) { if (!msgs || !Array.isArray(msgs)) return; msgs.forEach(m => appendMessage(m, m.username === myUsername)); }
+    function loadHistory(msgs) {
+        if (!msgs || !Array.isArray(msgs)) return; 
+        msgs.forEach(m => appendMessage(m, m.username === myUsername));
+    }
 
     function appendMessage(data, isMe) {
         const wrapper = document.createElement('div');
@@ -918,9 +957,13 @@
         if (data.deleted) {
             wrapper.className = 'msg deleted-compact is-deleted';
             wrapper.innerHTML = `<span style="margin-right: 6px; font-size:0.9rem;">🗑️</span> <span class="deleted-text">${data.username} deleted a message.</span>`;
+            
             if (isMe || myRole === 'admin') {
-                const viewTag = document.createElement('span'); viewTag.className = 'view-deleted-tag'; viewTag.textContent = '(view original)';
-                viewTag.onclick = () => viewDeleted(data._id); wrapper.appendChild(viewTag);
+                const viewTag = document.createElement('span'); 
+                viewTag.className = 'view-deleted-tag'; 
+                viewTag.textContent = '(view original)';
+                viewTag.onclick = () => viewDeleted(data._id); 
+                wrapper.appendChild(viewTag);
             }
             chatWindow.appendChild(wrapper); setTimeout(() => chatWindow.scrollTop = chatWindow.scrollHeight, 100); return;
         }
@@ -958,6 +1001,7 @@
         }
 
         const header = document.createElement('div'); header.className = 'msg-header';
+        
         const author = document.createElement('div'); author.className = 'msg-author'; 
         author.textContent = data.username; author.style.color = colorToUse;
         header.appendChild(author);
