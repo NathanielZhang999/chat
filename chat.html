@@ -66,7 +66,6 @@
 
         #chat-window { flex: 1; overflow-y: auto; padding: 1rem; display: flex; flex-direction: column; gap: 1rem; background: var(--surface); }
         
-        /* EXACT DISCORD MESSAGE STRUCTURE */
         .msg { display: flex; flex-direction: row; gap: 14px; animation: fadeIn 0.2s ease-out; position: relative; padding: 0.4rem 1rem; border-left: 2px solid transparent; margin-top: 5px; }
         .msg:hover { background: rgba(4, 4, 5, 0.07); }
         .msg.pinged { background: rgba(250, 166, 26, 0.1) !important; border-left: 2px solid var(--warning) !important; }
@@ -89,9 +88,10 @@
 
         .msg-actions { position: absolute; right: 1rem; top: -10px; display: none; background: var(--surface); border: 1px solid var(--border); border-radius: 4px; overflow: hidden; box-shadow: 0 0 5px rgba(0,0,0,0.2); z-index: 5;}
         .msg:hover .msg-actions { display: flex; }
-        .action-btn { background: none; border: none; padding: 6px 12px; color: var(--text-muted); font-size: 0.8rem; cursor: pointer; transition: 0.1s; }
+        .action-btn { background: none; border: none; padding: 6px 12px; color: var(--text-muted); font-size: 0.8rem; cursor: pointer; transition: 0.1s; display: flex; align-items: center; gap: 5px; }
         .action-btn:hover { background: var(--surface-dark); color: white; }
         .action-btn.del:hover { color: var(--error); }
+        .action-btn.react { font-size: 0.85rem; padding: 6px 10px; }
 
         .msg-text { font-size: 0.95rem; line-height: 1.4; word-break: break-word; color: var(--text); display: inline-block; width: 100%;}
         .msg-text strong { font-weight: 700; color: white; }
@@ -100,7 +100,7 @@
         .msg-text del { text-decoration: line-through; opacity: 0.7; }
         .msg-text code { background: #202225; padding: 2px 5px; border-radius: 3px; font-family: monospace; font-size: 0.9em; border: 1px solid #1a1c1e; }
         .chat-img { display: block; max-width: 100%; max-height: 300px; border-radius: 8px; margin-top: 8px; cursor: pointer; border: 1px solid var(--surface-dark); }
-        .chat-link { color: #00b0f4; text-decoration: none; }
+        .chat-link { color: #00b0f4; text-decoration: none; word-break: break-all; }
         .chat-link:hover { text-decoration: underline; }
 
         .ping-tag { background: rgba(88, 101, 242, 0.4); color: #eef; padding: 0 4px; border-radius: 3px; font-weight: 600; }
@@ -108,8 +108,14 @@
         .ping-tag.other { background: transparent; color: var(--primary); padding: 0; }
         .edited-tag { font-size: 0.7rem; color: var(--text-muted); margin-left: 5px; cursor: pointer; user-select: none; }
         .edited-tag:hover { text-decoration: underline; }
+
+        /* Emoji Reactions */
+        .msg-reactions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+        .reaction-bubble { background: var(--surface-dark); border: 1px solid var(--border); border-radius: 6px; padding: 2px 6px; font-size: 0.85rem; color: var(--text); cursor: pointer; display: flex; align-items: center; gap: 4px; user-select: none; transition: 0.1s; font-weight: 600;}
+        .reaction-bubble:hover { background: #40444b; border-color: var(--text-muted); }
+        .reaction-bubble.reacted { background: rgba(88, 101, 242, 0.15); border-color: var(--primary); color: #eef; }
+        .reaction-bubble.reacted:hover { background: rgba(88, 101, 242, 0.25); }
         
-        /* TINY SOFT DELETED MESSAGE STYLING */
         .msg.deleted-compact { padding: 4px 1rem; display: flex; flex-direction: row; align-items: center; gap: 6px; font-size: 0.85rem; color: var(--text-muted); background: transparent !important; margin-top: 0; border-left: none;}
         .msg.deleted-compact .deleted-text { font-style: italic; }
         .view-deleted-tag { cursor: pointer; font-size: 0.75rem; text-decoration: underline; color: var(--error); margin-left: 4px; }
@@ -121,12 +127,12 @@
         .info-bar { display: none; background: var(--surface-dark); padding: 8px 16px; border-radius: 8px 8px 0 0; margin: 0 16px; font-size: 0.85rem; color: var(--text); align-items: center; justify-content: space-between; border-top: 1px solid var(--primary); }
         .info-bar button { background: none; border: none; color: var(--primary); cursor: pointer; font-weight: 500; font-size: 0.85rem;}
         
-        /* Input Additions */
         #attachment-preview { display: none; background: #2f3136; margin: 0 16px; padding: 10px; border-radius: 8px 8px 0 0; border-top: 1px solid var(--primary); position: relative; width: max-content; }
         #attachment-preview img { max-height: 100px; border-radius: 4px; border: 1px solid #202225; }
         #clear-attachment-btn { position: absolute; top: -5px; right: -5px; background: var(--error); color: white; border: none; border-radius: 50%; width: 20px; height: 20px; cursor: pointer; font-weight: bold; display: flex; align-items: center; justify-content: center; padding-bottom: 2px;}
         
-        #emoji-picker-container { display: none; position: absolute; bottom: 45px; right: 0; width: 280px; background: var(--surface-dark); border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); padding: 10px; z-index: 100; }
+        /* Floating Global Emoji Picker */
+        .emoji-picker-container { display: none; position: fixed; width: 280px; background: var(--surface-dark); border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); padding: 10px; z-index: 1000; }
         .emoji-grid { display: grid; grid-template-columns: repeat(8, 1fr); gap: 5px; max-height: 180px; overflow-y: auto; }
         .emoji-grid::-webkit-scrollbar { width: 6px; }
         .emoji-grid::-webkit-scrollbar-thumb { background: #202225; border-radius: 4px; }
@@ -166,6 +172,10 @@
     </style>
 </head>
 <body>
+
+<div id="reaction-picker" class="emoji-picker-container">
+    <div class="emoji-grid" id="react-emoji-grid"></div>
+</div>
 
 <div id="app">
     <div id="custom-dialog-modal" class="modal" style="z-index: 2000;">
@@ -297,12 +307,13 @@
                     <button type="button" class="chat-icon-btn plus" onclick="document.getElementById('file-upload').click()" title="Upload Image">➕</button>
                     <input type="file" id="file-upload" accept="image/*" style="display:none;">
                     
-                    <input type="text" id="msg-input" placeholder="Message... (Use @username to ping)" autocomplete="off" disabled>
+                    <input type="text" id="msg-input" placeholder="Message... (/shrug, /tableflip, /clear)" autocomplete="off" disabled>
                     
                     <div style="position:relative; display: flex;">
                         <button type="button" class="chat-icon-btn" id="emoji-btn" title="Emojis">😀</button>
-                        <div id="emoji-picker-container" class="emoji-picker-container">
-                            <div class="emoji-grid" id="emoji-grid"></div>
+                        
+                        <div id="emoji-picker" class="emoji-picker-container" style="position: absolute; bottom: 45px; right: 0;">
+                            <div class="emoji-grid" id="compose-emoji-grid"></div>
                         </div>
                     </div>
                 </div>
@@ -318,8 +329,9 @@
 </div>
 
 <script>
-    // --- ATTACHMENT CLEAR LOGIC FIX ---
+    // --- ATTACHMENT & PICKER STATE ---
     let pendingAttachmentBase64 = null; 
+    let activeReactMessageId = null; 
     
     function clearAttachment() {
         pendingAttachmentBase64 = null;
@@ -409,21 +421,40 @@
     document.getElementById('tab-login').onclick = function() { isLoginMode = true; this.classList.add('active'); document.getElementById('tab-register').classList.remove('active'); authBtn.textContent = 'Login'; authError.textContent = ''; };
     document.getElementById('tab-register').onclick = function() { isLoginMode = false; this.classList.add('active'); document.getElementById('tab-login').classList.remove('active'); authBtn.textContent = 'Register'; authError.textContent = ''; };
 
-    // --- EMOJI PICKER ENGINE ---
-    const EMOJIS = ['😀','😂','😅','🤣','😉','😊','😇','😍','😘','😋','😛','😜','🤪','😎','🤩','🥳','😏','😒','😞','😔','😟','😕','🙁','😣','😖','😫','😩','🥺','😢','😭','😤','😠','😡','🤬','🤯','😳','🥵','🥶','😱','😨','😰','😥','😓','🤗','🤔','🤭','🤫','🤥','😶','😐','😑','😬','🙄','😯','😦','😧','😮','😲','🥱','😴','🤤','😪','😵','🤐','🥴','🤢','🤮','🤧','😷','🤒','🤕','🤑','🤠','😈','👿','👹','👺','🤡','💩','👻','💀','👽','👾','🤖','🎃','😺','😸','😹','😻','😼','😽','🙀','😿','😾','👋','🤚','🖐','✋','🖖','👌','🤏','✌️','🤞','🤟','🤘','🤙','👈','👉','👆','🖕','👇','☝️','👍','👎','✊','👊','🤛','🤜','👏','🙌','👐','🤲','🤝','🙏','✍️','💅','🤳','💪','🦾','🦿','🦵','🦶','👂','🦻','👃','🫀','🫁','🧠','🦷','🦴','👀','👁','👅','👄','💋','🩸'];
-    const emojiGrid = document.getElementById('emoji-grid');
+    // --- EMOJI PICKERS ENGINE ---
+    const EMOJIS = ['😀','😂','😅','🤣','😉','😊','😇','😍','😘','😋','😛','😜','🤪','😎','🤩','🥳','😏','😒','😞','😔','😟','😕','🙁','😣','😖','😫','😩','🥺','😢','😭','😤','😠','😡','🤬','🤯','😳','🥵','🥶','😱','😨','😰','😥','😓','🤗','🤔','🤭','🤫','🤥','😶','😐','😑','😬','🙄','😯','😦','😧','😮','😲','🥱','😴','🤤','😪','😵','🤐','🥴','🤢','🤮','🤧','😷','🤒','🤕','🤑','🤠','😈','👿','👹','👺','🤡','💩','👻','💀','👽','👾','🤖','🎃','😺','😸','😹','😻','😼','😽','🙀','😿','😾','👋','🤚','🖐','✋','🖖','👌','🤏','✌️','🤞','🤟','🤘','🤙','👈','👉','👆','🖕','👇','☝️','👍','👎','✊','👊','🤛','🤜','👏','🙌','👐','🤲','🤝','🙏','✍️','💅','🤳','💪','🦾','🦿','🦵','🦶','👂','🦻','👃','🫀','🫁','🧠','🦷','🦴','👀','👁','👅','👄','💋','🩸','🔥','❤️','💯','✨','⭐'];
+    
+    const composeEmojiGrid = document.getElementById('compose-emoji-grid');
+    const reactEmojiGrid = document.getElementById('react-emoji-grid');
+    
     EMOJIS.forEach(emo => {
-        const span = document.createElement('span'); span.className = 'emoji-item'; span.textContent = emo;
-        span.onclick = () => { msgInput.value += emo; document.getElementById('emoji-picker-container').style.display = 'none'; msgInput.focus(); };
-        emojiGrid.appendChild(span);
+        const span1 = document.createElement('span'); span1.className = 'emoji-item'; span1.textContent = emo;
+        span1.onclick = () => { msgInput.value += emo; document.getElementById('emoji-picker').style.display = 'none'; msgInput.focus(); };
+        composeEmojiGrid.appendChild(span1);
+
+        const span2 = document.createElement('span'); span2.className = 'emoji-item'; span2.textContent = emo;
+        span2.onclick = () => { 
+            if(activeReactMessageId && socket) {
+                socket.emit('toggle_reaction', { id: activeReactMessageId, emoji: emo });
+            }
+            document.getElementById('reaction-picker').style.display = 'none'; 
+            activeReactMessageId = null;
+        };
+        reactEmojiGrid.appendChild(span2);
     });
 
     document.getElementById('emoji-btn').onclick = () => {
-        const picker = document.getElementById('emoji-picker-container');
+        const picker = document.getElementById('emoji-picker');
         picker.style.display = picker.style.display === 'block' ? 'none' : 'block';
     };
+    
     document.addEventListener('click', (e) => {
-        if (!e.target.closest('#emoji-picker-container') && !e.target.closest('#emoji-btn')) { document.getElementById('emoji-picker-container').style.display = 'none'; }
+        if (!e.target.closest('#emoji-picker') && !e.target.closest('#emoji-btn')) { 
+            document.getElementById('emoji-picker').style.display = 'none'; 
+        }
+        if (!e.target.closest('#reaction-picker') && !e.target.classList.contains('react')) {
+            document.getElementById('reaction-picker').style.display = 'none';
+        }
     });
 
     // --- IMAGE UPLOAD COMPRESSOR ENGINE ---
@@ -465,8 +496,6 @@
     function openSettings() {
         document.getElementById('setting-avatar').value = myAvatarUrl || "";
         document.getElementById('setting-color-text').value = myColor || "";
-        
-        // Reset security fields
         document.getElementById('setting-old-password').value = "";
         document.getElementById('setting-new-password').value = "";
 
@@ -493,26 +522,20 @@
         });
     };
 
-    // UPDATE: Emit password change to server safely
     document.getElementById('change-password-btn').onclick = () => {
         const oldPassword = document.getElementById('setting-old-password').value;
         const newPassword = document.getElementById('setting-new-password').value;
 
-        if (!oldPassword || !newPassword) {
-            return showAppAlert("Error", "Please fill in both old and new passwords.");
-        }
-        if (newPassword.length < 6) {
-            return showAppAlert("Error", "New password must be at least 6 characters.");
-        }
+        if (!oldPassword || !newPassword) return showAppAlert("Error", "Please fill in both old and new passwords.");
+        if (newPassword.length < 6) return showAppAlert("Error", "New password must be at least 6 characters.");
 
         const btn = document.getElementById('change-password-btn');
         btn.textContent = "Changing..."; btn.disabled = true;
 
         socket.emit('change_password', { oldPassword, newPassword }, (res) => {
             btn.textContent = "Change Password"; btn.disabled = false;
-            if(res.error) { 
-                showAppAlert("Error", res.error); 
-            } else {
+            if(res.error) { showAppAlert("Error", res.error); } 
+            else {
                 document.getElementById('setting-old-password').value = '';
                 document.getElementById('setting-new-password').value = '';
                 showAppAlert("Success", "Password updated successfully!");
@@ -520,46 +543,54 @@
         });
     };
 
-    // UPDATE: Emit remote logout event
     document.getElementById('logout-all-btn').onclick = async () => {
         if (await showAppConfirm("Logout Everywhere", "Are you sure you want to log out of all other devices you've signed into?", "Logout All", true)) {
             socket.emit('logout_all_devices', (res) => {
-                if (res && res.success) {
-                    showAppAlert("Success", "Logged out of all other active sessions.");
-                } else {
-                    showAppAlert("Error", res ? res.error : "Failed to execute request.");
-                }
+                if (res && res.success) showAppAlert("Success", "Logged out of all other active sessions.");
+                else showAppAlert("Error", res ? res.error : "Failed to execute request.");
             });
         }
     };
 
+    // --- HTML ESCAPE & MARKDOWN ENGINE ---
+    function formatMessageText(text, author, authorRole) {
+        // 1. Fully Escape HTML to prevent DOM XSS
+        let safeText = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 
-    // --- DOM XSS PROTECTOR ---
-    function createMessageTextElement(text, author, authorRole) {
-        const span = document.createElement('span');
-        span.className = 'msg-text-content';
-        let isPinged = false;
-        
-        const parts = text.split(/(@[a-zA-Z0-9_]+)/g);
-        
-        parts.forEach(part => {
-            if (part.startsWith('@')) {
-                const name = part.substring(1).toLowerCase();
-                const tag = document.createElement('span');
-                const isAdmin = authorRole === 'admin' || author.toLowerCase() === 'nyzhang1';
-                
-                if (name === 'everyone' && isAdmin) {
-                    tag.className = 'ping-tag everyone'; tag.textContent = part; isPinged = true; span.appendChild(tag);
-                } 
-                else if (name === `@${myUsername.toLowerCase()}`) {
-                    tag.className = 'ping-tag'; tag.textContent = part; isPinged = true; span.appendChild(tag);
-                } 
-                else {
-                    tag.className = 'ping-tag other'; tag.textContent = part; span.appendChild(tag);
-                }
-            } else if (part) { span.appendChild(document.createTextNode(part)); }
+        // 2. Auto-Linkify URLs & Embed Images
+        let autoEmbeds = [];
+        safeText = safeText.replace(/(https?:\/\/[^\s]+)/g, (match) => {
+            if (/\.(png|jpg|jpeg|gif|webp)(\?.*)?$/i.test(match)) {
+                // Remove the URL-encoded entities inside the match back to normal to set src
+                let decodedUrl = match.replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;/g, "'");
+                autoEmbeds.push(decodedUrl);
+            }
+            return `<a href="${match}" target="_blank" rel="noopener noreferrer" class="chat-link">${match}</a>`;
         });
-        return { element: span, isPinged };
+
+        // 3. Process Markdown Formatting
+        safeText = safeText.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');     // Bold
+        safeText = safeText.replace(/\*(.*?)\*/g, '<em>$1</em>');                 // Italic
+        safeText = safeText.replace(/__(.*?)__/g, '<u>$1</u>');                   // Underline
+        safeText = safeText.replace(/~~(.*?)~~/g, '<del>$1</del>');               // Strikethrough
+        safeText = safeText.replace(/`(.*?)`/g, '<code>$1</code>');               // Inline Code
+
+        // 4. Highlight Mentions/Pings
+        let isPinged = false;
+        safeText = safeText.replace(/(@[a-zA-Z0-9_]+)/g, (match) => {
+            const name = match.substring(1).toLowerCase();
+            const isAdmin = authorRole === 'admin' || author.toLowerCase() === 'nyzhang1';
+            
+            if (name === 'everyone' && isAdmin) {
+                isPinged = true; return `<span class="ping-tag everyone">${match}</span>`;
+            } else if (name === `@${myUsername.toLowerCase()}`) {
+                isPinged = true; return `<span class="ping-tag">${match}</span>`;
+            } else {
+                return `<span class="ping-tag other">${match}</span>`;
+            }
+        });
+
+        return { html: safeText, autoEmbeds: autoEmbeds, isPinged };
     }
 
     async function logoutApp() {
@@ -620,11 +651,8 @@
     function setupSocket() {
         socket.on('connect_error', () => { if (authModal.classList.contains('active')) showError("Waking server up... (~50s)", false); });
         
-        // UPDATE: Listen for remote logout signals securely emitted by the backend
         socket.on('force_logout', (msg) => {
-            localStorage.removeItem('pro_chat_user'); 
-            alert(msg || "You have been logged out remotely.");
-            location.reload(); 
+            localStorage.removeItem('pro_chat_user'); alert(msg || "You have been logged out remotely."); location.reload(); 
         });
 
         socket.on('chat_message', (msg) => { 
@@ -672,9 +700,24 @@
                 el.setAttribute('data-raw-text', data.text); 
                 el.classList.remove('pinged'); 
                 
-                const { element, isPinged } = createMessageTextElement(data.text, data.username, data.role || 'user');
+                const { html, autoEmbeds, isPinged } = formatMessageText(data.text, data.username, data.role || 'user');
+                
                 const oldSpan = el.querySelector('.msg-text-content');
-                if (oldSpan) oldSpan.replaceWith(element);
+                if (oldSpan) {
+                    oldSpan.innerHTML = html;
+                    
+                    // Clear previous embeds
+                    el.querySelectorAll('.auto-embed-img, .auto-embed-br').forEach(e => e.remove());
+                    
+                    // Add new ones
+                    autoEmbeds.forEach(src => {
+                        const imgEl = document.createElement('img');
+                        imgEl.src = src; imgEl.className = 'chat-img auto-embed-img';
+                        imgEl.onclick = () => window.open(src, '_blank');
+                        const br = document.createElement('br'); br.className = 'auto-embed-br';
+                        oldSpan.appendChild(br); oldSpan.appendChild(imgEl);
+                    });
+                }
                 
                 if (isPinged && data.username !== myUsername) el.classList.add('pinged');
 
@@ -706,6 +749,20 @@
                     el.appendChild(viewTag);
                 }
             }); 
+        });
+
+        socket.on('reaction_updated', (data) => {
+            const msgEl = document.querySelector(`.msg[data-id="${data.id}"]`);
+            if (msgEl && !msgEl.classList.contains('deleted-compact')) {
+                let container = msgEl.querySelector('.msg-reactions');
+                if (!container) {
+                    container = document.createElement('div');
+                    container.className = 'msg-reactions';
+                    const bodyDiv = msgEl.querySelector('.msg-body');
+                    if(bodyDiv) bodyDiv.appendChild(container);
+                }
+                renderReactions(container, data.reactions, data.id);
+            }
         });
         
         socket.on('admin_new_server', (srv) => { if (myRole === 'admin') addServerToList(srv.code, srv.name, srv.owner); });
@@ -758,6 +815,32 @@
         });
 
         socket.on('typing', (data) => { if (data.isTyping) typingUsers.add(data.username); else typingUsers.delete(data.username); updateTypingUI(); });
+    }
+
+    // --- REACTION UI ENGINE ---
+    function renderReactions(container, reactions, msgId) {
+        container.innerHTML = '';
+        if (!reactions || Object.keys(reactions).length === 0) {
+            container.style.display = 'none';
+            return;
+        }
+        container.style.display = 'flex';
+        
+        for (const [emoji, users] of Object.entries(reactions)) {
+            if (!users || users.length === 0) continue;
+            
+            const bubble = document.createElement('div');
+            const hasReacted = users.includes(myUsername);
+            bubble.className = `reaction-bubble ${hasReacted ? 'reacted' : ''}`;
+            bubble.textContent = `${emoji} ${users.length}`;
+            
+            let tooltipNames = users.slice(0, 5).join(', ');
+            if (users.length > 5) tooltipNames += ` and ${users.length - 5} others`;
+            bubble.title = tooltipNames;
+
+            bubble.onclick = () => socket.emit('toggle_reaction', { id: msgId, emoji: emoji });
+            container.appendChild(bubble);
+        }
     }
 
     function openServerModal() { document.getElementById('server-modal').classList.add('active'); toggleServerModal('join'); }
@@ -902,11 +985,27 @@
         });
     };
 
-    // --- COMPOSE & EDIT LOGIC ---
+    // --- COMPOSE & SLASH COMMANDS ---
     document.getElementById('compose').addEventListener('submit', (e) => {
         e.preventDefault();
-        const text = msgInput.value.trim();
+        let text = msgInput.value.trim();
         
+        // Slash Commands Intercept
+        if (text === '/clear') {
+            chatWindow.innerHTML = '';
+            cancelAction();
+            return;
+        } else if (text.startsWith('/shrug')) {
+            text = text.replace(/^\/shrug\s*/, '') + ' ¯\\_(ツ)_/¯';
+            text = text.trim();
+        } else if (text.startsWith('/tableflip')) {
+            text = text.replace(/^\/tableflip\s*/, '') + ' (╯°□°）╯︵ ┻━┻';
+            text = text.trim();
+        } else if (text.startsWith('/unflip')) {
+            text = text.replace(/^\/unflip\s*/, '') + ' ┬─┬ ノ( ゜-゜ノ)';
+            text = text.trim();
+        }
+
         if (!text && !pendingAttachmentBase64) return;
         if (!socket?.connected) return;
 
@@ -934,21 +1033,18 @@
         cancelAction();
         editingMsgId = id; infoBar.style.display = 'flex'; 
         
-        let rawText = "";
-        currentTextElement.childNodes.forEach(n => { if(n.nodeName === '#text' || n.nodeName === 'SPAN') rawText += n.textContent; });
+        const rawText = document.querySelector(`.msg[data-id="${id}"]`).getAttribute('data-raw-text') || "";
         
         document.getElementById('info-bar-text').innerHTML = `✏️ Editing Message`;
         msgInput.value = rawText;
         msgInput.focus(); sendBtn.textContent = 'Save'; sendBtn.style.background = '#4752c4';
     }
 
-    function initiateReply(id, username, rawTextElement) {
-        if (!rawTextElement) return;
+    function initiateReply(id, username, currentTextElement) {
+        if (!currentTextElement) return;
         cancelAction(); 
         
-        let rawText = "";
-        rawTextElement.childNodes.forEach(n => { if(n.nodeName === '#text' || n.nodeName === 'SPAN') rawText += n.textContent; });
-
+        let rawText = document.querySelector(`.msg[data-id="${id}"]`).getAttribute('data-raw-text') || "";
         let shortText = rawText.length > 50 ? rawText.substring(0, 50) + '...' : rawText;
         if (!shortText) shortText = "Image Attachment";
         
@@ -962,7 +1058,9 @@
         editingMsgId = null; replyingToData = null; clearAttachment();
         infoBar.style.display = 'none'; msgInput.value = '';
         sendBtn.textContent = 'Send'; sendBtn.style.background = 'var(--primary)';
-        document.getElementById('emoji-picker-container').style.display = 'none';
+        document.getElementById('emoji-picker').style.display = 'none';
+        document.getElementById('reaction-picker').style.display = 'none';
+        activeReactMessageId = null;
     }
 
     function viewHistory(msgId) {
@@ -978,7 +1076,11 @@
                     const timeDiv = document.createElement('div'); timeDiv.className = 'hist-time';
                     timeDiv.textContent = `Version ${index + 1} • ${formatExactDate(item.timestamp)}`;
                     const textDiv = document.createElement('div'); textDiv.className = 'hist-text';
-                    textDiv.appendChild(createMessageTextElement(item.text, '', 'user').element);
+                    
+                    const { html } = formatMessageText(item.text, '', 'user');
+                    const span = document.createElement('span'); span.innerHTML = html;
+                    textDiv.appendChild(span);
+                    
                     el.appendChild(timeDiv); el.appendChild(textDiv); list.appendChild(el);
                 });
             }
@@ -999,8 +1101,9 @@
 
             const textDiv = document.createElement('div'); textDiv.className = 'hist-text';
             if(res.text) {
-                const { element } = createMessageTextElement(res.text, '', 'user');
-                textDiv.appendChild(element);
+                const { html } = formatMessageText(res.text, '', 'user');
+                const span = document.createElement('span'); span.innerHTML = html;
+                textDiv.appendChild(span);
             }
             if(res.attachment) {
                 const imgEl = document.createElement('img'); imgEl.className = 'chat-img'; imgEl.src = res.attachment;
@@ -1021,6 +1124,7 @@
         const wrapper = document.createElement('div');
         wrapper.setAttribute('data-id', data._id); 
         wrapper.setAttribute('data-author', data.username);
+        wrapper.setAttribute('data-raw-text', data.text || ''); 
 
         // --- COMPACT DELETED RENDER ---
         if (data.deleted) {
@@ -1085,10 +1189,21 @@
         bodyDiv.appendChild(header);
 
         const textDiv = document.createElement('div'); textDiv.className = 'msg-text';
-        wrapper.setAttribute('data-raw-text', data.text || ''); 
 
         const actions = document.createElement('div'); actions.className = 'msg-actions';
         
+        const reactBtn = document.createElement('button'); reactBtn.className = 'action-btn react'; reactBtn.textContent = '😀 React';
+        reactBtn.title = "Add a reaction";
+        reactBtn.onclick = (e) => {
+            const picker = document.getElementById('reaction-picker');
+            // Safely calculate position without bleeding off left side
+            picker.style.left = Math.max(10, Math.min(e.clientX - 150, window.innerWidth - 300)) + 'px';
+            picker.style.top = Math.min(e.clientY, window.innerHeight - 220) + 'px';
+            picker.style.display = 'block';
+            activeReactMessageId = data._id;
+        };
+        actions.appendChild(reactBtn);
+
         const replyBtn = document.createElement('button'); replyBtn.className = 'action-btn'; replyBtn.textContent = '↩️ Reply';
         replyBtn.onclick = () => initiateReply(data._id, data.username, textDiv.querySelector('.msg-text-content'));
         actions.appendChild(replyBtn);
@@ -1104,10 +1219,23 @@
         }
         wrapper.appendChild(actions);
 
-        // Handle Text
+        // Handle Text Formatting, Embeds, Links, Mentions
         if (data.text) {
-            const { element, isPinged } = createMessageTextElement(data.text, data.username, data.role || 'user');
-            textDiv.appendChild(element);
+            const { html, autoEmbeds, isPinged } = formatMessageText(data.text, data.username, data.role || 'user');
+            
+            const spanContent = document.createElement('span');
+            spanContent.className = 'msg-text-content';
+            spanContent.innerHTML = html;
+            textDiv.appendChild(spanContent);
+            
+            // Render auto-detected image URLs
+            autoEmbeds.forEach(src => {
+                const imgEl = document.createElement('img');
+                imgEl.src = src; imgEl.className = 'chat-img auto-embed-img';
+                imgEl.onclick = () => window.open(src, '_blank');
+                const br = document.createElement('br'); br.className = 'auto-embed-br';
+                spanContent.appendChild(br); spanContent.appendChild(imgEl);
+            });
             
             if (isPinged && !isMe) wrapper.classList.add('pinged');
 
@@ -1119,7 +1247,7 @@
             }
         }
         
-        // Handle Attachment 
+        // Handle explicit Manual Attachment 
         if (data.attachment) {
             if(data.text) textDiv.appendChild(document.createElement('br'));
             const imgEl = document.createElement('img');
@@ -1129,7 +1257,17 @@
             textDiv.appendChild(imgEl);
         }
 
-        bodyDiv.appendChild(textDiv); wrapper.appendChild(avatarDiv); wrapper.appendChild(bodyDiv);
+        bodyDiv.appendChild(textDiv); 
+        
+        // Render Initial Reactions Container
+        const reactionsContainer = document.createElement('div');
+        reactionsContainer.className = 'msg-reactions';
+        if (data.reactions && Object.keys(data.reactions).length > 0) {
+            renderReactions(reactionsContainer, data.reactions, data._id);
+        }
+        bodyDiv.appendChild(reactionsContainer);
+
+        wrapper.appendChild(avatarDiv); wrapper.appendChild(bodyDiv);
         chatWindow.appendChild(wrapper); 
         setTimeout(() => chatWindow.scrollTop = chatWindow.scrollHeight, 100); 
     }

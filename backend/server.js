@@ -76,8 +76,9 @@ const MessageSchema = new mongoose.Schema({
   color: { type: String, default: '' },      
   avatarUrl: { type: String, default: '' },  
   text: { type: String, default: '' },
-  attachment: { type: String, default: null }, // NEW: Stores Base64 Compressed Images
+  attachment: { type: String, default: null }, // Stores Base64 Compressed Images
   replyTo: { type: Object, default: null },
+  reactions: { type: Object, default: {} }, // NEW FEATURE: Mixed JS Object map of Emoji Reactions
   edited: { type: Boolean, default: false },
   deleted: { type: Boolean, default: false },
   history: [{ text: String, timestamp: Date }], 
@@ -129,12 +130,10 @@ io.on('connection', (socket) => {
 
   socket.on('register', async (data, callback) => {
     try {
-      // SECURITY: TYPE JUGGLING PREVENTION
       if (!data || typeof data.username !== 'string' || typeof data.password !== 'string') {
         return callback({ error: 'Invalid input format.' });
       }
 
-      // SECURITY: BRUTE FORCE PREVENTION
       const ip = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
       if (!checkRateLimit(ip)) return callback({ error: 'Too many requests. Try again later.' });
 
@@ -143,7 +142,6 @@ io.on('connection', (socket) => {
       if (cleanUser.toLowerCase() === 'nyzhang1') return callback({ error: 'Reserved name.' });
       if (data.password.length < 6) return callback({ error: 'Password must be at least 6 characters.' });
 
-      // SECURITY: ESCAPED REGEX PREVENTS DENIAL OF SERVICE
       const escapedUser = escapeRegExp(cleanUser);
       const existing = await User.findOne({ username: { $regex: new RegExp(`^${escapedUser}$`, 'i') } }); 
       if (existing) return callback({ error: 'Username taken.' });
@@ -158,12 +156,10 @@ io.on('connection', (socket) => {
 
   socket.on('login', async (data, callback) => {
     try {
-      // SECURITY: TYPE JUGGLING PREVENTION
       if (!data || typeof data.username !== 'string' || typeof data.password !== 'string') {
         return callback({ error: 'Invalid input format.' });
       }
 
-      // SECURITY: BRUTE FORCE PREVENTION
       const ip = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
       if (!checkRateLimit(ip)) return callback({ error: 'Too many login attempts. Try again later.' });
 
@@ -196,14 +192,12 @@ io.on('connection', (socket) => {
     } catch (err) { callback({ error: 'Login failed.' }); }
   });
 
-  // --- NEW SECURITY FEATURE: CHANGE PASSWORD ---
   socket.on('change_password', async (data, callback) => {
     if (!socket.username) return callback({ error: 'Not authenticated.' });
     if (!data || typeof data.oldPassword !== 'string' || typeof data.newPassword !== 'string') {
         return callback({ error: 'Invalid data format.' });
     }
     
-    // Rate limit changes to prevent rapid hash DoS via sockets
     const ip = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
     if (!checkRateLimit(ip)) return callback({ error: 'Too many attempts. Try again later.' });
 
@@ -226,7 +220,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // --- NEW SECURITY FEATURE: LOGOUT ALL OTHER DEVICES ---
   socket.on('logout_all_devices', async (callback) => {
       if (!socket.username) return;
       try {
@@ -349,11 +342,11 @@ io.on('connection', (socket) => {
 
       const history = await Message.find(query).sort({ timestamp: -1 }).limit(100).lean();
       
-      // Clear sensitive data on soft deleted messages for normal users
       const safeHistory = history.map(msg => {
           if (msg.deleted && socket.role !== 'admin' && msg.username !== socket.username) {
-              msg.text = ''; msg.attachment = null;
+              msg.text = ''; msg.attachment = null; msg.reactions = {};
           }
+          if (!msg.reactions) msg.reactions = {};
           return msg;
       });
       if(callback) callback({ history: safeHistory.reverse() });
@@ -370,14 +363,12 @@ io.on('connection', (socket) => {
     }
     lastMessageTime = now;
 
-    // SECURITY: Payload verification check limits false-injection mapping
     if (typeof payload !== 'string' && typeof payload !== 'object') return;
     
     const rawText = typeof payload === 'string' ? payload : (payload.text || '');
     const attachment = typeof payload === 'object' ? payload.attachment : null; 
     const replyTo = typeof payload === 'object' ? payload.replyTo : null;
     
-    // SECURITY: Limit socket memory crash vulnerabilities (block files over 15MB strictly at socket line)
     if (attachment && (typeof attachment !== 'string' || attachment.length > 15000000)) return;
 
     let cleanText = rawText.trim().substring(0, 2000);
@@ -388,14 +379,51 @@ io.on('connection', (socket) => {
     try {
       const msg = await Message.create({ 
           serverCode: socket.serverCode, username: socket.username, role: socket.role, 
-          color: socket.color, avatarUrl: socket.avatarUrl, text: cleanText, attachment: attachment, replyTo: replyTo 
+          color: socket.color, avatarUrl: socket.avatarUrl, text: cleanText, attachment: attachment, replyTo: replyTo,
+          reactions: {} // New messages start with 0 reactions
       });
       
       io.to(socket.serverCode).emit('chat_message', { 
           _id: msg._id, username: msg.username, role: socket.role, color: msg.color, avatarUrl: msg.avatarUrl,
-          text: msg.text, attachment: msg.attachment, replyTo: msg.replyTo, timestamp: msg.timestamp, edited: false, deleted: false 
+          text: msg.text, attachment: msg.attachment, replyTo: msg.replyTo, reactions: {}, timestamp: msg.timestamp, edited: false, deleted: false 
       });
     } catch (err) {}
+  });
+
+  // --- NEW FEATURE: TOGGLE MESSAGE EMOJI REACTION ---
+  socket.on('toggle_reaction', async (data) => {
+      if (!socket.username || !socket.serverCode) return;
+      try {
+          const { id, emoji } = data;
+          if (!id || !emoji) return;
+
+          const msg = await Message.findById(id);
+          if (!msg || msg.deleted) return;
+
+          // Standardize reactions storage
+          let rx = msg.reactions || {};
+          let users = rx[emoji] || [];
+
+          // Toggle logic
+          if (users.includes(socket.username)) {
+              users = users.filter(u => u !== socket.username); // Remove user
+              if (users.length === 0) delete rx[emoji];
+              else rx[emoji] = users;
+          } else {
+              users.push(socket.username); // Add user
+              rx[emoji] = users;
+          }
+
+          msg.reactions = rx;
+          msg.markModified('reactions'); // Tell mongoose that the Mixed field changed
+          await msg.save();
+
+          // Push updated reactions array map to clients in this room
+          io.to(msg.serverCode).emit('reaction_updated', {
+              id: msg._id,
+              reactions: msg.reactions
+          });
+      } catch (err) {}
   });
 
   socket.on('edit_message', async (data) => {
