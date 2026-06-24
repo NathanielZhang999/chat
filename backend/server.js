@@ -33,8 +33,9 @@ const MessageSchema = new mongoose.Schema({
   username: String,
   role: { type: String, default: 'user' }, 
   text: String,
+  replyTo: { type: Object, default: null }, // NEW: Tracks replies in the DB
   edited: { type: Boolean, default: false },
-  deleted: { type: Boolean, default: false }, // Tracks Soft Deletions
+  deleted: { type: Boolean, default: false },
   history: [{ text: String, timestamp: Date }], 
   timestamp: { type: Date, default: Date.now }
 });
@@ -45,7 +46,6 @@ async function seedSystem() {
   try {
     const adminUser = 'NYZhang1';
     const hashed = await bcrypt.hash('DragonNYZ0924', 10);
-    
     await User.findOneAndUpdate(
       { username: { $regex: new RegExp(`^${adminUser}$`, 'i') } },
       { username: adminUser, password: hashed, role: 'admin' },
@@ -59,10 +59,8 @@ async function seedSystem() {
     console.log('👑 Admin & Global Server ready.');
   } catch (err) { console.error("Seeding error:", err); }
 }
-
 if (MONGO_URI) mongoose.connect(MONGO_URI).then(seedSystem).catch(console.error);
 
-// --- REAL-TIME PRESENCE LOGIC ---
 const onlineUsers = new Map(); 
 
 function broadcastOnlineUsers(serverCode) {
@@ -70,7 +68,6 @@ function broadcastOnlineUsers(serverCode) {
   const usersMap = new Map();
   for (const info of onlineUsers.values()) {
     if (info.serverCode === serverCode) {
-      // Admins are visible if they joined the server OR are in Global.
       const isVisible = info.role !== 'admin' || info.joinedServers.includes(serverCode) || serverCode === 'global';
       if (isVisible && !usersMap.has(info.username)) {
         usersMap.set(info.username, { username: info.username, role: info.role });
@@ -118,10 +115,7 @@ io.on('connection', (socket) => {
       const isVisible = socket.role !== 'admin' || socket.joinedServers.includes('global');
       if (isVisible) socket.to('global').emit('system_message', `${user.username} joined the app.`);
 
-      const servers = socket.role === 'admin' 
-        ? await ChatServer.find() 
-        : await ChatServer.find({ code: { $in: user.servers } });
-
+      const servers = socket.role === 'admin' ? await ChatServer.find() : await ChatServer.find({ code: { $in: user.servers } });
       callback({ success: true, username: user.username, role: socket.role, servers: servers || [], joinedServers: user.servers });
     } catch (err) { callback({ error: 'Login failed.' }); }
   });
@@ -133,20 +127,14 @@ io.on('connection', (socket) => {
       const srv = await ChatServer.create({ code, name: name.substring(0, 30), owner: socket.username });
       
       const user = await User.findOne({ username: socket.username });
-      if (!user.servers) user.servers = ['global'];
       if (!user.servers.includes(code)) {
-        user.servers.push(code);
-        await user.save();
+        user.servers.push(code); await user.save();
         socket.joinedServers = user.servers;
         if(onlineUsers.has(socket.id)) onlineUsers.get(socket.id).joinedServers = user.servers;
       }
-
       callback({ success: true, server: srv });
-
       const sockets = await io.fetchSockets();
-      sockets.forEach(s => { 
-          if (onlineUsers.has(s.id) && onlineUsers.get(s.id).role === 'admin') s.emit('admin_new_server', srv); 
-      });
+      sockets.forEach(s => { if (onlineUsers.has(s.id) && onlineUsers.get(s.id).role === 'admin') s.emit('admin_new_server', srv); });
     } catch (err) { callback({ error: 'Creation failed.' }); }
   });
 
@@ -157,17 +145,12 @@ io.on('connection', (socket) => {
       if (!srv) return callback({ error: 'Invalid invite code.' });
 
       const user = await User.findOne({ username: socket.username });
-      if (!user.servers) user.servers = ['global'];
       if (!user.servers.includes(srv.code)) {
-        user.servers.push(srv.code);
-        await user.save();
+        user.servers.push(srv.code); await user.save();
         socket.joinedServers = user.servers;
         if(onlineUsers.has(socket.id)) onlineUsers.get(socket.id).joinedServers = user.servers;
         
-        if (socket.serverCode === srv.code) {
-           socket.to(srv.code).emit('system_message', `${socket.username} joined.`);
-           broadcastOnlineUsers(srv.code);
-        }
+        if (socket.serverCode === srv.code) { socket.to(srv.code).emit('system_message', `${socket.username} joined.`); broadcastOnlineUsers(srv.code); }
       }
       callback({ success: true, server: srv });
     } catch (err) { callback({ error: 'Join failed.' }); }
@@ -178,15 +161,10 @@ io.on('connection', (socket) => {
     try {
       const user = await User.findOne({ username: socket.username });
       if (user.servers.includes(code)) {
-        user.servers = user.servers.filter(s => s !== code);
-        await user.save();
+        user.servers = user.servers.filter(s => s !== code); await user.save();
         socket.joinedServers = user.servers;
         if(onlineUsers.has(socket.id)) onlineUsers.get(socket.id).joinedServers = user.servers;
-
-        if (socket.serverCode === code) {
-           socket.to(code).emit('system_message', `${socket.username} left the server.`);
-           broadcastOnlineUsers(code);
-        }
+        if (socket.serverCode === code) { socket.to(code).emit('system_message', `${socket.username} left the server.`); broadcastOnlineUsers(code); }
       }
       callback({ success: true });
     } catch (err) { callback({ error: 'Failed to leave.' }); }
@@ -204,7 +182,6 @@ io.on('connection', (socket) => {
         await User.updateMany({}, { $pull: { servers: code } }); 
         
         io.emit('server_deleted', code); 
-        
         const sockets = await io.fetchSockets();
         sockets.forEach(s => {
           if (s.joinedServers && s.joinedServers.includes(code)) {
@@ -213,12 +190,8 @@ io.on('connection', (socket) => {
           }
           if (s.serverCode === code) { s.leave(code); s.serverCode = 'global'; s.join('global'); }
         });
-
-        broadcastOnlineUsers('global');
-        callback({ success: true });
-      } else {
-        callback({ error: 'Permission denied. Must be owner or admin.' });
-      }
+        broadcastOnlineUsers('global'); callback({ success: true });
+      } else { callback({ error: 'Permission denied.' }); }
     } catch (err) { callback({ error: 'Deletion failed.' }); }
   });
 
@@ -226,76 +199,65 @@ io.on('connection', (socket) => {
     if (!socket.username) return;
     try {
       const oldCode = socket.serverCode;
-      if (oldCode) {
-          socket.leave(oldCode);
-          broadcastOnlineUsers(oldCode);
-      }
+      if (oldCode) { socket.leave(oldCode); broadcastOnlineUsers(oldCode); }
 
-      socket.serverCode = code;
-      socket.join(code);
+      socket.serverCode = code; socket.join(code);
       if (onlineUsers.has(socket.id)) onlineUsers.get(socket.id).serverCode = code;
-      
       broadcastOnlineUsers(code);
       
       let query = { serverCode: code };
       if (code === 'global') query = { $or: [{ serverCode: 'global' }, { serverCode: { $exists: false } }, { serverCode: null }] };
 
       const history = await Message.find(query).sort({ timestamp: -1 }).limit(100).lean();
-      
-      // SECURITY: Scrub deleted message text for regular users so they can't hack the DOM to read it
       const safeHistory = history.map(msg => {
-          if (msg.deleted && socket.role !== 'admin' && msg.username !== socket.username) {
-              msg.text = ''; 
-          }
+          if (msg.deleted && socket.role !== 'admin' && msg.username !== socket.username) msg.text = ''; 
           return msg;
       });
-
       if(callback) callback({ history: safeHistory.reverse() });
-    } catch (err) { console.error(err); }
+    } catch (err) {}
   });
 
-  socket.on('chat_message', async (text) => {
+  socket.on('chat_message', async (payload) => {
     if (!socket.username || !socket.serverCode) return;
-    let cleanText = text.trim().substring(0, 1000);
-    if (!cleanText) return;
+    
+    // Support new payload objects with replies
+    const rawText = typeof payload === 'string' ? payload : payload.text;
+    const replyTo = typeof payload === 'object' ? payload.replyTo : null;
 
+    let cleanText = rawText.trim().substring(0, 2000);
+    if (!cleanText) return;
     if (socket.role !== 'admin') cleanText = cleanText.replace(/@everyone/gi, 'everyone');
 
     try {
-      const msg = await Message.create({ serverCode: socket.serverCode, username: socket.username, role: socket.role, text: cleanText });
-      io.to(socket.serverCode).emit('chat_message', { _id: msg._id, username: msg.username, role: socket.role, text: msg.text, timestamp: msg.timestamp, edited: false, deleted: false });
+      const msg = await Message.create({ serverCode: socket.serverCode, username: socket.username, role: socket.role, text: cleanText, replyTo: replyTo });
+      io.to(socket.serverCode).emit('chat_message', { _id: msg._id, username: msg.username, role: socket.role, text: msg.text, replyTo: msg.replyTo, timestamp: msg.timestamp, edited: false, deleted: false });
     } catch (err) {}
   });
 
   socket.on('edit_message', async (data) => {
     if (!socket.username || !data.id || typeof data.text !== 'string') return;
     try {
-      let cleanText = data.text.trim().substring(0, 1000);
+      let cleanText = data.text.trim().substring(0, 2000);
       if (!cleanText) return;
-
       if (socket.role !== 'admin') cleanText = cleanText.replace(/@everyone/gi, 'everyone');
 
       const msg = await Message.findById(data.id);
       if (msg && !msg.deleted && (msg.username === socket.username || socket.role === 'admin') && msg.text !== cleanText) {
         if (!msg.history) msg.history = []; 
         msg.history.push({ text: msg.text, timestamp: new Date() });
-        msg.text = cleanText;
-        msg.edited = true;
-        msg.markModified('history'); 
+        msg.text = cleanText; msg.edited = true; msg.markModified('history'); 
         await msg.save();
         io.to(socket.serverCode).emit('message_edited', { id: msg._id, username: msg.username, role: msg.role, text: cleanText });
       }
     } catch (err) {}
   });
 
-  // Soft Delete Logic
   socket.on('delete_message', async (msgId) => {
     if (!socket.username) return;
     try {
       const msg = await Message.findById(msgId);
       if (msg && !msg.deleted && (msg.username === socket.username || socket.role === 'admin')) {
-        msg.deleted = true;
-        await msg.save();
+        msg.deleted = true; await msg.save();
         io.to(msg.serverCode).emit('message_deleted', msgId);
       }
     } catch (err) {}
@@ -305,20 +267,17 @@ io.on('connection', (socket) => {
     if (!socket.username) return;
     try {
       const msg = await Message.findById(msgId);
-      if (msg && (msg.username === socket.username || socket.role === 'admin')) {
-        callback({ success: true, history: msg.history || [] });
-      } else { callback({ error: 'Permission denied.' }); }
+      if (msg && (msg.username === socket.username || socket.role === 'admin')) callback({ success: true, history: msg.history || [] });
+      else callback({ error: 'Permission denied.' });
     } catch (err) { callback({ error: 'Failed to load history.' }); }
   });
 
-  // Fetch deleted message content securely
   socket.on('get_deleted_message', async (msgId, callback) => {
     if (!socket.username) return;
     try {
       const msg = await Message.findById(msgId);
-      if (msg && msg.deleted && (msg.username === socket.username || socket.role === 'admin')) {
-        callback({ success: true, text: msg.text });
-      } else { callback({ error: 'Permission denied.' }); }
+      if (msg && msg.deleted && (msg.username === socket.username || socket.role === 'admin')) callback({ success: true, text: msg.text });
+      else callback({ error: 'Permission denied.' });
     } catch (err) { callback({ error: 'Failed to load deleted message.' }); }
   });
 
