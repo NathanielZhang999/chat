@@ -8,7 +8,12 @@ const bcrypt = require('bcryptjs');
 const app = express();
 app.use(cors());
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: "*" } });
+
+// INCREASED PAYLOAD LIMIT TO 10MB FOR IMAGE UPLOADS
+const io = new Server(server, { 
+    cors: { origin: "*" },
+    maxHttpBufferSize: 1e7 
+});
 
 const MONGO_URI = process.env.MONGO_URI; 
 
@@ -17,8 +22,8 @@ const UserSchema = new mongoose.Schema({
   username: { type: String, required: true, unique: true },
   password: { type: String, required: true },
   role: { type: String, default: 'user' },
-  color: { type: String, default: '' },      // NEW: Custom Name Color
-  avatarUrl: { type: String, default: '' },  // NEW: Custom Profile Picture
+  color: { type: String, default: '' },      
+  avatarUrl: { type: String, default: '' },  
   servers: { type: [String], default: ['global'] } 
 });
 const User = mongoose.model('User', UserSchema);
@@ -36,7 +41,8 @@ const MessageSchema = new mongoose.Schema({
   role: { type: String, default: 'user' }, 
   color: { type: String, default: '' },      
   avatarUrl: { type: String, default: '' },  
-  text: String,
+  text: { type: String, default: '' },
+  attachment: { type: String, default: null }, // NEW: Stores Base64 Compressed Images
   replyTo: { type: Object, default: null },
   edited: { type: Boolean, default: false },
   deleted: { type: Boolean, default: false },
@@ -74,12 +80,7 @@ function broadcastOnlineUsers(serverCode) {
     if (info.serverCode === serverCode) {
       const isVisible = info.role !== 'admin' || info.joinedServers.includes(serverCode) || serverCode === 'global';
       if (isVisible && !usersMap.has(info.username)) {
-        usersMap.set(info.username, { 
-            username: info.username, 
-            role: info.role, 
-            color: info.color, 
-            avatarUrl: info.avatarUrl 
-        });
+        usersMap.set(info.username, { username: info.username, role: info.role, color: info.color, avatarUrl: info.avatarUrl });
       }
     }
   }
@@ -119,14 +120,7 @@ io.on('connection', (socket) => {
       socket.joinedServers = user.servers;
       
       socket.join('global');
-      onlineUsers.set(socket.id, { 
-          username: user.username, 
-          role: socket.role, 
-          color: socket.color, 
-          avatarUrl: socket.avatarUrl,
-          serverCode: 'global', 
-          joinedServers: user.servers 
-      });
+      onlineUsers.set(socket.id, { username: user.username, role: socket.role, color: socket.color, avatarUrl: socket.avatarUrl, serverCode: 'global', joinedServers: user.servers });
       
       broadcastOnlineUsers('global');
 
@@ -134,43 +128,25 @@ io.on('connection', (socket) => {
       if (isVisible) socket.to('global').emit('system_message', `${user.username} joined the app.`);
 
       const servers = socket.role === 'admin' ? await ChatServer.find() : await ChatServer.find({ code: { $in: user.servers } });
-      callback({ 
-          success: true, 
-          username: user.username, 
-          role: socket.role, 
-          color: socket.color,
-          avatarUrl: socket.avatarUrl,
-          servers: servers || [], 
-          joinedServers: user.servers 
-      });
+      callback({ success: true, username: user.username, role: socket.role, color: socket.color, avatarUrl: socket.avatarUrl, servers: servers || [], joinedServers: user.servers });
     } catch (err) { callback({ error: 'Login failed.' }); }
   });
 
-  // NEW: Profile Customization Event
   socket.on('update_profile', async (data, callback) => {
       if (!socket.username) return;
       try {
           const color = data.color ? data.color.trim().substring(0, 30) : '';
-          const url = data.avatarUrl ? data.avatarUrl.trim().substring(0, 500) : '';
+          const url = data.avatarUrl ? data.avatarUrl.trim().substring(0, 1000) : '';
 
           const user = await User.findOne({ username: socket.username });
-          user.color = color;
-          user.avatarUrl = url;
-          await user.save();
+          user.color = color; user.avatarUrl = url; await user.save();
           
-          // Instantly sync the new identity to all past messages
           await Message.updateMany({ username: socket.username }, { $set: { color: color, avatarUrl: url } });
 
-          socket.color = color;
-          socket.avatarUrl = url;
-          if(onlineUsers.has(socket.id)) {
-              let session = onlineUsers.get(socket.id);
-              session.color = color;
-              session.avatarUrl = url;
-          }
+          socket.color = color; socket.avatarUrl = url;
+          if(onlineUsers.has(socket.id)) { let session = onlineUsers.get(socket.id); session.color = color; session.avatarUrl = url; }
           
           io.emit('profile_updated', { username: socket.username, color: color, avatarUrl: url });
-          
           socket.joinedServers.forEach(code => broadcastOnlineUsers(code));
           if (!socket.joinedServers.includes('global')) broadcastOnlineUsers('global');
           
@@ -183,11 +159,9 @@ io.on('connection', (socket) => {
     try {
       const code = Math.random().toString(36).substring(2, 8).toUpperCase(); 
       const srv = await ChatServer.create({ code, name: name.substring(0, 30), owner: socket.username });
-      
       const user = await User.findOne({ username: socket.username });
       if (!user.servers.includes(code)) {
-        user.servers.push(code); await user.save();
-        socket.joinedServers = user.servers;
+        user.servers.push(code); await user.save(); socket.joinedServers = user.servers;
         if(onlineUsers.has(socket.id)) onlineUsers.get(socket.id).joinedServers = user.servers;
       }
       callback({ success: true, server: srv });
@@ -201,13 +175,10 @@ io.on('connection', (socket) => {
     try {
       const srv = await ChatServer.findOne({ code: code.toUpperCase() });
       if (!srv) return callback({ error: 'Invalid invite code.' });
-
       const user = await User.findOne({ username: socket.username });
       if (!user.servers.includes(srv.code)) {
-        user.servers.push(srv.code); await user.save();
-        socket.joinedServers = user.servers;
+        user.servers.push(srv.code); await user.save(); socket.joinedServers = user.servers;
         if(onlineUsers.has(socket.id)) onlineUsers.get(socket.id).joinedServers = user.servers;
-        
         if (socket.serverCode === srv.code) { socket.to(srv.code).emit('system_message', `${socket.username} joined.`); broadcastOnlineUsers(srv.code); }
       }
       callback({ success: true, server: srv });
@@ -238,7 +209,6 @@ io.on('connection', (socket) => {
         await ChatServer.deleteOne({ code: code });
         await Message.deleteMany({ serverCode: code });
         await User.updateMany({}, { $pull: { servers: code } }); 
-        
         io.emit('server_deleted', code); 
         const sockets = await io.fetchSockets();
         sockets.forEach(s => {
@@ -267,8 +237,12 @@ io.on('connection', (socket) => {
       if (code === 'global') query = { $or: [{ serverCode: 'global' }, { serverCode: { $exists: false } }, { serverCode: null }] };
 
       const history = await Message.find(query).sort({ timestamp: -1 }).limit(100).lean();
+      
+      // Clear sensitive data on soft deleted messages for normal users
       const safeHistory = history.map(msg => {
-          if (msg.deleted && socket.role !== 'admin' && msg.username !== socket.username) msg.text = ''; 
+          if (msg.deleted && socket.role !== 'admin' && msg.username !== socket.username) {
+              msg.text = ''; msg.attachment = null;
+          }
           return msg;
       });
       if(callback) callback({ history: safeHistory.reverse() });
@@ -278,22 +252,24 @@ io.on('connection', (socket) => {
   socket.on('chat_message', async (payload) => {
     if (!socket.username || !socket.serverCode) return;
     
-    const rawText = typeof payload === 'string' ? payload : payload.text;
+    const rawText = typeof payload === 'string' ? payload : (payload.text || '');
+    const attachment = typeof payload === 'object' ? payload.attachment : null; 
     const replyTo = typeof payload === 'object' ? payload.replyTo : null;
 
     let cleanText = rawText.trim().substring(0, 2000);
-    if (!cleanText) return;
+    
+    if (!cleanText && !attachment) return; // Prevent empty sends
     if (socket.role !== 'admin') cleanText = cleanText.replace(/@everyone/gi, 'everyone');
 
     try {
       const msg = await Message.create({ 
           serverCode: socket.serverCode, username: socket.username, role: socket.role, 
-          color: socket.color, avatarUrl: socket.avatarUrl, text: cleanText, replyTo: replyTo 
+          color: socket.color, avatarUrl: socket.avatarUrl, text: cleanText, attachment: attachment, replyTo: replyTo 
       });
       
       io.to(socket.serverCode).emit('chat_message', { 
           _id: msg._id, username: msg.username, role: socket.role, color: msg.color, avatarUrl: msg.avatarUrl,
-          text: msg.text, replyTo: msg.replyTo, timestamp: msg.timestamp, edited: false, deleted: false 
+          text: msg.text, attachment: msg.attachment, replyTo: msg.replyTo, timestamp: msg.timestamp, edited: false, deleted: false 
       });
     } catch (err) {}
   });
@@ -340,8 +316,9 @@ io.on('connection', (socket) => {
     if (!socket.username) return;
     try {
       const msg = await Message.findById(msgId);
-      if (msg && msg.deleted && (msg.username === socket.username || socket.role === 'admin')) callback({ success: true, text: msg.text });
-      else callback({ error: 'Permission denied.' });
+      if (msg && msg.deleted && (msg.username === socket.username || socket.role === 'admin')) {
+        callback({ success: true, text: msg.text, attachment: msg.attachment });
+      } else { callback({ error: 'Permission denied.' }); }
     } catch (err) { callback({ error: 'Failed to load deleted message.' }); }
   });
 
