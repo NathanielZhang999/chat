@@ -15,7 +15,9 @@
         /* Modals */
         .modal { position: absolute; inset: 0; background: rgba(0,0,0,0.85); z-index: 100; display: none; flex-direction: column; align-items: center; justify-content: center; padding: 2rem; backdrop-filter: blur(2px); animation: fadeModal 0.15s ease-out; }
         .modal.active { display: flex; }
-        .modal-box { width: 100%; max-width: 400px; background: var(--surface); padding: 2rem; border-radius: 8px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); position: relative; animation: popModal 0.15s ease-out; }
+        .modal-box { width: 100%; max-width: 400px; background: var(--surface); padding: 2rem; border-radius: 8px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); position: relative; animation: popModal 0.15s ease-out; max-height: 90vh; overflow-y: auto;}
+        .modal-box::-webkit-scrollbar { width: 6px; }
+        .modal-box::-webkit-scrollbar-thumb { background: #202225; border-radius: 4px; }
         .modal-box h2 { color: white; margin-bottom: 1.5rem; text-align: center; font-size: 1.4rem; }
         .close-btn { position: absolute; top: 15px; right: 20px; cursor: pointer; color: var(--text-muted); font-size: 1.5rem; background: none; border: none; }
         .close-btn:hover { color: white; }
@@ -181,6 +183,7 @@
         <div class="modal-box">
             <button class="close-btn" onclick="document.getElementById('settings-modal').classList.remove('active')">&times;</button>
             <h2>Profile Settings</h2>
+            
             <div class="input-group">
                 <label>Custom Avatar Image URL (Optional)</label>
                 <input type="text" id="setting-avatar" class="text-input" placeholder="https://imgur.com/my-pic.png">
@@ -193,6 +196,21 @@
                 </div>
             </div>
             <button id="save-settings-btn" class="btn-primary" style="margin-top:10px;">Save Profile</button>
+            
+            <hr style="border: 0; border-top: 1px solid var(--surface-dark); margin: 20px 0;">
+            <h3 style="color: white; margin-bottom: 1rem; font-size: 1.1rem; text-align: center;">Security & Account</h3>
+            
+            <div class="input-group">
+                <label>Current Password</label>
+                <input type="password" id="setting-old-password" class="text-input" placeholder="Required to change password">
+            </div>
+            <div class="input-group">
+                <label>New Password</label>
+                <input type="password" id="setting-new-password" class="text-input" placeholder="Min 6 characters">
+            </div>
+            
+            <button id="change-password-btn" class="btn-primary btn-secondary" style="margin-bottom: 10px;">Change Password</button>
+            <button id="logout-all-btn" class="btn-primary" style="background: var(--error);">Log Out All Other Devices</button>
         </div>
     </div>
 
@@ -205,7 +223,7 @@
             </div>
             <div class="input-group"><label>Backend URL</label><input type="text" id="url-input" class="text-input" placeholder="https://your-app.onrender.com"></div>
             <div class="input-group"><label>Username</label><input type="text" id="username-input" class="text-input" maxlength="20"></div>
-            <div class="input-group"><label>Password</label><input type="password" id="password-input" class="text-input"></div>
+            <div class="input-group"><label>Password</label><input type="password" id="password-input" class="text-input" placeholder="Min 6 characters"></div>
             <button id="auth-btn" class="btn-primary">Login</button>
             <div id="auth-error"></div>
         </div>
@@ -438,7 +456,6 @@
         reader.readAsDataURL(file);
     });
 
-
     // --- SETTINGS LOGIC ---
     document.getElementById('setting-color-picker').addEventListener('input', (e) => { document.getElementById('setting-color-text').value = e.target.value; });
     document.getElementById('setting-color-text').addEventListener('input', (e) => {
@@ -448,6 +465,11 @@
     function openSettings() {
         document.getElementById('setting-avatar').value = myAvatarUrl || "";
         document.getElementById('setting-color-text').value = myColor || "";
+        
+        // Reset security fields
+        document.getElementById('setting-old-password').value = "";
+        document.getElementById('setting-new-password').value = "";
+
         if(myColor && myColor.startsWith('#') && myColor.length === 7) { document.getElementById('setting-color-picker').value = myColor; } 
         else { document.getElementById('setting-color-picker').value = '#5865F2'; }
         document.getElementById('settings-modal').classList.add('active');
@@ -466,11 +488,51 @@
             if(res.error) { showAppAlert("Error", res.error || "Failed to update profile."); } 
             else {
                 myAvatarUrl = res.avatarUrl; myColor = res.color;
-                document.getElementById('settings-modal').classList.remove('active');
                 showAppAlert("Success", "Profile updated! Your new look will apply immediately.");
             }
         });
     };
+
+    // UPDATE: Emit password change to server safely
+    document.getElementById('change-password-btn').onclick = () => {
+        const oldPassword = document.getElementById('setting-old-password').value;
+        const newPassword = document.getElementById('setting-new-password').value;
+
+        if (!oldPassword || !newPassword) {
+            return showAppAlert("Error", "Please fill in both old and new passwords.");
+        }
+        if (newPassword.length < 6) {
+            return showAppAlert("Error", "New password must be at least 6 characters.");
+        }
+
+        const btn = document.getElementById('change-password-btn');
+        btn.textContent = "Changing..."; btn.disabled = true;
+
+        socket.emit('change_password', { oldPassword, newPassword }, (res) => {
+            btn.textContent = "Change Password"; btn.disabled = false;
+            if(res.error) { 
+                showAppAlert("Error", res.error); 
+            } else {
+                document.getElementById('setting-old-password').value = '';
+                document.getElementById('setting-new-password').value = '';
+                showAppAlert("Success", "Password updated successfully!");
+            }
+        });
+    };
+
+    // UPDATE: Emit remote logout event
+    document.getElementById('logout-all-btn').onclick = async () => {
+        if (await showAppConfirm("Logout Everywhere", "Are you sure you want to log out of all other devices you've signed into?", "Logout All", true)) {
+            socket.emit('logout_all_devices', (res) => {
+                if (res && res.success) {
+                    showAppAlert("Success", "Logged out of all other active sessions.");
+                } else {
+                    showAppAlert("Error", res ? res.error : "Failed to execute request.");
+                }
+            });
+        }
+    };
+
 
     // --- DOM XSS PROTECTOR ---
     function createMessageTextElement(text, author, authorRole) {
@@ -558,6 +620,13 @@
     function setupSocket() {
         socket.on('connect_error', () => { if (authModal.classList.contains('active')) showError("Waking server up... (~50s)", false); });
         
+        // UPDATE: Listen for remote logout signals securely emitted by the backend
+        socket.on('force_logout', (msg) => {
+            localStorage.removeItem('pro_chat_user'); 
+            alert(msg || "You have been logged out remotely.");
+            location.reload(); 
+        });
+
         socket.on('chat_message', (msg) => { 
             const isMe = msg.username === myUsername;
             appendMessage(msg, isMe); 

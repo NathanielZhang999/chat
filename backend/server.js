@@ -17,6 +17,40 @@ const io = new Server(server, {
 
 const MONGO_URI = process.env.MONGO_URI; 
 
+// --- SECURITY: REGEX ESCAPE (PREVENT ReDOS) ---
+function escapeRegExp(string) {
+  return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); 
+}
+
+// --- SECURITY: RATE LIMITING ---
+const authAttempts = new Map();
+
+function checkRateLimit(ip) {
+    const now = Date.now();
+    const attempts = authAttempts.get(ip) || [];
+    const recent = attempts.filter(time => now - time < 15 * 60 * 1000); // 15 mins window
+    if (recent.length >= 10) { // Limit 10 attempts
+        return false;
+    }
+    recent.push(now);
+    authAttempts.set(ip, recent);
+    return true;
+}
+
+function clearRateLimit(ip) {
+    authAttempts.delete(ip);
+}
+
+// Clean up stale IP limits memory every 15 mins
+setInterval(() => {
+    const now = Date.now();
+    for (const [ip, attempts] of authAttempts.entries()) {
+        const recent = attempts.filter(time => now - time < 15 * 60 * 1000);
+        if (recent.length === 0) authAttempts.delete(ip);
+        else authAttempts.set(ip, recent);
+    }
+}, 15 * 60 * 1000);
+
 // --- DATABASE SCHEMAS ---
 const UserSchema = new mongoose.Schema({
   username: { type: String, required: true, unique: true },
@@ -90,23 +124,51 @@ function broadcastOnlineUsers(serverCode) {
 io.on('connection', (socket) => {
   socket.serverCode = null;
   socket.joinedServers = [];
+  
+  let lastMessageTime = 0; // State for spam filter
 
   socket.on('register', async (data, callback) => {
     try {
+      // SECURITY: TYPE JUGGLING PREVENTION
+      if (!data || typeof data.username !== 'string' || typeof data.password !== 'string') {
+        return callback({ error: 'Invalid input format.' });
+      }
+
+      // SECURITY: BRUTE FORCE PREVENTION
+      const ip = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
+      if (!checkRateLimit(ip)) return callback({ error: 'Too many requests. Try again later.' });
+
       const cleanUser = data.username.trim().substring(0, 20);
+      if (cleanUser.length < 3) return callback({ error: 'Username must be at least 3 characters.' });
       if (cleanUser.toLowerCase() === 'nyzhang1') return callback({ error: 'Reserved name.' });
-      const existing = await User.findOne({ username: { $regex: new RegExp(`^${cleanUser}$`, 'i') } }); 
+      if (data.password.length < 6) return callback({ error: 'Password must be at least 6 characters.' });
+
+      // SECURITY: ESCAPED REGEX PREVENTS DENIAL OF SERVICE
+      const escapedUser = escapeRegExp(cleanUser);
+      const existing = await User.findOne({ username: { $regex: new RegExp(`^${escapedUser}$`, 'i') } }); 
       if (existing) return callback({ error: 'Username taken.' });
 
       const hashedPassword = await bcrypt.hash(data.password, 10);
       await User.create({ username: cleanUser, password: hashedPassword, servers: ['global'] });
+      
+      clearRateLimit(ip);
       callback({ success: true });
     } catch (err) { callback({ error: 'Registration failed.' }); }
   });
 
   socket.on('login', async (data, callback) => {
     try {
-      const user = await User.findOne({ username: { $regex: new RegExp(`^${data.username.trim()}$`, 'i') } });
+      // SECURITY: TYPE JUGGLING PREVENTION
+      if (!data || typeof data.username !== 'string' || typeof data.password !== 'string') {
+        return callback({ error: 'Invalid input format.' });
+      }
+
+      // SECURITY: BRUTE FORCE PREVENTION
+      const ip = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
+      if (!checkRateLimit(ip)) return callback({ error: 'Too many login attempts. Try again later.' });
+
+      const escapedUser = escapeRegExp(data.username.trim());
+      const user = await User.findOne({ username: { $regex: new RegExp(`^${escapedUser}$`, 'i') } });
       if (!user) return callback({ error: 'User not found.' });
       if (!(await bcrypt.compare(data.password, user.password))) return callback({ error: 'Incorrect password.' });
 
@@ -126,10 +188,59 @@ io.on('connection', (socket) => {
 
       const isVisible = socket.role !== 'admin' || socket.joinedServers.includes('global');
       if (isVisible) socket.to('global').emit('system_message', `${user.username} joined the app.`);
+      
+      clearRateLimit(ip);
 
       const servers = socket.role === 'admin' ? await ChatServer.find() : await ChatServer.find({ code: { $in: user.servers } });
       callback({ success: true, username: user.username, role: socket.role, color: socket.color, avatarUrl: socket.avatarUrl, servers: servers || [], joinedServers: user.servers });
     } catch (err) { callback({ error: 'Login failed.' }); }
+  });
+
+  // --- NEW SECURITY FEATURE: CHANGE PASSWORD ---
+  socket.on('change_password', async (data, callback) => {
+    if (!socket.username) return callback({ error: 'Not authenticated.' });
+    if (!data || typeof data.oldPassword !== 'string' || typeof data.newPassword !== 'string') {
+        return callback({ error: 'Invalid data format.' });
+    }
+    
+    // Rate limit changes to prevent rapid hash DoS via sockets
+    const ip = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
+    if (!checkRateLimit(ip)) return callback({ error: 'Too many attempts. Try again later.' });
+
+    try {
+      const user = await User.findOne({ username: socket.username });
+      if (!user) return callback({ error: 'User not found.' });
+
+      const isMatch = await bcrypt.compare(data.oldPassword, user.password);
+      if (!isMatch) return callback({ error: 'Incorrect current password.' });
+
+      if (data.newPassword.length < 6) return callback({ error: 'New password must be at least 6 characters long.' });
+
+      user.password = await bcrypt.hash(data.newPassword, 10);
+      await user.save();
+      
+      clearRateLimit(ip);
+      callback({ success: true });
+    } catch (err) {
+      callback({ error: 'Failed to update password.' });
+    }
+  });
+
+  // --- NEW SECURITY FEATURE: LOGOUT ALL OTHER DEVICES ---
+  socket.on('logout_all_devices', async (callback) => {
+      if (!socket.username) return;
+      try {
+          const sockets = await io.fetchSockets();
+          sockets.forEach(s => {
+              if (s.username === socket.username && s.id !== socket.id) {
+                  s.emit('force_logout', "You have been logged out because 'Logout All Devices' was triggered remotely.");
+                  s.disconnect(true); // Close socket immediately
+              }
+          });
+          callback({ success: true });
+      } catch(err) {
+          callback({ error: 'Failed to execute remote logout.'});
+      }
   });
 
   socket.on('update_profile', async (data, callback) => {
@@ -252,9 +363,22 @@ io.on('connection', (socket) => {
   socket.on('chat_message', async (payload) => {
     if (!socket.username || !socket.serverCode) return;
     
+    // SECURITY: Message Spam Rate Limiter (500ms cooldown for non-admin users)
+    const now = Date.now();
+    if (socket.role !== 'admin' && now - lastMessageTime < 500) {
+        return socket.emit('system_message', '⚠️ Slow down! You are sending messages too fast.');
+    }
+    lastMessageTime = now;
+
+    // SECURITY: Payload verification check limits false-injection mapping
+    if (typeof payload !== 'string' && typeof payload !== 'object') return;
+    
     const rawText = typeof payload === 'string' ? payload : (payload.text || '');
     const attachment = typeof payload === 'object' ? payload.attachment : null; 
     const replyTo = typeof payload === 'object' ? payload.replyTo : null;
+    
+    // SECURITY: Limit socket memory crash vulnerabilities (block files over 15MB strictly at socket line)
+    if (attachment && (typeof attachment !== 'string' || attachment.length > 15000000)) return;
 
     let cleanText = rawText.trim().substring(0, 2000);
     
