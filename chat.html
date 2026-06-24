@@ -37,8 +37,8 @@
         #auth-error { color: var(--error); font-size: 0.85rem; text-align: center; margin-top: 1rem; min-height: 20px; font-weight: 500; }
 
         /* Servers Sidebar (SCROLLBAR COMPLETELY HIDDEN) */
-        #servers-sidebar { width: 72px; background: #202225; display: flex; flex-direction: column; align-items: center; padding: 12px 0; gap: 8px; overflow-y: scroll; flex-shrink: 0; scrollbar-width: none; -ms-overflow-style: none; }
-        #servers-sidebar::-webkit-scrollbar { display: none; }
+        #servers-sidebar { width: 72px; background: #202225; display: flex; flex-direction: column; align-items: center; padding: 12px 0; gap: 8px; overflow-y: auto; overflow-x: hidden; flex-shrink: 0; scrollbar-width: none; -ms-overflow-style: none; }
+        #servers-sidebar::-webkit-scrollbar { display: none; width: 0; height: 0; }
         
         .server-icon { width: 48px; height: 48px; border-radius: 50%; background: #36393f; color: white; display: flex; justify-content: center; align-items: center; cursor: pointer; font-weight: bold; transition: 0.2s; font-size: 1.2rem; position: relative; flex-shrink: 0; }
         .server-icon:hover { border-radius: 16px; background: var(--primary); opacity: 1 !important; border: none !important; }
@@ -52,7 +52,7 @@
         #chat-area { flex: 1; display: flex; flex-direction: column; position: relative; min-width: 0; }
         header { padding: 0 1rem; height: 50px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; background: var(--surface); box-shadow: 0 1px 2px rgba(0,0,0,0.2); z-index: 10; }
         #server-title { font-weight: 600; font-size: 1rem; color: white; display: flex; align-items: center; gap: 8px; }
-        .admin-badge { background: var(--error); color: white; font-size: 0.6rem; padding: 2px 5px; border-radius: 4px; font-weight: bold; text-transform: uppercase; }
+        .admin-badge { background: var(--error); color: white; font-size: 0.6rem; padding: 2px 5px; border-radius: 4px; font-weight: bold; text-transform: uppercase; margin-left: 5px; }
         
         .header-actions { display: flex; gap: 8px; align-items: center; }
         .header-btn { font-size: 0.8rem; padding: 6px 12px; border-radius: 4px; color: white; cursor: pointer; transition: 0.2s; font-weight: 600; border: none; display: none; }
@@ -93,6 +93,10 @@
         .edited-tag { font-size: 0.7rem; color: var(--text-muted); margin-left: 5px; cursor: pointer; user-select: none; }
         .edited-tag:hover { text-decoration: underline; }
         
+        /* Soft Delete Styling */
+        .msg.is-deleted .deleted-text { font-style: italic; color: var(--text-muted); }
+        .view-deleted-tag { cursor: pointer; text-decoration: underline; margin-left: 5px; color: var(--error); }
+        
         .system-msg { text-align: center; font-size: 0.85rem; color: var(--text-muted); margin: 1rem 0; font-weight: 600; display: flex; align-items: center; justify-content: center; gap: 10px; }
         .system-msg::before, .system-msg::after { content: ""; flex: 1; border-bottom: 1px solid var(--surface-dark); max-width: 50px; }
 
@@ -118,6 +122,7 @@
         .user-item:hover { background: #393c43; color: var(--text); }
         .avatar { width: 32px; height: 32px; border-radius: 50%; background: var(--primary); display: flex; justify-content: center; align-items: center; color: white; font-weight: bold; position: relative; }
         .status-dot { position: absolute; bottom: -2px; right: -2px; width: 12px; height: 12px; border-radius: 50%; background: #3ba55c; border: 2px solid #2f3136; }
+        
         .stealth-admin { color: var(--warning) !important; font-style: italic; }
         .stealth-admin .status-dot { background: var(--warning); }
 
@@ -186,7 +191,7 @@
     <div id="history-modal" class="modal">
         <div class="modal-box" style="max-width: 500px;">
             <button class="close-btn" onclick="document.getElementById('history-modal').classList.remove('active')">&times;</button>
-            <h2>Message Edit History</h2>
+            <h2 id="history-modal-title">Message Edit History</h2>
             <div id="history-list"></div>
         </div>
     </div>
@@ -233,7 +238,7 @@
     </div>
 
     <div id="online-sidebar">
-        <div class="sidebar-header">Global Online — <span id="online-count">0</span></div>
+        <div class="sidebar-header" id="online-header">Room Online — <span id="online-count">0</span></div>
         <ul id="online-list"></ul>
     </div>
 </div>
@@ -242,7 +247,7 @@
     let socket;
     let myUsername = "";
     let myRole = "user"; 
-    let currentServerCode = null; // FIX: Prepares a clean slate to prevent double-loading
+    let currentServerCode = null; 
     let myJoinedServers = []; 
     let serversCache = { 'global': { name: 'Global Chat', owner: 'System' } }; 
     
@@ -273,6 +278,7 @@
     document.getElementById('tab-login').onclick = function() { isLoginMode = true; this.classList.add('active'); document.getElementById('tab-register').classList.remove('active'); authBtn.textContent = 'Login'; authError.textContent = ''; };
     document.getElementById('tab-register').onclick = function() { isLoginMode = false; this.classList.add('active'); document.getElementById('tab-login').classList.remove('active'); authBtn.textContent = 'Register'; authError.textContent = ''; };
 
+    // Built-in DOM XSS Protector for parsing ping tags safely
     function createMessageTextElement(text, author, authorRole) {
         const span = document.createElement('span');
         span.className = 'msg-text-content';
@@ -288,34 +294,23 @@
                 const isAdmin = authorRole === 'admin' || author.toLowerCase() === 'nyzhang1';
                 
                 if (name === 'everyone' && isAdmin) {
-                    tag.className = 'ping-tag everyone'; 
-                    tag.textContent = part;
-                    isPinged = true; 
-                    span.appendChild(tag);
+                    tag.className = 'ping-tag everyone'; tag.textContent = part; isPinged = true; span.appendChild(tag);
                 } 
                 else if (name === myUsername.toLowerCase()) {
-                    tag.className = 'ping-tag'; 
-                    tag.textContent = part;
-                    isPinged = true; 
-                    span.appendChild(tag);
+                    tag.className = 'ping-tag'; tag.textContent = part; isPinged = true; span.appendChild(tag);
                 } 
                 else {
-                    tag.className = 'ping-tag other'; 
-                    tag.textContent = part;
-                    span.appendChild(tag);
+                    tag.className = 'ping-tag other'; tag.textContent = part; span.appendChild(tag);
                 }
-            } else if (part) {
-                span.appendChild(document.createTextNode(part));
-            }
+            } else if (part) { span.appendChild(document.createTextNode(part)); }
         });
         return { element: span, isPinged };
     }
 
-    // --- LOGOUT LOGIC ---
     function logoutApp() {
         if (confirm("Are you sure you want to log out?")) {
             localStorage.removeItem('pro_chat_user'); 
-            location.reload(); // Instantly and safely resets all Javascript and session data
+            location.reload(); 
         }
     }
 
@@ -334,11 +329,7 @@
         
         authError.style.color = "var(--text)"; authError.textContent = "Connecting to server..."; authBtn.disabled = true;
 
-        if (!socket) { 
-            // FIX: Restored standard connection fallbacks to prevent freezing when Render is sleeping!
-            socket = io(url, { reconnectionAttempts: Infinity }); 
-            setupSocket(); 
-        }
+        if (!socket) { socket = io(url, { reconnectionAttempts: Infinity }); setupSocket(); }
 
         const action = isLoginMode ? 'login' : 'register';
         const doAuth = () => {
@@ -360,7 +351,7 @@
                     
                     renderServers(res.servers || []);
                     
-                    // FIX: Ensures we only fetch history once upon switching to the Global room
+                    // FIX: Double History Prevented by resetting serverCode cache before fetching
                     currentServerCode = null; 
                     switchServer('global');
                 }
@@ -378,14 +369,12 @@
         socket.on('system_message', (txt) => appendSystemMessage(txt));
         
         socket.on('message_edited', (data) => {
-            // FIX: Safely grabs and updates all copies in the rare event of duplicates
             const elements = document.querySelectorAll(`.msg[data-id="${data.id}"]`);
             elements.forEach(el => {
                 el.setAttribute('data-raw-text', data.text); 
                 el.classList.remove('pinged'); 
                 
                 const { element, isPinged } = createMessageTextElement(data.text, data.username, data.role || 'user');
-                
                 const oldSpan = el.querySelector('.msg-text-content');
                 if (oldSpan) oldSpan.replaceWith(element);
                 
@@ -401,7 +390,33 @@
             });
         });
 
-        socket.on('message_deleted', (id) => { const els = document.querySelectorAll(`.msg[data-id="${id}"]`); els.forEach(el => el.remove()); });
+        // SOFT DELETION DOM MANIPULATION
+        socket.on('message_deleted', (id) => { 
+            const els = document.querySelectorAll(`.msg[data-id="${id}"]`); 
+            els.forEach(el => {
+                el.classList.add('is-deleted');
+                el.classList.remove('pinged');
+                
+                const textDiv = el.querySelector('.msg-text');
+                const msgAuthor = el.querySelector('.msg-author').textContent;
+                const isMe = msgAuthor === myUsername;
+
+                textDiv.innerHTML = `<span class="msg-text-content deleted-text">🚫 This message was deleted.</span>`;
+                
+                // Allow Admin or Author to securely view what the deleted text was
+                if (isMe || myRole === 'admin') {
+                    const viewTag = document.createElement('span'); 
+                    viewTag.className = 'edited-tag view-deleted-tag'; 
+                    viewTag.textContent = '(view)';
+                    viewTag.onclick = () => viewDeleted(id);
+                    textDiv.appendChild(viewTag);
+                }
+
+                const actions = el.querySelector('.msg-actions');
+                if (actions) actions.remove(); 
+                el.querySelectorAll('.edited-tag:not(.view-deleted-tag)').forEach(t => t.remove());
+            }); 
+        });
         
         socket.on('admin_new_server', (srv) => { if (myRole === 'admin') addServerToList(srv.code, srv.name, srv.owner); });
 
@@ -421,20 +436,24 @@
             const list = document.getElementById('online-list');
             list.innerHTML = '';
             
-            const isHiddenAdmin = myRole === 'admin' && !users.includes(myUsername);
+            const roomType = currentServerCode === 'global' ? 'Global Online' : 'Room Online';
+            document.getElementById('online-header').innerHTML = `${roomType} — <span id="online-count">0</span>`;
+            
+            const isHiddenAdmin = myRole === 'admin' && !myJoinedServers.includes(currentServerCode) && currentServerCode !== 'global';
             document.getElementById('online-count').textContent = users.length + (isHiddenAdmin ? 1 : 0);
 
             if (isHiddenAdmin) {
                 const li = document.createElement('li'); 
                 li.className = "user-item stealth-admin"; 
-                li.innerHTML = `<div class="avatar">A<div class="status-dot" style="background:var(--warning);"></div></div><div style="color:var(--warning); font-style:italic;">${myUsername} (Hidden)</div>`;
+                li.innerHTML = `<div class="avatar">A<div class="status-dot" style="background:var(--warning);"></div></div><div style="color:var(--warning); font-style:italic;">${myUsername} (Ghost)</div>`;
                 list.appendChild(li);
             }
 
             users.forEach(u => {
                 const li = document.createElement('li');
                 li.className = "user-item";
-                li.innerHTML = `<div class="avatar">${u.charAt(0).toUpperCase()}<div class="status-dot"></div></div><div>${u}${u === myUsername ? " (You)" : ""}</div>`;
+                const isAdminBadge = u.role === 'admin' ? `<span class="admin-badge" style="font-size:0.5rem; margin-left:8px;">ADMIN</span>` : '';
+                li.innerHTML = `<div class="avatar">${u.username.charAt(0).toUpperCase()}<div class="status-dot"></div></div><div>${u.username}${u.username === myUsername ? " (You)" : ""}${isAdminBadge}</div>`;
                 list.appendChild(li);
             });
         });
@@ -494,7 +513,8 @@
             inviteBtn.style.display = 'block';
             inviteBtn.textContent = `Copy Code: ${code}`;
             
-            if (myRole === 'admin' || srv.owner === myUsername) deleteBtn.style.display = 'block';
+            // FIX: Allows the person who created the server to safely delete it
+            if (myRole === 'admin' || (srv.owner && srv.owner.toLowerCase() === myUsername.toLowerCase())) deleteBtn.style.display = 'block';
             else deleteBtn.style.display = 'none';
 
             if (myJoinedServers.includes(code)) {
@@ -509,7 +529,6 @@
         cancelEdit();
         
         socket.emit('switch_server', code, (res) => { 
-            // FIX: Clears window right before inserting data to prevent racing duplicates
             chatWindow.innerHTML = '';
             if (res && res.history) loadHistory(res.history); 
         });
@@ -517,7 +536,8 @@
 
     function copyCode() {
         navigator.clipboard.writeText(currentServerCode);
-        const old = inviteBtn.textContent; inviteBtn.textContent = "Copied!";
+        const old = inviteBtn.textContent;
+        inviteBtn.textContent = "Copied!";
         setTimeout(() => inviteBtn.textContent = old, 1500);
     }
 
@@ -569,7 +589,7 @@
             
             const existingIcon = document.getElementById(`srv-${res.server.code}`);
             if (existingIcon) { existingIcon.style.opacity = '1'; existingIcon.style.border = 'none'; }
-            else { addServerToList(res.server.code, res.server.name, socket.username); }
+            else { addServerToList(res.server.code, res.server.name, myUsername); } // Binds local ownership properly
             
             switchServer(res.server.code);
         });
@@ -614,10 +634,17 @@
         typingTimeout = setTimeout(() => socket.emit('typing', false), 1500); 
     });
 
-    function initiateEdit(id, currentText) {
-        editingMsgId = id; editBar.style.display = 'flex'; msgInput.value = currentText;
+    function initiateEdit(id, currentTextElement) {
+        if (!currentTextElement) return;
+        editingMsgId = id; editBar.style.display = 'flex'; 
+        
+        let rawText = "";
+        currentTextElement.childNodes.forEach(n => { rawText += n.textContent; });
+        
+        msgInput.value = rawText;
         msgInput.focus(); sendBtn.textContent = 'Save'; sendBtn.style.background = '#4752c4';
     }
+    
     function cancelEdit() {
         editingMsgId = null; editBar.style.display = 'none'; msgInput.value = '';
         sendBtn.textContent = 'Send'; sendBtn.style.background = 'var(--primary)';
@@ -627,25 +654,37 @@
     function viewHistory(msgId) {
         socket.emit('get_edit_history', msgId, (res) => {
             if (res.error) return alert(res.error);
-            const list = document.getElementById('history-list');
-            list.innerHTML = '';
+            const list = document.getElementById('history-list'); list.innerHTML = '';
+            document.getElementById('history-modal-title').textContent = "Message Edit History";
+
             if (!res.history || res.history.length === 0) { list.innerHTML = '<div class="hist-item" style="border-left-color: var(--text-muted);">No previous edits.</div>'; }
             else {
                 res.history.forEach((item, index) => {
                     const el = document.createElement('div'); el.className = 'hist-item';
-                    
-                    const timeDiv = document.createElement('div');
-                    timeDiv.className = 'hist-time';
+                    const timeDiv = document.createElement('div'); timeDiv.className = 'hist-time';
                     timeDiv.textContent = `Version ${index + 1} • ${new Date(item.timestamp).toLocaleString()}`;
-                    
-                    const textDiv = document.createElement('div');
-                    textDiv.className = 'hist-text';
+                    const textDiv = document.createElement('div'); textDiv.className = 'hist-text';
                     textDiv.appendChild(createMessageTextElement(item.text, '', 'user').element);
-                    
-                    el.appendChild(timeDiv); el.appendChild(textDiv);
-                    list.appendChild(el);
+                    el.appendChild(timeDiv); el.appendChild(textDiv); list.appendChild(el);
                 });
             }
+            document.getElementById('history-modal').classList.add('active');
+        });
+    }
+
+    function viewDeleted(msgId) {
+        socket.emit('get_deleted_message', msgId, (res) => {
+            if (res.error) return alert(res.error);
+            const list = document.getElementById('history-list'); list.innerHTML = '';
+            document.getElementById('history-modal-title').textContent = "Deleted Message";
+
+            const el = document.createElement('div'); el.className = 'hist-item';
+            const timeDiv = document.createElement('div'); timeDiv.className = 'hist-time';
+            timeDiv.textContent = `Original Content (Hidden from normal users)`;
+            const textDiv = document.createElement('div'); textDiv.className = 'hist-text';
+            textDiv.appendChild(createMessageTextElement(res.text, '', 'user').element);
+            
+            el.appendChild(timeDiv); el.appendChild(textDiv); list.appendChild(el);
             document.getElementById('history-modal').classList.add('active');
         });
     }
@@ -658,7 +697,6 @@
     function appendMessage(data, isMe) {
         const wrapper = document.createElement('div');
         wrapper.className = `msg`; wrapper.setAttribute('data-id', data._id); 
-        wrapper.setAttribute('data-raw-text', data.text); 
 
         const header = document.createElement('div'); header.className = 'msg-header';
         const author = document.createElement('div'); author.className = 'msg-author';
@@ -672,28 +710,51 @@
         time.textContent = new Date(data.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
         header.appendChild(time);
 
-        if (isMe || myRole === 'admin') {
-            const actions = document.createElement('div'); actions.className = 'msg-actions';
-            const editBtn = document.createElement('button'); editBtn.className = 'action-btn'; editBtn.textContent = '✏️ Edit';
-            editBtn.onclick = () => initiateEdit(data._id, wrapper.getAttribute('data-raw-text'));
-            const delBtn = document.createElement('button'); delBtn.className = 'action-btn del'; delBtn.textContent = '🗑️ Delete';
-            delBtn.onclick = () => { if (confirm("Delete this message?")) socket.emit('delete_message', data._id); };
-
-            actions.appendChild(editBtn); actions.appendChild(delBtn); wrapper.appendChild(actions);
-        }
-
         const textDiv = document.createElement('div'); textDiv.className = 'msg-text';
-        
-        const { element, isPinged } = createMessageTextElement(data.text, data.username, data.role || 'user');
-        textDiv.appendChild(element);
-        
-        if (isPinged && !isMe) wrapper.classList.add('pinged');
 
-        if (data.edited) {
-            const tag = document.createElement('span'); tag.className = 'edited-tag'; tag.textContent = '(edited)';
-            if (isMe || myRole === 'admin') { tag.title = "View edit history"; tag.onclick = () => viewHistory(data._id); } 
-            else { tag.style.cursor = 'default'; }
-            textDiv.appendChild(tag);
+        // Handles rendering Soft-Deleted messages dynamically 
+        if (data.deleted) {
+            wrapper.classList.add('is-deleted');
+            const span = document.createElement('span'); 
+            span.className = 'msg-text-content deleted-text'; 
+            span.textContent = '🚫 This message was deleted.';
+            span.style.fontStyle = 'italic'; 
+            span.style.color = 'var(--text-muted)';
+            textDiv.appendChild(span);
+
+            if (isMe || myRole === 'admin') {
+                const viewTag = document.createElement('span'); 
+                viewTag.className = 'edited-tag view-deleted-tag'; 
+                viewTag.textContent = '(view)';
+                viewTag.onclick = () => viewDeleted(data._id); 
+                textDiv.appendChild(viewTag);
+            }
+        } else {
+            wrapper.setAttribute('data-raw-text', data.text || ''); 
+
+            if (isMe || myRole === 'admin') {
+                const actions = document.createElement('div'); actions.className = 'msg-actions';
+                
+                const editBtn = document.createElement('button'); editBtn.className = 'action-btn'; editBtn.textContent = '✏️ Edit';
+                editBtn.onclick = () => initiateEdit(data._id, textDiv.querySelector('.msg-text-content'));
+                
+                const delBtn = document.createElement('button'); delBtn.className = 'action-btn del'; delBtn.textContent = '🗑️ Delete';
+                delBtn.onclick = () => { if (confirm("Delete this message?")) socket.emit('delete_message', data._id); };
+
+                actions.appendChild(editBtn); actions.appendChild(delBtn); wrapper.appendChild(actions);
+            }
+
+            const { element, isPinged } = createMessageTextElement(data.text, data.username, data.role || 'user');
+            textDiv.appendChild(element);
+            
+            if (isPinged && !isMe) wrapper.classList.add('pinged');
+
+            if (data.edited) {
+                const tag = document.createElement('span'); tag.className = 'edited-tag'; tag.textContent = '(edited)';
+                if (isMe || myRole === 'admin') { tag.title = "View edit history"; tag.onclick = () => viewHistory(data._id); } 
+                else { tag.style.cursor = 'default'; }
+                textDiv.appendChild(tag);
+            }
         }
 
         wrapper.appendChild(header); wrapper.appendChild(textDiv);

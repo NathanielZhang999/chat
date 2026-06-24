@@ -34,6 +34,7 @@ const MessageSchema = new mongoose.Schema({
   role: { type: String, default: 'user' }, 
   text: String,
   edited: { type: Boolean, default: false },
+  deleted: { type: Boolean, default: false }, // Tracks Soft Deletions
   history: [{ text: String, timestamp: Date }], 
   timestamp: { type: Date, default: Date.now }
 });
@@ -64,12 +65,19 @@ if (MONGO_URI) mongoose.connect(MONGO_URI).then(seedSystem).catch(console.error)
 // --- REAL-TIME PRESENCE LOGIC ---
 const onlineUsers = new Map(); 
 
-function broadcastGlobalOnlineUsers() {
-  const users = [];
+function broadcastOnlineUsers(serverCode) {
+  if (!serverCode) return;
+  const usersMap = new Map();
   for (const info of onlineUsers.values()) {
-    if (info.role !== 'admin') users.push(info.username);
+    if (info.serverCode === serverCode) {
+      // Admins are visible if they joined the server OR are in Global.
+      const isVisible = info.role !== 'admin' || info.joinedServers.includes(serverCode) || serverCode === 'global';
+      if (isVisible && !usersMap.has(info.username)) {
+        usersMap.set(info.username, { username: info.username, role: info.role });
+      }
+    }
   }
-  io.emit('online_users', [...new Set(users)]);
+  io.to(serverCode).emit('online_users', Array.from(usersMap.values()));
 }
 
 io.on('connection', (socket) => {
@@ -103,9 +111,9 @@ io.on('connection', (socket) => {
       socket.joinedServers = user.servers;
       
       socket.join('global');
-      onlineUsers.set(socket.id, { username: user.username, role: socket.role, joinedServers: user.servers });
+      onlineUsers.set(socket.id, { username: user.username, role: socket.role, serverCode: 'global', joinedServers: user.servers });
       
-      broadcastGlobalOnlineUsers();
+      broadcastOnlineUsers('global');
 
       const isVisible = socket.role !== 'admin' || socket.joinedServers.includes('global');
       if (isVisible) socket.to('global').emit('system_message', `${user.username} joined the app.`);
@@ -114,7 +122,6 @@ io.on('connection', (socket) => {
         ? await ChatServer.find() 
         : await ChatServer.find({ code: { $in: user.servers } });
 
-      // FIX: We no longer fetch history here to prevent double-loading. switch_server handles it natively!
       callback({ success: true, username: user.username, role: socket.role, servers: servers || [], joinedServers: user.servers });
     } catch (err) { callback({ error: 'Login failed.' }); }
   });
@@ -157,7 +164,10 @@ io.on('connection', (socket) => {
         socket.joinedServers = user.servers;
         if(onlineUsers.has(socket.id)) onlineUsers.get(socket.id).joinedServers = user.servers;
         
-        if (socket.serverCode === srv.code) socket.to(srv.code).emit('system_message', `${socket.username} joined.`);
+        if (socket.serverCode === srv.code) {
+           socket.to(srv.code).emit('system_message', `${socket.username} joined.`);
+           broadcastOnlineUsers(srv.code);
+        }
       }
       callback({ success: true, server: srv });
     } catch (err) { callback({ error: 'Join failed.' }); }
@@ -173,7 +183,10 @@ io.on('connection', (socket) => {
         socket.joinedServers = user.servers;
         if(onlineUsers.has(socket.id)) onlineUsers.get(socket.id).joinedServers = user.servers;
 
-        if (socket.serverCode === code) socket.to(code).emit('system_message', `${socket.username} left the server.`);
+        if (socket.serverCode === code) {
+           socket.to(code).emit('system_message', `${socket.username} left the server.`);
+           broadcastOnlineUsers(code);
+        }
       }
       callback({ success: true });
     } catch (err) { callback({ error: 'Failed to leave.' }); }
@@ -185,7 +198,7 @@ io.on('connection', (socket) => {
       const srv = await ChatServer.findOne({ code: code });
       if (!srv) return callback({ error: 'Server not found.' });
 
-      if (socket.role === 'admin' || srv.owner === socket.username) {
+      if (socket.role === 'admin' || srv.owner.toLowerCase() === socket.username.toLowerCase()) {
         await ChatServer.deleteOne({ code: code });
         await Message.deleteMany({ serverCode: code });
         await User.updateMany({}, { $pull: { servers: code } }); 
@@ -201,6 +214,7 @@ io.on('connection', (socket) => {
           if (s.serverCode === code) { s.leave(code); s.serverCode = 'global'; s.join('global'); }
         });
 
+        broadcastOnlineUsers('global');
         callback({ success: true });
       } else {
         callback({ error: 'Permission denied. Must be owner or admin.' });
@@ -212,17 +226,31 @@ io.on('connection', (socket) => {
     if (!socket.username) return;
     try {
       const oldCode = socket.serverCode;
-      if (oldCode) socket.leave(oldCode);
+      if (oldCode) {
+          socket.leave(oldCode);
+          broadcastOnlineUsers(oldCode);
+      }
 
       socket.serverCode = code;
       socket.join(code);
       if (onlineUsers.has(socket.id)) onlineUsers.get(socket.id).serverCode = code;
       
+      broadcastOnlineUsers(code);
+      
       let query = { serverCode: code };
       if (code === 'global') query = { $or: [{ serverCode: 'global' }, { serverCode: { $exists: false } }, { serverCode: null }] };
 
-      const history = await Message.find(query).sort({ timestamp: -1 }).limit(100);
-      if(callback) callback({ history: history.reverse() });
+      const history = await Message.find(query).sort({ timestamp: -1 }).limit(100).lean();
+      
+      // SECURITY: Scrub deleted message text for regular users so they can't hack the DOM to read it
+      const safeHistory = history.map(msg => {
+          if (msg.deleted && socket.role !== 'admin' && msg.username !== socket.username) {
+              msg.text = ''; 
+          }
+          return msg;
+      });
+
+      if(callback) callback({ history: safeHistory.reverse() });
     } catch (err) { console.error(err); }
   });
 
@@ -235,7 +263,7 @@ io.on('connection', (socket) => {
 
     try {
       const msg = await Message.create({ serverCode: socket.serverCode, username: socket.username, role: socket.role, text: cleanText });
-      io.to(socket.serverCode).emit('chat_message', { _id: msg._id, username: msg.username, role: socket.role, text: msg.text, timestamp: msg.timestamp, edited: false });
+      io.to(socket.serverCode).emit('chat_message', { _id: msg._id, username: msg.username, role: socket.role, text: msg.text, timestamp: msg.timestamp, edited: false, deleted: false });
     } catch (err) {}
   });
 
@@ -248,17 +276,27 @@ io.on('connection', (socket) => {
       if (socket.role !== 'admin') cleanText = cleanText.replace(/@everyone/gi, 'everyone');
 
       const msg = await Message.findById(data.id);
-      if (msg && (msg.username === socket.username || socket.role === 'admin') && msg.text !== cleanText) {
-        
-        // BUG FIX: Automatically create the history array if old messages are missing it!
+      if (msg && !msg.deleted && (msg.username === socket.username || socket.role === 'admin') && msg.text !== cleanText) {
         if (!msg.history) msg.history = []; 
-        
         msg.history.push({ text: msg.text, timestamp: new Date() });
         msg.text = cleanText;
         msg.edited = true;
-        msg.markModified('history'); // Forces MongoDB to save the array correctly
+        msg.markModified('history'); 
         await msg.save();
         io.to(socket.serverCode).emit('message_edited', { id: msg._id, username: msg.username, role: msg.role, text: cleanText });
+      }
+    } catch (err) {}
+  });
+
+  // Soft Delete Logic
+  socket.on('delete_message', async (msgId) => {
+    if (!socket.username) return;
+    try {
+      const msg = await Message.findById(msgId);
+      if (msg && !msg.deleted && (msg.username === socket.username || socket.role === 'admin')) {
+        msg.deleted = true;
+        await msg.save();
+        io.to(msg.serverCode).emit('message_deleted', msgId);
       }
     } catch (err) {}
   });
@@ -273,15 +311,15 @@ io.on('connection', (socket) => {
     } catch (err) { callback({ error: 'Failed to load history.' }); }
   });
 
-  socket.on('delete_message', async (msgId) => {
+  // Fetch deleted message content securely
+  socket.on('get_deleted_message', async (msgId, callback) => {
     if (!socket.username) return;
     try {
       const msg = await Message.findById(msgId);
-      if (msg && (msg.username === socket.username || socket.role === 'admin')) {
-        await Message.findByIdAndDelete(msgId);
-        io.to(msg.serverCode).emit('message_deleted', msgId);
-      }
-    } catch (err) {}
+      if (msg && msg.deleted && (msg.username === socket.username || socket.role === 'admin')) {
+        callback({ success: true, text: msg.text });
+      } else { callback({ error: 'Permission denied.' }); }
+    } catch (err) { callback({ error: 'Failed to load deleted message.' }); }
   });
 
   socket.on('typing', (isTyping) => {
@@ -292,10 +330,13 @@ io.on('connection', (socket) => {
 
   socket.on('disconnect', () => {
     if (socket.username) {
+      const serverCode = onlineUsers.get(socket.id)?.serverCode;
       onlineUsers.delete(socket.id);
-      broadcastGlobalOnlineUsers();
-      const isVisible = socket.role !== 'admin' || (socket.joinedServers && socket.joinedServers.includes(socket.serverCode)) || socket.serverCode === 'global';
-      if (isVisible && socket.serverCode) io.to(socket.serverCode).emit('system_message', `${socket.username} disconnected.`);
+      if (serverCode) {
+        broadcastOnlineUsers(serverCode);
+        const isVisible = socket.role !== 'admin' || (socket.joinedServers && socket.joinedServers.includes(serverCode)) || serverCode === 'global';
+        if (isVisible) io.to(serverCode).emit('system_message', `${socket.username} disconnected.`);
+      }
     }
   });
 });
