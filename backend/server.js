@@ -17,6 +17,8 @@ const UserSchema = new mongoose.Schema({
   username: { type: String, required: true, unique: true },
   password: { type: String, required: true },
   role: { type: String, default: 'user' },
+  color: { type: String, default: '' },      // NEW: Custom Name Color
+  avatarUrl: { type: String, default: '' },  // NEW: Custom Profile Picture
   servers: { type: [String], default: ['global'] } 
 });
 const User = mongoose.model('User', UserSchema);
@@ -32,8 +34,10 @@ const MessageSchema = new mongoose.Schema({
   serverCode: { type: String, required: true, default: 'global' },
   username: String,
   role: { type: String, default: 'user' }, 
+  color: { type: String, default: '' },      
+  avatarUrl: { type: String, default: '' },  
   text: String,
-  replyTo: { type: Object, default: null }, // NEW: Tracks replies in the DB
+  replyTo: { type: Object, default: null },
   edited: { type: Boolean, default: false },
   deleted: { type: Boolean, default: false },
   history: [{ text: String, timestamp: Date }], 
@@ -70,7 +74,12 @@ function broadcastOnlineUsers(serverCode) {
     if (info.serverCode === serverCode) {
       const isVisible = info.role !== 'admin' || info.joinedServers.includes(serverCode) || serverCode === 'global';
       if (isVisible && !usersMap.has(info.username)) {
-        usersMap.set(info.username, { username: info.username, role: info.role });
+        usersMap.set(info.username, { 
+            username: info.username, 
+            role: info.role, 
+            color: info.color, 
+            avatarUrl: info.avatarUrl 
+        });
       }
     }
   }
@@ -104,11 +113,20 @@ io.on('connection', (socket) => {
 
       socket.username = user.username;
       socket.role = user.role || 'user';
+      socket.color = user.color || '';
+      socket.avatarUrl = user.avatarUrl || '';
       socket.serverCode = 'global'; 
       socket.joinedServers = user.servers;
       
       socket.join('global');
-      onlineUsers.set(socket.id, { username: user.username, role: socket.role, serverCode: 'global', joinedServers: user.servers });
+      onlineUsers.set(socket.id, { 
+          username: user.username, 
+          role: socket.role, 
+          color: socket.color, 
+          avatarUrl: socket.avatarUrl,
+          serverCode: 'global', 
+          joinedServers: user.servers 
+      });
       
       broadcastOnlineUsers('global');
 
@@ -116,8 +134,48 @@ io.on('connection', (socket) => {
       if (isVisible) socket.to('global').emit('system_message', `${user.username} joined the app.`);
 
       const servers = socket.role === 'admin' ? await ChatServer.find() : await ChatServer.find({ code: { $in: user.servers } });
-      callback({ success: true, username: user.username, role: socket.role, servers: servers || [], joinedServers: user.servers });
+      callback({ 
+          success: true, 
+          username: user.username, 
+          role: socket.role, 
+          color: socket.color,
+          avatarUrl: socket.avatarUrl,
+          servers: servers || [], 
+          joinedServers: user.servers 
+      });
     } catch (err) { callback({ error: 'Login failed.' }); }
+  });
+
+  // NEW: Profile Customization Event
+  socket.on('update_profile', async (data, callback) => {
+      if (!socket.username) return;
+      try {
+          const color = data.color ? data.color.trim().substring(0, 30) : '';
+          const url = data.avatarUrl ? data.avatarUrl.trim().substring(0, 500) : '';
+
+          const user = await User.findOne({ username: socket.username });
+          user.color = color;
+          user.avatarUrl = url;
+          await user.save();
+          
+          // Instantly sync the new identity to all past messages
+          await Message.updateMany({ username: socket.username }, { $set: { color: color, avatarUrl: url } });
+
+          socket.color = color;
+          socket.avatarUrl = url;
+          if(onlineUsers.has(socket.id)) {
+              let session = onlineUsers.get(socket.id);
+              session.color = color;
+              session.avatarUrl = url;
+          }
+          
+          io.emit('profile_updated', { username: socket.username, color: color, avatarUrl: url });
+          
+          socket.joinedServers.forEach(code => broadcastOnlineUsers(code));
+          if (!socket.joinedServers.includes('global')) broadcastOnlineUsers('global');
+          
+          callback({ success: true, color: color, avatarUrl: url });
+      } catch(err) { callback({ error: 'Failed to update profile.' }); }
   });
 
   socket.on('create_server', async (name, callback) => {
@@ -220,7 +278,6 @@ io.on('connection', (socket) => {
   socket.on('chat_message', async (payload) => {
     if (!socket.username || !socket.serverCode) return;
     
-    // Support new payload objects with replies
     const rawText = typeof payload === 'string' ? payload : payload.text;
     const replyTo = typeof payload === 'object' ? payload.replyTo : null;
 
@@ -229,8 +286,15 @@ io.on('connection', (socket) => {
     if (socket.role !== 'admin') cleanText = cleanText.replace(/@everyone/gi, 'everyone');
 
     try {
-      const msg = await Message.create({ serverCode: socket.serverCode, username: socket.username, role: socket.role, text: cleanText, replyTo: replyTo });
-      io.to(socket.serverCode).emit('chat_message', { _id: msg._id, username: msg.username, role: socket.role, text: msg.text, replyTo: msg.replyTo, timestamp: msg.timestamp, edited: false, deleted: false });
+      const msg = await Message.create({ 
+          serverCode: socket.serverCode, username: socket.username, role: socket.role, 
+          color: socket.color, avatarUrl: socket.avatarUrl, text: cleanText, replyTo: replyTo 
+      });
+      
+      io.to(socket.serverCode).emit('chat_message', { 
+          _id: msg._id, username: msg.username, role: socket.role, color: msg.color, avatarUrl: msg.avatarUrl,
+          text: msg.text, replyTo: msg.replyTo, timestamp: msg.timestamp, edited: false, deleted: false 
+      });
     } catch (err) {}
   });
 
