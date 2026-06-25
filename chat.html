@@ -27,7 +27,7 @@
             border-radius: 8px; box-shadow: 0 10px 25px rgba(0,0,0,0.8); position: relative; 
             max-height: 90vh; overflow-y: auto;
             transform: scale(0.9) translateY(20px); opacity: 0;
-            transition: all 0.4s cubic-bezier(0.34, 1.56, 0.64, 1); /* Spring bounce */
+            transition: all 0.4s cubic-bezier(0.34, 1.56, 0.64, 1);
         }
         .modal.active .modal-box { transform: scale(1) translateY(0); opacity: 1; }
         
@@ -213,16 +213,28 @@
         form#compose button.submit-btn { width: auto; padding: 8px 16px; border-radius: 4px; font-weight: 600; font-size: 0.9rem; transition: 0.2s cubic-bezier(0.175, 0.885, 0.32, 1.275);}
         form#compose button.submit-btn:hover:not(:disabled) { transform: scale(1.05); }
 
-        /* Online Users Sidebar */
+        /* --- ONLINE USERS SIDEBAR --- */
         #online-sidebar { width: 240px; background: #2f3136; display: flex; flex-direction: column; flex-shrink: 0; }
         @media (max-width: 800px) { #online-sidebar { display: none; } }
         .sidebar-header { padding: 1.2rem 1rem 0.5rem 1rem; font-weight: 600; color: var(--text-muted); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.5px; }
         #online-list { list-style: none; padding: 0.5rem; flex: 1; overflow-y: auto; overflow-x: hidden; }
+        
         .user-item { display: flex; align-items: center; gap: 10px; padding: 8px; border-radius: 4px; color: var(--text-muted); font-weight: 500; cursor: pointer; transition: 0.15s; animation: slideInRight 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275) forwards; opacity: 0; transform: translateX(20px);}
         .user-item:hover { background: #393c43; color: var(--text); transform: translateX(4px); }
+        
+        /* Offline status dimming & grayscale */
+        .user-item.offline { opacity: 0.5; }
+        .user-item.offline .avatar { filter: grayscale(100%); }
+        .user-item.offline:hover { opacity: 0.8; }
+
         .avatar { width: 32px; height: 32px; border-radius: 50%; background: var(--primary); display: flex; justify-content: center; align-items: center; color: white; font-weight: bold; position: relative; text-shadow: 0 1px 2px rgba(0,0,0,0.5); overflow: hidden;}
         .avatar img { width: 100%; height: 100%; object-fit: cover; }
-        .status-dot { position: absolute; bottom: -2px; right: -2px; width: 12px; height: 12px; border-radius: 50%; background: #3ba55c; border: 2px solid #2f3136; z-index: 2;}
+        
+        /* Dynamic Green / Gray dot styling */
+        .status-dot { position: absolute; bottom: -2px; right: -2px; width: 12px; height: 12px; border-radius: 50%; border: 2px solid #2f3136; z-index: 2; transition: background 0.3s;}
+        .status-dot.online { background: #3ba55c; }
+        .status-dot.offline { background: #747f8d; }
+        
         .stealth-admin { color: var(--warning) !important; font-style: italic; }
 
         #history-list { max-height: 350px; overflow-y: auto; margin-top: 1rem; text-align: left; }
@@ -395,7 +407,7 @@
     </div>
 
     <div id="online-sidebar">
-        <div class="sidebar-header" id="online-header">Room Online — <span id="online-count">0</span></div>
+        <div class="sidebar-header" id="online-header">Loading...</div>
         <ul id="online-list"></ul>
     </div>
 </div>
@@ -857,36 +869,45 @@
             }
         });
 
+        // --- NEW UPDATED ONLINE USERS RENDERER ---
         socket.on('online_users', (users) => {
             const list = document.getElementById('online-list');
             list.innerHTML = '';
             
-            const roomType = currentServerCode === 'global' ? 'Global Online' : 'Room Online';
-            document.getElementById('online-header').innerHTML = `${roomType} — <span id="online-count">0</span>`;
+            const isGlobal = currentServerCode === 'global';
+            const roomType = isGlobal ? 'Global Online' : 'Room Members';
             
-            const isHiddenAdmin = myRole === 'admin' && !myJoinedServers.includes(currentServerCode) && currentServerCode !== 'global';
-            document.getElementById('online-count').textContent = users.length + (isHiddenAdmin ? 1 : 0);
+            const onlineCount = users.filter(u => u.online !== false).length;
+            const totalCount = users.length;
+            
+            const isHiddenAdmin = myRole === 'admin' && !myJoinedServers.includes(currentServerCode) && !isGlobal;
+            const displayCount = isGlobal ? onlineCount + (isHiddenAdmin ? 1 : 0) : totalCount + (isHiddenAdmin ? 1 : 0);
+            
+            document.getElementById('online-header').innerHTML = `${roomType} — <span id="online-count">${displayCount}</span>`;
 
             if (isHiddenAdmin) {
                 const li = document.createElement('li'); 
                 li.className = "user-item stealth-admin"; 
-                li.innerHTML = `<div class="avatar" style="background:var(--error)">A<div class="status-dot" style="background:var(--warning);"></div></div><div style="color:var(--warning); font-style:italic;">${myUsername} (Ghost)</div>`;
+                li.innerHTML = `<div class="avatar" style="background:var(--error)">A<div class="status-dot online" style="background:var(--warning);"></div></div><div style="color:var(--warning); font-style:italic;">${myUsername} (Ghost)</div>`;
                 list.appendChild(li);
             }
 
             users.forEach((u, index) => {
                 const li = document.createElement('li');
                 li.className = "user-item";
+                if (u.online === false && !isGlobal) li.classList.add('offline');
                 li.style.animationDelay = `${index * 30}ms`; 
                 
                 const isAdminBadge = u.role === 'admin' ? `<span class="admin-badge" style="font-size:0.5rem; margin-left:8px;">ADMIN</span>` : '';
                 const cToUse = u.color || getUserColor(u.username);
                 
+                const dotClass = u.online !== false ? 'online' : 'offline';
+                
                 let avatarHTML = '';
                 if (u.avatarUrl && u.avatarUrl.startsWith('http')) {
-                    avatarHTML = `<div class="avatar" style="background:transparent;"><img src="${u.avatarUrl.replace(/"/g, '&quot;')}" onerror="this.style.display='none'; this.parentNode.textContent='${u.username.charAt(0).toUpperCase()}'; this.parentNode.style.background='${cToUse}';"><div class="status-dot"></div></div>`;
+                    avatarHTML = `<div class="avatar" style="background:transparent;"><img src="${u.avatarUrl.replace(/"/g, '&quot;')}" onerror="this.style.display='none'; this.parentNode.textContent='${u.username.charAt(0).toUpperCase()}'; this.parentNode.style.background='${cToUse}';"><div class="status-dot ${dotClass}"></div></div>`;
                 } else {
-                    avatarHTML = `<div class="avatar" style="background:${cToUse}">${u.username.charAt(0).toUpperCase()}<div class="status-dot"></div></div>`;
+                    avatarHTML = `<div class="avatar" style="background:${cToUse}">${u.username.charAt(0).toUpperCase()}<div class="status-dot ${dotClass}"></div></div>`;
                 }
 
                 li.innerHTML = `${avatarHTML}<div style="color:${cToUse}; font-weight:600;">${u.username}${u.username === myUsername ? " (You)" : ""}${isAdminBadge}</div>`;

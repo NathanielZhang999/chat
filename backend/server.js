@@ -24,24 +24,16 @@ function escapeRegExp(string) {
 
 // --- SECURITY: RATE LIMITING ---
 const authAttempts = new Map();
-
 function checkRateLimit(ip) {
     const now = Date.now();
     const attempts = authAttempts.get(ip) || [];
-    const recent = attempts.filter(time => now - time < 15 * 60 * 1000); // 15 mins window
-    if (recent.length >= 10) { // Limit 10 attempts
-        return false;
-    }
+    const recent = attempts.filter(time => now - time < 15 * 60 * 1000); 
+    if (recent.length >= 10) return false;
     recent.push(now);
     authAttempts.set(ip, recent);
     return true;
 }
-
-function clearRateLimit(ip) {
-    authAttempts.delete(ip);
-}
-
-// Clean up stale IP limits memory every 15 mins
+function clearRateLimit(ip) { authAttempts.delete(ip); }
 setInterval(() => {
     const now = Date.now();
     for (const [ip, attempts] of authAttempts.entries()) {
@@ -76,9 +68,9 @@ const MessageSchema = new mongoose.Schema({
   color: { type: String, default: '' },      
   avatarUrl: { type: String, default: '' },  
   text: { type: String, default: '' },
-  attachment: { type: String, default: null }, // Stores Base64 Compressed Images
+  attachment: { type: String, default: null },
   replyTo: { type: Object, default: null },
-  reactions: { type: Object, default: {} }, // NEW FEATURE: Mixed JS Object map of Emoji Reactions
+  reactions: { type: Object, default: {} }, 
   edited: { type: Boolean, default: false },
   deleted: { type: Boolean, default: false },
   history: [{ text: String, timestamp: Date }], 
@@ -108,32 +100,70 @@ if (MONGO_URI) mongoose.connect(MONGO_URI).then(seedSystem).catch(console.error)
 
 const onlineUsers = new Map(); 
 
-function broadcastOnlineUsers(serverCode) {
+// --- UPDATED ONLINE PRESENCE ENGINE ---
+async function broadcastOnlineUsers(serverCode) {
   if (!serverCode) return;
-  const usersMap = new Map();
+  
+  // Track unique usernames globally connected across any room/socket
+  const globalOnlineMap = new Map();
   for (const info of onlineUsers.values()) {
-    if (info.serverCode === serverCode) {
-      const isVisible = info.role !== 'admin' || info.joinedServers.includes(serverCode) || serverCode === 'global';
-      if (isVisible && !usersMap.has(info.username)) {
-        usersMap.set(info.username, { username: info.username, role: info.role, color: info.color, avatarUrl: info.avatarUrl });
-      }
-    }
+      if (!globalOnlineMap.has(info.username)) globalOnlineMap.set(info.username, info);
   }
-  io.to(serverCode).emit('online_users', Array.from(usersMap.values()));
+
+  let usersList = [];
+
+  if (serverCode === 'global') {
+      // ONLY globally connected users are shown in Global Chat
+      for (const info of globalOnlineMap.values()) {
+          const isVisible = info.role !== 'admin' || info.joinedServers.includes('global') || serverCode === 'global';
+          if (isVisible) {
+              usersList.push({ 
+                  username: info.username, role: info.role, color: info.color, 
+                  avatarUrl: info.avatarUrl, online: true 
+              });
+          }
+      }
+      usersList.sort((a, b) => a.username.localeCompare(b.username));
+  } else {
+      // Query specific server members to show BOTH online & offline users in Room
+      try {
+          const members = await User.find({ servers: serverCode }).lean();
+          
+          for (const member of members) {
+              const isOnline = globalOnlineMap.has(member.username);
+              const activeData = globalOnlineMap.get(member.username);
+              usersList.push({
+                  username: member.username,
+                  role: member.role,
+                  color: activeData ? activeData.color : member.color,
+                  avatarUrl: activeData ? activeData.avatarUrl : member.avatarUrl,
+                  online: isOnline
+              });
+          }
+          
+          // Sort online users first, then by username
+          usersList.sort((a, b) => {
+              if (a.online === b.online) return a.username.localeCompare(b.username);
+              return a.online ? -1 : 1; 
+          });
+      } catch (err) { 
+          console.error(err); 
+      }
+  }
+
+  io.to(serverCode).emit('online_users', usersList);
 }
 
 io.on('connection', (socket) => {
   socket.serverCode = null;
   socket.joinedServers = [];
   
-  let lastMessageTime = 0; // State for spam filter
+  let lastMessageTime = 0; 
 
   socket.on('register', async (data, callback) => {
     try {
-      if (!data || typeof data.username !== 'string' || typeof data.password !== 'string') {
-        return callback({ error: 'Invalid input format.' });
-      }
-
+      if (!data || typeof data.username !== 'string' || typeof data.password !== 'string') return callback({ error: 'Invalid input format.' });
+      
       const ip = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
       if (!checkRateLimit(ip)) return callback({ error: 'Too many requests. Try again later.' });
 
@@ -156,10 +186,8 @@ io.on('connection', (socket) => {
 
   socket.on('login', async (data, callback) => {
     try {
-      if (!data || typeof data.username !== 'string' || typeof data.password !== 'string') {
-        return callback({ error: 'Invalid input format.' });
-      }
-
+      if (!data || typeof data.username !== 'string' || typeof data.password !== 'string') return callback({ error: 'Invalid input format.' });
+      
       const ip = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
       if (!checkRateLimit(ip)) return callback({ error: 'Too many login attempts. Try again later.' });
 
@@ -180,7 +208,10 @@ io.on('connection', (socket) => {
       socket.join('global');
       onlineUsers.set(socket.id, { username: user.username, role: socket.role, color: socket.color, avatarUrl: socket.avatarUrl, serverCode: 'global', joinedServers: user.servers });
       
-      broadcastOnlineUsers('global');
+      // Update all servers user belongs to immediately
+      const serversToUpdate = new Set(user.servers);
+      serversToUpdate.add('global');
+      serversToUpdate.forEach(c => broadcastOnlineUsers(c));
 
       const isVisible = socket.role !== 'admin' || socket.joinedServers.includes('global');
       if (isVisible) socket.to('global').emit('system_message', `${user.username} joined the app.`);
@@ -194,9 +225,7 @@ io.on('connection', (socket) => {
 
   socket.on('change_password', async (data, callback) => {
     if (!socket.username) return callback({ error: 'Not authenticated.' });
-    if (!data || typeof data.oldPassword !== 'string' || typeof data.newPassword !== 'string') {
-        return callback({ error: 'Invalid data format.' });
-    }
+    if (!data || typeof data.oldPassword !== 'string' || typeof data.newPassword !== 'string') return callback({ error: 'Invalid data format.' });
     
     const ip = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
     if (!checkRateLimit(ip)) return callback({ error: 'Too many attempts. Try again later.' });
@@ -227,7 +256,7 @@ io.on('connection', (socket) => {
           sockets.forEach(s => {
               if (s.username === socket.username && s.id !== socket.id) {
                   s.emit('force_logout', "You have been logged out because 'Logout All Devices' was triggered remotely.");
-                  s.disconnect(true); // Close socket immediately
+                  s.disconnect(true); 
               }
           });
           callback({ success: true });
@@ -251,8 +280,10 @@ io.on('connection', (socket) => {
           if(onlineUsers.has(socket.id)) { let session = onlineUsers.get(socket.id); session.color = color; session.avatarUrl = url; }
           
           io.emit('profile_updated', { username: socket.username, color: color, avatarUrl: url });
-          socket.joinedServers.forEach(code => broadcastOnlineUsers(code));
-          if (!socket.joinedServers.includes('global')) broadcastOnlineUsers('global');
+          
+          const serversToUpdate = new Set(socket.joinedServers);
+          serversToUpdate.add('global');
+          serversToUpdate.forEach(c => broadcastOnlineUsers(c));
           
           callback({ success: true, color: color, avatarUrl: url });
       } catch(err) { callback({ error: 'Failed to update profile.' }); }
@@ -264,11 +295,14 @@ io.on('connection', (socket) => {
       const code = Math.random().toString(36).substring(2, 8).toUpperCase(); 
       const srv = await ChatServer.create({ code, name: name.substring(0, 30), owner: socket.username });
       const user = await User.findOne({ username: socket.username });
+      
       if (!user.servers.includes(code)) {
         user.servers.push(code); await user.save(); socket.joinedServers = user.servers;
         if(onlineUsers.has(socket.id)) onlineUsers.get(socket.id).joinedServers = user.servers;
+        broadcastOnlineUsers(code);
       }
       callback({ success: true, server: srv });
+      
       const sockets = await io.fetchSockets();
       sockets.forEach(s => { if (onlineUsers.has(s.id) && onlineUsers.get(s.id).role === 'admin') s.emit('admin_new_server', srv); });
     } catch (err) { callback({ error: 'Creation failed.' }); }
@@ -279,11 +313,17 @@ io.on('connection', (socket) => {
     try {
       const srv = await ChatServer.findOne({ code: code.toUpperCase() });
       if (!srv) return callback({ error: 'Invalid invite code.' });
+      
       const user = await User.findOne({ username: socket.username });
       if (!user.servers.includes(srv.code)) {
         user.servers.push(srv.code); await user.save(); socket.joinedServers = user.servers;
         if(onlineUsers.has(socket.id)) onlineUsers.get(socket.id).joinedServers = user.servers;
-        if (socket.serverCode === srv.code) { socket.to(srv.code).emit('system_message', `${socket.username} joined.`); broadcastOnlineUsers(srv.code); }
+        
+        broadcastOnlineUsers(srv.code);
+
+        if (socket.serverCode === srv.code) { 
+            socket.to(srv.code).emit('system_message', `${socket.username} joined.`); 
+        }
       }
       callback({ success: true, server: srv });
     } catch (err) { callback({ error: 'Join failed.' }); }
@@ -297,7 +337,12 @@ io.on('connection', (socket) => {
         user.servers = user.servers.filter(s => s !== code); await user.save();
         socket.joinedServers = user.servers;
         if(onlineUsers.has(socket.id)) onlineUsers.get(socket.id).joinedServers = user.servers;
-        if (socket.serverCode === code) { socket.to(code).emit('system_message', `${socket.username} left the server.`); broadcastOnlineUsers(code); }
+        
+        broadcastOnlineUsers(code);
+
+        if (socket.serverCode === code) { 
+            socket.to(code).emit('system_message', `${socket.username} left the server.`); 
+        }
       }
       callback({ success: true });
     } catch (err) { callback({ error: 'Failed to leave.' }); }
@@ -335,7 +380,9 @@ io.on('connection', (socket) => {
 
       socket.serverCode = code; socket.join(code);
       if (onlineUsers.has(socket.id)) onlineUsers.get(socket.id).serverCode = code;
+      
       broadcastOnlineUsers(code);
+      broadcastOnlineUsers('global');
       
       let query = { serverCode: code };
       if (code === 'global') query = { $or: [{ serverCode: 'global' }, { serverCode: { $exists: false } }, { serverCode: null }] };
@@ -356,7 +403,6 @@ io.on('connection', (socket) => {
   socket.on('chat_message', async (payload) => {
     if (!socket.username || !socket.serverCode) return;
     
-    // SECURITY: Message Spam Rate Limiter (500ms cooldown for non-admin users)
     const now = Date.now();
     if (socket.role !== 'admin' && now - lastMessageTime < 500) {
         return socket.emit('system_message', '⚠️ Slow down! You are sending messages too fast.');
@@ -373,14 +419,14 @@ io.on('connection', (socket) => {
 
     let cleanText = rawText.trim().substring(0, 2000);
     
-    if (!cleanText && !attachment) return; // Prevent empty sends
+    if (!cleanText && !attachment) return; 
     if (socket.role !== 'admin') cleanText = cleanText.replace(/@everyone/gi, 'everyone');
 
     try {
       const msg = await Message.create({ 
           serverCode: socket.serverCode, username: socket.username, role: socket.role, 
           color: socket.color, avatarUrl: socket.avatarUrl, text: cleanText, attachment: attachment, replyTo: replyTo,
-          reactions: {} // New messages start with 0 reactions
+          reactions: {} 
       });
       
       io.to(socket.serverCode).emit('chat_message', { 
@@ -390,7 +436,6 @@ io.on('connection', (socket) => {
     } catch (err) {}
   });
 
-  // --- NEW FEATURE: TOGGLE MESSAGE EMOJI REACTION ---
   socket.on('toggle_reaction', async (data) => {
       if (!socket.username || !socket.serverCode) return;
       try {
@@ -400,29 +445,23 @@ io.on('connection', (socket) => {
           const msg = await Message.findById(id);
           if (!msg || msg.deleted) return;
 
-          // Standardize reactions storage
           let rx = msg.reactions || {};
           let users = rx[emoji] || [];
 
-          // Toggle logic
           if (users.includes(socket.username)) {
-              users = users.filter(u => u !== socket.username); // Remove user
+              users = users.filter(u => u !== socket.username); 
               if (users.length === 0) delete rx[emoji];
               else rx[emoji] = users;
           } else {
-              users.push(socket.username); // Add user
+              users.push(socket.username); 
               rx[emoji] = users;
           }
 
           msg.reactions = rx;
-          msg.markModified('reactions'); // Tell mongoose that the Mixed field changed
+          msg.markModified('reactions'); 
           await msg.save();
 
-          // Push updated reactions array map to clients in this room
-          io.to(msg.serverCode).emit('reaction_updated', {
-              id: msg._id,
-              reactions: msg.reactions
-          });
+          io.to(msg.serverCode).emit('reaction_updated', { id: msg._id, reactions: msg.reactions });
       } catch (err) {}
   });
 
@@ -482,11 +521,19 @@ io.on('connection', (socket) => {
 
   socket.on('disconnect', () => {
     if (socket.username) {
-      const serverCode = onlineUsers.get(socket.id)?.serverCode;
+      const session = onlineUsers.get(socket.id);
+      const serverCode = session?.serverCode;
+      const joinedServers = session?.joinedServers || [];
+      
       onlineUsers.delete(socket.id);
+      
+      // Update this user's online status instantly across EVERY server they were a member of
+      const serversToUpdate = new Set(joinedServers || []);
+      serversToUpdate.add('global');
+      serversToUpdate.forEach(code => broadcastOnlineUsers(code));
+
       if (serverCode) {
-        broadcastOnlineUsers(serverCode);
-        const isVisible = socket.role !== 'admin' || (socket.joinedServers && socket.joinedServers.includes(serverCode)) || serverCode === 'global';
+        const isVisible = socket.role !== 'admin' || (joinedServers && joinedServers.includes(serverCode)) || serverCode === 'global';
         if (isVisible) io.to(serverCode).emit('system_message', `${socket.username} disconnected.`);
       }
     }
