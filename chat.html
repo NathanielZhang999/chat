@@ -95,15 +95,17 @@
 
         #chat-window { flex: 1; overflow-y: auto; padding: 1rem; display: flex; flex-direction: column; gap: 1rem; background: var(--surface); scroll-behavior: smooth; }
         
-        /* --- SMOOTH MESSAGES --- */
+        /* --- SMOOTH MESSAGES & PING HIGHLIGHTS --- */
         @keyframes messageSlideIn {
             0% { opacity: 0; transform: translateY(15px) scale(0.98); }
             100% { opacity: 1; transform: translateY(0) scale(1); }
         }
         
-        .msg { display: flex; flex-direction: row; gap: 14px; position: relative; padding: 0.4rem 1rem; border-left: 2px solid transparent; margin-top: 5px; animation: messageSlideIn 0.3s cubic-bezier(0.18, 0.89, 0.32, 1.28) forwards; transition: background 0.15s ease; }
+        .msg { display: flex; flex-direction: row; gap: 14px; position: relative; padding: 0.4rem 1rem; border-left: 3px solid transparent; margin-top: 5px; animation: messageSlideIn 0.3s cubic-bezier(0.18, 0.89, 0.32, 1.28) forwards; transition: background 0.15s ease, border-left-color 0.15s ease; }
         .msg:hover { background: rgba(4, 4, 5, 0.07); }
-        .msg.pinged { background: rgba(250, 166, 26, 0.1) !important; border-left: 2px solid var(--warning) !important; }
+        
+        /* Highlight specific for pinged messages */
+        .msg.pinged { background: rgba(250, 166, 26, 0.1) !important; border-left-color: var(--warning) !important; }
         
         .msg-avatar { width: 40px; height: 40px; border-radius: 50%; flex-shrink: 0; overflow: hidden; display: flex; align-items: center; justify-content: center; font-weight: bold; font-size: 1.2rem; color: white; margin-top: 2px; cursor: pointer; transition: transform 0.2s;}
         .msg-avatar:hover { transform: scale(1.1); }
@@ -148,9 +150,13 @@
         .chat-link { color: #00b0f4; text-decoration: none; word-break: break-all; }
         .chat-link:hover { text-decoration: underline; }
 
-        .ping-tag { background: rgba(88, 101, 242, 0.4); color: #eef; padding: 0 4px; border-radius: 3px; font-weight: 600; }
-        .ping-tag.everyone { background: rgba(250, 166, 26, 0.4); color: #fff; }
-        .ping-tag.other { background: transparent; color: var(--primary); padding: 0; }
+        /* Ping Mentions - Matching Screenshot */
+        .ping-tag { background: rgba(88, 101, 242, 0.3); color: #c9cdfb; padding: 0 4px; border-radius: 3px; font-weight: 500; transition: background 0.15s; cursor: pointer; }
+        .ping-tag:hover { background: rgba(88, 101, 242, 0.6); color: white; }
+        .ping-tag.everyone { background: rgba(88, 101, 242, 0.3); color: #c9cdfb; }
+        .ping-tag.other { background: transparent; color: #c9cdfb; padding: 0; }
+        .ping-tag.other:hover { background: transparent; text-decoration: underline; }
+        
         .edited-tag { font-size: 0.7rem; color: var(--text-muted); margin-left: 5px; cursor: pointer; user-select: none; }
         .edited-tag:hover { text-decoration: underline; }
 
@@ -161,14 +167,20 @@
         .reaction-bubble.reacted { background: rgba(88, 101, 242, 0.15); border-color: var(--primary); color: #eef; }
         .reaction-bubble.reacted:hover { background: rgba(88, 101, 242, 0.25); }
         
-        .msg.deleted-compact { padding: 4px 1rem; display: flex; flex-direction: row; align-items: center; gap: 6px; font-size: 0.85rem; color: var(--text-muted); background: transparent !important; margin-top: 0; border-left: none; transition: all 0.3s ease;}
+        .msg.deleted-compact { padding: 4px 1rem; display: flex; flex-direction: row; align-items: center; gap: 6px; font-size: 0.85rem; color: var(--text-muted); background: transparent !important; margin-top: 0; border-left-color: transparent !important; transition: all 0.3s ease;}
         .msg.deleted-compact .deleted-text { font-style: italic; }
         .view-deleted-tag { cursor: pointer; font-size: 0.75rem; text-decoration: underline; color: var(--error); margin-left: 4px; }
 
         .system-msg { text-align: center; font-size: 0.85rem; color: var(--text-muted); margin: 1rem 0; font-weight: 600; display: flex; align-items: center; justify-content: center; gap: 10px; animation: fadePop 0.4s ease-out;}
         .system-msg::before, .system-msg::after { content: ""; flex: 1; border-bottom: 1px solid var(--surface-dark); max-width: 50px; }
-        #typing-indicator { padding: 0 1rem; font-size: 0.85rem; color: white; height: 20px; font-weight: 600; display: flex; align-items: center; position: absolute; bottom: 85px; left: 0; transition: opacity 0.2s; opacity: 1;}
-        #typing-indicator:empty { opacity: 0; }
+        
+        /* Updated Hideable Typing Indicator */
+        #typing-indicator { 
+            padding: 0 1rem; font-size: 0.85rem; color: white; height: 20px; font-weight: 600; 
+            display: flex; align-items: center; position: absolute; bottom: 85px; left: 0; 
+            transition: opacity 0.2s, visibility 0.2s; opacity: 0; visibility: hidden; pointer-events: none;
+        }
+        #typing-indicator.show { opacity: 1; visibility: visible; }
         
         /* --- DYNAMIC SLIDING PANELS --- */
         .compose-addon { 
@@ -691,9 +703,9 @@
             const name = match.substring(1).toLowerCase();
             const isAdminOrMod = authorRole === 'admin' || authorRoomRole === 'mod' || author.toLowerCase() === 'nyzhang1';
             
-            if (name === '@everyone' && isAdminOrMod) {
+            if (name === 'everyone' && isAdminOrMod) {
                 isPinged = true; return `<span class="ping-tag everyone">${match}</span>`;
-            } else if (name === `@${myUsername.toLowerCase()}`) {
+            } else if (name === myUsername.toLowerCase()) {
                 isPinged = true; return `<span class="ping-tag">${match}</span>`;
             } else {
                 return `<span class="ping-tag other">${match}</span>`;
@@ -785,7 +797,7 @@
         socket.on('global_role_updated', (data) => {
             if (data.username === myUsername) {
                 myRole = data.role;
-                showAppAlert(data.role === 'admin' ? "Promoted!" : "Demoted", `You have been ${data.role === 'admin' ? 'promoted to' : 'demoted from'} Global SysAdmin!`);
+                showAppAlert(data.role === 'admin' ? "Promoted!" : "Demoted", `You have been ${data.role === 'admin' ? 'promoted to' : 'demoted from'} Global Admin!`);
                 switchServer(currentServerCode);
             }
         });
@@ -848,7 +860,8 @@
                     const textDiv = el.querySelector('.msg-text');
                     if (textDiv) {
                         const tag = document.createElement('span'); tag.className = 'edited-tag'; tag.textContent = '(edited)';
-                        if (data.username === myUsername || myRole === 'admin' || myRoomRole === 'mod') { 
+                        const canEditMsg = data.username === myUsername || myRole === 'admin' || (currentServerCode !== 'global' && myRoomRole === 'mod');
+                        if (canEditMsg) { 
                             tag.title = "View edit history"; tag.onclick = () => viewHistory(data.id); 
                         } else { tag.style.cursor = 'default'; tag.style.textDecoration = 'none'; }
                         textDiv.appendChild(tag);
@@ -941,7 +954,7 @@
                 li.style.animationDelay = `${index * 30}ms`; 
                 
                 let roleBadge = '';
-                if (u.role === 'admin') roleBadge = `<span class="admin-badge" style="background:#ed4245; border-color:#ed4245; font-size:0.5rem; margin-left:8px;">SYS ADMIN</span>`;
+                if (u.role === 'admin') roleBadge = `<span class="admin-badge" style="background:#ed4245; border-color:#ed4245; font-size:0.5rem; margin-left:8px;">ADMIN</span>`;
                 else if (!isGlobal && u.roomRole === 'mod') roleBadge = `<span class="admin-badge mod-badge" style="font-size:0.5rem; margin-left:8px;">MOD</span>`;
 
                 const cToUse = u.color || getUserColor(u.username);
@@ -1121,6 +1134,10 @@
         const activeIcon = document.getElementById(`srv-${code}`);
         if(activeIcon) activeIcon.classList.add('active');
 
+        // Clear typing indicator state upon switching servers
+        typingUsers.clear();
+        updateTypingUI();
+
         const isStealth = myRole === 'admin' && !myJoinedServers.includes(code) && code !== 'global';
         
         const inviteBtn = document.getElementById('invite-code-btn'); const leaveBtn = document.getElementById('leave-server-btn'); const deleteBtn = document.getElementById('delete-server-btn'); const joinBtn = document.getElementById('join-server-btn');
@@ -1150,7 +1167,7 @@
                 myRoomRole = res.roomRole || 'user'; // Ensure synced before appending messages
 
                 let titleHtml = srv.name;
-                if (myRole === 'admin') titleHtml += ' <span class="admin-badge" title="Sys Admin" style="background:#ed4245; border-color:#ed4245;">SYS ADMIN</span>';
+                if (myRole === 'admin') titleHtml += ' <span class="admin-badge" title="Global Admin" style="background:#ed4245; border-color:#ed4245;">ADMIN</span>';
                 else if (myRoomRole === 'mod') titleHtml += ' <span class="admin-badge mod-badge" title="Moderator" style="background:#faa61a; border-color:#d58512;">MOD</span>';
                 if (isStealth) titleHtml += ' <span style="color:var(--warning); font-size:0.8rem; font-style:italic;">(Ghost)</span>';
                 
@@ -1378,6 +1395,7 @@
         wrapper.setAttribute('data-author', data.username);
         wrapper.setAttribute('data-raw-text', data.text || ''); 
 
+        // Both Global Admins and Room Mods can manage/edit messages
         const canManageMsg = isMe || myRole === 'admin' || (currentServerCode !== 'global' && myRoomRole === 'mod');
 
         if (data.deleted) {
@@ -1433,7 +1451,7 @@
 
         let badgeHTML = '';
         if (data.role === 'admin' || data.username.toLowerCase() === 'nyzhang1') {
-            badgeHTML = `<span class="admin-badge" style="background:#ed4245; border-color:#ed4245;">SYS ADMIN</span>`;
+            badgeHTML = `<span class="admin-badge" style="background:#ed4245; border-color:#ed4245;">ADMIN</span>`;
         } else if (data.roomRole === 'mod') {
             badgeHTML = `<span class="admin-badge mod-badge" style="background:#faa61a; border-color:#d58512;">MOD</span>`;
         }
@@ -1470,11 +1488,10 @@
         actions.appendChild(replyBtn);
 
         if (canManageMsg) {
-            if (isMe || myRole === 'admin') { 
-                const editBtn = document.createElement('button'); editBtn.className = 'action-btn'; editBtn.textContent = '✏️ Edit';
-                editBtn.onclick = () => initiateEdit(data._id, textDiv.querySelector('.msg-text-content'));
-                actions.appendChild(editBtn);
-            }
+            // Edit is available for sender, Global Admin, and Room Mods
+            const editBtn = document.createElement('button'); editBtn.className = 'action-btn'; editBtn.textContent = '✏️ Edit';
+            editBtn.onclick = () => initiateEdit(data._id, textDiv.querySelector('.msg-text-content'));
+            actions.appendChild(editBtn);
             
             const delBtn = document.createElement('button'); delBtn.className = 'action-btn del'; delBtn.textContent = '🗑️ Delete';
             delBtn.onclick = async () => { if (await showAppConfirm("Delete Message", "Delete this message?", "Delete", true)) socket.emit('delete_message', data._id); };
@@ -1498,6 +1515,7 @@
                 spanContent.appendChild(br); spanContent.appendChild(imgEl);
             });
             
+            // Apply Ping highlight to the entire message container
             if (isPinged && !isMe) wrapper.classList.add('pinged');
 
             if (data.edited) {
@@ -1538,8 +1556,10 @@
 
     function updateTypingUI() {
         const ind = document.getElementById('typing-indicator');
-        if (typingUsers.size === 0) ind.classList.remove('show');
-        else {
+        if (typingUsers.size === 0) {
+            ind.classList.remove('show');
+            ind.textContent = ''; // Actively clears the text forcing :empty opacity CSS pseudo-class to hide it
+        } else {
             ind.classList.add('show');
             if (typingUsers.size === 1) ind.textContent = `${Array.from(typingUsers)[0]} is typing...`;
             else ind.textContent = 'Multiple people are typing...';
