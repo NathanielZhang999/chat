@@ -77,8 +77,11 @@
         #chat-area { flex: 1; display: flex; flex-direction: column; position: relative; min-width: 0; }
         header { padding: 0 1rem; height: 50px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; background: var(--surface); box-shadow: 0 1px 2px rgba(0,0,0,0.2); z-index: 10; }
         #server-title { font-weight: 600; font-size: 1rem; color: white; display: flex; align-items: center; gap: 8px; }
-        .admin-badge { background: #2f3136; color: white; font-size: 0.65rem; padding: 2px 6px; border-radius: 4px; font-weight: 700; text-transform: uppercase; margin-left: 2px; display: inline-flex; align-items: center; gap: 3px; border: 1px solid #202225; }
+        
+        .admin-badge { background: #ed4245; color: white; font-size: 0.65rem; padding: 2px 6px; border-radius: 4px; font-weight: 700; text-transform: uppercase; margin-left: 2px; display: inline-flex; align-items: center; gap: 3px; border: 1px solid #202225; }
         .admin-badge::before { content: '👑'; font-size: 0.7rem; margin-right: 2px; }
+        .admin-badge.mod-badge { background: #faa61a; border-color: #d58512; }
+        .admin-badge.mod-badge::before { content: '🛡️'; font-size: 0.7rem; margin-right: 2px; }
         
         .header-actions { display: flex; gap: 8px; align-items: center; }
         .header-btn { font-size: 0.8rem; padding: 6px 12px; border-radius: 4px; color: white; cursor: pointer; transition: 0.2s; font-weight: 600; border: none; display: none; }
@@ -241,6 +244,22 @@
         .hist-item { background: var(--surface-dark); padding: 1rem; border-radius: 4px; margin-bottom: 0.5rem; border-left: 3px solid var(--primary); }
         .hist-time { font-size: 0.75rem; color: var(--text-muted); margin-bottom: 0.5rem; font-weight: 600;}
         .hist-text { font-size: 0.95rem; white-space: pre-wrap; word-break: break-word; color: var(--text); }
+        
+        /* --- DYNAMIC CONTEXT MENU --- */
+        .context-menu {
+            position: fixed; background: var(--surface-dark); border: 1px solid var(--border);
+            border-radius: 6px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); z-index: 9999;
+            padding: 5px; display: flex; flex-direction: column; gap: 2px;
+            opacity: 0; visibility: hidden; transform: scale(0.95); transition: 0.15s cubic-bezier(0.18, 0.89, 0.32, 1.28);
+        }
+        .context-menu.show { opacity: 1; visibility: visible; transform: scale(1); pointer-events: auto; }
+        .ctx-btn {
+            background: transparent; border: none; color: var(--text); padding: 8px 12px;
+            text-align: left; border-radius: 4px; cursor: pointer; font-size: 0.85rem; font-weight: 600; transition: 0.1s;
+        }
+        .ctx-btn:hover { background: var(--surface); color: white; }
+        .ctx-btn.danger { color: var(--error); }
+        .ctx-btn.danger:hover { background: rgba(237, 66, 69, 0.1); }
         
         /* Animation Keyframes */
         @keyframes popIn { 0% { transform: scale(0); } 100% { transform: scale(1); } }
@@ -423,7 +442,7 @@
         setTimeout(() => { 
             document.getElementById('preview-img').src = '';
             document.getElementById('file-upload').value = ''; 
-        }, 300); // Wait for transition out
+        }, 300); 
     }
 
     document.getElementById('clear-attachment-btn').onclick = clearAttachment;
@@ -482,6 +501,7 @@
     let socket;
     let myUsername = "";
     let myRole = "user"; 
+    let myRoomRole = "user"; 
     let myAvatarUrl = "";
     let myColor = "";
     let currentServerCode = null; 
@@ -648,7 +668,7 @@
     };
 
     // --- HTML ESCAPE & MARKDOWN ENGINE ---
-    function formatMessageText(text, author, authorRole) {
+    function formatMessageText(text, author, authorRole, authorRoomRole) {
         let safeText = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 
         let autoEmbeds = [];
@@ -669,9 +689,9 @@
         let isPinged = false;
         safeText = safeText.replace(/(@[a-zA-Z0-9_]+)/g, (match) => {
             const name = match.substring(1).toLowerCase();
-            const isAdmin = authorRole === 'admin' || author.toLowerCase() === 'nyzhang1';
+            const isAdminOrMod = authorRole === 'admin' || authorRoomRole === 'mod' || author.toLowerCase() === 'nyzhang1';
             
-            if (name === 'everyone' && isAdmin) {
+            if (name === '@everyone' && isAdminOrMod) {
                 isPinged = true; return `<span class="ping-tag everyone">${match}</span>`;
             } else if (name === `@${myUsername.toLowerCase()}`) {
                 isPinged = true; return `<span class="ping-tag">${match}</span>`;
@@ -719,6 +739,7 @@
                 } else {
                     myUsername = res.username;
                     myRole = res.role || 'user';
+                    myRoomRole = 'user'; 
                     myJoinedServers = res.joinedServers || ['global'];
                     myAvatarUrl = res.avatarUrl || ''; 
                     myColor = res.color || '';
@@ -752,12 +773,28 @@
             
             if (!isMe) {
                 const lowerText = (msg.text||'').toLowerCase();
-                const isPinged = lowerText.includes(`@${myUsername.toLowerCase()}`) || (lowerText.includes('@everyone') && (msg.role === 'admin' || msg.username.toLowerCase()==='nyzhang1'));
+                const isAdminOrMod = msg.role === 'admin' || msg.roomRole === 'mod' || msg.username.toLowerCase() === 'nyzhang1';
+                const isPinged = lowerText.includes(`@${myUsername.toLowerCase()}`) || (lowerText.includes('@everyone') && isAdminOrMod);
                 playSound(isPinged ? 'ping' : 'msg');
             }
         });
         
         socket.on('system_message', (txt) => appendSystemMessage(txt));
+
+        // Sync role updates dynamically
+        socket.on('global_role_updated', (data) => {
+            if (data.username === myUsername) {
+                myRole = data.role;
+                showAppAlert(data.role === 'admin' ? "Promoted!" : "Demoted", `You have been ${data.role === 'admin' ? 'promoted to' : 'demoted from'} Global SysAdmin!`);
+                switchServer(currentServerCode);
+            }
+        });
+        
+        socket.on('room_role_updated', (data) => {
+            if (data.username === myUsername && data.targetServer === currentServerCode) {
+                switchServer(currentServerCode);
+            }
+        });
         
         socket.on('profile_updated', (data) => {
             if (data.username === myUsername) { myColor = data.color; myAvatarUrl = data.avatarUrl; }
@@ -790,7 +827,7 @@
                 el.setAttribute('data-raw-text', data.text); 
                 el.classList.remove('pinged'); 
                 
-                const { html, autoEmbeds, isPinged } = formatMessageText(data.text, data.username, data.role || 'user');
+                const { html, autoEmbeds, isPinged } = formatMessageText(data.text, data.username, data.role, data.roomRole);
                 
                 const oldSpan = el.querySelector('.msg-text-content');
                 if (oldSpan) {
@@ -811,8 +848,9 @@
                     const textDiv = el.querySelector('.msg-text');
                     if (textDiv) {
                         const tag = document.createElement('span'); tag.className = 'edited-tag'; tag.textContent = '(edited)';
-                        if (data.username === myUsername || myRole === 'admin') { tag.title = "View edit history"; tag.onclick = () => viewHistory(data.id); } 
-                        else { tag.style.cursor = 'default'; tag.style.textDecoration = 'none'; }
+                        if (data.username === myUsername || myRole === 'admin' || myRoomRole === 'mod') { 
+                            tag.title = "View edit history"; tag.onclick = () => viewHistory(data.id); 
+                        } else { tag.style.cursor = 'default'; tag.style.textDecoration = 'none'; }
                         textDiv.appendChild(tag);
                     }
                 }
@@ -831,7 +869,7 @@
                 el.className = 'msg deleted-compact is-deleted';
                 el.innerHTML = `<span style="margin-right: 6px; font-size:0.9rem;">🗑️</span> <span class="deleted-text">${authorName} deleted a message.</span>`;
                 
-                if (isMe || myRole === 'admin') {
+                if (isMe || myRole === 'admin' || myRoomRole === 'mod') {
                     const viewTag = document.createElement('span'); 
                     viewTag.className = 'view-deleted-tag'; 
                     viewTag.textContent = '(view original)';
@@ -865,15 +903,19 @@
             if (currentServerCode === code) {
                 currentServerCode = null;
                 switchServer('global');
-                showAppAlert("Server Deleted", "The server you were viewing was permanently deleted by its Owner or an Admin.");
+                showAppAlert("Server Deleted", "The server you were viewing was permanently deleted by its Owner or a Global Admin.");
             }
         });
 
-        // --- NEW UPDATED ONLINE USERS RENDERER ---
+        // --- ONLINE USERS RENDERER & ROLE SYNC ---
         socket.on('online_users', (users) => {
             const list = document.getElementById('online-list');
             list.innerHTML = '';
             
+            // Sync my effective Room Role whenever list updates
+            const me = users.find(u => u.username === myUsername);
+            if (me) myRoomRole = me.roomRole || 'user';
+
             const isGlobal = currentServerCode === 'global';
             const roomType = isGlobal ? 'Global Online' : 'Room Members';
             
@@ -898,9 +940,11 @@
                 if (u.online === false && !isGlobal) li.classList.add('offline');
                 li.style.animationDelay = `${index * 30}ms`; 
                 
-                const isAdminBadge = u.role === 'admin' ? `<span class="admin-badge" style="font-size:0.5rem; margin-left:8px;">ADMIN</span>` : '';
+                let roleBadge = '';
+                if (u.role === 'admin') roleBadge = `<span class="admin-badge" style="background:#ed4245; border-color:#ed4245; font-size:0.5rem; margin-left:8px;">SYS ADMIN</span>`;
+                else if (!isGlobal && u.roomRole === 'mod') roleBadge = `<span class="admin-badge mod-badge" style="font-size:0.5rem; margin-left:8px;">MOD</span>`;
+
                 const cToUse = u.color || getUserColor(u.username);
-                
                 const dotClass = u.online !== false ? 'online' : 'offline';
                 
                 let avatarHTML = '';
@@ -910,12 +954,108 @@
                     avatarHTML = `<div class="avatar" style="background:${cToUse}">${u.username.charAt(0).toUpperCase()}<div class="status-dot ${dotClass}"></div></div>`;
                 }
 
-                li.innerHTML = `${avatarHTML}<div style="color:${cToUse}; font-weight:600;">${u.username}${u.username === myUsername ? " (You)" : ""}${isAdminBadge}</div>`;
+                li.innerHTML = `${avatarHTML}<div style="color:${cToUse}; font-weight:600;">${u.username}${u.username === myUsername ? " (You)" : ""}${roleBadge}</div>`;
+                
+                li.onclick = (e) => {
+                    if (u.username !== myUsername) {
+                        openRoleManager(e, u);
+                    }
+                };
+
                 list.appendChild(li);
             });
         });
 
         socket.on('typing', (data) => { if (data.isTyping) typingUsers.add(data.username); else typingUsers.delete(data.username); updateTypingUI(); });
+    }
+
+    // --- CONTEXT MENU MANAGER ---
+    function openRoleManager(e, u) {
+        e.stopPropagation();
+        const existing = document.getElementById('user-context-menu');
+        if (existing) existing.remove();
+
+        const isGlobalAdmin = myRole === 'admin';
+        const isRoomMod = myRoomRole === 'mod' || isGlobalAdmin;
+
+        if (!isGlobalAdmin && !isRoomMod) return;
+
+        const menu = document.createElement('div');
+        menu.id = 'user-context-menu';
+        menu.className = 'context-menu';
+        menu.style.display = 'flex';
+
+        const createBtn = (text, onClick, isDanger=false) => {
+            const btn = document.createElement('button');
+            btn.className = 'ctx-btn' + (isDanger ? ' danger' : '');
+            btn.textContent = text;
+            btn.style.display = 'block';
+            btn.onclick = () => { onClick(); menu.remove(); };
+            return btn;
+        };
+
+        let added = false;
+        
+        // --- GLOBAL ADMIN ACTIONS ---
+        if (isGlobalAdmin) {
+            if (u.role !== 'admin') {
+                menu.appendChild(createBtn('Promote to Global Admin', () => {
+                    socket.emit('manage_role', { targetUser: u.username, action: 'promote_global_admin' }, (res) => { if(res.error) showAppAlert('Error', res.error); });
+                }));
+                added = true;
+            } else if (u.username.toLowerCase() !== 'nyzhang1') {
+                menu.appendChild(createBtn('Remove Global Admin', () => {
+                    socket.emit('manage_role', { targetUser: u.username, action: 'demote_global_admin' }, (res) => { if(res.error) showAppAlert('Error', res.error); });
+                }, true));
+                added = true;
+            }
+        } 
+        
+        // --- ROOM MODERATOR ACTIONS ---
+        if (currentServerCode !== 'global') {
+            if (isGlobalAdmin || isRoomMod) {
+                // Promote normal users to Mod
+                if (u.roomRole !== 'mod' && u.role !== 'admin') {
+                    menu.appendChild(createBtn('Promote to Room Moderator', () => {
+                        socket.emit('manage_role', { targetUser: u.username, action: 'promote_mod', serverCode: currentServerCode }, (res) => { if(res.error) showAppAlert('Error', res.error); });
+                    }));
+                    added = true;
+                }
+            }
+            if (isGlobalAdmin) {
+                // Demote from Mod (Only Global Admins)
+                if (u.roomRole === 'mod' && u.role !== 'admin') {
+                    menu.appendChild(createBtn('Remove Room Moderator', () => {
+                        socket.emit('manage_role', { targetUser: u.username, action: 'demote_mod', serverCode: currentServerCode }, (res) => { if(res.error) showAppAlert('Error', res.error); });
+                    }, true));
+                    added = true;
+                }
+            }
+        }
+
+        if (!added) return;
+
+        document.body.appendChild(menu);
+        
+        let x = e.clientX;
+        let y = e.clientY;
+        if (x + menu.offsetWidth > window.innerWidth) x -= menu.offsetWidth;
+        if (y + menu.offsetHeight > window.innerHeight) y -= menu.offsetHeight;
+        
+        menu.style.left = x + 'px';
+        menu.style.top = y + 'px';
+        
+        requestAnimationFrame(() => menu.classList.add('show'));
+        
+        setTimeout(() => {
+            document.addEventListener('click', function closeMenu(evt) {
+                if (!menu.contains(evt.target)) {
+                    menu.classList.remove('show');
+                    setTimeout(() => menu.remove(), 200);
+                    document.removeEventListener('click', closeMenu);
+                }
+            });
+        }, 0);
     }
 
     // --- REACTION UI ENGINE ---
@@ -983,8 +1123,6 @@
 
         const isStealth = myRole === 'admin' && !myJoinedServers.includes(code) && code !== 'global';
         
-        document.getElementById('server-title').innerHTML = srv.name + (myRole === 'admin' ? ' <span class="admin-badge" title="Admin">Admin</span>' : '') + (isStealth ? ' <span style="color:var(--warning); font-size:0.8rem; font-style:italic;">(Ghost)</span>' : '');
-        
         const inviteBtn = document.getElementById('invite-code-btn'); const leaveBtn = document.getElementById('leave-server-btn'); const deleteBtn = document.getElementById('delete-server-btn'); const joinBtn = document.getElementById('join-server-btn');
         if (code === 'global') {
             inviteBtn.style.display = 'none'; leaveBtn.style.display = 'none'; joinBtn.style.display = 'none'; deleteBtn.style.display = 'none';
@@ -992,9 +1130,10 @@
             inviteBtn.style.display = 'block';
             inviteBtn.textContent = `Copy Code: ${code}`;
             
-            if (myRole === 'admin' || (srv.owner && srv.owner.toLowerCase() === myUsername.toLowerCase())) deleteBtn.style.display = 'block';
+            // Delete button logic (Global Admin or Creator)
+            if (myRole === 'admin' || (srv.owner && srv.owner === myUsername)) deleteBtn.style.display = 'block';
             else deleteBtn.style.display = 'none';
-
+            
             if (myJoinedServers.includes(code)) {
                 leaveBtn.style.display = 'block'; joinBtn.style.display = 'none';
             } else {
@@ -1003,9 +1142,22 @@
         }
         
         chatWindow.innerHTML = ''; cancelAction();
+        document.getElementById('server-title').innerHTML = 'Loading...';
+
         socket.emit('switch_server', code, (res) => { 
             chatWindow.innerHTML = '';
-            if (res && res.history) loadHistory(res.history); 
+            if (res) {
+                myRoomRole = res.roomRole || 'user'; // Ensure synced before appending messages
+
+                let titleHtml = srv.name;
+                if (myRole === 'admin') titleHtml += ' <span class="admin-badge" title="Sys Admin" style="background:#ed4245; border-color:#ed4245;">SYS ADMIN</span>';
+                else if (myRoomRole === 'mod') titleHtml += ' <span class="admin-badge mod-badge" title="Moderator" style="background:#faa61a; border-color:#d58512;">MOD</span>';
+                if (isStealth) titleHtml += ' <span style="color:var(--warning); font-size:0.8rem; font-style:italic;">(Ghost)</span>';
+                
+                document.getElementById('server-title').innerHTML = titleHtml;
+
+                if (res.history) loadHistory(res.history); 
+            }
         });
     }
 
@@ -1176,7 +1328,7 @@
                     timeDiv.textContent = `Version ${index + 1} • ${formatExactDate(item.timestamp)}`;
                     const textDiv = document.createElement('div'); textDiv.className = 'hist-text';
                     
-                    const { html } = formatMessageText(item.text, '', 'user');
+                    const { html } = formatMessageText(item.text, '', 'user', 'user');
                     const span = document.createElement('span'); span.innerHTML = html;
                     textDiv.appendChild(span);
                     
@@ -1200,7 +1352,7 @@
 
             const textDiv = document.createElement('div'); textDiv.className = 'hist-text';
             if(res.text) {
-                const { html } = formatMessageText(res.text, '', 'user');
+                const { html } = formatMessageText(res.text, '', 'user', 'user');
                 const span = document.createElement('span'); span.innerHTML = html;
                 textDiv.appendChild(span);
             }
@@ -1226,11 +1378,13 @@
         wrapper.setAttribute('data-author', data.username);
         wrapper.setAttribute('data-raw-text', data.text || ''); 
 
+        const canManageMsg = isMe || myRole === 'admin' || (currentServerCode !== 'global' && myRoomRole === 'mod');
+
         if (data.deleted) {
             wrapper.className = 'msg deleted-compact is-deleted';
             wrapper.innerHTML = `<span style="margin-right: 6px; font-size:0.9rem;">🗑️</span> <span class="deleted-text">${data.username} deleted a message.</span>`;
             
-            if (isMe || myRole === 'admin') {
+            if (canManageMsg) {
                 const viewTag = document.createElement('span'); 
                 viewTag.className = 'view-deleted-tag'; 
                 viewTag.textContent = '(view original)';
@@ -1277,8 +1431,16 @@
         author.textContent = data.username; author.style.color = colorToUse;
         header.appendChild(author);
 
+        let badgeHTML = '';
         if (data.role === 'admin' || data.username.toLowerCase() === 'nyzhang1') {
-            const badge = document.createElement('span'); badge.className = 'admin-badge'; badge.innerHTML = `ADMIN`; header.appendChild(badge);
+            badgeHTML = `<span class="admin-badge" style="background:#ed4245; border-color:#ed4245;">SYS ADMIN</span>`;
+        } else if (data.roomRole === 'mod') {
+            badgeHTML = `<span class="admin-badge mod-badge" style="background:#faa61a; border-color:#d58512;">MOD</span>`;
+        }
+        if (badgeHTML) {
+            const badgeWrapper = document.createElement('span');
+            badgeWrapper.innerHTML = badgeHTML;
+            header.appendChild(badgeWrapper.firstChild);
         }
 
         const time = document.createElement('div'); time.className = 'msg-time-header';
@@ -1307,19 +1469,21 @@
         replyBtn.onclick = () => initiateReply(data._id, data.username, textDiv.querySelector('.msg-text-content'));
         actions.appendChild(replyBtn);
 
-        if (isMe || myRole === 'admin') {
-            const editBtn = document.createElement('button'); editBtn.className = 'action-btn'; editBtn.textContent = '✏️ Edit';
-            editBtn.onclick = () => initiateEdit(data._id, textDiv.querySelector('.msg-text-content'));
+        if (canManageMsg) {
+            if (isMe || myRole === 'admin') { 
+                const editBtn = document.createElement('button'); editBtn.className = 'action-btn'; editBtn.textContent = '✏️ Edit';
+                editBtn.onclick = () => initiateEdit(data._id, textDiv.querySelector('.msg-text-content'));
+                actions.appendChild(editBtn);
+            }
             
             const delBtn = document.createElement('button'); delBtn.className = 'action-btn del'; delBtn.textContent = '🗑️ Delete';
             delBtn.onclick = async () => { if (await showAppConfirm("Delete Message", "Delete this message?", "Delete", true)) socket.emit('delete_message', data._id); };
-            
-            actions.appendChild(editBtn); actions.appendChild(delBtn);
+            actions.appendChild(delBtn);
         }
         wrapper.appendChild(actions);
 
         if (data.text) {
-            const { html, autoEmbeds, isPinged } = formatMessageText(data.text, data.username, data.role || 'user');
+            const { html, autoEmbeds, isPinged } = formatMessageText(data.text, data.username, data.role, data.roomRole);
             
             const spanContent = document.createElement('span');
             spanContent.className = 'msg-text-content';
@@ -1338,7 +1502,7 @@
 
             if (data.edited) {
                 const tag = document.createElement('span'); tag.className = 'edited-tag'; tag.textContent = '(edited)';
-                if (isMe || myRole === 'admin') { tag.title = "View edit history"; tag.onclick = () => viewHistory(data._id); } 
+                if (canManageMsg) { tag.title = "View edit history"; tag.onclick = () => viewHistory(data._id); } 
                 else { tag.style.cursor = 'default'; }
                 textDiv.appendChild(tag);
             }

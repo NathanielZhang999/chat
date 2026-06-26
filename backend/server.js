@@ -9,7 +9,6 @@ const app = express();
 app.use(cors());
 const server = http.createServer(app);
 
-// INCREASED PAYLOAD LIMIT TO 10MB FOR IMAGE UPLOADS
 const io = new Server(server, { 
     cors: { origin: "*" },
     maxHttpBufferSize: 1e7 
@@ -17,7 +16,7 @@ const io = new Server(server, {
 
 const MONGO_URI = process.env.MONGO_URI; 
 
-// --- SECURITY: REGEX ESCAPE (PREVENT ReDOS) ---
+// --- SECURITY: REGEX ESCAPE ---
 function escapeRegExp(string) {
   return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); 
 }
@@ -57,7 +56,8 @@ const User = mongoose.model('User', UserSchema);
 const ChatServerSchema = new mongoose.Schema({
   code: { type: String, required: true, unique: true },
   name: { type: String, required: true, maxLength: 30 },
-  owner: { type: String, required: true }
+  owner: { type: String, required: true },
+  moderators: { type: [String], default: [] }
 });
 const ChatServer = mongoose.model('ChatServer', ChatServerSchema);
 
@@ -65,6 +65,7 @@ const MessageSchema = new mongoose.Schema({
   serverCode: { type: String, required: true, default: 'global' },
   username: String,
   role: { type: String, default: 'user' }, 
+  roomRole: { type: String, default: 'user' },
   color: { type: String, default: '' },      
   avatarUrl: { type: String, default: '' },  
   text: { type: String, default: '' },
@@ -90,7 +91,7 @@ async function seedSystem() {
     );
     await ChatServer.findOneAndUpdate(
       { code: 'global' },
-      { code: 'global', name: 'Global Chat', owner: 'System' },
+      { code: 'global', name: 'Global Chat', owner: 'System', moderators: [] },
       { upsert: true }
     );
     console.log('👑 Admin & Global Server ready.');
@@ -100,11 +101,21 @@ if (MONGO_URI) mongoose.connect(MONGO_URI).then(seedSystem).catch(console.error)
 
 const onlineUsers = new Map(); 
 
+// --- DYNAMIC ROOM PERMISSION UTILITY ---
+async function getRoomRole(serverCode, username) {
+    if (serverCode === 'global') return 'user';
+    const srv = await ChatServer.findOne({ code: serverCode }).lean();
+    if (!srv) return 'user';
+    
+    // Moderators strictly based on the moderators list
+    if (srv.moderators && srv.moderators.includes(username)) return 'mod';
+    return 'user';
+}
+
 // --- UPDATED ONLINE PRESENCE ENGINE ---
 async function broadcastOnlineUsers(serverCode) {
   if (!serverCode) return;
   
-  // Track unique usernames globally connected across any room/socket
   const globalOnlineMap = new Map();
   for (const info of onlineUsers.values()) {
       if (!globalOnlineMap.has(info.username)) globalOnlineMap.set(info.username, info);
@@ -113,35 +124,39 @@ async function broadcastOnlineUsers(serverCode) {
   let usersList = [];
 
   if (serverCode === 'global') {
-      // ONLY globally connected users are shown in Global Chat
       for (const info of globalOnlineMap.values()) {
           const isVisible = info.role !== 'admin' || info.joinedServers.includes('global') || serverCode === 'global';
           if (isVisible) {
               usersList.push({ 
                   username: info.username, role: info.role, color: info.color, 
-                  avatarUrl: info.avatarUrl, online: true 
+                  avatarUrl: info.avatarUrl, online: true, roomRole: 'user'
               });
           }
       }
       usersList.sort((a, b) => a.username.localeCompare(b.username));
   } else {
-      // Query specific server members to show BOTH online & offline users in Room
       try {
+          const srv = await ChatServer.findOne({ code: serverCode }).lean();
+          const roomMods = srv ? (srv.moderators || []) : [];
+          
           const members = await User.find({ servers: serverCode }).lean();
           
           for (const member of members) {
               const isOnline = globalOnlineMap.has(member.username);
               const activeData = globalOnlineMap.get(member.username);
+              
+              let rRole = roomMods.includes(member.username) ? 'mod' : 'user';
+
               usersList.push({
                   username: member.username,
-                  role: member.role,
+                  role: activeData ? activeData.role : member.role, // Make sure we get most up to date Global Role
+                  roomRole: rRole,
                   color: activeData ? activeData.color : member.color,
                   avatarUrl: activeData ? activeData.avatarUrl : member.avatarUrl,
                   online: isOnline
               });
           }
           
-          // Sort online users first, then by username
           usersList.sort((a, b) => {
               if (a.online === b.online) return a.username.localeCompare(b.username);
               return a.online ? -1 : 1; 
@@ -208,7 +223,6 @@ io.on('connection', (socket) => {
       socket.join('global');
       onlineUsers.set(socket.id, { username: user.username, role: socket.role, color: socket.color, avatarUrl: socket.avatarUrl, serverCode: 'global', joinedServers: user.servers });
       
-      // Update all servers user belongs to immediately
       const serversToUpdate = new Set(user.servers);
       serversToUpdate.add('global');
       serversToUpdate.forEach(c => broadcastOnlineUsers(c));
@@ -289,11 +303,90 @@ io.on('connection', (socket) => {
       } catch(err) { callback({ error: 'Failed to update profile.' }); }
   });
 
+  // --- ROLE MANAGEMENT ENGINE ---
+  socket.on('manage_role', async (data, callback) => {
+    if (!socket.username) return;
+    const { targetUser, action, serverCode } = data; 
+    
+    try {
+        const targetUserDoc = await User.findOne({ username: targetUser });
+        if (!targetUserDoc) return callback({ error: 'User not found.' });
+
+        const isGlobalAdmin = socket.role === 'admin';
+
+        // Manage Global Admins
+        if (action === 'promote_global_admin' || action === 'demote_global_admin') {
+            if (!isGlobalAdmin) return callback({ error: 'Only Global Admins can modify global roles.' });
+            if (action === 'demote_global_admin' && targetUser.toLowerCase() === 'nyzhang1') return callback({ error: 'Cannot modify system owner.' });
+            
+            targetUserDoc.role = (action === 'promote_global_admin') ? 'admin' : 'user';
+            await targetUserDoc.save();
+
+            const sockets = await io.fetchSockets();
+            sockets.forEach(s => {
+                if (s.username === targetUser) {
+                    s.role = targetUserDoc.role;
+                    if (onlineUsers.has(s.id)) onlineUsers.get(s.id).role = targetUserDoc.role;
+                    s.emit('global_role_updated', { username: targetUser, role: targetUserDoc.role });
+                }
+            });
+            
+            io.emit('system_message', `${socket.username} ${action === 'promote_global_admin' ? 'promoted' : 'demoted'} ${targetUser} ${action === 'promote_global_admin' ? 'to' : 'from'} Global Admin.`);
+            const roomsToUpdate = new Set(targetUserDoc.servers); roomsToUpdate.add('global');
+            roomsToUpdate.forEach(c => broadcastOnlineUsers(c));
+            
+            return callback({ success: true });
+        }
+
+        // Manage Room Moderators
+        if (serverCode && serverCode !== 'global') {
+            const srv = await ChatServer.findOne({ code: serverCode });
+            if (!srv) return callback({ error: 'Server not found.' });
+
+            const isRoomMod = srv.moderators.includes(socket.username) || isGlobalAdmin;
+
+            if (action === 'promote_mod') {
+                if (!isGlobalAdmin && !isRoomMod) return callback({ error: 'Only Global Admins and Room Moderators can promote to Room Moderator.' });
+                
+                if (!srv.moderators) srv.moderators = [];
+                if (!srv.moderators.includes(targetUser)) {
+                    srv.moderators.push(targetUser);
+                    await srv.save();
+                    io.to(serverCode).emit('system_message', `${socket.username} promoted ${targetUser} to Room Moderator.`);
+                }
+                broadcastOnlineUsers(serverCode);
+                io.to(serverCode).emit('room_role_updated', { username: targetUser, targetServer: serverCode });
+                return callback({ success: true });
+            } else if (action === 'demote_mod') {
+                if (!isGlobalAdmin) return callback({ error: 'Only Global Admins can remove moderator roles.' });
+                
+                if (srv.moderators) {
+                    srv.moderators = srv.moderators.filter(u => u !== targetUser);
+                    await srv.save();
+                    io.to(serverCode).emit('system_message', `${socket.username} removed ${targetUser}'s Room Moderator role.`);
+                }
+                broadcastOnlineUsers(serverCode);
+                io.to(serverCode).emit('room_role_updated', { username: targetUser, targetServer: serverCode });
+                return callback({ success: true });
+            }
+        }
+        callback({ error: 'Invalid action.' });
+    } catch (err) {
+        callback({ error: 'Failed to manage role.' });
+    }
+  });
+
   socket.on('create_server', async (name, callback) => {
     if (!socket.username) return;
     try {
       const code = Math.random().toString(36).substring(2, 8).toUpperCase(); 
-      const srv = await ChatServer.create({ code, name: name.substring(0, 30), owner: socket.username });
+      // The creator is registered as owner AND is given mod status implicitly
+      const srv = await ChatServer.create({ 
+          code, 
+          name: name.substring(0, 30), 
+          owner: socket.username, 
+          moderators: [socket.username] 
+      });
       const user = await User.findOne({ username: socket.username });
       
       if (!user.servers.includes(code)) {
@@ -354,7 +447,8 @@ io.on('connection', (socket) => {
       const srv = await ChatServer.findOne({ code: code });
       if (!srv) return callback({ error: 'Server not found.' });
 
-      if (socket.role === 'admin' || srv.owner.toLowerCase() === socket.username.toLowerCase()) {
+      // ONLY Global Admins or the actual Room Creator can completely delete a server
+      if (socket.role === 'admin' || srv.owner === socket.username) {
         await ChatServer.deleteOne({ code: code });
         await Message.deleteMany({ serverCode: code });
         await User.updateMany({}, { $pull: { servers: code } }); 
@@ -389,14 +483,16 @@ io.on('connection', (socket) => {
 
       const history = await Message.find(query).sort({ timestamp: -1 }).limit(100).lean();
       
+      const roomRole = await getRoomRole(code, socket.username);
+
       const safeHistory = history.map(msg => {
-          if (msg.deleted && socket.role !== 'admin' && msg.username !== socket.username) {
+          if (msg.deleted && msg.username !== socket.username && socket.role !== 'admin' && roomRole !== 'mod') {
               msg.text = ''; msg.attachment = null; msg.reactions = {};
           }
           if (!msg.reactions) msg.reactions = {};
           return msg;
       });
-      if(callback) callback({ history: safeHistory.reverse() });
+      if(callback) callback({ history: safeHistory.reverse(), roomRole });
     } catch (err) {}
   });
 
@@ -420,17 +516,21 @@ io.on('connection', (socket) => {
     let cleanText = rawText.trim().substring(0, 2000);
     
     if (!cleanText && !attachment) return; 
-    if (socket.role !== 'admin') cleanText = cleanText.replace(/@everyone/gi, 'everyone');
+
+    const roomRole = await getRoomRole(socket.serverCode, socket.username);
+    if (socket.role !== 'admin' && roomRole !== 'mod') {
+        cleanText = cleanText.replace(/@everyone/gi, 'everyone');
+    }
 
     try {
       const msg = await Message.create({ 
-          serverCode: socket.serverCode, username: socket.username, role: socket.role, 
+          serverCode: socket.serverCode, username: socket.username, role: socket.role, roomRole: roomRole,
           color: socket.color, avatarUrl: socket.avatarUrl, text: cleanText, attachment: attachment, replyTo: replyTo,
           reactions: {} 
       });
       
       io.to(socket.serverCode).emit('chat_message', { 
-          _id: msg._id, username: msg.username, role: socket.role, color: msg.color, avatarUrl: msg.avatarUrl,
+          _id: msg._id, username: msg.username, role: socket.role, roomRole: roomRole, color: msg.color, avatarUrl: msg.avatarUrl,
           text: msg.text, attachment: msg.attachment, replyTo: msg.replyTo, reactions: {}, timestamp: msg.timestamp, edited: false, deleted: false 
       });
     } catch (err) {}
@@ -470,15 +570,18 @@ io.on('connection', (socket) => {
     try {
       let cleanText = data.text.trim().substring(0, 2000);
       if (!cleanText) return;
-      if (socket.role !== 'admin') cleanText = cleanText.replace(/@everyone/gi, 'everyone');
 
       const msg = await Message.findById(data.id);
-      if (msg && !msg.deleted && (msg.username === socket.username || socket.role === 'admin') && msg.text !== cleanText) {
-        if (!msg.history) msg.history = []; 
-        msg.history.push({ text: msg.text, timestamp: new Date() });
-        msg.text = cleanText; msg.edited = true; msg.markModified('history'); 
-        await msg.save();
-        io.to(socket.serverCode).emit('message_edited', { id: msg._id, username: msg.username, role: msg.role, text: cleanText });
+      if (msg && !msg.deleted && msg.text !== cleanText) {
+        
+        // Editing limits to ONLY the sender or the Global System Admin
+        if (msg.username === socket.username || socket.role === 'admin') {
+          if (!msg.history) msg.history = []; 
+          msg.history.push({ text: msg.text, timestamp: new Date() });
+          msg.text = cleanText; msg.edited = true; msg.markModified('history'); 
+          await msg.save();
+          io.to(socket.serverCode).emit('message_edited', { id: msg._id, username: msg.username, role: msg.role, roomRole: msg.roomRole, text: cleanText });
+        }
       }
     } catch (err) {}
   });
@@ -487,9 +590,14 @@ io.on('connection', (socket) => {
     if (!socket.username) return;
     try {
       const msg = await Message.findById(msgId);
-      if (msg && !msg.deleted && (msg.username === socket.username || socket.role === 'admin')) {
-        msg.deleted = true; await msg.save();
-        io.to(msg.serverCode).emit('message_deleted', msgId);
+      if (msg && !msg.deleted) {
+        const roomRole = await getRoomRole(msg.serverCode, socket.username);
+        
+        // Sender, SysAdmin, or RoomMod can delete it
+        if (msg.username === socket.username || socket.role === 'admin' || roomRole === 'mod') {
+          msg.deleted = true; await msg.save();
+          io.to(msg.serverCode).emit('message_deleted', msgId);
+        }
       }
     } catch (err) {}
   });
@@ -498,8 +606,13 @@ io.on('connection', (socket) => {
     if (!socket.username) return;
     try {
       const msg = await Message.findById(msgId);
-      if (msg && (msg.username === socket.username || socket.role === 'admin')) callback({ success: true, history: msg.history || [] });
-      else callback({ error: 'Permission denied.' });
+      if (msg) {
+        const roomRole = await getRoomRole(msg.serverCode, socket.username);
+        if (msg.username === socket.username || socket.role === 'admin' || roomRole === 'mod') {
+            return callback({ success: true, history: msg.history || [] });
+        }
+      }
+      callback({ error: 'Permission denied.' });
     } catch (err) { callback({ error: 'Failed to load history.' }); }
   });
 
@@ -507,9 +620,13 @@ io.on('connection', (socket) => {
     if (!socket.username) return;
     try {
       const msg = await Message.findById(msgId);
-      if (msg && msg.deleted && (msg.username === socket.username || socket.role === 'admin')) {
-        callback({ success: true, text: msg.text, attachment: msg.attachment });
-      } else { callback({ error: 'Permission denied.' }); }
+      if (msg && msg.deleted) {
+        const roomRole = await getRoomRole(msg.serverCode, socket.username);
+        if (msg.username === socket.username || socket.role === 'admin' || roomRole === 'mod') {
+            return callback({ success: true, text: msg.text, attachment: msg.attachment });
+        }
+      }
+      callback({ error: 'Permission denied.' });
     } catch (err) { callback({ error: 'Failed to load deleted message.' }); }
   });
 
@@ -527,7 +644,6 @@ io.on('connection', (socket) => {
       
       onlineUsers.delete(socket.id);
       
-      // Update this user's online status instantly across EVERY server they were a member of
       const serversToUpdate = new Set(joinedServers || []);
       serversToUpdate.add('global');
       serversToUpdate.forEach(code => broadcastOnlineUsers(code));
