@@ -574,8 +574,10 @@ io.on('connection', (socket) => {
       const msg = await Message.findById(data.id);
       if (msg && !msg.deleted && msg.text !== cleanText) {
         
-        // Editing limits to ONLY the sender or the Global System Admin
-        if (msg.username === socket.username || socket.role === 'admin') {
+        const roomRole = await getRoomRole(msg.serverCode, socket.username);
+
+        // Editing permits: Sender, Global Admin, or Room Mod
+        if (msg.username === socket.username || socket.role === 'admin' || roomRole === 'mod') {
           if (!msg.history) msg.history = []; 
           msg.history.push({ text: msg.text, timestamp: new Date() });
           msg.text = cleanText; msg.edited = true; msg.markModified('history'); 
