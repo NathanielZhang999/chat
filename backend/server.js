@@ -45,6 +45,7 @@ setInterval(() => {
 // --- DATABASE SCHEMAS ---
 const UserSchema = new mongoose.Schema({
   username: { type: String, required: true, unique: true },
+  displayName: { type: String, default: '' },
   password: { type: String, required: true },
   role: { type: String, default: 'user' },
   color: { type: String, default: '' },      
@@ -64,6 +65,7 @@ const ChatServer = mongoose.model('ChatServer', ChatServerSchema);
 const MessageSchema = new mongoose.Schema({
   serverCode: { type: String, required: true, default: 'global' },
   username: String,
+  displayName: { type: String, default: '' },
   role: { type: String, default: 'user' }, 
   roomRole: { type: String, default: 'user' },
   color: { type: String, default: '' },      
@@ -86,7 +88,7 @@ async function seedSystem() {
     const hashed = await bcrypt.hash('DragonNYZ0924', 10);
     await User.findOneAndUpdate(
       { username: { $regex: new RegExp(`^${adminUser}$`, 'i') } },
-      { username: adminUser, password: hashed, role: 'admin' },
+      { username: adminUser, displayName: 'Bacon', password: hashed, role: 'admin' },
       { upsert: true }
     );
     await ChatServer.findOneAndUpdate(
@@ -112,6 +114,45 @@ async function getRoomRole(serverCode, username) {
     return 'user';
 }
 
+// --- SECURE BACKEND PING RESOLVER ENGINE ---
+// Converts `@username` or `@DisplayName` securely into the `{{PING:username|DisplayName}}` format
+async function resolvePings(text, serverCode, senderRole, senderRoomRole, senderUsername) {
+    let processed = text;
+    if (!processed.includes('@')) return processed;
+
+    const isAdminOrMod = senderRole === 'admin' || senderRoomRole === 'mod' || senderUsername.toLowerCase() === 'nyzhang1';
+
+    if (isAdminOrMod && /(^|\s)@everyone(?=\s|$|[.,!?<])/i.test(processed)) {
+        processed = processed.replace(/(^|\s)@everyone(?=\s|$|[.,!?<])/gi, '$1{{PING:everyone|everyone}}');
+    } else {
+        processed = processed.replace(/@everyone/gi, 'everyone');
+    }
+
+    if (processed.includes('@')) {
+        const roomUsers = await User.find({ servers: serverCode }, 'username displayName');
+        
+        // Build search array mapping every possible matching handle
+        const searchList = [];
+        for (let u of roomUsers) {
+            const dn = u.displayName || u.username;
+            searchList.push({ search: dn, username: u.username, display: dn });
+            if (u.username.toLowerCase() !== dn.toLowerCase()) {
+                searchList.push({ search: u.username, username: u.username, display: dn });
+            }
+        }
+        
+        // Sort by longest string length to correctly catch Display Names containing Usernames
+        searchList.sort((a, b) => b.search.length - a.search.length);
+
+        for (let {search, username, display} of searchList) {
+            const regex = new RegExp(`(^|\\s)@${escapeRegExp(search)}(?![a-zA-Z0-9_-])`, 'gi');
+            processed = processed.replace(regex, `$1{{PING:${username}|${display}}}`);
+        }
+    }
+    
+    return processed;
+}
+
 // --- UPDATED ONLINE PRESENCE ENGINE ---
 async function broadcastOnlineUsers(serverCode) {
   if (!serverCode) return;
@@ -128,12 +169,12 @@ async function broadcastOnlineUsers(serverCode) {
           const isVisible = info.role !== 'admin' || info.joinedServers.includes('global') || serverCode === 'global';
           if (isVisible) {
               usersList.push({ 
-                  username: info.username, role: info.role, color: info.color, 
+                  username: info.username, displayName: info.displayName, role: info.role, color: info.color, 
                   avatarUrl: info.avatarUrl, online: true, roomRole: 'user'
               });
           }
       }
-      usersList.sort((a, b) => a.username.localeCompare(b.username));
+      usersList.sort((a, b) => (a.displayName||a.username).localeCompare(b.displayName||b.username));
   } else {
       try {
           const srv = await ChatServer.findOne({ code: serverCode }).lean();
@@ -149,7 +190,8 @@ async function broadcastOnlineUsers(serverCode) {
 
               usersList.push({
                   username: member.username,
-                  role: activeData ? activeData.role : member.role, // Make sure we get most up to date Global Role
+                  displayName: activeData ? activeData.displayName : (member.displayName || member.username),
+                  role: activeData ? activeData.role : member.role, 
                   roomRole: rRole,
                   color: activeData ? activeData.color : member.color,
                   avatarUrl: activeData ? activeData.avatarUrl : member.avatarUrl,
@@ -158,12 +200,10 @@ async function broadcastOnlineUsers(serverCode) {
           }
           
           usersList.sort((a, b) => {
-              if (a.online === b.online) return a.username.localeCompare(b.username);
+              if (a.online === b.online) return (a.displayName||a.username).localeCompare(b.displayName||b.username);
               return a.online ? -1 : 1; 
           });
-      } catch (err) { 
-          console.error(err); 
-      }
+      } catch (err) { console.error(err); }
   }
 
   io.to(serverCode).emit('online_users', usersList);
@@ -183,16 +223,25 @@ io.on('connection', (socket) => {
       if (!checkRateLimit(ip)) return callback({ error: 'Too many requests. Try again later.' });
 
       const cleanUser = data.username.trim().substring(0, 20);
-      if (cleanUser.length < 3) return callback({ error: 'Username must be at least 3 characters.' });
-      if (cleanUser.toLowerCase() === 'nyzhang1') return callback({ error: 'Reserved name.' });
+      let cleanDisp = (data.displayName || '').trim().replace(/[^a-zA-Z0-9_ -]/g, '').substring(0, 30);
+      
+      if (!cleanDisp) cleanDisp = cleanUser;
+
+      if (!/^[a-zA-Z0-9_-]+$/.test(cleanUser)) return callback({error: 'Username can only contain letters, numbers, dashes, and underscores.'});
+
+      if (cleanUser.toLowerCase() === 'nyzhang1' || cleanDisp.toLowerCase() === 'nyzhang1') return callback({ error: 'Reserved name.' });
       if (data.password.length < 6) return callback({ error: 'Password must be at least 6 characters.' });
 
       const escapedUser = escapeRegExp(cleanUser);
       const existing = await User.findOne({ username: { $regex: new RegExp(`^${escapedUser}$`, 'i') } }); 
       if (existing) return callback({ error: 'Username taken.' });
 
+      const escapedDisp = escapeRegExp(cleanDisp);
+      const existingDisp = await User.findOne({ displayName: { $regex: new RegExp(`^${escapedDisp}$`, 'i') } }); 
+      if (existingDisp && cleanDisp.toLowerCase() !== cleanUser.toLowerCase()) return callback({ error: 'Display Name is already taken.' });
+
       const hashedPassword = await bcrypt.hash(data.password, 10);
-      await User.create({ username: cleanUser, password: hashedPassword, servers: ['global'] });
+      await User.create({ username: cleanUser, displayName: cleanDisp, password: hashedPassword, servers: ['global'] });
       
       clearRateLimit(ip);
       callback({ success: true });
@@ -212,8 +261,10 @@ io.on('connection', (socket) => {
       if (!(await bcrypt.compare(data.password, user.password))) return callback({ error: 'Incorrect password.' });
 
       if (!user.servers || user.servers.length === 0) { user.servers = ['global']; await user.save(); }
+      if (!user.displayName) { user.displayName = user.username; await user.save(); }
 
       socket.username = user.username;
+      socket.displayName = user.displayName;
       socket.role = user.role || 'user';
       socket.color = user.color || '';
       socket.avatarUrl = user.avatarUrl || '';
@@ -221,19 +272,19 @@ io.on('connection', (socket) => {
       socket.joinedServers = user.servers;
       
       socket.join('global');
-      onlineUsers.set(socket.id, { username: user.username, role: socket.role, color: socket.color, avatarUrl: socket.avatarUrl, serverCode: 'global', joinedServers: user.servers });
+      onlineUsers.set(socket.id, { username: user.username, displayName: socket.displayName, role: socket.role, color: socket.color, avatarUrl: socket.avatarUrl, serverCode: 'global', joinedServers: user.servers });
       
       const serversToUpdate = new Set(user.servers);
       serversToUpdate.add('global');
       serversToUpdate.forEach(c => broadcastOnlineUsers(c));
 
       const isVisible = socket.role !== 'admin' || socket.joinedServers.includes('global');
-      if (isVisible) socket.to('global').emit('system_message', `${user.username} joined the app.`);
+      if (isVisible) socket.to('global').emit('system_message', `${socket.displayName} joined the app.`);
       
       clearRateLimit(ip);
 
       const servers = socket.role === 'admin' ? await ChatServer.find() : await ChatServer.find({ code: { $in: user.servers } });
-      callback({ success: true, username: user.username, role: socket.role, color: socket.color, avatarUrl: socket.avatarUrl, servers: servers || [], joinedServers: user.servers });
+      callback({ success: true, username: user.username, displayName: socket.displayName, role: socket.role, color: socket.color, avatarUrl: socket.avatarUrl, servers: servers || [], joinedServers: user.servers });
     } catch (err) { callback({ error: 'Login failed.' }); }
   });
 
@@ -284,26 +335,31 @@ io.on('connection', (socket) => {
       try {
           const color = data.color ? data.color.trim().substring(0, 30) : '';
           const url = data.avatarUrl ? data.avatarUrl.trim().substring(0, 1000) : '';
+          const dName = data.displayName ? data.displayName.replace(/[^a-zA-Z0-9_ -]/g, '').substring(0, 30).trim() : socket.username;
+
+          if (dName.toLowerCase() !== socket.displayName.toLowerCase()) {
+              const existingDisp = await User.findOne({ displayName: { $regex: new RegExp(`^${escapeRegExp(dName)}$`, 'i') } });
+              if (existingDisp) return callback({ error: 'Display Name is already taken.' });
+          }
 
           const user = await User.findOne({ username: socket.username });
-          user.color = color; user.avatarUrl = url; await user.save();
+          user.color = color; user.avatarUrl = url; user.displayName = dName; await user.save();
           
-          await Message.updateMany({ username: socket.username }, { $set: { color: color, avatarUrl: url } });
+          await Message.updateMany({ username: socket.username }, { $set: { color: color, avatarUrl: url, displayName: dName } });
 
-          socket.color = color; socket.avatarUrl = url;
-          if(onlineUsers.has(socket.id)) { let session = onlineUsers.get(socket.id); session.color = color; session.avatarUrl = url; }
+          socket.color = color; socket.avatarUrl = url; socket.displayName = dName;
+          if(onlineUsers.has(socket.id)) { let session = onlineUsers.get(socket.id); session.color = color; session.avatarUrl = url; session.displayName = dName; }
           
-          io.emit('profile_updated', { username: socket.username, color: color, avatarUrl: url });
+          io.emit('profile_updated', { username: socket.username, displayName: dName, color: color, avatarUrl: url });
           
           const serversToUpdate = new Set(socket.joinedServers);
           serversToUpdate.add('global');
           serversToUpdate.forEach(c => broadcastOnlineUsers(c));
           
-          callback({ success: true, color: color, avatarUrl: url });
+          callback({ success: true, displayName: dName, color: color, avatarUrl: url });
       } catch(err) { callback({ error: 'Failed to update profile.' }); }
   });
 
-  // --- ROLE MANAGEMENT ENGINE ---
   socket.on('manage_role', async (data, callback) => {
     if (!socket.username) return;
     const { targetUser, action, serverCode } = data; 
@@ -312,6 +368,7 @@ io.on('connection', (socket) => {
         const targetUserDoc = await User.findOne({ username: targetUser });
         if (!targetUserDoc) return callback({ error: 'User not found.' });
 
+        const targetDisp = targetUserDoc.displayName || targetUserDoc.username;
         const isGlobalAdmin = socket.role === 'admin';
 
         // Manage Global Admins
@@ -331,7 +388,7 @@ io.on('connection', (socket) => {
                 }
             });
             
-            io.emit('system_message', `${socket.username} ${action === 'promote_global_admin' ? 'promoted' : 'demoted'} ${targetUser} ${action === 'promote_global_admin' ? 'to' : 'from'} Global Admin.`);
+            io.emit('system_message', `${socket.displayName} ${action === 'promote_global_admin' ? 'promoted' : 'demoted'} ${targetDisp} ${action === 'promote_global_admin' ? 'to' : 'from'} Global Admin.`);
             const roomsToUpdate = new Set(targetUserDoc.servers); roomsToUpdate.add('global');
             roomsToUpdate.forEach(c => broadcastOnlineUsers(c));
             
@@ -352,7 +409,7 @@ io.on('connection', (socket) => {
                 if (!srv.moderators.includes(targetUser)) {
                     srv.moderators.push(targetUser);
                     await srv.save();
-                    io.to(serverCode).emit('system_message', `${socket.username} promoted ${targetUser} to Room Moderator.`);
+                    io.to(serverCode).emit('system_message', `${socket.displayName} promoted ${targetDisp} to Room Moderator.`);
                 }
                 broadcastOnlineUsers(serverCode);
                 io.to(serverCode).emit('room_role_updated', { username: targetUser, targetServer: serverCode });
@@ -363,7 +420,7 @@ io.on('connection', (socket) => {
                 if (srv.moderators) {
                     srv.moderators = srv.moderators.filter(u => u !== targetUser);
                     await srv.save();
-                    io.to(serverCode).emit('system_message', `${socket.username} removed ${targetUser}'s Room Moderator role.`);
+                    io.to(serverCode).emit('system_message', `${socket.displayName} removed ${targetDisp}'s Room Moderator role.`);
                 }
                 broadcastOnlineUsers(serverCode);
                 io.to(serverCode).emit('room_role_updated', { username: targetUser, targetServer: serverCode });
@@ -415,7 +472,7 @@ io.on('connection', (socket) => {
         broadcastOnlineUsers(srv.code);
 
         if (socket.serverCode === srv.code) { 
-            socket.to(srv.code).emit('system_message', `${socket.username} joined.`); 
+            socket.to(srv.code).emit('system_message', `${socket.displayName} joined.`); 
         }
       }
       callback({ success: true, server: srv });
@@ -434,7 +491,7 @@ io.on('connection', (socket) => {
         broadcastOnlineUsers(code);
 
         if (socket.serverCode === code) { 
-            socket.to(code).emit('system_message', `${socket.username} left the server.`); 
+            socket.to(code).emit('system_message', `${socket.displayName} left the server.`); 
         }
       }
       callback({ success: true });
@@ -518,19 +575,18 @@ io.on('connection', (socket) => {
     if (!cleanText && !attachment) return; 
 
     const roomRole = await getRoomRole(socket.serverCode, socket.username);
-    if (socket.role !== 'admin' && roomRole !== 'mod') {
-        cleanText = cleanText.replace(/@everyone/gi, 'everyone');
-    }
+
+    cleanText = await resolvePings(cleanText, socket.serverCode, socket.role, roomRole, socket.username);
 
     try {
       const msg = await Message.create({ 
-          serverCode: socket.serverCode, username: socket.username, role: socket.role, roomRole: roomRole,
-          color: socket.color, avatarUrl: socket.avatarUrl, text: cleanText, attachment: attachment, replyTo: replyTo,
-          reactions: {} 
+          serverCode: socket.serverCode, username: socket.username, displayName: socket.displayName, 
+          role: socket.role, roomRole: roomRole, color: socket.color, avatarUrl: socket.avatarUrl, 
+          text: cleanText, attachment: attachment, replyTo: replyTo, reactions: {} 
       });
       
       io.to(socket.serverCode).emit('chat_message', { 
-          _id: msg._id, username: msg.username, role: socket.role, roomRole: roomRole, color: msg.color, avatarUrl: msg.avatarUrl,
+          _id: msg._id, username: msg.username, displayName: msg.displayName, role: socket.role, roomRole: roomRole, color: msg.color, avatarUrl: msg.avatarUrl,
           text: msg.text, attachment: msg.attachment, replyTo: msg.replyTo, reactions: {}, timestamp: msg.timestamp, edited: false, deleted: false 
       });
     } catch (err) {}
@@ -572,17 +628,21 @@ io.on('connection', (socket) => {
       if (!cleanText) return;
 
       const msg = await Message.findById(data.id);
-      if (msg && !msg.deleted && msg.text !== cleanText) {
-        
+      if (msg && !msg.deleted) {
         const roomRole = await getRoomRole(msg.serverCode, socket.username);
 
-        // Editing permits: Sender, Global Admin, or Room Mod
+        // Edit allowed for Sender, Global Admin, or Room Mod
         if (msg.username === socket.username || socket.role === 'admin' || roomRole === 'mod') {
-          if (!msg.history) msg.history = []; 
-          msg.history.push({ text: msg.text, timestamp: new Date() });
-          msg.text = cleanText; msg.edited = true; msg.markModified('history'); 
-          await msg.save();
-          io.to(socket.serverCode).emit('message_edited', { id: msg._id, username: msg.username, role: msg.role, roomRole: msg.roomRole, text: cleanText });
+          
+          cleanText = await resolvePings(cleanText, msg.serverCode, socket.role, roomRole, socket.username);
+
+          if (msg.text !== cleanText) {
+              if (!msg.history) msg.history = []; 
+              msg.history.push({ text: msg.text, timestamp: new Date() });
+              msg.text = cleanText; msg.edited = true; msg.markModified('history'); 
+              await msg.save();
+              io.to(socket.serverCode).emit('message_edited', { id: msg._id, username: msg.username, role: msg.role, roomRole: msg.roomRole, text: cleanText });
+          }
         }
       }
     } catch (err) {}
@@ -635,6 +695,7 @@ io.on('connection', (socket) => {
   socket.on('typing', (isTyping) => {
     if (!socket.username || !socket.serverCode) return;
     const isVisible = socket.role !== 'admin' || socket.joinedServers.includes(socket.serverCode) || socket.serverCode === 'global';
+    
     if (isVisible) socket.to(socket.serverCode).emit('typing', { username: socket.username, isTyping });
   });
 
@@ -643,6 +704,7 @@ io.on('connection', (socket) => {
       const session = onlineUsers.get(socket.id);
       const serverCode = session?.serverCode;
       const joinedServers = session?.joinedServers || [];
+      const dName = session?.displayName || socket.username;
       
       onlineUsers.delete(socket.id);
       
@@ -652,7 +714,10 @@ io.on('connection', (socket) => {
 
       if (serverCode) {
         const isVisible = socket.role !== 'admin' || (joinedServers && joinedServers.includes(serverCode)) || serverCode === 'global';
-        if (isVisible) io.to(serverCode).emit('system_message', `${socket.username} disconnected.`);
+        if (isVisible) {
+            io.to(serverCode).emit('system_message', `${dName} disconnected.`);
+            io.to(serverCode).emit('typing', { username: socket.username, isTyping: false });
+        }
       }
     }
   });

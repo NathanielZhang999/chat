@@ -101,10 +101,10 @@
             100% { opacity: 1; transform: translateY(0) scale(1); }
         }
         
-        .msg { display: flex; flex-direction: row; gap: 14px; position: relative; padding: 0.4rem 1rem; border-left: 3px solid transparent; margin-top: 5px; animation: messageSlideIn 0.3s cubic-bezier(0.18, 0.89, 0.32, 1.28) forwards; transition: background 0.15s ease, border-left-color 0.15s ease; }
+        .msg { display: flex; flex-direction: row; gap: 14px; position: relative; padding: 0.4rem 1rem; border-left: 4px solid transparent; margin-top: 5px; animation: messageSlideIn 0.3s cubic-bezier(0.18, 0.89, 0.32, 1.28) forwards; transition: background 0.15s ease, border-left-color 0.15s ease; }
         .msg:hover { background: rgba(4, 4, 5, 0.07); }
         
-        /* Highlight specific for pinged messages */
+        /* Message highlight specifically for YOU when pinged */
         .msg.pinged { background: rgba(250, 166, 26, 0.1) !important; border-left-color: var(--warning) !important; }
         
         .msg-avatar { width: 40px; height: 40px; border-radius: 50%; flex-shrink: 0; overflow: hidden; display: flex; align-items: center; justify-content: center; font-weight: bold; font-size: 1.2rem; color: white; margin-top: 2px; cursor: pointer; transition: transform 0.2s;}
@@ -150,12 +150,10 @@
         .chat-link { color: #00b0f4; text-decoration: none; word-break: break-all; }
         .chat-link:hover { text-decoration: underline; }
 
-        /* Ping Mentions - Matching Screenshot */
+        /* Ping Mentions Pill - Matches exact styling for EVERYONE viewing */
         .ping-tag { background: rgba(88, 101, 242, 0.3); color: #c9cdfb; padding: 0 4px; border-radius: 3px; font-weight: 500; transition: background 0.15s; cursor: pointer; }
-        .ping-tag:hover { background: rgba(88, 101, 242, 0.6); color: white; }
+        .ping-tag:hover { background: rgba(88, 101, 242, 0.6); color: white; text-decoration: none;}
         .ping-tag.everyone { background: rgba(88, 101, 242, 0.3); color: #c9cdfb; }
-        .ping-tag.other { background: transparent; color: #c9cdfb; padding: 0; }
-        .ping-tag.other:hover { background: transparent; text-decoration: underline; }
         
         .edited-tag { font-size: 0.7rem; color: var(--text-muted); margin-left: 5px; cursor: pointer; user-select: none; }
         .edited-tag:hover { text-decoration: underline; }
@@ -176,11 +174,10 @@
         
         /* Updated Hideable Typing Indicator */
         #typing-indicator { 
-            padding: 0 1rem; font-size: 0.85rem; color: white; height: 20px; font-weight: 600; 
-            display: flex; align-items: center; position: absolute; bottom: 85px; left: 0; 
-            transition: opacity 0.2s, visibility 0.2s; opacity: 0; visibility: hidden; pointer-events: none;
+            padding: 0 1rem; font-size: 0.85rem; color: var(--text-muted); font-weight: 600; 
+            display: flex; align-items: center; height: 0; opacity: 0; overflow: hidden; transition: all 0.2s;
         }
-        #typing-indicator.show { opacity: 1; visibility: visible; }
+        #typing-indicator.show { height: 24px; opacity: 1; margin-bottom: 8px; }
         
         /* --- DYNAMIC SLIDING PANELS --- */
         .compose-addon { 
@@ -265,6 +262,11 @@
             opacity: 0; visibility: hidden; transform: scale(0.95); transition: 0.15s cubic-bezier(0.18, 0.89, 0.32, 1.28);
         }
         .context-menu.show { opacity: 1; visibility: visible; transform: scale(1); pointer-events: auto; }
+        
+        .ctx-header { padding: 10px 12px; border-bottom: 1px solid var(--border); margin-bottom: 4px; pointer-events: none; display: flex; flex-direction: column; gap: 2px; }
+        .ctx-header .d-name { font-weight: bold; color: white; font-size: 0.95rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;}
+        .ctx-header .u-name { font-size: 0.75rem; color: var(--text-muted); font-family: monospace;}
+        
         .ctx-btn {
             background: transparent; border: none; color: var(--text); padding: 8px 12px;
             text-align: left; border-radius: 4px; cursor: pointer; font-size: 0.85rem; font-weight: 600; transition: 0.1s;
@@ -306,6 +308,10 @@
             <h2>Profile Settings</h2>
             
             <div class="input-group">
+                <label>Display Name</label>
+                <input type="text" id="setting-displayname" class="text-input" placeholder="Your Display Name" maxlength="20" oninput="this.value = this.value.replace(/[^a-zA-Z0-9_-]/g, '')">
+            </div>
+            <div class="input-group">
                 <label>Custom Avatar Image URL (Optional)</label>
                 <input type="text" id="setting-avatar" class="text-input" placeholder="https://imgur.com/my-pic.png">
             </div>
@@ -344,7 +350,13 @@
             </div>
             <div id="auth-form-fields">
                 <div class="input-group"><label>Backend URL</label><input type="text" id="url-input" class="text-input" placeholder="https://your-app.onrender.com"></div>
-                <div class="input-group"><label>Username</label><input type="text" id="username-input" class="text-input" maxlength="20"></div>
+                
+                <div class="input-group" id="displayname-group" style="display:none;">
+                    <label>Display Name</label>
+                    <input type="text" id="displayname-input" class="text-input" placeholder="Your visible name" maxlength="20" oninput="this.value = this.value.replace(/[^a-zA-Z0-9_-]/g, '')">
+                </div>
+                
+                <div class="input-group"><label>Username</label><input type="text" id="username-input" class="text-input" maxlength="20" placeholder="Unique ID (e.g. john123)"></div>
                 <div class="input-group"><label>Password</label><input type="password" id="password-input" class="text-input" placeholder="Min 6 characters"></div>
             </div>
             <button id="auth-btn" class="btn-primary">Login</button>
@@ -512,6 +524,7 @@
     // --- MAIN STATE ---
     let socket;
     let myUsername = "";
+    let myDisplayName = "";
     let myRole = "user"; 
     let myRoomRole = "user"; 
     let myAvatarUrl = "";
@@ -519,10 +532,11 @@
     let currentServerCode = null; 
     let myJoinedServers = []; 
     let serversCache = { 'global': { name: 'Global Chat', owner: 'System' } }; 
-    
+    let usersCache = {}; 
+
     let isLoginMode = true;
     let typingTimeout;
-    const typingUsers = new Set();
+    const typingUsers = new Map();
     
     let editingMsgId = null;
     let replyingToData = null; 
@@ -544,8 +558,23 @@
         fields.style.animation = 'fadePop 0.25s ease-out backwards';
     }
 
-    document.getElementById('tab-login').onclick = function() { isLoginMode = true; this.classList.add('active'); document.getElementById('tab-register').classList.remove('active'); authBtn.textContent = 'Login'; authError.textContent = ''; animateAuthTabSwap(); };
-    document.getElementById('tab-register').onclick = function() { isLoginMode = false; this.classList.add('active'); document.getElementById('tab-login').classList.remove('active'); authBtn.textContent = 'Register'; authError.textContent = ''; animateAuthTabSwap(); };
+    document.getElementById('tab-login').onclick = function() { 
+        isLoginMode = true; 
+        this.classList.add('active'); 
+        document.getElementById('tab-register').classList.remove('active'); 
+        document.getElementById('displayname-group').style.display = 'none';
+        authBtn.textContent = 'Login'; authError.textContent = ''; 
+        animateAuthTabSwap(); 
+    };
+    
+    document.getElementById('tab-register').onclick = function() { 
+        isLoginMode = false; 
+        this.classList.add('active'); 
+        document.getElementById('tab-login').classList.remove('active'); 
+        document.getElementById('displayname-group').style.display = 'block';
+        authBtn.textContent = 'Register'; authError.textContent = ''; 
+        animateAuthTabSwap(); 
+    };
 
     // --- EMOJI PICKERS ENGINE ---
     const EMOJIS = ['😀','😂','😅','🤣','😉','😊','😇','😍','😘','😋','😛','😜','🤪','😎','🤩','🥳','😏','😒','😞','😔','😟','😕','🙁','😣','😖','😫','😩','🥺','😢','😭','😤','😠','😡','🤬','🤯','😳','🥵','🥶','😱','😨','😰','😥','😓','🤗','🤔','🤭','🤫','🤥','😶','😐','😑','😬','🙄','😯','😦','😧','😮','😲','🥱','😴','🤤','😪','😵','🤐','🥴','🤢','🤮','🤧','😷','🤒','🤕','🤑','🤠','😈','👿','👹','👺','🤡','💩','👻','💀','👽','👾','🤖','🎃','😺','😸','😹','😻','😼','😽','🙀','😿','😾','👋','🤚','🖐','✋','🖖','👌','🤏','✌️','🤞','🤟','🤘','🤙','👈','👉','👆','🖕','👇','☝️','👍','👎','✊','👊','🤛','🤜','👏','🙌','👐','🤲','🤝','🙏','✍️','💅','🤳','💪','🦾','🦿','🦵','🦶','👂','🦻','👃','🫀','🫁','🧠','🦷','🦴','👀','👁','👅','👄','💋','🩸','🔥','❤️','💯','✨','⭐'];
@@ -621,6 +650,7 @@
     });
 
     function openSettings() {
+        document.getElementById('setting-displayname').value = myDisplayName || "";
         document.getElementById('setting-avatar').value = myAvatarUrl || "";
         document.getElementById('setting-color-text').value = myColor || "";
         document.getElementById('setting-old-password').value = "";
@@ -632,18 +662,23 @@
     }
 
     document.getElementById('save-settings-btn').onclick = () => {
+        const dName = document.getElementById('setting-displayname').value.trim();
         const avatarUrl = document.getElementById('setting-avatar').value.trim();
         let color = document.getElementById('setting-color-text').value.trim();
         if (color && !color.startsWith('#') && color.length === 6) color = '#' + color; 
         
+        if (!dName) return showAppAlert("Error", "Display Name cannot be empty.");
+
         const btn = document.getElementById('save-settings-btn');
         btn.textContent = "Saving..."; btn.disabled = true;
 
-        socket.emit('update_profile', { avatarUrl, color: color }, (res) => {
+        socket.emit('update_profile', { displayName: dName, avatarUrl, color: color }, (res) => {
             btn.textContent = "Save Profile"; btn.disabled = false;
             if(res.error) { showAppAlert("Error", res.error || "Failed to update profile."); } 
             else {
-                myAvatarUrl = res.avatarUrl; myColor = res.color;
+                myDisplayName = res.displayName || myUsername;
+                myAvatarUrl = res.avatarUrl; 
+                myColor = res.color;
                 showAppAlert("Success", "Profile updated! Your new look will apply immediately.");
             }
         });
@@ -679,8 +714,8 @@
         }
     };
 
-    // --- HTML ESCAPE & MARKDOWN ENGINE ---
-    function formatMessageText(text, author, authorRole, authorRoomRole) {
+    // --- HTML ESCAPE & BACKEND SMART PING PARSING ---
+    function formatMessageText(text) {
         let safeText = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 
         let autoEmbeds = [];
@@ -699,16 +734,18 @@
         safeText = safeText.replace(/`(.*?)`/g, '<code>$1</code>');               
 
         let isPinged = false;
-        safeText = safeText.replace(/(@[a-zA-Z0-9_]+)/g, (match) => {
-            const name = match.substring(1).toLowerCase();
-            const isAdminOrMod = authorRole === 'admin' || authorRoomRole === 'mod' || author.toLowerCase() === 'nyzhang1';
+        
+        // Render exactly verified pings from the backend
+        safeText = safeText.replace(/\{\{PING:(.*?)\|(.*?)\}\}/g, (match, uname, dname) => {
+            // Check if WE are pinged so we can highlight the entire message
+            if (uname === myUsername || dname === myDisplayName || uname === 'everyone') {
+                isPinged = true;
+            }
             
-            if (name === 'everyone' && isAdminOrMod) {
-                isPinged = true; return `<span class="ping-tag everyone">${match}</span>`;
-            } else if (name === myUsername.toLowerCase()) {
-                isPinged = true; return `<span class="ping-tag">${match}</span>`;
+            if (uname === 'everyone') {
+                return `<span class="ping-tag everyone">@everyone</span>`;
             } else {
-                return `<span class="ping-tag other">${match}</span>`;
+                return `<span class="ping-tag">@${dname}</span>`;
             }
         });
 
@@ -726,8 +763,11 @@
         let url = document.getElementById('url-input').value.trim();
         const user = document.getElementById('username-input').value.trim();
         const pass = document.getElementById('password-input').value;
+        const dName = document.getElementById('displayname-input').value.trim();
 
-        if (!url || !user || !pass) return showError('All fields required.', false);
+        if (!url || !user || !pass) return showError('All required fields missing.', false);
+        if (!isLoginMode && !dName) return showError('Please set a Display Name.', false);
+        
         if (!url.startsWith('http')) url = 'https://' + url;
         url = url.replace(/\/$/, ''); 
         
@@ -739,8 +779,10 @@
         if (!socket) { socket = io(url, { reconnectionAttempts: Infinity }); setupSocket(); }
 
         const action = isLoginMode ? 'login' : 'register';
+        const payload = isLoginMode ? { username: user, password: pass } : { username: user, password: pass, displayName: dName };
+        
         const doAuth = () => {
-            socket.emit(action, { username: user, password: pass }, (res) => {
+            socket.emit(action, payload, (res) => {
                 authBtn.disabled = false;
                 if (res.error) return showError(res.error, false);
                 
@@ -750,6 +792,7 @@
                     setTimeout(() => document.getElementById('tab-login').click(), 1000);
                 } else {
                     myUsername = res.username;
+                    myDisplayName = res.displayName || res.username;
                     myRole = res.role || 'user';
                     myRoomRole = 'user'; 
                     myJoinedServers = res.joinedServers || ['global'];
@@ -784,16 +827,14 @@
             typingUsers.delete(msg.username); updateTypingUI(); 
             
             if (!isMe) {
-                const lowerText = (msg.text||'').toLowerCase();
-                const isAdminOrMod = msg.role === 'admin' || msg.roomRole === 'mod' || msg.username.toLowerCase() === 'nyzhang1';
-                const isPinged = lowerText.includes(`@${myUsername.toLowerCase()}`) || (lowerText.includes('@everyone') && isAdminOrMod);
+                // Determine if we need to play the special Ping sound
+                const isPinged = (msg.text||'').includes(`{{PING:${myUsername}|`) || (msg.text||'').includes(`|${myDisplayName}}}`) || (msg.text||'').includes('{{PING:everyone|everyone}}');
                 playSound(isPinged ? 'ping' : 'msg');
             }
         });
         
         socket.on('system_message', (txt) => appendSystemMessage(txt));
 
-        // Sync role updates dynamically
         socket.on('global_role_updated', (data) => {
             if (data.username === myUsername) {
                 myRole = data.role;
@@ -809,7 +850,7 @@
         });
         
         socket.on('profile_updated', (data) => {
-            if (data.username === myUsername) { myColor = data.color; myAvatarUrl = data.avatarUrl; }
+            if (data.username === myUsername) { myColor = data.color; myAvatarUrl = data.avatarUrl; myDisplayName = data.displayName || data.username; }
             document.querySelectorAll(`.msg[data-author="${data.username}"]`).forEach(el => {
                 if (el.classList.contains('deleted-compact')) return;
                 
@@ -818,17 +859,18 @@
                 if(!authorDiv || !avatarDiv) return;
                 
                 const cToUse = data.color || getUserColor(data.username);
+                authorDiv.textContent = data.displayName || data.username;
                 authorDiv.style.color = cToUse;
                 
                 if (data.avatarUrl) {
                     avatarDiv.style.background = 'transparent';
                     avatarDiv.innerHTML = '';
                     const img = document.createElement('img'); img.src = data.avatarUrl;
-                    img.onerror = () => { img.style.display='none'; avatarDiv.textContent=data.username.charAt(0).toUpperCase(); avatarDiv.style.background=cToUse; };
+                    img.onerror = () => { img.style.display='none'; avatarDiv.textContent=(data.displayName||data.username).charAt(0).toUpperCase(); avatarDiv.style.background=cToUse; };
                     avatarDiv.appendChild(img);
                 } else {
                     avatarDiv.innerHTML = '';
-                    avatarDiv.textContent = data.username.charAt(0).toUpperCase();
+                    avatarDiv.textContent = (data.displayName||data.username).charAt(0).toUpperCase();
                     avatarDiv.style.background = cToUse;
                 }
             });
@@ -839,7 +881,7 @@
                 el.setAttribute('data-raw-text', data.text); 
                 el.classList.remove('pinged'); 
                 
-                const { html, autoEmbeds, isPinged } = formatMessageText(data.text, data.username, data.role, data.roomRole);
+                const { html, autoEmbeds, isPinged } = formatMessageText(data.text);
                 
                 const oldSpan = el.querySelector('.msg-text-content');
                 if (oldSpan) {
@@ -854,6 +896,7 @@
                     });
                 }
                 
+                // Show Highlight Border For Everyone if edited to contain a ping meant for YOU
                 if (isPinged && data.username !== myUsername) el.classList.add('pinged');
 
                 if (!el.querySelector('.edited-tag')) {
@@ -872,8 +915,8 @@
 
         socket.on('message_deleted', (id) => { 
             document.querySelectorAll(`.msg[data-id="${id}"]`).forEach(el => {
-                const authorName = el.getAttribute('data-author') || 'Someone';
-                const isMe = authorName === myUsername;
+                const authorName = el.getAttribute('data-display') || el.getAttribute('data-author') || 'Someone';
+                const isMe = el.getAttribute('data-author') === myUsername;
                 
                 el.style.animation = 'none';
                 el.offsetHeight; 
@@ -925,7 +968,8 @@
             const list = document.getElementById('online-list');
             list.innerHTML = '';
             
-            // Sync my effective Room Role whenever list updates
+            usersCache = {}; // Rebuild local lookup
+
             const me = users.find(u => u.username === myUsername);
             if (me) myRoomRole = me.roomRole || 'user';
 
@@ -943,11 +987,14 @@
             if (isHiddenAdmin) {
                 const li = document.createElement('li'); 
                 li.className = "user-item stealth-admin"; 
-                li.innerHTML = `<div class="avatar" style="background:var(--error)">A<div class="status-dot online" style="background:var(--warning);"></div></div><div style="color:var(--warning); font-style:italic;">${myUsername} (Ghost)</div>`;
+                li.innerHTML = `<div class="avatar" style="background:var(--error)">A<div class="status-dot online" style="background:var(--warning);"></div></div><div style="color:var(--warning); font-style:italic;">${myDisplayName} (Ghost)</div>`;
                 list.appendChild(li);
+                usersCache[myUsername] = myDisplayName;
             }
 
             users.forEach((u, index) => {
+                usersCache[u.username] = u.displayName || u.username;
+
                 const li = document.createElement('li');
                 li.className = "user-item";
                 if (u.online === false && !isGlobal) li.classList.add('offline');
@@ -959,44 +1006,52 @@
 
                 const cToUse = u.color || getUserColor(u.username);
                 const dotClass = u.online !== false ? 'online' : 'offline';
+                const dName = u.displayName || u.username;
                 
                 let avatarHTML = '';
                 if (u.avatarUrl && u.avatarUrl.startsWith('http')) {
-                    avatarHTML = `<div class="avatar" style="background:transparent;"><img src="${u.avatarUrl.replace(/"/g, '&quot;')}" onerror="this.style.display='none'; this.parentNode.textContent='${u.username.charAt(0).toUpperCase()}'; this.parentNode.style.background='${cToUse}';"><div class="status-dot ${dotClass}"></div></div>`;
+                    avatarHTML = `<div class="avatar" style="background:transparent;"><img src="${u.avatarUrl.replace(/"/g, '&quot;')}" onerror="this.style.display='none'; this.parentNode.textContent='${dName.charAt(0).toUpperCase()}'; this.parentNode.style.background='${cToUse}';"><div class="status-dot ${dotClass}"></div></div>`;
                 } else {
-                    avatarHTML = `<div class="avatar" style="background:${cToUse}">${u.username.charAt(0).toUpperCase()}<div class="status-dot ${dotClass}"></div></div>`;
+                    avatarHTML = `<div class="avatar" style="background:${cToUse}">${dName.charAt(0).toUpperCase()}<div class="status-dot ${dotClass}"></div></div>`;
                 }
 
-                li.innerHTML = `${avatarHTML}<div style="color:${cToUse}; font-weight:600;">${u.username}${u.username === myUsername ? " (You)" : ""}${roleBadge}</div>`;
+                li.innerHTML = `${avatarHTML}<div style="color:${cToUse}; font-weight:600;">${dName}${u.username === myUsername ? " (You)" : ""}${roleBadge}</div>`;
                 
-                li.onclick = (e) => {
-                    if (u.username !== myUsername) {
-                        openRoleManager(e, u);
-                    }
-                };
+                li.onclick = (e) => { openRoleManager(e, u); };
 
                 list.appendChild(li);
             });
         });
 
-        socket.on('typing', (data) => { if (data.isTyping) typingUsers.add(data.username); else typingUsers.delete(data.username); updateTypingUI(); });
+        socket.on('typing', (data) => { 
+            if (data.isTyping) typingUsers.set(data.username, data.displayName); 
+            else typingUsers.delete(data.username); 
+            updateTypingUI(); 
+        });
     }
 
-    // --- CONTEXT MENU MANAGER ---
+    // --- CONTEXT MENU MANAGER (PROFILES & ROLES) ---
     function openRoleManager(e, u) {
         e.stopPropagation();
         const existing = document.getElementById('user-context-menu');
         if (existing) existing.remove();
 
-        const isGlobalAdmin = myRole === 'admin';
-        const isRoomMod = myRoomRole === 'mod' || isGlobalAdmin;
-
-        if (!isGlobalAdmin && !isRoomMod) return;
-
         const menu = document.createElement('div');
         menu.id = 'user-context-menu';
         menu.className = 'context-menu';
         menu.style.display = 'flex';
+
+        // Profile Display Header
+        const header = document.createElement('div');
+        header.className = 'ctx-header';
+        header.innerHTML = `<div class="d-name">${u.displayName || u.username}</div>
+                            <div class="u-name">@${u.username}</div>`;
+        menu.appendChild(header);
+
+        const isGlobalAdmin = myRole === 'admin';
+        const isRoomMod = myRoomRole === 'mod' || isGlobalAdmin;
+        
+        let optionsAdded = false;
 
         const createBtn = (text, onClick, isDanger=false) => {
             const btn = document.createElement('button');
@@ -1006,47 +1061,52 @@
             btn.onclick = () => { onClick(); menu.remove(); };
             return btn;
         };
-
-        let added = false;
         
-        // --- GLOBAL ADMIN ACTIONS ---
-        if (isGlobalAdmin) {
-            if (u.role !== 'admin') {
-                menu.appendChild(createBtn('Promote to Global Admin', () => {
-                    socket.emit('manage_role', { targetUser: u.username, action: 'promote_global_admin' }, (res) => { if(res.error) showAppAlert('Error', res.error); });
-                }));
-                added = true;
-            } else if (u.username.toLowerCase() !== 'nyzhang1') {
-                menu.appendChild(createBtn('Remove Global Admin', () => {
-                    socket.emit('manage_role', { targetUser: u.username, action: 'demote_global_admin' }, (res) => { if(res.error) showAppAlert('Error', res.error); });
-                }, true));
-                added = true;
-            }
-        } 
-        
-        // --- ROOM MODERATOR ACTIONS ---
-        if (currentServerCode !== 'global') {
-            if (isGlobalAdmin || isRoomMod) {
-                // Promote normal users to Mod
-                if (u.roomRole !== 'mod' && u.role !== 'admin') {
-                    menu.appendChild(createBtn('Promote to Room Moderator', () => {
-                        socket.emit('manage_role', { targetUser: u.username, action: 'promote_mod', serverCode: currentServerCode }, (res) => { if(res.error) showAppAlert('Error', res.error); });
-                    }));
-                    added = true;
-                }
-            }
+        if (u.username !== myUsername) {
+            // --- GLOBAL ADMIN ACTIONS ---
             if (isGlobalAdmin) {
-                // Demote from Mod (Only Global Admins)
-                if (u.roomRole === 'mod' && u.role !== 'admin') {
-                    menu.appendChild(createBtn('Remove Room Moderator', () => {
-                        socket.emit('manage_role', { targetUser: u.username, action: 'demote_mod', serverCode: currentServerCode }, (res) => { if(res.error) showAppAlert('Error', res.error); });
+                if (u.role !== 'admin') {
+                    menu.appendChild(createBtn('Promote to Global Admin', () => {
+                        socket.emit('manage_role', { targetUser: u.username, action: 'promote_global_admin' }, (res) => { if(res.error) showAppAlert('Error', res.error); });
+                    }));
+                    optionsAdded = true;
+                } else if (u.username.toLowerCase() !== 'nyzhang1') {
+                    menu.appendChild(createBtn('Remove Global Admin', () => {
+                        socket.emit('manage_role', { targetUser: u.username, action: 'demote_global_admin' }, (res) => { if(res.error) showAppAlert('Error', res.error); });
                     }, true));
-                    added = true;
+                    optionsAdded = true;
+                }
+            } 
+            
+            // --- ROOM MODERATOR ACTIONS ---
+            if (currentServerCode !== 'global') {
+                if (isGlobalAdmin || isRoomMod) {
+                    if (u.roomRole !== 'mod' && u.role !== 'admin') {
+                        menu.appendChild(createBtn('Promote to Room Moderator', () => {
+                            socket.emit('manage_role', { targetUser: u.username, action: 'promote_mod', serverCode: currentServerCode }, (res) => { if(res.error) showAppAlert('Error', res.error); });
+                        }));
+                        optionsAdded = true;
+                    }
+                }
+                if (isGlobalAdmin) { // Only Global Admins can demote moderators
+                    if (u.roomRole === 'mod' && u.role !== 'admin') {
+                        menu.appendChild(createBtn('Remove Room Moderator', () => {
+                            socket.emit('manage_role', { targetUser: u.username, action: 'demote_mod', serverCode: currentServerCode }, (res) => { if(res.error) showAppAlert('Error', res.error); });
+                        }, true));
+                        optionsAdded = true;
+                    }
                 }
             }
         }
 
-        if (!added) return;
+        if (!optionsAdded) {
+            const noActions = document.createElement('div');
+            noActions.style.padding = '8px 12px';
+            noActions.style.fontSize = '0.75rem';
+            noActions.style.color = 'var(--text-muted)';
+            noActions.textContent = 'No actions available';
+            menu.appendChild(noActions);
+        }
 
         document.body.appendChild(menu);
         
@@ -1167,7 +1227,7 @@
                 myRoomRole = res.roomRole || 'user'; // Ensure synced before appending messages
 
                 let titleHtml = srv.name;
-                if (myRole === 'admin') titleHtml += ' <span class="admin-badge" title="Global Admin" style="background:#ed4245; border-color:#ed4245;">ADMIN</span>';
+                if (myRole === 'admin') titleHtml += ' <span class="admin-badge" style="background:#ed4245; border-color:#ed4245;">ADMIN</span>';
                 else if (myRoomRole === 'mod') titleHtml += ' <span class="admin-badge mod-badge" title="Moderator" style="background:#faa61a; border-color:#d58512;">MOD</span>';
                 if (isStealth) titleHtml += ' <span style="color:var(--warning); font-size:0.8rem; font-style:italic;">(Ghost)</span>';
                 
@@ -1303,22 +1363,26 @@
         
         const rawText = document.querySelector(`.msg[data-id="${id}"]`).getAttribute('data-raw-text') || "";
         
+        // Convert internal {{PING:...}} tokens back to raw readable @DisplayName for the input field
+        const editText = rawText.replace(/\{\{PING:(.*?)\|(.*?)\}\}/g, '@$2');
+        
         document.getElementById('info-bar-text').innerHTML = `✏️ Editing Message`;
-        msgInput.value = rawText;
+        msgInput.value = editText;
         msgInput.focus(); sendBtn.textContent = 'Save'; sendBtn.style.background = '#4752c4';
     }
 
-    function initiateReply(id, username, currentTextElement) {
+    function initiateReply(id, displayname, currentTextElement) {
         if (!currentTextElement) return;
         cancelAction(); 
         
         let rawText = document.querySelector(`.msg[data-id="${id}"]`).getAttribute('data-raw-text') || "";
+        rawText = rawText.replace(/\{\{PING:(.*?)\|(.*?)\}\}/g, '@$2');
         let shortText = rawText.length > 50 ? rawText.substring(0, 50) + '...' : rawText;
         if (!shortText) shortText = "Image Attachment";
         
-        replyingToData = { id, username, text: shortText };
+        replyingToData = { id, displayname, text: shortText };
         document.getElementById('info-bar').classList.add('show'); 
-        document.getElementById('info-bar-text').innerHTML = `↳ Replying to <strong>@${username}</strong>`;
+        document.getElementById('info-bar-text').innerHTML = `↳ Replying to <strong>@${displayname}</strong>`;
         msgInput.focus();
     }
     
@@ -1345,7 +1409,7 @@
                     timeDiv.textContent = `Version ${index + 1} • ${formatExactDate(item.timestamp)}`;
                     const textDiv = document.createElement('div'); textDiv.className = 'hist-text';
                     
-                    const { html } = formatMessageText(item.text, '', 'user', 'user');
+                    const { html } = formatMessageText(item.text);
                     const span = document.createElement('span'); span.innerHTML = html;
                     textDiv.appendChild(span);
                     
@@ -1369,7 +1433,7 @@
 
             const textDiv = document.createElement('div'); textDiv.className = 'hist-text';
             if(res.text) {
-                const { html } = formatMessageText(res.text, '', 'user', 'user');
+                const { html } = formatMessageText(res.text);
                 const span = document.createElement('span'); span.innerHTML = html;
                 textDiv.appendChild(span);
             }
@@ -1393,14 +1457,16 @@
         const wrapper = document.createElement('div');
         wrapper.setAttribute('data-id', data._id); 
         wrapper.setAttribute('data-author', data.username);
+        wrapper.setAttribute('data-display', data.displayName || data.username);
         wrapper.setAttribute('data-raw-text', data.text || ''); 
 
         // Both Global Admins and Room Mods can manage/edit messages
         const canManageMsg = isMe || myRole === 'admin' || (currentServerCode !== 'global' && myRoomRole === 'mod');
+        const displayAuthorName = data.displayName || data.username;
 
         if (data.deleted) {
             wrapper.className = 'msg deleted-compact is-deleted';
-            wrapper.innerHTML = `<span style="margin-right: 6px; font-size:0.9rem;">🗑️</span> <span class="deleted-text">${data.username} deleted a message.</span>`;
+            wrapper.innerHTML = `<span style="margin-right: 6px; font-size:0.9rem;">🗑️</span> <span class="deleted-text">${displayAuthorName} deleted a message.</span>`;
             
             if (canManageMsg) {
                 const viewTag = document.createElement('span'); 
@@ -1413,7 +1479,7 @@
         }
 
         wrapper.className = `msg`; 
-        
+
         const avatarDiv = document.createElement('div'); 
         avatarDiv.className = 'msg-avatar';
         const colorToUse = data.color || getUserColor(data.username);
@@ -1421,10 +1487,10 @@
         if (data.avatarUrl) {
             avatarDiv.style.background = 'transparent';
             const img = document.createElement('img'); img.src = data.avatarUrl;
-            img.onerror = () => { img.style.display='none'; avatarDiv.textContent=data.username.charAt(0).toUpperCase(); avatarDiv.style.background=colorToUse; };
+            img.onerror = () => { img.style.display='none'; avatarDiv.textContent=displayAuthorName.charAt(0).toUpperCase(); avatarDiv.style.background=colorToUse; };
             avatarDiv.appendChild(img);
         } else {
-            avatarDiv.textContent = data.username.charAt(0).toUpperCase();
+            avatarDiv.textContent = displayAuthorName.charAt(0).toUpperCase();
             avatarDiv.style.background = colorToUse;
         }
 
@@ -1432,8 +1498,13 @@
         
         if (data.replyTo && data.replyTo.id) {
             const rb = document.createElement('div'); rb.className = 'reply-context';
-            const safeText = document.createElement('span'); safeText.className = 'reply-text'; safeText.textContent = data.replyTo.text;
-            rb.innerHTML = `<span class="reply-author">@${data.replyTo.username}</span> `;
+            const safeText = document.createElement('span'); safeText.className = 'reply-text'; 
+            // Re-format the ping strings gracefully inside replies
+            let safeReplyText = data.replyTo.text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            safeReplyText = safeReplyText.replace(/\{\{PING:(.*?)\|(.*?)\}\}/g, '@$2');
+            safeText.innerHTML = safeReplyText;
+            
+            rb.innerHTML = `<span class="reply-author">@${data.replyTo.displayname}</span> `;
             rb.appendChild(safeText);
             
             rb.onclick = () => {
@@ -1446,7 +1517,7 @@
         const header = document.createElement('div'); header.className = 'msg-header';
         
         const author = document.createElement('div'); author.className = 'msg-author'; 
-        author.textContent = data.username; author.style.color = colorToUse;
+        author.textContent = displayAuthorName; author.style.color = colorToUse;
         header.appendChild(author);
 
         let badgeHTML = '';
@@ -1484,11 +1555,10 @@
         actions.appendChild(reactBtn);
 
         const replyBtn = document.createElement('button'); replyBtn.className = 'action-btn'; replyBtn.textContent = '↩️ Reply';
-        replyBtn.onclick = () => initiateReply(data._id, data.username, textDiv.querySelector('.msg-text-content'));
+        replyBtn.onclick = () => initiateReply(data._id, displayAuthorName, textDiv.querySelector('.msg-text-content'));
         actions.appendChild(replyBtn);
 
         if (canManageMsg) {
-            // Edit is available for sender, Global Admin, and Room Mods
             const editBtn = document.createElement('button'); editBtn.className = 'action-btn'; editBtn.textContent = '✏️ Edit';
             editBtn.onclick = () => initiateEdit(data._id, textDiv.querySelector('.msg-text-content'));
             actions.appendChild(editBtn);
@@ -1500,7 +1570,7 @@
         wrapper.appendChild(actions);
 
         if (data.text) {
-            const { html, autoEmbeds, isPinged } = formatMessageText(data.text, data.username, data.role, data.roomRole);
+            const { html, autoEmbeds, isPinged } = formatMessageText(data.text);
             
             const spanContent = document.createElement('span');
             spanContent.className = 'msg-text-content';
@@ -1515,7 +1585,7 @@
                 spanContent.appendChild(br); spanContent.appendChild(imgEl);
             });
             
-            // Apply Ping highlight to the entire message container
+            // Only Highlight the Full Message specifically IF the ping target was YOU.
             if (isPinged && !isMe) wrapper.classList.add('pinged');
 
             if (data.edited) {
@@ -1558,10 +1628,16 @@
         const ind = document.getElementById('typing-indicator');
         if (typingUsers.size === 0) {
             ind.classList.remove('show');
-            ind.textContent = ''; // Actively clears the text forcing :empty opacity CSS pseudo-class to hide it
+            // Timeout securely clears DOM structural text so it collapses flawlessly.
+            setTimeout(() => { if (!ind.classList.contains('show')) ind.textContent = ''; }, 200); 
         } else {
             ind.classList.add('show');
-            if (typingUsers.size === 1) ind.textContent = `${Array.from(typingUsers)[0]} is typing...`;
+            
+            if (typingUsers.size === 1) {
+                const typedUsername = Array.from(typingUsers.keys())[0];
+                const dName = typingUsers.get(typedUsername);
+                ind.textContent = `${dName} is typing...`;
+            }
             else ind.textContent = 'Multiple people are typing...';
         }
     }
