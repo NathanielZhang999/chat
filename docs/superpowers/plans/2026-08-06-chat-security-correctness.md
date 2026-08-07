@@ -2,15 +2,17 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Repair the confirmed backend authorization and validation defects plus the confirmed single-file frontend rendering and connection defects without changing intended chat workflows.
+**Goal:** Repair confirmed backend authorization and validation defects plus confirmed frontend rendering and connection defects while keeping the production chat application at exactly three files.
 
-**Architecture:** Keep `chat.html` as the only production frontend file. Extract dependency-free backend policy functions into `backend/lib/chat-security.js`, integrate them into the existing Socket.IO handlers, and test both the pure rules and their wiring with Node's built-in test runner.
+**Architecture:** Keep all backend helpers and the dependency-injected Socket.IO connection-handler factory in `backend/server.js`; keep all browser code in `chat.html`; keep scripts and deployment notes in `backend/package.json`. Add test-only files under `backend/test/` and exercise exported production behavior with in-memory socket and model fakes.
 
 **Tech Stack:** Node.js 22, CommonJS, `node:test`, Express 4, Socket.IO 4, Mongoose 8, bcryptjs, plain HTML/CSS/JavaScript.
 
 ## Global Constraints
 
-- Keep `chat.html` as the only production frontend file; do not create production `.js` or `.css` files.
+- The production chat application consists of exactly `chat.html`, `backend/server.js`, and `backend/package.json`.
+- Do not create another production JavaScript, CSS, HTML, README, environment, or helper file.
+- Test-only files under `backend/test/`, repository configuration, and Superpowers documents are not production application files.
 - Preserve Socket.IO event names, acknowledgement object shapes, MongoDB schemas, room roles, and visible workflows.
 - Preserve global-administrator ghost access to existing rooms.
 - Use Node's built-in test runner and add no production dependency.
@@ -18,24 +20,25 @@
 - Avatar URLs are HTTP(S) and at most 1,000 characters.
 - Attachments are JPEG, PNG, GIF, or WebP base64 data URLs no longer than 8,000,000 characters.
 - Edit history retains the 20 most recent previous versions.
-- Preserve the unstaged deletions of all three `Zone.Identifier` metadata files.
+- The original checkout's `Zone.Identifier` deletions remain untouched; the isolated worktree may retain its tracked copies.
+- Tests assert behavior and observable side effects, not source-code text.
 
 ---
 
-### Task 1: Add dependency-free security policy helpers
+### Task 1: Make the backend importable and add policy helpers
 
 **Files:**
-- Create: `backend/lib/chat-security.js`
-- Create: `backend/test/chat-security.test.js`
+- Modify: `backend/server.js`
 - Modify: `backend/package.json`
+- Create: `backend/test/chat-security.test.js`
 
 **Interfaces:**
-- Consumes: JavaScript primitives plus socket identity objects shaped as `{ role: string, joinedServers: string[] }`.
-- Produces: `safeAck`, `normalizeUsername`, `normalizeDisplayName`, `normalizeServerName`, `normalizeServerCode`, `isValidPassword`, `normalizeColor`, `normalizeAvatarUrl`, `isValidAttachment`, `isValidReaction`, `isValidObjectId`, `neutralizePingTokens`, `canAccessRoom`, `appendBoundedHistory`, and `createReplySnapshot`.
+- Produces from `backend/server.js`: `safeAck(callback)`, `normalizeUsername(value)`, `normalizeDisplayName(value)`, `normalizeServerName(value)`, `normalizeServerCode(value)`, `isValidPassword(value)`, `normalizeColor(value)`, `normalizeAvatarUrl(value)`, `isValidAttachment(value)`, `isValidReaction(value)`, `isValidObjectId(value)`, `neutralizePingTokens(text)`, `canAccessRoom(identity, serverCode)`, `appendBoundedHistory(history, entry, limit)`, `createReplySnapshot(message)`, and `start()`.
+- Keeps production execution through `if (require.main === module) start();` so requiring the file does not bind a port or connect to MongoDB.
 
-- [ ] **Step 1: Add the test command and write the failing helper tests**
+- [ ] **Step 1: Add the test command and write failing behavior tests**
 
-Update `backend/package.json` scripts to:
+Format `backend/package.json` conventionally and set:
 
 ```json
 "scripts": {
@@ -44,110 +47,103 @@ Update `backend/package.json` scripts to:
 }
 ```
 
-Create `backend/test/chat-security.test.js` with table-driven behavioral tests:
+Create `backend/test/chat-security.test.js`:
 
 ```js
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const {
-  safeAck,
-  normalizeUsername,
-  normalizeDisplayName,
-  normalizeServerName,
-  normalizeServerCode,
-  isValidPassword,
-  normalizeColor,
-  normalizeAvatarUrl,
-  isValidAttachment,
-  isValidReaction,
-  isValidObjectId,
-  neutralizePingTokens,
-  canAccessRoom,
-  appendBoundedHistory,
-  createReplySnapshot
-} = require('../lib/chat-security');
+const security = require('../server');
 
-test('safeAck returns a callable no-op when acknowledgement is omitted', () => {
-  assert.doesNotThrow(() => safeAck(undefined)({ error: 'ignored' }));
+test('requiring server.js does not start the HTTP server', () => {
+  assert.equal(typeof security.start, 'function');
+  assert.equal(security.server.listening, false);
+});
+
+test('safeAck preserves callbacks and replaces missing callbacks', () => {
+  assert.doesNotThrow(() => security.safeAck(undefined)({ error: 'ignored' }));
   let received;
-  safeAck(value => { received = value; })({ success: true });
+  security.safeAck(value => { received = value; })({ success: true });
   assert.deepEqual(received, { success: true });
 });
 
-test('identity and room values are normalized without truncating invalid input', () => {
-  assert.equal(normalizeUsername(' Alice_1 '), 'Alice_1');
-  assert.equal(normalizeUsername('x'.repeat(21)), null);
-  assert.equal(normalizeDisplayName(' Alice Smith '), 'Alice Smith');
-  assert.equal(normalizeDisplayName('<img>'), null);
-  assert.equal(normalizeServerName(' Team Room '), 'Team Room');
-  assert.equal(normalizeServerName('Room<script>'), null);
-  assert.equal(normalizeServerCode(' ab12cd '), 'AB12CD');
-  assert.equal(normalizeServerCode('global'), 'global');
-  assert.equal(normalizeServerCode('ABC'), null);
+test('identity and room values reject invalid or oversized input', () => {
+  assert.equal(security.normalizeUsername(' Alice_1 '), 'Alice_1');
+  assert.equal(security.normalizeUsername('x'.repeat(21)), null);
+  assert.equal(security.normalizeDisplayName(' Alice Smith '), 'Alice Smith');
+  assert.equal(security.normalizeDisplayName('<img>'), null);
+  assert.equal(security.normalizeServerName(' Team Room '), 'Team Room');
+  assert.equal(security.normalizeServerName('Room<script>'), null);
+  assert.equal(security.normalizeServerCode(' ab12cd '), 'AB12CD');
+  assert.equal(security.normalizeServerCode('global'), 'global');
+  assert.equal(security.normalizeServerCode('ABC'), null);
 });
 
-test('password, profile, attachment, reaction, and id validation is bounded', () => {
-  assert.equal(isValidPassword('123456'), true);
-  assert.equal(isValidPassword('x'.repeat(129)), false);
-  assert.equal(normalizeColor('#A1b2C3'), '#a1b2c3');
-  assert.equal(normalizeColor('red; background:url(x)'), null);
-  assert.equal(normalizeAvatarUrl('https://example.com/a.png'), 'https://example.com/a.png');
-  assert.equal(normalizeAvatarUrl('javascript:alert(1)'), null);
-  assert.equal(isValidAttachment('data:image/png;base64,AAAA'), true);
-  assert.equal(isValidAttachment('javascript:alert(1)'), false);
-  assert.equal(isValidReaction('👍'), true);
-  assert.equal(isValidReaction('__proto__😀'), false);
-  assert.equal(isValidObjectId('507f1f77bcf86cd799439011'), true);
-  assert.equal(isValidObjectId('not-an-id'), false);
+test('credential and stored-profile validators enforce exact boundaries', () => {
+  assert.equal(security.isValidPassword('123456'), true);
+  assert.equal(security.isValidPassword('x'.repeat(129)), false);
+  assert.equal(security.normalizeColor('#A1b2C3'), '#a1b2c3');
+  assert.equal(security.normalizeColor("red';background:url(x)"), null);
+  assert.equal(security.normalizeAvatarUrl('https://example.com/a.png'), 'https://example.com/a.png');
+  assert.equal(security.normalizeAvatarUrl('javascript:alert(1)'), null);
 });
 
-test('client ping tokens become ordinary mention text before resolution', () => {
+test('attachment, reaction, and object-id validators reject unsafe values', () => {
+  assert.equal(security.isValidAttachment('data:image/png;base64,AAAA'), true);
+  assert.equal(security.isValidAttachment('data:image/svg+xml;base64,AAAA'), false);
+  assert.equal(security.isValidAttachment('javascript:alert(1)'), false);
+  assert.equal(security.isValidReaction('👍'), true);
+  assert.equal(security.isValidReaction('__proto__😀'), false);
+  assert.equal(security.isValidObjectId('507f1f77bcf86cd799439011'), true);
+  assert.equal(security.isValidObjectId('not-an-id'), false);
+});
+
+test('client ping tokens become ordinary text before mention resolution', () => {
   assert.equal(
-    neutralizePingTokens('hello {{PING:everyone|everyone}}'),
+    security.neutralizePingTokens('hello {{PING:everyone|everyone}}'),
     'hello @everyone'
   );
-  assert.equal(
-    neutralizePingTokens('{{PING:alice|Alice Smith}}'),
-    '@Alice Smith'
-  );
+  assert.equal(security.neutralizePingTokens('{{PING:alice|Alice Smith}}'), '@Alice Smith');
 });
 
-test('room access preserves global and admin access but rejects non-members', () => {
-  assert.equal(canAccessRoom({ role: 'user', joinedServers: ['global'] }, 'global'), true);
-  assert.equal(canAccessRoom({ role: 'user', joinedServers: ['global'] }, 'ABC123'), false);
-  assert.equal(canAccessRoom({ role: 'user', joinedServers: ['global', 'ABC123'] }, 'ABC123'), true);
-  assert.equal(canAccessRoom({ role: 'admin', joinedServers: ['global'] }, 'ABC123'), true);
+test('room access preserves global and administrator access only', () => {
+  assert.equal(security.canAccessRoom({ role: 'user', joinedServers: ['global'] }, 'global'), true);
+  assert.equal(security.canAccessRoom({ role: 'user', joinedServers: ['global'] }, 'ABC123'), false);
+  assert.equal(security.canAccessRoom({ role: 'user', joinedServers: ['global', 'ABC123'] }, 'ABC123'), true);
+  assert.equal(security.canAccessRoom({ role: 'admin', joinedServers: ['global'] }, 'ABC123'), true);
 });
 
-test('history and reply snapshots are derived and bounded', () => {
+test('history and reply snapshots derive bounded stored data', () => {
   const history = Array.from({ length: 20 }, (_, index) => ({ text: String(index) }));
-  const bounded = appendBoundedHistory(history, { text: 'next' });
+  const bounded = security.appendBoundedHistory(history, { text: 'next' });
   assert.equal(bounded.length, 20);
   assert.equal(bounded[0].text, '1');
   assert.equal(bounded[19].text, 'next');
 
-  const snapshot = createReplySnapshot({
+  const snapshot = security.createReplySnapshot({
     _id: '507f1f77bcf86cd799439011',
     username: 'alice',
     displayName: 'Alice',
     text: 'x'.repeat(150),
     attachment: null
   });
-  assert.equal(snapshot.displayname, 'Alice');
-  assert.equal(snapshot.text.length, 100);
+  assert.deepEqual(snapshot, {
+    id: '507f1f77bcf86cd799439011',
+    displayname: 'Alice',
+    text: 'x'.repeat(100)
+  });
 });
 ```
 
-- [ ] **Step 2: Run the helper tests and confirm the red state**
+- [ ] **Step 2: Run the focused tests and verify the red state**
 
 Run: `npm test --prefix backend`
 
-Expected: FAIL with `Cannot find module '../lib/chat-security'`.
+Expected: FAIL because the current module starts listening when required and does not export the policy functions.
 
-- [ ] **Step 3: Implement the minimal policy module**
+- [ ] **Step 3: Implement the pure helpers inside `backend/server.js`**
 
-Create `backend/lib/chat-security.js`:
+Define the following constants and functions after imports and before schemas:
 
 ```js
 const USERNAME_RE = /^[A-Za-z0-9_-]{1,20}$/;
@@ -243,8 +239,37 @@ function createReplySnapshot(message) {
     text: text || (message.attachment ? 'Image Attachment' : '')
   };
 }
+```
+
+- [ ] **Step 4: Make startup explicit and export the tested interface**
+
+Replace unconditional startup with:
+
+```js
+async function start() {
+  if (MONGO_URI) {
+    await mongoose.connect(MONGO_URI);
+    await seedSystem();
+  }
+  return new Promise(resolve => {
+    server.listen(PORT, () => {
+      console.log(`🚀 Server on port ${PORT}`);
+      resolve(server);
+    });
+  });
+}
+
+if (require.main === module) {
+  start().catch(err => {
+    console.error('Database startup failed:', err);
+    process.exitCode = 1;
+  });
+}
 
 module.exports = {
+  app,
+  server,
+  start,
   safeAck,
   normalizeUsername,
   normalizeDisplayName,
@@ -263,114 +288,238 @@ module.exports = {
 };
 ```
 
-- [ ] **Step 4: Run the helper tests and confirm the green state**
+Call `.unref()` on the rate-limit cleanup interval so importing the module cannot keep a test process alive.
 
-Run: `npm test --prefix backend`
+- [ ] **Step 5: Run focused and full tests**
 
-Expected: all helper tests PASS with no warnings.
-
-- [ ] **Step 5: Commit Task 1**
+Run:
 
 ```bash
-git add backend/package.json backend/lib/chat-security.js backend/test/chat-security.test.js
+npm test --prefix backend
+node --check backend/server.js
+```
+
+Expected: all tests PASS with no warnings; syntax exits 0.
+
+- [ ] **Step 6: Commit Task 1**
+
+```bash
+git add backend/server.js backend/package.json backend/test/chat-security.test.js
 git commit -m "test: add chat security policy coverage"
 ```
 
 ---
 
-### Task 2: Secure authentication, seeding, roles, and room lifecycle
+### Task 2: Add an injectable handler factory and secure room lifecycle
 
 **Files:**
 - Modify: `backend/server.js`
-- Create: `backend/test/server-wiring.test.js`
-- Test: `backend/test/chat-security.test.js`
+- Create: `backend/test/support/fakes.js`
+- Create: `backend/test/room-lifecycle.test.js`
 
 **Interfaces:**
-- Consumes: Task 1 exports from `./lib/chat-security`.
-- Produces: protected `register`, `login`, `change_password`, `logout_all_devices`, `update_profile`, `manage_role`, `create_server`, `join_server`, `leave_server`, `delete_server`, and `switch_server` handlers.
+- Produces `createConnectionHandler(overrides = {})`, where supported overrides are `ioInstance`, `UserModel`, `ChatServerModel`, `MessageModel`, `bcryptImpl`, `onlineUsersMap`, `broadcastOnlineUsersFn`, `getRoomRoleFn`, and `resolvePingsFn`.
+- The returned function accepts one Socket.IO-compatible socket and registers the existing events.
+- Production registers handlers with `io.on('connection', createConnectionHandler())`.
 
-- [ ] **Step 1: Write failing wiring regressions**
+- [ ] **Step 1: Create reusable in-memory test fakes**
 
-Create `backend/test/server-wiring.test.js` with source-level integration assertions:
+Create `backend/test/support/fakes.js` with:
+
+```js
+class FakeSocket {
+  constructor() {
+    this.handlers = new Map();
+    this.joinedRooms = new Set();
+    this.leftRooms = [];
+    this.outbound = [];
+    this.handshake = { headers: {}, address: '127.0.0.1' };
+    this.id = 'socket-1';
+  }
+  on(event, handler) { this.handlers.set(event, handler); }
+  async trigger(event, ...args) { return this.handlers.get(event)(...args); }
+  join(room) { this.joinedRooms.add(room); }
+  leave(room) { this.joinedRooms.delete(room); this.leftRooms.push(room); }
+  emit(event, payload) { this.outbound.push({ target: 'self', event, payload }); }
+  to(room) {
+    return { emit: (event, payload) => this.outbound.push({ target: room, event, payload }) };
+  }
+  disconnect() { this.disconnected = true; }
+}
+
+class FakeIo {
+  constructor() { this.outbound = []; this.sockets = []; }
+  to(room) { return { emit: (event, payload) => this.outbound.push({ room, event, payload }) }; }
+  emit(event, payload) { this.outbound.push({ room: '*', event, payload }); }
+  async fetchSockets() { return this.sockets; }
+}
+
+function queryResult(value) {
+  return {
+    lean: async () => value,
+    sort() { return this; },
+    limit() { return this; },
+    then(resolve, reject) { return Promise.resolve(value).then(resolve, reject); }
+  };
+}
+
+function acknowledge() {
+  let value;
+  return { callback(result) { value = result; }, value() { return value; } };
+}
+
+module.exports = { FakeSocket, FakeIo, queryResult, acknowledge };
+```
+
+- [ ] **Step 2: Write failing room-lifecycle behavior tests**
+
+Create `backend/test/room-lifecycle.test.js` covering these observable behaviors with `FakeSocket`, `FakeIo`, literal model results, and no source-text assertions:
 
 ```js
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const fs = require('node:fs');
-const path = require('node:path');
+const { createConnectionHandler } = require('../server');
+const { FakeSocket, FakeIo, queryResult, acknowledge } = require('./support/fakes');
 
-const source = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
-
-function handler(name) {
-  const start = source.indexOf(`socket.on('${name}'`);
-  assert.notEqual(start, -1, `missing ${name} handler`);
-  const next = source.indexOf("socket.on('", start + 12);
-  return source.slice(start, next === -1 ? source.length : next);
+function register(overrides = {}) {
+  const socket = new FakeSocket();
+  const ioInstance = new FakeIo();
+  createConnectionHandler({
+    ioInstance,
+    onlineUsersMap: new Map(),
+    broadcastOnlineUsersFn: async () => {},
+    getRoomRoleFn: async () => 'user',
+    resolvePingsFn: async text => text,
+    ...overrides
+  })(socket);
+  return { socket, ioInstance };
 }
 
-test('source contains no shipped administrator password', () => {
-  assert.doesNotMatch(source, /DragonNYZ0924/);
-  assert.match(source, /process\.env\.ADMIN_PASSWORD/);
+test('login rejects replacing an authenticated socket identity', async () => {
+  const { socket } = register();
+  socket.username = 'alice';
+  const ack = acknowledge();
+  await socket.trigger('login', { username: 'bob', password: '123456' }, ack.callback);
+  assert.deepEqual(ack.value(), { error: 'Already authenticated.' });
+  assert.equal(socket.username, 'alice');
 });
 
-test('acknowledgement handlers normalize omitted callbacks', () => {
-  for (const event of [
-    'register', 'login', 'change_password', 'logout_all_devices', 'update_profile',
-    'manage_role', 'create_server', 'join_server', 'leave_server', 'delete_server',
-    'switch_server', 'get_edit_history', 'get_deleted_message'
-  ]) {
-    assert.match(handler(event), /safeAck\(callback\)/, `${event} must use safeAck`);
-  }
+test('unauthorized room switch leaves current membership unchanged', async () => {
+  const ChatServerModel = { findOne: () => queryResult({ code: 'ABC123' }) };
+  const MessageModel = { find: () => queryResult([]) };
+  const { socket } = register({ ChatServerModel, MessageModel });
+  socket.username = 'alice';
+  socket.role = 'user';
+  socket.joinedServers = ['global'];
+  socket.serverCode = 'global';
+  socket.joinedRooms.add('global');
+  const ack = acknowledge();
+  await socket.trigger('switch_server', 'ABC123', ack.callback);
+  assert.deepEqual(ack.value(), { error: 'Permission denied.' });
+  assert.equal(socket.serverCode, 'global');
+  assert.equal(socket.leftRooms.length, 0);
 });
 
-test('login blocks identity replacement and room switches check access before leaving', () => {
-  assert.match(handler('login'), /if \(socket\.username\)/);
-  const switchHandler = handler('switch_server');
-  assert.match(switchHandler, /canAccessRoom/);
-  assert.ok(switchHandler.indexOf('canAccessRoom') < switchHandler.indexOf('socket.leave'));
+test('authorized room switch leaves old room only after access succeeds', async () => {
+  const ChatServerModel = { findOne: () => queryResult({ code: 'ABC123', moderators: [] }) };
+  const MessageModel = { find: () => queryResult([]) };
+  const { socket } = register({ ChatServerModel, MessageModel });
+  socket.username = 'alice';
+  socket.role = 'user';
+  socket.joinedServers = ['global', 'ABC123'];
+  socket.serverCode = 'global';
+  socket.joinedRooms.add('global');
+  const ack = acknowledge();
+  await socket.trigger('switch_server', 'ABC123', ack.callback);
+  assert.equal(socket.serverCode, 'ABC123');
+  assert.deepEqual(socket.leftRooms, ['global']);
+  assert.equal(socket.joinedRooms.has('ABC123'), true);
+  assert.deepEqual(ack.value(), { history: [], roomRole: 'user' });
 });
 
-test('leaving a room removes socket and moderator membership', () => {
-  const leaveHandler = handler('leave_server');
-  assert.match(leaveHandler, /socket\.leave\(code\)/);
-  assert.match(leaveHandler, /\$pull: \{ moderators: socket\.username \}/);
-  assert.match(leaveHandler, /socket\.serverCode = 'global'/);
+test('leaving the active room removes transport and moderator access then moves to global', async () => {
+  const user = { servers: ['global', 'ABC123'], async save() {} };
+  const pulled = [];
+  const UserModel = { findOne: async () => user };
+  const ChatServerModel = { async updateOne(filter, update) { pulled.push({ filter, update }); } };
+  const { socket } = register({ UserModel, ChatServerModel });
+  socket.username = 'alice';
+  socket.displayName = 'Alice';
+  socket.serverCode = 'ABC123';
+  socket.joinedServers = user.servers;
+  socket.joinedRooms.add('ABC123');
+  const ack = acknowledge();
+  await socket.trigger('leave_server', 'ABC123', ack.callback);
+  assert.deepEqual(user.servers, ['global']);
+  assert.equal(socket.joinedRooms.has('ABC123'), false);
+  assert.equal(socket.joinedRooms.has('global'), true);
+  assert.equal(socket.serverCode, 'global');
+  assert.deepEqual(pulled, [{
+    filter: { code: 'ABC123' },
+    update: { $pull: { moderators: 'alice' } }
+  }]);
+  assert.deepEqual(ack.value(), { success: true });
 });
 ```
 
-- [ ] **Step 2: Run the targeted test and confirm the red state**
+In the same file, add table-driven behavior tests that trigger each acknowledgement event without a callback and assert the returned promise does not reject. Add spies that prove invalid profile values cause no `UserModel` write, promotion of a non-member causes no `ChatServerModel` write, and registration checks case-insensitive collisions independently for both username and display name.
 
-Run: `node --test backend/test/server-wiring.test.js`
+- [ ] **Step 3: Run the room tests and verify the red state**
 
-Expected: FAIL on the hardcoded password assertion before later wiring assertions can pass.
+Run: `node --test backend/test/room-lifecycle.test.js`
 
-- [ ] **Step 3: Import helpers and make seeding non-destructive**
+Expected: FAIL because `createConnectionHandler` is not exported and current handlers close over production dependencies.
 
-At the top of `backend/server.js`, import all Task 1 functions. Replace `seedSystem` with logic equivalent to:
+- [ ] **Step 4: Refactor existing handlers into the injectable factory**
+
+Wrap the current `io.on('connection', socket => { ... })` body in:
 
 ```js
-async function seedSystem() {
-  await ChatServer.findOneAndUpdate(
+function createConnectionHandler({
+  ioInstance = io,
+  UserModel = User,
+  ChatServerModel = ChatServer,
+  MessageModel = Message,
+  bcryptImpl = bcrypt,
+  onlineUsersMap = onlineUsers,
+  broadcastOnlineUsersFn = broadcastOnlineUsers,
+  getRoomRoleFn = getRoomRole,
+  resolvePingsFn = resolvePings
+} = {}) {
+  return socket => {
+    // existing event registrations, using the injected names above
+  };
+}
+
+io.on('connection', createConnectionHandler());
+```
+
+Replace handler references to `io`, `User`, `ChatServer`, `Message`, `bcrypt`, `onlineUsers`, `broadcastOnlineUsers`, `getRoomRole`, and `resolvePings` with the injected names inside the factory. Export `createConnectionHandler` in Task 1's `module.exports` object.
+
+- [ ] **Step 5: Implement authentication, seeding, input, and lifecycle fixes**
+
+Make `seedSystem` injectable and export it:
+
+```js
+async function seedSystem({
+  UserModel = User,
+  ChatServerModel = ChatServer,
+  bcryptImpl = bcrypt,
+  adminPassword = process.env.ADMIN_PASSWORD
+} = {}) {
+  await ChatServerModel.findOneAndUpdate(
     { code: 'global' },
     { $setOnInsert: { code: 'global', name: 'Global Chat', owner: 'System', moderators: [] } },
     { upsert: true, setDefaultsOnInsert: true }
   );
-
-  const adminPassword = process.env.ADMIN_PASSWORD;
-  if (!adminPassword) {
-    console.warn('ADMIN_PASSWORD is not set; owner account seeding skipped.');
-    return;
-  }
-  if (!isValidPassword(adminPassword)) {
-    throw new Error('ADMIN_PASSWORD must contain 6 to 128 characters.');
-  }
-
-  const existingAdmin = await User.findOne({ username: /^NYZhang1$/i });
-  if (!existingAdmin) {
-    await User.create({
+  if (!adminPassword) return;
+  if (!isValidPassword(adminPassword)) throw new Error('ADMIN_PASSWORD must contain 6 to 128 characters.');
+  const existing = await UserModel.findOne({ username: /^NYZhang1$/i });
+  if (!existing) {
+    await UserModel.create({
       username: 'NYZhang1',
       displayName: 'Bacon',
-      password: await bcrypt.hash(adminPassword, 10),
+      password: await bcryptImpl.hash(adminPassword, 10),
       role: 'admin',
       servers: ['global']
     });
@@ -378,199 +527,167 @@ async function seedSystem() {
 }
 ```
 
-Keep `mongoose.connect(MONGO_URI).then(seedSystem)` and replace the generic rejection handler with `console.error('Database startup failed:', err)`.
+For every acknowledgement handler, set `callback = safeAck(callback)` before early returns. Apply these exact rules:
 
-- [ ] **Step 4: Normalize callbacks and payloads across acknowledgement handlers**
+- Registration uses normalized username/display name, validates a 6–128 character password, reserves `NYZhang1`, and rejects every case-insensitive username or display-name collision.
+- Login rejects an already authenticated socket, validates inputs before bcrypt, and never changes rooms before success.
+- Password change uses `isValidPassword` for the new password.
+- Profile update requires normalized display name, color, and avatar URL and reserves the owner name.
+- Server creation requires `normalizeServerName`; retry duplicate generated codes at most five times.
+- Join, leave, delete, and switch require `normalizeServerCode`.
+- Role actions come from the four existing allowed action strings; room promotion requires target membership.
+- `switch_server` confirms room existence and `canAccessRoom` before calling `socket.leave`.
+- `leave_server` removes database membership, pulls the moderator entry, emits the old-room leave message, calls `socket.leave(code)`, and moves an active socket to global.
 
-At the first line of every acknowledgement handler, assign `callback = safeAck(callback)`. Use the Task 1 normalizers instead of `.substring()` or direct property access. Apply these exact rules:
-
-```js
-const cleanUser = normalizeUsername(data?.username);
-const cleanDisplay = normalizeDisplayName(data?.displayName || data?.username);
-if (!cleanUser || !cleanDisplay || !isValidPassword(data?.password)) {
-  return callback({ error: 'Invalid input format.' });
-}
-```
-
-- Registration rejects every case-insensitive display-name collision, even when display name equals the new username.
-- Login rejects `socket.username` with `{ error: 'Already authenticated.' }` and validates password type and maximum length before bcrypt.
-- Password change uses `isValidPassword(data?.newPassword)`.
-- Profile updates require a valid normalized display name, color, and avatar URL and reserve `NYZhang1` for the system owner.
-- Server creation requires `normalizeServerName(name)` and retries code creation up to five times only when MongoDB reports duplicate key code `11000`.
-- Join, leave, delete, and switch use `normalizeServerCode(code)`.
-- Role management accepts only `promote_global_admin`, `demote_global_admin`, `promote_mod`, or `demote_mod`; room promotion verifies `targetUserDoc.servers.includes(serverCode)`.
-
-- [ ] **Step 5: Enforce room access before state changes**
-
-Use this identity shape everywhere:
-
-```js
-const identity = { role: socket.role, joinedServers: socket.joinedServers || [] };
-```
-
-In `switch_server`, look up non-global rooms before leaving the old room, reject missing rooms with `Server not found.`, and reject `!canAccessRoom(identity, code)` with `Permission denied.`. Only then leave the old room, join the new room, set `socket.serverCode`, update presence, and return `{ history, roomRole }`.
-
-In `leave_server`, after updating the user:
-
-```js
-await ChatServer.updateOne({ code }, { $pull: { moderators: socket.username } });
-socket.leave(code);
-if (socket.serverCode === code) {
-  socket.serverCode = 'global';
-  socket.join('global');
-}
-```
-
-Update `onlineUsers` after changing both `joinedServers` and `serverCode`. Emit the leave system message to the old room before `socket.leave(code)`.
-
-- [ ] **Step 6: Run Task 2 tests and syntax checks**
+- [ ] **Step 6: Run Task 2 tests and full suite**
 
 Run:
 
 ```bash
+node --test backend/test/room-lifecycle.test.js
 npm test --prefix backend
 node --check backend/server.js
 ```
 
-Expected: all tests PASS; syntax check exits 0.
+Expected: all tests PASS with no warnings; syntax exits 0.
 
 - [ ] **Step 7: Commit Task 2**
 
 ```bash
-git add backend/server.js backend/test/server-wiring.test.js backend/test/chat-security.test.js
+git add backend/server.js backend/test/support/fakes.js backend/test/room-lifecycle.test.js
 git commit -m "fix: secure authentication and room lifecycle"
 ```
 
 ---
 
-### Task 3: Secure message creation and room-sensitive actions
+### Task 3: Secure message creation and message actions behaviorally
 
 **Files:**
 - Modify: `backend/server.js`
-- Modify: `backend/test/server-wiring.test.js`
-- Test: `backend/test/chat-security.test.js`
+- Create: `backend/test/message-actions.test.js`
 
 **Interfaces:**
-- Consumes: `neutralizePingTokens`, `isValidAttachment`, `isValidReaction`, `isValidObjectId`, `canAccessRoom`, `appendBoundedHistory`, and `createReplySnapshot` from Task 1.
-- Produces: trusted message persistence and room-authorized message action handlers.
+- Consumes Task 1 policies and Task 2 `createConnectionHandler` injection points.
+- Produces trusted message persistence and room-authorized `chat_message`, `toggle_reaction`, `edit_message`, `delete_message`, `get_edit_history`, `get_deleted_message`, and `typing` behavior.
 
-- [ ] **Step 1: Add failing room-sensitive handler assertions**
+- [ ] **Step 1: Write failing behavior tests for room-sensitive actions**
 
-Append to `backend/test/server-wiring.test.js`:
+Create `backend/test/message-actions.test.js` with the Task 2 fakes and real registered handlers. Cover at least these literal outcomes:
 
 ```js
-test('every room-sensitive handler enforces access', () => {
-  for (const event of [
-    'chat_message', 'toggle_reaction', 'edit_message', 'delete_message',
-    'get_edit_history', 'get_deleted_message', 'typing'
-  ]) {
-    assert.match(handler(event), /canAccessRoom/, `${event} must check room access`);
-  }
+test('reaction in an inaccessible message room does not save or emit', async () => {
+  let saved = false;
+  const message = {
+    serverCode: 'ABC123', deleted: false, reactions: {},
+    markModified() {}, async save() { saved = true; }
+  };
+  const MessageModel = { findById: async () => message };
+  const { socket, ioInstance } = registerMessages({ MessageModel });
+  socket.username = 'alice';
+  socket.role = 'user';
+  socket.joinedServers = ['global'];
+  socket.serverCode = 'global';
+  await socket.trigger('toggle_reaction', { id: '507f1f77bcf86cd799439011', emoji: '👍' });
+  assert.equal(saved, false);
+  assert.deepEqual(ioInstance.outbound, []);
 });
 
-test('message mutations emit to the stored message room', () => {
-  for (const event of ['toggle_reaction', 'edit_message', 'delete_message']) {
-    assert.match(handler(event), /io\.to\(msg\.serverCode\)/, `${event} must emit to msg.serverCode`);
-  }
-  assert.doesNotMatch(handler('edit_message'), /io\.to\(socket\.serverCode\)/);
+test('editing emits to the stored message room rather than current socket room', async () => {
+  const message = {
+    _id: '507f1f77bcf86cd799439011', serverCode: 'ABC123', username: 'alice',
+    role: 'user', roomRole: 'user', text: 'before', history: [], deleted: false,
+    markModified() {}, async save() {}
+  };
+  const MessageModel = { findById: async () => message };
+  const { socket, ioInstance } = registerMessages({ MessageModel });
+  socket.username = 'alice';
+  socket.role = 'user';
+  socket.joinedServers = ['global', 'ABC123'];
+  socket.serverCode = 'global';
+  await socket.trigger('edit_message', { id: message._id, text: 'after' });
+  assert.equal(ioInstance.outbound.at(-1).room, 'ABC123');
+  assert.equal(ioInstance.outbound.at(-1).event, 'message_edited');
 });
 
-test('message creation validates attachment, neutralizes tokens, and derives replies', () => {
-  const chat = handler('chat_message');
-  assert.match(chat, /isValidAttachment/);
-  assert.match(chat, /neutralizePingTokens/);
-  assert.match(chat, /createReplySnapshot/);
-  assert.doesNotMatch(chat, /replyTo: replyTo/);
-});
-
-test('typing includes the display name expected by the client', () => {
-  assert.match(handler('typing'), /displayName: socket\.displayName/);
+test('message reply snapshot comes from the stored same-room message', async () => {
+  let created;
+  const referenced = {
+    _id: '507f1f77bcf86cd799439011', serverCode: 'ABC123', username: 'bob',
+    displayName: 'Bob', text: 'trusted stored text', deleted: false
+  };
+  const MessageModel = {
+    findById: async () => referenced,
+    async create(value) { created = value; return { ...value, _id: '507f191e810c19729de860ea', timestamp: new Date() }; }
+  };
+  const { socket } = registerMessages({ MessageModel });
+  socket.username = 'alice';
+  socket.displayName = 'Alice';
+  socket.role = 'user';
+  socket.joinedServers = ['global', 'ABC123'];
+  socket.serverCode = 'ABC123';
+  await socket.trigger('chat_message', {
+    text: 'reply',
+    replyTo: { id: referenced._id, displayname: '<img>', text: '<script>' }
+  });
+  assert.deepEqual(created.replyTo, {
+    id: referenced._id,
+    displayname: 'Bob',
+    text: 'trusted stored text'
+  });
 });
 ```
 
-- [ ] **Step 2: Run the targeted wiring test and confirm the red state**
+In the same file, add behavior tests with injected spies proving that raw `{{PING:everyone|everyone}}` reaches the mention resolver as `@everyone`, invalid attachment and reaction values cause no model write, a 21-entry edit history retains only the newest 20 entries, owners who left a room cannot edit/read/delete old messages, and typing emits `{ username, displayName, isTyping }` only for accessible active rooms.
 
-Run: `node --test backend/test/server-wiring.test.js`
+- [ ] **Step 2: Run the message tests and verify the red state**
 
-Expected: FAIL because the current handlers do not call `canAccessRoom`, message creation trusts `replyTo`, and typing omits `displayName`.
+Run: `node --test backend/test/message-actions.test.js`
+
+Expected: FAIL because current handlers do not enforce message-room access, trust reply snapshots, and edit to `socket.serverCode`.
 
 - [ ] **Step 3: Validate and authorize message creation**
 
-In `chat_message`:
+In `chat_message`, require an authenticated identity with access to `socket.serverCode`, require a string text field, validate the optional attachment, neutralize ping tokens before resolving real mentions, and cap text at 2,000 characters.
 
-```js
-const identity = { role: socket.role, joinedServers: socket.joinedServers || [] };
-if (!socket.username || !socket.serverCode || !canAccessRoom(identity, socket.serverCode)) return;
-if (!payload || (typeof payload !== 'string' && typeof payload !== 'object')) return;
-
-const rawText = typeof payload === 'string' ? payload : payload.text;
-const attachment = typeof payload === 'object' ? payload.attachment ?? null : null;
-if (typeof rawText !== 'string' || !isValidAttachment(attachment)) return;
-
-let cleanText = neutralizePingTokens(rawText).trim().slice(0, 2000);
-```
-
-Before `Message.create`, derive `replyTo` only when `payload.replyTo.id` is a valid object id. Load the referenced message, require `!referenced.deleted`, require `referenced.serverCode === socket.serverCode`, require `canAccessRoom(identity, referenced.serverCode)`, and then call `createReplySnapshot(referenced)`. Otherwise persist `replyTo: null`.
+For `replyTo.id`, require a valid object id, load the referenced message, require the same active room, require that it is not deleted, and persist only `createReplySnapshot(referenced)`. Persist `null` for an invalid reference without rejecting an otherwise valid outgoing message.
 
 - [ ] **Step 4: Validate and authorize every referenced-message action**
 
-For `toggle_reaction`, require an object payload, a valid object id, and `isValidReaction(emoji)`. After loading `msg`, require:
+After loading a message for reaction, edit, delete, edit history, or deleted-content reads, call:
 
 ```js
 const identity = { role: socket.role, joinedServers: socket.joinedServers || [] };
 if (!canAccessRoom(identity, msg.serverCode)) return;
 ```
 
-Apply the same access check after loading `msg` in edit, delete, history, and deleted-message handlers. A user's ownership of an old message does not override loss of room membership. Preserve administrator access and room-moderator permissions after the membership check.
-
-In edits, replace the history mutation with:
+Require valid object ids. Require `isValidReaction(emoji)` before reading or writing reaction keys. Preserve sender/admin/moderator permissions only after access is established. Use:
 
 ```js
 msg.history = appendBoundedHistory(msg.history, { text: msg.text, timestamp: new Date() });
-msg.markModified('history');
 ```
 
-Emit reactions, edits, and deletions through `io.to(msg.serverCode)`.
+Emit mutations with `ioInstance.to(msg.serverCode)`. Include `displayName: socket.displayName || socket.username` in typing payloads and validate the boolean typing state.
 
-- [ ] **Step 5: Fix typing authorization and payload shape**
+- [ ] **Step 5: Log unexpected failures without sensitive payload content**
 
-Validate `typeof isTyping === 'boolean'`, check `canAccessRoom(identity, socket.serverCode)`, and emit:
+Replace empty catches with event-specific logging such as `console.error('edit_message failed:', err)`. Never log passwords, message text, attachment data, or reply snapshots.
 
-```js
-socket.to(socket.serverCode).emit('typing', {
-  username: socket.username,
-  displayName: socket.displayName || socket.username,
-  isTyping
-});
-```
-
-- [ ] **Step 6: Log unexpected handler failures without message or credential content**
-
-Replace empty catches in room and message handlers with event-specific logging, for example:
-
-```js
-} catch (err) {
-  console.error('edit_message failed:', err);
-}
-```
-
-Do not log payloads, passwords, message text, attachments, or reply snapshots.
-
-- [ ] **Step 7: Run Task 3 tests and syntax checks**
+- [ ] **Step 6: Run Task 3 tests and full suite**
 
 Run:
 
 ```bash
+node --test backend/test/message-actions.test.js
 npm test --prefix backend
 node --check backend/server.js
 ```
 
-Expected: all tests PASS; syntax check exits 0.
+Expected: all tests PASS with no warnings; syntax exits 0.
 
-- [ ] **Step 8: Commit Task 3**
+- [ ] **Step 7: Commit Task 3**
 
 ```bash
-git add backend/server.js backend/test/server-wiring.test.js backend/test/chat-security.test.js
+git add backend/server.js backend/test/message-actions.test.js
 git commit -m "fix: authorize and validate message actions"
 ```
 
@@ -583,33 +700,14 @@ git commit -m "fix: authorize and validate message actions"
 - Create: `backend/test/client-smoke.test.js`
 
 **Interfaces:**
-- Consumes: existing Socket.IO events and acknowledgements plus corrected typing payload `{ username, displayName, isTyping }`.
-- Produces: inline `ChatClientHelpers` with `normalizeBackendUrl`, `replaceSocket`, `appendTextElement`, and `typingDisplayName`; safer DOM rendering; acknowledged room transitions.
+- Produces inline `ChatClientHelpers` with `normalizeBackendUrl`, `replaceSocket`, `appendTextElement`, and `typingDisplayName`.
+- Consumes corrected typing payload `{ username, displayName, isTyping }` and unchanged acknowledgement object shapes.
 
-- [ ] **Step 1: Write the failing client helper smoke test**
+- [ ] **Step 1: Write the failing inline-helper smoke test**
 
-Create a delimited helper block expectation in `backend/test/client-smoke.test.js`:
+Create `backend/test/client-smoke.test.js` that reads `chat.html`, extracts the code between `TESTABLE_CLIENT_HELPERS_START` and `TESTABLE_CLIENT_HELPERS_END`, executes that real block with `node:vm`, and asserts:
 
 ```js
-const test = require('node:test');
-const assert = require('node:assert/strict');
-const fs = require('node:fs');
-const path = require('node:path');
-const vm = require('node:vm');
-
-const html = fs.readFileSync(path.join(__dirname, '..', '..', 'chat.html'), 'utf8');
-
-function loadHelpers() {
-  const match = html.match(
-    /\/\/ TESTABLE_CLIENT_HELPERS_START([\s\S]*?)\/\/ TESTABLE_CLIENT_HELPERS_END/
-  );
-  assert.ok(match, 'testable client helper block is missing');
-  const context = { URL };
-  context.globalThis = context;
-  vm.runInNewContext(match[1], context);
-  return context.ChatClientHelpers;
-}
-
 test('backend URLs allow only HTTP and HTTPS', () => {
   const helpers = loadHelpers();
   assert.equal(helpers.normalizeBackendUrl('example.com/'), 'https://example.com');
@@ -617,150 +715,69 @@ test('backend URLs allow only HTTP and HTTPS', () => {
   assert.equal(helpers.normalizeBackendUrl('javascript:alert(1)'), null);
 });
 
-test('replacing a backend connection disconnects only when URL changes', () => {
+test('changing backend URL disconnects and replaces the old socket', () => {
   const helpers = loadHelpers();
   let disconnected = 0;
   const oldSocket = { disconnect() { disconnected += 1; } };
-  let created = 0;
-  const ioFactory = url => ({ url, created: ++created });
-
-  const kept = helpers.replaceSocket(oldSocket, 'https://a.test', 'https://a.test', ioFactory);
-  assert.equal(kept.socket, oldSocket);
+  const ioFactory = url => ({ url });
+  assert.equal(helpers.replaceSocket(oldSocket, 'https://a.test', 'https://a.test', ioFactory).socket, oldSocket);
   assert.equal(disconnected, 0);
-
-  const replaced = helpers.replaceSocket(oldSocket, 'https://a.test', 'https://b.test', ioFactory);
+  assert.equal(helpers.replaceSocket(oldSocket, 'https://a.test', 'https://b.test', ioFactory).socket.url, 'https://b.test');
   assert.equal(disconnected, 1);
-  assert.equal(replaced.socket.url, 'https://b.test');
 });
 
-test('text elements do not interpret stored markup', () => {
+test('stored markup is assigned as text rather than interpreted HTML', () => {
   const helpers = loadHelpers();
   const parent = { children: [], appendChild(child) { this.children.push(child); } };
-  const documentStub = {
-    createElement(tagName) {
-      return { tagName, className: '', textContent: '', children: [], appendChild(child) { this.children.push(child); } };
-    }
-  };
-  const child = helpers.appendTextElement(documentStub, parent, 'span', 'name', '<img src=x>');
+  const doc = { createElement: tagName => ({ tagName, className: '', textContent: '' }) };
+  const child = helpers.appendTextElement(doc, parent, 'span', 'name', '<img src=x>');
   assert.equal(child.textContent, '<img src=x>');
-  assert.equal(child.className, 'name');
 });
 
-test('typing display names fall back to usernames', () => {
+test('typing display falls back to username', () => {
   const helpers = loadHelpers();
   assert.equal(helpers.typingDisplayName({ username: 'alice', displayName: 'Alice' }), 'Alice');
   assert.equal(helpers.typingDisplayName({ username: 'alice' }), 'alice');
 });
 ```
 
-- [ ] **Step 2: Run the client smoke test and confirm the red state**
+- [ ] **Step 2: Run the client test and verify the red state**
 
 Run: `node --test backend/test/client-smoke.test.js`
 
-Expected: FAIL with `testable client helper block is missing`.
+Expected: FAIL because the inline helper block does not exist.
 
-- [ ] **Step 3: Add inline client helpers and the success color**
+- [ ] **Step 3: Add inline helpers and success color**
 
-Add `--success: #3ba55c` to `:root`. Near the beginning of the existing inline script, add:
+Add `--success: #3ba55c` to `:root`. Add a delimited `ChatClientHelpers` block near the beginning of the existing inline script. Implement URL normalization, conditional socket replacement, safe text-element creation, and typing-name fallback exactly as exercised by Step 1. Expose it with `globalThis.ChatClientHelpers = ChatClientHelpers` for the smoke test.
 
-```js
-// TESTABLE_CLIENT_HELPERS_START
-const ChatClientHelpers = (() => {
-  function normalizeBackendUrl(value) {
-    if (typeof value !== 'string') return null;
-    let candidate = value.trim();
-    if (!candidate) return null;
-    if (!/^https?:\/\//i.test(candidate)) candidate = `https://${candidate}`;
-    try {
-      const parsed = new URL(candidate);
-      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
-      return parsed.origin + parsed.pathname.replace(/\/$/, '');
-    } catch {
-      return null;
-    }
-  }
+- [ ] **Step 4: Fix authentication connection lifecycle**
 
-  function replaceSocket(currentSocket, currentUrl, nextUrl, ioFactory) {
-    if (currentSocket && currentUrl === nextUrl) return { socket: currentSocket, url: currentUrl, created: false };
-    if (currentSocket) currentSocket.disconnect();
-    return { socket: ioFactory(nextUrl), url: nextUrl, created: true };
-  }
-
-  function appendTextElement(doc, parent, tagName, className, text) {
-    const element = doc.createElement(tagName);
-    element.className = className;
-    element.textContent = text == null ? '' : String(text);
-    parent.appendChild(element);
-    return element;
-  }
-
-  function typingDisplayName(data) {
-    return data?.displayName || data?.username || 'Someone';
-  }
-
-  return { normalizeBackendUrl, replaceSocket, appendTextElement, typingDisplayName };
-})();
-globalThis.ChatClientHelpers = ChatClientHelpers;
-// TESTABLE_CLIENT_HELPERS_END
-```
-
-Track `let socketUrl = null`. In authentication, use `normalizeBackendUrl`; show `Enter a valid HTTP(S) backend URL.` on null. Call `replaceSocket(socket, socketUrl, url, io)`, assign both returned values, and call `setupSocket()` only when `created` is true.
-
-- [ ] **Step 4: Recover authentication controls after connection failure**
-
-Create an inline `setAuthPending(pending, message)` function that sets `authBtn.disabled = pending` and sets the status text only when `message` is provided. The `connect_error` handler must call `setAuthPending(false, 'Unable to connect. Check the backend URL and try again.')`. All acknowledgement callbacks must start with:
-
-```js
-const response = res || { error: 'No response from server.' };
-```
-
-Read `response.error` and other fields after this guard.
+Track `socketUrl`. Validate with `normalizeBackendUrl`. When a normalized URL differs, disconnect the old socket, create a new one, and call `setupSocket()` once for that new socket. On `connect_error`, re-enable the authentication button and show `Unable to connect. Check the backend URL and try again.`. Treat an absent acknowledgement result as `{ error: 'No response from server.' }` before reading it.
 
 - [ ] **Step 5: Replace untrusted HTML interpolation with DOM construction**
 
-Use `appendTextElement` or direct `textContent` in these exact paths:
-
-- server icon tooltip and server title;
-- online user display name, ghost label, badges, avatar fallback, and context-menu header;
-- deleted-message author label;
-- reply author and reply text;
-- reply/edit info bar labels.
-
-Keep `innerHTML` only for constant application markup or the output of `formatMessageText`, which escapes input before adding allowed formatting. Create `<img>` elements with `img.src = validatedUrl`; do not construct image markup strings containing `avatarUrl`, display names, or colors.
-
-Build the server title with a text node plus separately created badge and ghost nodes. Build deleted-message rows with icon and label text nodes. Build reply context with a `.reply-author` span whose `textContent` is `@${displayname}` and a `.reply-text` span whose `textContent` is the stored reply text after converting trusted ping tokens to visible `@name` text.
+Use `appendTextElement` or direct `textContent` for server tooltips and titles, user labels and context menus, deleted-message author labels, reply authors and reply text, and compose info-bar labels. Create image and badge nodes directly. Keep `innerHTML` only for constant markup or the escaped output of `formatMessageText`.
 
 - [ ] **Step 6: Make room switching acknowledgement-driven**
 
-Capture `previousCode = currentServerCode` and do not assign `currentServerCode = code` before emitting. In the callback:
+Do not assign `currentServerCode` or mutate active-room UI before a successful acknowledgement. On `{ error }`, retain the previous room and show the existing modal. On success, assign room state, render active icon/header/buttons, clear old history and typing state, and load the acknowledged history.
 
-```js
-const response = res || { error: 'No response from server.' };
-if (response.error) {
-  showAppAlert('Error', response.error);
-  renderActiveServer(previousCode);
-  return;
-}
-currentServerCode = code;
-renderActiveServer(code);
-```
+- [ ] **Step 7: Correct typing names**
 
-Move header-button state, title rendering, history clearing, typing-state clearing, and `cancelAction()` behind a successful acknowledgement. Extract `renderActiveServer(code)` inside `chat.html` to update `.active` classes without changing server state.
+Store `typingUsers.set(data.username, ChatClientHelpers.typingDisplayName(data))` and retain the existing single/multiple typing wording.
 
-- [ ] **Step 7: Correct typing-name rendering**
-
-Store `typingUsers.set(data.username, ChatClientHelpers.typingDisplayName(data))`. Keep the existing single-user and multiple-user wording.
-
-- [ ] **Step 8: Run frontend tests and syntax checks**
+- [ ] **Step 8: Run Task 4 tests and full suite**
 
 Run:
 
 ```bash
+node --test backend/test/client-smoke.test.js
 npm test --prefix backend
 sed -n '/<script>/,/<\/script>/p' chat.html | sed '1d;$d' | node --check -
 ```
 
-Expected: all tests PASS; inline script syntax exits 0.
+Expected: all tests PASS; inline syntax exits 0.
 
 - [ ] **Step 9: Commit Task 4**
 
@@ -771,113 +788,87 @@ git commit -m "fix: harden single-file chat client"
 
 ---
 
-### Task 5: Document startup requirements and perform the complete audit
+### Task 5: Document deployment in package metadata and verify the three-file application
 
 **Files:**
-- Create: `backend/README.md`
-- Modify: `backend/test/server-wiring.test.js`
+- Modify: `backend/package.json`
 - Verify: `backend/server.js`
 - Verify: `chat.html`
+- Verify: test-only files under `backend/test/`
 
 **Interfaces:**
-- Consumes: all prior tasks.
-- Produces: deployment instructions and final regression evidence.
+- Consumes all previous tasks.
+- Produces final package metadata and complete verification evidence.
 
-- [ ] **Step 1: Add final credential and single-frontend regression assertions**
+- [ ] **Step 1: Document environment requirements without adding an application file**
 
-Append to `backend/test/server-wiring.test.js`:
+Set the package description to:
 
-```js
-test('only one production frontend file exists', () => {
-  const root = path.join(__dirname, '..', '..');
-  const productionFrontendFiles = fs.readdirSync(root)
-    .filter(name => /\.(?:html|css|js)$/i.test(name));
-  assert.deepEqual(productionFrontendFiles, ['chat.html']);
-});
-
-test('server source contains no password literal passed to bcrypt', () => {
-  assert.doesNotMatch(source, /bcrypt\.hash\(\s*['"][^'"]+['"]/);
-});
+```json
+"description": "Three-file Socket.IO chat; requires MONGO_URI, supports optional ADMIN_PASSWORD (6-128 characters), and defaults PORT to 3000"
 ```
 
-- [ ] **Step 2: Run the final assertions and confirm their state**
+Do not create a README, `.env`, production helper, client script, stylesheet, or additional manifest.
 
-Run: `npm test --prefix backend`
-
-Expected: PASS if prior tasks are complete. If either new assertion fails, correct the production file responsible before continuing.
-
-- [ ] **Step 3: Document environment and startup behavior**
-
-Create `backend/README.md` containing:
-
-````markdown
-# Chat backend
-
-## Environment
-
-- `MONGO_URI` is required for database-backed chat operations.
-- `PORT` is optional and defaults to `3000`.
-- `ADMIN_PASSWORD` is optional. When set to 6–128 characters, startup creates the `NYZhang1` owner only if that account does not already exist. Startup never overwrites an existing password.
-
-## Commands
-
-```bash
-npm install
-npm test
-npm start
-```
-````
-
-- [ ] **Step 4: Run full automated verification**
+- [ ] **Step 2: Run the complete automated suite and syntax checks**
 
 Run:
 
 ```bash
 npm test --prefix backend
 node --check backend/server.js
-node --check backend/lib/chat-security.js
 sed -n '/<script>/,/<\/script>/p' chat.html | sed '1d;$d' | node --check -
-git diff --check 94f9669..HEAD
+git diff --check 593dda5..HEAD
 ```
 
-Expected: every test passes, every syntax check exits 0, and `git diff --check` prints nothing.
+Expected: all tests pass, all syntax checks exit 0, and the diff check prints nothing.
 
-- [ ] **Step 5: Run final security and protocol scans**
+- [ ] **Step 3: Verify credentials and production file count**
 
 Run:
 
 ```bash
-rg -n "DragonNYZ0924|bcrypt\.hash\(['\"]|replyTo: replyTo|io\.to\(socket\.serverCode\)\.emit\('message_edited'" backend chat.html
-rg -n "socket\.on\(|socket\.emit\(" backend/server.js chat.html
-rg -n "innerHTML\s*=.*\$\{" chat.html
-git status --short
-git diff --stat 94f9669..HEAD
+rg -n "DragonNYZ0924|bcrypt\\.hash\\([[:space:]]*['\"]" backend/server.js chat.html backend/package.json
+find . -path './.git' -prune -o -path './.superpowers' -prune -o -path './backend/test' -prune -o -path './docs' -prune -o -path './.worktrees' -prune -o -type f -print | sort
 ```
 
-Expected:
+Expected: the credential scan returns no matches. After excluding Git metadata, test-only files, planning documents, and worktree scratch data, the application file list contains `.gitignore`, the three tracked `Zone.Identifier` metadata files, and exactly these three production files:
 
-- the credential and known-vulnerability scan returns no matches;
-- every client-emitted event still has a server handler and every server-emitted event used by the UI still has a client handler;
-- remaining interpolated `innerHTML` assignments contain only constants or formatter-produced escaped markup;
-- `git status` shows only the three intended `Zone.Identifier` deletions before the documentation commit;
-- `chat.html` remains the only production frontend file.
+```text
+./backend/package.json
+./backend/server.js
+./chat.html
+```
 
-- [ ] **Step 6: Commit Task 5**
+- [ ] **Step 4: Verify protocol event coverage manually**
+
+Run:
 
 ```bash
-git add backend/README.md backend/test/server-wiring.test.js
+rg -n 'socket\.on\(|socket\.emit\(' backend/server.js chat.html
+rg -n 'innerHTML[[:space:]]*=.*\$\{' chat.html
+git status --short
+git diff --stat 593dda5..HEAD
+```
+
+Confirm every client-emitted event retains a backend handler, every server-emitted UI event retains a client handler, and remaining interpolated `innerHTML` assignments contain only constant or formatter-escaped markup. The isolated worktree must be clean before final review.
+
+- [ ] **Step 5: Commit Task 5**
+
+```bash
+git add backend/package.json
 git commit -m "docs: document secure chat startup"
 ```
 
-- [ ] **Step 7: Review the complete implementation diff**
+- [ ] **Step 6: Review final branch history**
 
 Run:
 
 ```bash
-git log --oneline --decorate -6
-git diff --stat 94f9669..HEAD
-git diff --check 94f9669..HEAD
+git log --oneline --decorate -8
+git diff --stat 593dda5..HEAD
+git diff --check 593dda5..HEAD
 git status --short
 ```
 
-Expected: five focused implementation commits after design commit `94f9669`; no whitespace errors; only the user's three metadata deletions remain unstaged.
+Expected: five focused implementation commits after `593dda5`, no whitespace errors, and a clean isolated worktree.

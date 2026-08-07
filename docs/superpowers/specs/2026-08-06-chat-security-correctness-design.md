@@ -4,10 +4,11 @@
 
 ## Scope and constraints
 
-- Keep `chat.html` as the only production frontend file. Its HTML, CSS, and browser JavaScript remain inline.
+- Keep the production chat application at exactly three files: `chat.html`, `backend/server.js`, and `backend/package.json`.
+- Keep all frontend HTML, CSS, and browser JavaScript inline in `chat.html`.
 - Preserve the existing Socket.IO event names, acknowledgement shapes, MongoDB schemas, room roles, and visible workflows.
 - Preserve the documented global-administrator ability to inspect rooms without joining them.
-- Add focused backend helper and test files where isolation improves correctness.
+- Add focused test files only; do not add another production application file.
 - Use Node's built-in test runner and do not add production dependencies.
 - Do not add persistent sessions, redesign authentication, or migrate legacy database records.
 - Preserve the user's deletion of the three `Zone.Identifier` metadata files.
@@ -38,7 +39,7 @@ MongoDB stores users, chat servers, and messages. A user's `servers` array is th
 
 ### Backend validation and acknowledgement helpers
 
-Add a dependency-free backend helper module with pure functions for:
+Define and export dependency-free pure functions from `backend/server.js` for:
 
 - a no-op-safe acknowledgement wrapper;
 - bounded string and password validation: usernames are 1–20 characters, display names and server names are 1–30 characters, message text is at most 2,000 characters, and passwords are 6–128 characters;
@@ -54,6 +55,8 @@ Add a dependency-free backend helper module with pure functions for:
 Every acknowledgement-based handler will normalize its callback before any early return. Every event will validate its payload before reading properties or calling string methods. Invalid payloads will return `Invalid input format.` when the event has an acknowledgement; fire-and-forget events will be ignored safely.
 
 Profile fields, room names, reactions, and attachments will be rejected rather than silently storing unsafe values. Server codes will be either `global` or exactly six uppercase ASCII letters or digits.
+
+`backend/server.js` will expose its pure helpers and a dependency-injected Socket.IO connection-handler factory through `module.exports`. The HTTP server will listen only when the file is executed directly. Tests can therefore exercise real handler behavior with in-memory socket and model fakes, without grepping implementation text or starting a network listener.
 
 ### Authentication and room lifecycle
 
@@ -103,14 +106,14 @@ The frontend will surface acknowledgement errors through its existing modal and 
 
 ## Testing and verification
 
-Use `node:test` for dependency-free regression tests of callback safety, normalization, profile and attachment validation, reaction validation, mention neutralization, room-access decisions, and bounded history behavior. Each production change begins with a focused test that fails for the confirmed defect.
+Use `node:test` for regression tests of callback safety, normalization, profile and attachment validation, reaction validation, mention neutralization, room-access decisions, bounded history behavior, and actual Socket.IO handler outcomes. Each production change begins with a focused test that fails for the confirmed defect.
 
-Backend integration points will be verified with a static event audit showing that every room-sensitive handler calls the centralized access rule and emits to the stored room. Frontend regressions will use a small Node smoke harness that loads the real inline script with minimal browser stubs; no second production frontend file or browser dependency is required.
+Backend handler tests will register the real exported connection handler against in-memory fakes and assert acknowledgements, socket room membership, persistence calls, and emitted room targets. Credential scans and the three-production-file constraint remain final verification commands rather than brittle source-text unit tests. Frontend regressions will use a small Node smoke harness that loads the real inline script with minimal browser stubs; no second production frontend file or browser dependency is required.
 
 Final verification includes:
 
 - the complete built-in test suite;
-- syntax checks for `backend/server.js`, the helper, the tests, and the inline client script;
+- syntax checks for `backend/server.js`, the tests, and the inline client script;
 - a client smoke test for URL replacement, connection-error recovery, safe rendering helpers, and rejected room switches;
 - a scan for hardcoded credentials and unsafe untrusted interpolation paths;
 - a clean review of the final diff, excluding the user's pre-existing `Zone.Identifier` deletions.
@@ -121,4 +124,4 @@ Final verification includes:
 - A frontend split, build system, framework migration, or visual redesign.
 - Schema migrations for previously stored unsafe values.
 - Distributed rate limiting across multiple backend processes.
-- Deployment configuration beyond documenting the required `MONGO_URI` and optional `ADMIN_PASSWORD` environment variables.
+- Deployment configuration beyond documenting the required `MONGO_URI` and optional `ADMIN_PASSWORD` environment variables in `backend/package.json`.
