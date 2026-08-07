@@ -84,6 +84,78 @@ test('authorized room switch leaves old room only after access succeeds', async 
   assert.deepEqual(ack.value(), { history: [], roomRole: 'user' });
 });
 
+test('room switch history failure preserves transport, socket, and presence state', async () => {
+  const onlineUsersMap = new Map([['socket-1', {
+    username: 'alice', serverCode: 'OLD123', joinedServers: ['global', 'OLD123', 'ABC123']
+  }]]);
+  const broadcasts = [];
+  const ChatServerModel = { findOne: () => queryResult({ code: 'ABC123', moderators: [] }) };
+  const MessageModel = {
+    find() {
+      return {
+        sort() { return this; },
+        limit() { return this; },
+        async lean() { throw new Error('history unavailable'); }
+      };
+    }
+  };
+  const { socket } = register({
+    ChatServerModel,
+    MessageModel,
+    onlineUsersMap,
+    broadcastOnlineUsersFn: code => broadcasts.push(code)
+  });
+  socket.username = 'alice';
+  socket.role = 'user';
+  socket.joinedServers = ['global', 'OLD123', 'ABC123'];
+  socket.serverCode = 'OLD123';
+  socket.joinedRooms.add('OLD123');
+
+  const ack = acknowledge();
+  await socket.trigger('switch_server', 'ABC123', ack.callback);
+
+  assert.deepEqual(ack.value(), { error: 'Failed to switch server.' });
+  assert.equal(socket.serverCode, 'OLD123');
+  assert.deepEqual(socket.leftRooms, []);
+  assert.equal(socket.joinedRooms.has('OLD123'), true);
+  assert.equal(socket.joinedRooms.has('ABC123'), false);
+  assert.equal(onlineUsersMap.get('socket-1').serverCode, 'OLD123');
+  assert.deepEqual(broadcasts, []);
+});
+
+test('room switch acknowledges success before broadcasting target presence', async () => {
+  const events = [];
+  const onlineUsersMap = new Map([['socket-1', {
+    username: 'alice', serverCode: 'OLD123', joinedServers: ['global', 'OLD123', 'ABC123']
+  }]]);
+  const ChatServerModel = { findOne: () => queryResult({ code: 'ABC123', moderators: [] }) };
+  const MessageModel = { find: () => queryResult([]) };
+  const { socket } = register({
+    ChatServerModel,
+    MessageModel,
+    onlineUsersMap,
+    broadcastOnlineUsersFn: code => events.push(`broadcast:${code}`)
+  });
+  socket.username = 'alice';
+  socket.role = 'user';
+  socket.joinedServers = ['global', 'OLD123', 'ABC123'];
+  socket.serverCode = 'OLD123';
+  socket.joinedRooms.add('OLD123');
+
+  await socket.trigger('switch_server', 'ABC123', result => {
+    events.push('ack');
+    assert.deepEqual(result, { history: [], roomRole: 'user' });
+  });
+
+  assert.equal(socket.serverCode, 'ABC123');
+  assert.equal(socket.joinedRooms.has('OLD123'), false);
+  assert.equal(socket.joinedRooms.has('ABC123'), true);
+  assert.equal(onlineUsersMap.get('socket-1').serverCode, 'ABC123');
+  assert.deepEqual(events, [
+    'ack', 'broadcast:OLD123', 'broadcast:ABC123', 'broadcast:global'
+  ]);
+});
+
 test('leaving the active room removes transport and moderator access then moves to global', async () => {
   const user = { servers: ['global', 'ABC123'], async save() {} };
   const pulled = [];

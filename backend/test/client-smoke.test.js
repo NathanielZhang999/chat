@@ -55,3 +55,51 @@ test('typing display falls back to username', () => {
   assert.equal(helpers.typingDisplayName({ username: 'alice', displayName: 'Alice' }), 'Alice');
   assert.equal(helpers.typingDisplayName({ username: 'alice' }), 'alice');
 });
+
+test('room switches serialize and retain only the latest queued target', () => {
+  const helpers = loadHelpers();
+  const acknowledgements = [];
+  const events = [];
+  const coordinator = helpers.createSwitchCoordinator(
+    (target, callback) => {
+      events.push(`emit:${target}`);
+      acknowledgements.push(callback);
+    },
+    target => events.push(`handle:${target}`)
+  );
+
+  coordinator.request('AAAAAA');
+  coordinator.request('BBBBBB');
+  coordinator.request('CCCCCC');
+
+  assert.deepEqual(events, ['emit:AAAAAA']);
+  acknowledgements[0]({ history: [] });
+  assert.deepEqual(events, ['emit:AAAAAA', 'handle:AAAAAA', 'emit:CCCCCC']);
+  assert.equal(events.includes('emit:BBBBBB'), false);
+
+  acknowledgements[1]({ history: [] });
+  assert.deepEqual(events, [
+    'emit:AAAAAA', 'handle:AAAAAA', 'emit:CCCCCC', 'handle:CCCCCC'
+  ]);
+});
+
+test('room switch queue advances after an error acknowledgement', () => {
+  const helpers = loadHelpers();
+  const acknowledgements = [];
+  const events = [];
+  const coordinator = helpers.createSwitchCoordinator(
+    (target, callback) => {
+      events.push(`emit:${target}`);
+      acknowledgements.push(callback);
+    },
+    (target, result) => events.push(`handle:${target}:${result.error || 'ok'}`)
+  );
+
+  coordinator.request('AAAAAA');
+  coordinator.request('BBBBBB');
+  acknowledgements[0]({ error: 'Denied.' });
+
+  assert.deepEqual(events, [
+    'emit:AAAAAA', 'handle:AAAAAA:Denied.', 'emit:BBBBBB'
+  ]);
+});

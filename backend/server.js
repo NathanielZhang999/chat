@@ -693,35 +693,47 @@ function createConnectionHandler({
     if (!socket.username) return callback({ error: 'Not authenticated.' });
     const serverCode = normalizeServerCode(code);
     if (!serverCode) return callback({ error: 'Invalid server code.' });
+
+    let safeHistory;
+    let roomRole;
     try {
       const room = await ChatServerModel.findOne({ code: serverCode });
       if (!room) return callback({ error: 'Server not found.' });
       if (!canAccessRoom(socket, serverCode)) return callback({ error: 'Permission denied.' });
-      const oldCode = socket.serverCode;
-      if (oldCode && oldCode !== serverCode) { socket.leave(oldCode); broadcastOnlineUsersFn(oldCode); }
 
-      socket.serverCode = serverCode; socket.join(serverCode);
-      if (onlineUsersMap.has(socket.id)) onlineUsersMap.get(socket.id).serverCode = serverCode;
-      
-      broadcastOnlineUsersFn(serverCode);
-      broadcastOnlineUsersFn('global');
-      
       let query = { serverCode };
       if (serverCode === 'global') query = { $or: [{ serverCode: 'global' }, { serverCode: { $exists: false } }, { serverCode: null }] };
 
       const history = await MessageModel.find(query).sort({ timestamp: -1 }).limit(100).lean();
-      
-      const roomRole = await getRoomRoleFn(serverCode, socket.username);
+      roomRole = await getRoomRoleFn(serverCode, socket.username);
 
-      const safeHistory = history.map(msg => {
+      safeHistory = history.map(msg => {
           if (msg.deleted && msg.username !== socket.username && socket.role !== 'admin' && roomRole !== 'mod') {
               msg.text = ''; msg.attachment = null; msg.reactions = {};
           }
           if (!msg.reactions) msg.reactions = {};
           return msg;
-      });
-      callback({ history: safeHistory.reverse(), roomRole });
-    } catch (err) { callback({ error: 'Failed to switch server.' }); }
+      }).reverse();
+    } catch (err) {
+      return callback({ error: 'Failed to switch server.' });
+    }
+
+    const oldCode = socket.serverCode;
+    if (oldCode && oldCode !== serverCode) socket.leave(oldCode);
+    socket.serverCode = serverCode;
+    socket.join(serverCode);
+    if (onlineUsersMap.has(socket.id)) onlineUsersMap.get(socket.id).serverCode = serverCode;
+
+    callback({ history: safeHistory, roomRole });
+
+    const broadcastCodes = [];
+    if (oldCode && oldCode !== serverCode) broadcastCodes.push(oldCode);
+    broadcastCodes.push(serverCode, 'global');
+    [...new Set(broadcastCodes)].forEach(broadcastCode => {
+      try {
+        Promise.resolve(broadcastOnlineUsersFn(broadcastCode)).catch(() => {});
+      } catch {}
+    });
   });
 
   socket.on('chat_message', async (payload) => {
