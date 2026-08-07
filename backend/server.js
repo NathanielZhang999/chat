@@ -724,31 +724,34 @@ function createConnectionHandler({
   });
 
   socket.on('chat_message', async (payload) => {
-    if (!socket.username || !socket.serverCode) return;
-    
-    const now = Date.now();
-    if (socket.role !== 'admin' && now - lastMessageTime < 500) {
-        return socket.emit('system_message', '⚠️ Slow down! You are sending messages too fast.');
-    }
-    lastMessageTime = now;
-
-    if (typeof payload !== 'string' && typeof payload !== 'object') return;
-    
-    const rawText = typeof payload === 'string' ? payload : (payload.text || '');
-    const attachment = typeof payload === 'object' ? payload.attachment : null; 
-    const replyTo = typeof payload === 'object' ? payload.replyTo : null;
-    
-    if (attachment && (typeof attachment !== 'string' || attachment.length > 15000000)) return;
-
-    let cleanText = rawText.trim().substring(0, 2000);
-    
-    if (!cleanText && !attachment) return; 
-
-    const roomRole = await getRoomRoleFn(socket.serverCode, socket.username);
-
-    cleanText = await resolvePingsFn(cleanText, socket.serverCode, socket.role, roomRole, socket.username);
-
     try {
+      const identity = { role: socket.role, joinedServers: socket.joinedServers || [] };
+      if (!socket.username || !socket.serverCode || !canAccessRoom(identity, socket.serverCode)) return;
+      if (!payload || typeof payload !== 'object' || Array.isArray(payload) || typeof payload.text !== 'string') return;
+      if (!isValidAttachment(payload.attachment)) return;
+
+      const now = Date.now();
+      if (socket.role !== 'admin' && now - lastMessageTime < 500) {
+        return socket.emit('system_message', '⚠️ Slow down! You are sending messages too fast.');
+      }
+      lastMessageTime = now;
+
+      const attachment = payload.attachment || null;
+      let cleanText = payload.text.trim().substring(0, 2000);
+      if (!cleanText && !attachment) return;
+
+      let replyTo = null;
+      if (payload.replyTo && typeof payload.replyTo === 'object' && isValidObjectId(payload.replyTo.id)) {
+        const referenced = await MessageModel.findById(payload.replyTo.id);
+        if (referenced && !referenced.deleted && referenced.serverCode === socket.serverCode) {
+          replyTo = createReplySnapshot(referenced);
+        }
+      }
+
+      const roomRole = await getRoomRoleFn(socket.serverCode, socket.username);
+      cleanText = neutralizePingTokens(cleanText);
+      cleanText = await resolvePingsFn(cleanText, socket.serverCode, socket.role, roomRole, socket.username);
+
       const msg = await MessageModel.create({
           serverCode: socket.serverCode, username: socket.username, displayName: socket.displayName, 
           role: socket.role, roomRole: roomRole, color: socket.color, avatarUrl: socket.avatarUrl, 
@@ -759,17 +762,19 @@ function createConnectionHandler({
           _id: msg._id, username: msg.username, displayName: msg.displayName, role: socket.role, roomRole: roomRole, color: msg.color, avatarUrl: msg.avatarUrl,
           text: msg.text, attachment: msg.attachment, replyTo: msg.replyTo, reactions: {}, timestamp: msg.timestamp, edited: false, deleted: false 
       });
-    } catch (err) {}
+    } catch (err) { console.error('chat_message failed:', err); }
   });
 
   socket.on('toggle_reaction', async (data) => {
-      if (!socket.username || !socket.serverCode) return;
       try {
+          if (!socket.username || !data || typeof data !== 'object' || Array.isArray(data)) return;
           const { id, emoji } = data;
-          if (!id || !emoji) return;
+          if (!isValidObjectId(id) || !isValidReaction(emoji)) return;
 
           const msg = await MessageModel.findById(id);
           if (!msg || msg.deleted) return;
+          const identity = { role: socket.role, joinedServers: socket.joinedServers || [] };
+          if (!canAccessRoom(identity, msg.serverCode)) return;
 
           let rx = msg.reactions || {};
           let users = rx[emoji] || [];
@@ -788,17 +793,20 @@ function createConnectionHandler({
           await msg.save();
 
           ioInstance.to(msg.serverCode).emit('reaction_updated', { id: msg._id, reactions: msg.reactions });
-      } catch (err) {}
+      } catch (err) { console.error('toggle_reaction failed:', err); }
   });
 
   socket.on('edit_message', async (data) => {
-    if (!socket.username || !data.id || typeof data.text !== 'string') return;
     try {
+      if (!socket.username || !data || typeof data !== 'object' || Array.isArray(data) ||
+          !isValidObjectId(data.id) || typeof data.text !== 'string') return;
       let cleanText = data.text.trim().substring(0, 2000);
       if (!cleanText) return;
 
       const msg = await MessageModel.findById(data.id);
       if (msg && !msg.deleted) {
+        const identity = { role: socket.role, joinedServers: socket.joinedServers || [] };
+        if (!canAccessRoom(identity, msg.serverCode)) return;
         const roomRole = await getRoomRoleFn(msg.serverCode, socket.username);
 
         // Edit allowed for Sender, Global Admin, or Room Mod
@@ -807,22 +815,23 @@ function createConnectionHandler({
           cleanText = await resolvePingsFn(cleanText, msg.serverCode, socket.role, roomRole, socket.username);
 
           if (msg.text !== cleanText) {
-              if (!msg.history) msg.history = []; 
-              msg.history.push({ text: msg.text, timestamp: new Date() });
+              msg.history = appendBoundedHistory(msg.history, { text: msg.text, timestamp: new Date() });
               msg.text = cleanText; msg.edited = true; msg.markModified('history'); 
               await msg.save();
-              ioInstance.to(socket.serverCode).emit('message_edited', { id: msg._id, username: msg.username, role: msg.role, roomRole: msg.roomRole, text: cleanText });
+              ioInstance.to(msg.serverCode).emit('message_edited', { id: msg._id, username: msg.username, role: msg.role, roomRole: msg.roomRole, text: cleanText });
           }
         }
       }
-    } catch (err) {}
+    } catch (err) { console.error('edit_message failed:', err); }
   });
 
   socket.on('delete_message', async (msgId) => {
-    if (!socket.username) return;
     try {
+      if (!socket.username || !isValidObjectId(msgId)) return;
       const msg = await MessageModel.findById(msgId);
       if (msg && !msg.deleted) {
+        const identity = { role: socket.role, joinedServers: socket.joinedServers || [] };
+        if (!canAccessRoom(identity, msg.serverCode)) return;
         const roomRole = await getRoomRoleFn(msg.serverCode, socket.username);
         
         // Sender, SysAdmin, or RoomMod can delete it
@@ -831,44 +840,53 @@ function createConnectionHandler({
           ioInstance.to(msg.serverCode).emit('message_deleted', msgId);
         }
       }
-    } catch (err) {}
+    } catch (err) { console.error('delete_message failed:', err); }
   });
 
   socket.on('get_edit_history', async (msgId, callback) => {
     callback = safeAck(callback);
     if (!socket.username) return callback({ error: 'Not authenticated.' });
     try {
+      if (!isValidObjectId(msgId)) return callback({ error: 'Permission denied.' });
       const msg = await MessageModel.findById(msgId);
       if (msg) {
+        const identity = { role: socket.role, joinedServers: socket.joinedServers || [] };
+        if (!canAccessRoom(identity, msg.serverCode)) return callback({ error: 'Permission denied.' });
         const roomRole = await getRoomRoleFn(msg.serverCode, socket.username);
         if (msg.username === socket.username || socket.role === 'admin' || roomRole === 'mod') {
-            return callback({ success: true, history: msg.history || [] });
+            return callback({ success: true, history: (Array.isArray(msg.history) ? msg.history : []).slice(-20) });
         }
       }
       callback({ error: 'Permission denied.' });
-    } catch (err) { callback({ error: 'Failed to load history.' }); }
+    } catch (err) { console.error('get_edit_history failed:', err); callback({ error: 'Failed to load history.' }); }
   });
 
   socket.on('get_deleted_message', async (msgId, callback) => {
     callback = safeAck(callback);
     if (!socket.username) return callback({ error: 'Not authenticated.' });
     try {
+      if (!isValidObjectId(msgId)) return callback({ error: 'Permission denied.' });
       const msg = await MessageModel.findById(msgId);
       if (msg && msg.deleted) {
+        const identity = { role: socket.role, joinedServers: socket.joinedServers || [] };
+        if (!canAccessRoom(identity, msg.serverCode)) return callback({ error: 'Permission denied.' });
         const roomRole = await getRoomRoleFn(msg.serverCode, socket.username);
         if (msg.username === socket.username || socket.role === 'admin' || roomRole === 'mod') {
             return callback({ success: true, text: msg.text, attachment: msg.attachment });
         }
       }
       callback({ error: 'Permission denied.' });
-    } catch (err) { callback({ error: 'Failed to load deleted message.' }); }
+    } catch (err) { console.error('get_deleted_message failed:', err); callback({ error: 'Failed to load deleted message.' }); }
   });
 
   socket.on('typing', (isTyping) => {
-    if (!socket.username || !socket.serverCode) return;
-    const isVisible = socket.role !== 'admin' || socket.joinedServers.includes(socket.serverCode) || socket.serverCode === 'global';
-    
-    if (isVisible) socket.to(socket.serverCode).emit('typing', { username: socket.username, isTyping });
+    const identity = { role: socket.role, joinedServers: socket.joinedServers || [] };
+    if (!socket.username || !socket.serverCode || typeof isTyping !== 'boolean' || !canAccessRoom(identity, socket.serverCode)) return;
+    socket.to(socket.serverCode).emit('typing', {
+      username: socket.username,
+      displayName: socket.displayName || socket.username,
+      isTyping
+    });
   });
 
   socket.on('disconnect', () => {
