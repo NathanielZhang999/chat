@@ -103,3 +103,50 @@ test('room switch queue advances after an error acknowledgement', () => {
     'emit:AAAAAA', 'handle:AAAAAA:Denied.', 'emit:BBBBBB'
   ]);
 });
+
+test('room switch coordinator reports pending state', () => {
+  const helpers = loadHelpers();
+  let acknowledgeSwitch;
+  const coordinator = helpers.createSwitchCoordinator(
+    (_target, callback) => { acknowledgeSwitch = callback; },
+    () => {}
+  );
+
+  assert.equal(coordinator.isPending(), false);
+  coordinator.request('BBBBBB');
+  assert.equal(coordinator.isPending(), true);
+  acknowledgeSwitch({ history: [] });
+  assert.equal(coordinator.isPending(), false);
+});
+
+test('selecting the displayed room while another switch is pending returns to it', () => {
+  const helpers = loadHelpers();
+  const acknowledgements = [];
+  const emissions = [];
+  let displayedRoom = 'AAAAAA';
+  const coordinator = helpers.createSwitchCoordinator(
+    (target, callback) => {
+      emissions.push(target);
+      acknowledgements.push(callback);
+    },
+    (target, result) => {
+      if (!result.error) displayedRoom = target;
+    }
+  );
+  const selectRoom = target => {
+    if (displayedRoom === target && !coordinator.isPending()) return;
+    coordinator.request(target);
+  };
+
+  selectRoom('BBBBBB');
+  selectRoom('AAAAAA');
+  assert.deepEqual(emissions, ['BBBBBB']);
+
+  acknowledgements[0]({ history: [] });
+  assert.equal(displayedRoom, 'BBBBBB');
+  assert.deepEqual(emissions, ['BBBBBB', 'AAAAAA']);
+
+  acknowledgements[1]({ history: [] });
+  assert.equal(displayedRoom, 'AAAAAA');
+  assert.equal(coordinator.isPending(), false);
+});

@@ -156,6 +156,47 @@ test('room switch acknowledges success before broadcasting target presence', asy
   ]);
 });
 
+test('room switch finishes role lookup before history lookup begins', async () => {
+  const events = [];
+  const ChatServerModel = { findOne: () => queryResult({ code: 'ABC123', moderators: [] }) };
+  const MessageModel = {
+    find() {
+      events.push('history:find');
+      return {
+        sort() { return this; },
+        limit() { return this; },
+        async lean() {
+          events.push('history:lean');
+          return [];
+        }
+      };
+    }
+  };
+  const { socket } = register({
+    ChatServerModel,
+    MessageModel,
+    async getRoomRoleFn() {
+      events.push('role:start');
+      await Promise.resolve();
+      events.push('role:end');
+      return 'user';
+    }
+  });
+  socket.username = 'alice';
+  socket.role = 'user';
+  socket.joinedServers = ['global', 'ABC123'];
+  socket.serverCode = 'global';
+  socket.joinedRooms.add('global');
+
+  const ack = acknowledge();
+  await socket.trigger('switch_server', 'ABC123', ack.callback);
+
+  assert.deepEqual(ack.value(), { history: [], roomRole: 'user' });
+  assert.deepEqual(events, [
+    'role:start', 'role:end', 'history:find', 'history:lean'
+  ]);
+});
+
 test('leaving the active room removes transport and moderator access then moves to global', async () => {
   const user = { servers: ['global', 'ABC123'], async save() {} };
   const pulled = [];

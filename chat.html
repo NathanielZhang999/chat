@@ -517,6 +517,9 @@
             };
 
             return {
+                isPending() {
+                    return inFlightTarget !== null;
+                },
                 request(target) {
                     if (inFlightTarget !== null) {
                         queuedTarget = target;
@@ -1333,7 +1336,8 @@
     }
 
     function switchServer(code) {
-        if (currentServerCode === code && chatWindow.innerHTML !== '') return;
+        if (currentServerCode === code && chatWindow.innerHTML !== '' &&
+            !roomSwitchCoordinator.isPending()) return;
         roomSwitchCoordinator.request(code);
     }
 

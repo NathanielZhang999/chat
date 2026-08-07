@@ -704,8 +704,8 @@ function createConnectionHandler({
       let query = { serverCode };
       if (serverCode === 'global') query = { $or: [{ serverCode: 'global' }, { serverCode: { $exists: false } }, { serverCode: null }] };
 
-      const history = await MessageModel.find(query).sort({ timestamp: -1 }).limit(100).lean();
       roomRole = await getRoomRoleFn(serverCode, socket.username);
+      const history = await MessageModel.find(query).sort({ timestamp: -1 }).limit(100).lean();
 
       safeHistory = history.map(msg => {
           if (msg.deleted && msg.username !== socket.username && socket.role !== 'admin' && roomRole !== 'mod') {
