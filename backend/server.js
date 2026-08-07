@@ -77,7 +77,8 @@ function isValidAttachment(value) {
 }
 
 function isValidReaction(value) {
-  return typeof value === 'string' && value.length > 0 && value.length <= 64 && REACTION_RE.test(value);
+  return typeof value === 'string' && value.length > 0 && value.length <= 64 &&
+    REACTION_RE.test(value) && /\p{Extended_Pictographic}/u.test(value);
 }
 
 function isValidObjectId(value) {
@@ -751,6 +752,7 @@ function createConnectionHandler({
       const roomRole = await getRoomRoleFn(socket.serverCode, socket.username);
       cleanText = neutralizePingTokens(cleanText);
       cleanText = await resolvePingsFn(cleanText, socket.serverCode, socket.role, roomRole, socket.username);
+      if (typeof cleanText !== 'string' || cleanText.length > 2000) return;
 
       const msg = await MessageModel.create({
           serverCode: socket.serverCode, username: socket.username, displayName: socket.displayName, 
@@ -812,7 +814,9 @@ function createConnectionHandler({
         // Edit allowed for Sender, Global Admin, or Room Mod
         if (msg.username === socket.username || socket.role === 'admin' || roomRole === 'mod') {
           
+          cleanText = neutralizePingTokens(cleanText);
           cleanText = await resolvePingsFn(cleanText, msg.serverCode, socket.role, roomRole, socket.username);
+          if (typeof cleanText !== 'string' || cleanText.length > 2000) return;
 
           if (msg.text !== cleanText) {
               msg.history = appendBoundedHistory(msg.history, { text: msg.text, timestamp: new Date() });

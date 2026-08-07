@@ -251,3 +251,75 @@ test('typing emits a complete payload only for accessible active rooms and boole
     payload: { username: 'alice', displayName: 'Alice', isTyping: true }
   }]);
 });
+
+test('editing neutralizes client ping tokens before resolving mentions', async () => {
+  let resolverInput;
+  const message = {
+    _id: '507f1f77bcf86cd799439011', serverCode: 'global', username: 'alice',
+    text: 'before', history: [], deleted: false,
+    markModified() {}, async save() {}
+  };
+  const { socket } = registerMessages({
+    MessageModel: { findById: async () => message },
+    resolvePingsFn: async text => { resolverInput = text; return text; }
+  });
+  authenticate(socket);
+  await socket.trigger('edit_message', { id: message._id, text: '{{PING:everyone|everyone}}' });
+  assert.equal(resolverInput, '@everyone');
+});
+
+test('chat messages do not persist or emit text expanded beyond two thousand characters', async () => {
+  let created = 0;
+  const { socket, ioInstance } = registerMessages({
+    resolvePingsFn: async () => 'x'.repeat(2001),
+    MessageModel: {
+      async create(value) {
+        created += 1;
+        return { ...value, _id: '507f191e810c19729de860ea', timestamp: new Date() };
+      }
+    }
+  });
+  authenticate(socket);
+  await socket.trigger('chat_message', { text: 'short input' });
+  assert.equal(created, 0);
+  assert.deepEqual(ioInstance.outbound, []);
+});
+
+test('edits do not persist or emit text expanded beyond two thousand characters', async () => {
+  let saved = 0;
+  const message = {
+    _id: '507f1f77bcf86cd799439011', serverCode: 'global', username: 'alice',
+    text: 'before', history: [], deleted: false,
+    markModified() {}, async save() { saved += 1; }
+  };
+  const { socket, ioInstance } = registerMessages({
+    MessageModel: { findById: async () => message },
+    resolvePingsFn: async () => 'x'.repeat(2001)
+  });
+  authenticate(socket);
+  await socket.trigger('edit_message', { id: message._id, text: 'short input' });
+  assert.equal(saved, 0);
+  assert.equal(message.text, 'before');
+  assert.deepEqual(message.history, []);
+  assert.deepEqual(ioInstance.outbound, []);
+});
+
+test('reaction handlers reject non-pictographic permitted sequence characters before lookup', async () => {
+  let lookups = 0;
+  let saved = 0;
+  const { socket, ioInstance } = registerMessages({
+    MessageModel: {
+      async findById() {
+        lookups += 1;
+        return { serverCode: 'global', reactions: {}, markModified() {}, async save() { saved += 1; } };
+      }
+    }
+  });
+  authenticate(socket);
+  for (const emoji of ['\uFE0F', '\u200D', '🏻']) {
+    await socket.trigger('toggle_reaction', { id: '507f1f77bcf86cd799439011', emoji });
+  }
+  assert.equal(lookups, 0);
+  assert.equal(saved, 0);
+  assert.deepEqual(ioInstance.outbound, []);
+});
