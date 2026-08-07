@@ -26,6 +26,31 @@ test('login rejects replacing an authenticated socket identity', async () => {
   assert.equal(socket.username, 'alice');
 });
 
+test('a late login server query failure leaves socket, rooms, presence, and broadcasts unchanged', async () => {
+  const onlineUsersMap = new Map();
+  const broadcasts = [];
+  const { socket } = register({
+    UserModel: {
+      async findOne() {
+        return { username: 'alice', displayName: 'Alice', password: 'hash', role: 'user', servers: ['global'] };
+      }
+    },
+    ChatServerModel: { async find() { throw new Error('database unavailable'); } },
+    bcryptImpl: { async compare() { return true; } },
+    onlineUsersMap,
+    broadcastOnlineUsersFn: async code => broadcasts.push(code)
+  });
+  const ack = acknowledge();
+  await socket.trigger('login', { username: 'alice', password: '123456' }, ack.callback);
+  assert.deepEqual(ack.value(), { error: 'Login failed.' });
+  assert.equal(socket.username, undefined);
+  assert.equal(socket.serverCode, null);
+  assert.deepEqual(socket.joinedServers, []);
+  assert.equal(socket.joinedRooms.has('global'), false);
+  assert.equal(onlineUsersMap.size, 0);
+  assert.deepEqual(broadcasts, []);
+});
+
 test('unauthorized room switch leaves current membership unchanged', async () => {
   const ChatServerModel = { findOne: () => queryResult({ code: 'ABC123' }) };
   const MessageModel = { find: () => queryResult([]) };
@@ -81,6 +106,76 @@ test('leaving the active room removes transport and moderator access then moves 
     update: { $pull: { moderators: 'alice' } }
   }]);
   assert.deepEqual(ack.value(), { success: true });
+});
+
+test('leaving an active ghost-access room moves a global admin to global without database cleanup', async () => {
+  const user = { servers: ['global'], async save() { throw new Error('must not save'); } };
+  const pulled = [];
+  const onlineUsersMap = new Map([['socket-1', { serverCode: 'ABC123', joinedServers: ['global'] }]]);
+  const { socket } = register({
+    UserModel: { async findOne() { return user; } },
+    ChatServerModel: { async updateOne(...args) { pulled.push(args); } },
+    onlineUsersMap
+  });
+  socket.username = 'alice';
+  socket.displayName = 'Alice';
+  socket.role = 'admin';
+  socket.serverCode = 'ABC123';
+  socket.joinedServers = ['global'];
+  socket.joinedRooms.add('ABC123');
+  const ack = acknowledge();
+  await socket.trigger('leave_server', 'ABC123', ack.callback);
+  assert.deepEqual(ack.value(), { success: true });
+  assert.deepEqual(user.servers, ['global']);
+  assert.deepEqual(pulled, []);
+  assert.equal(socket.joinedRooms.has('ABC123'), false);
+  assert.equal(socket.joinedRooms.has('global'), true);
+  assert.equal(socket.serverCode, 'global');
+  assert.equal(onlineUsersMap.get('socket-1').serverCode, 'global');
+});
+
+test('deleting an active room keeps the socket and mapped session in global', async () => {
+  const onlineUsersMap = new Map([['socket-1', { serverCode: 'ABC123', joinedServers: ['global', 'ABC123'] }]]);
+  const { socket, ioInstance } = register({
+    onlineUsersMap,
+    ChatServerModel: {
+      async findOne() { return { code: 'ABC123', owner: 'alice' }; },
+      async deleteOne() {}
+    },
+    UserModel: { async updateMany() {} },
+    MessageModel: { async deleteMany() {} }
+  });
+  socket.username = 'alice';
+  socket.role = 'user';
+  socket.serverCode = 'ABC123';
+  socket.joinedServers = ['global', 'ABC123'];
+  socket.joinedRooms.add('ABC123');
+  ioInstance.sockets = [socket];
+  const ack = acknowledge();
+  await socket.trigger('delete_server', 'ABC123', ack.callback);
+  assert.deepEqual(ack.value(), { success: true });
+  assert.equal(socket.serverCode, 'global');
+  assert.equal(socket.joinedRooms.has('ABC123'), false);
+  assert.equal(socket.joinedRooms.has('global'), true);
+  assert.equal(onlineUsersMap.get('socket-1').serverCode, 'global');
+});
+
+test('a failed best-effort admin notification acknowledges server creation only once', async () => {
+  const user = { servers: ['global'], async save() {} };
+  const ioInstance = new FakeIo();
+  ioInstance.fetchSockets = async () => { throw new Error('notification unavailable'); };
+  const { socket } = register({
+    ioInstance,
+    ChatServerModel: { async create() { return { code: 'ABC123', name: 'Team', owner: 'alice' }; } },
+    UserModel: { async findOne() { return user; } }
+  });
+  socket.username = 'alice';
+  const acknowledgements = [];
+  await assert.doesNotReject(socket.trigger('create_server', 'Team', value => acknowledgements.push(value)));
+  assert.deepEqual(acknowledgements, [{
+    success: true,
+    server: { code: 'ABC123', name: 'Team', owner: 'alice' }
+  }]);
 });
 
 test('invalid profile values do not write the user record', async () => {
@@ -175,7 +270,7 @@ test('seedSystem creates the global room without an administrator password', asy
   await seedSystem({
     UserModel: { async findOne() { userLookups += 1; } },
     ChatServerModel: { async findOneAndUpdate(...args) { roomUpdates.push(args); } },
-    adminPassword: undefined
+    adminPassword: ''
   });
   assert.deepEqual(roomUpdates, [[
     { code: 'global' },

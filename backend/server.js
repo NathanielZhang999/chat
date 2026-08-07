@@ -373,9 +373,14 @@ function createConnectionHandler({
       if (!user.servers || user.servers.length === 0) { user.servers = ['global']; await user.save(); }
       if (!user.displayName) { user.displayName = user.username; await user.save(); }
 
+      const role = user.role || 'user';
+      const servers = role === 'admin'
+        ? await ChatServerModel.find()
+        : await ChatServerModel.find({ code: { $in: user.servers } });
+
       socket.username = user.username;
       socket.displayName = user.displayName;
-      socket.role = user.role || 'user';
+      socket.role = role;
       socket.color = user.color || '';
       socket.avatarUrl = user.avatarUrl || '';
       socket.serverCode = 'global'; 
@@ -393,7 +398,6 @@ function createConnectionHandler({
       
       clearRateLimit(ip);
 
-      const servers = socket.role === 'admin' ? await ChatServerModel.find() : await ChatServerModel.find({ code: { $in: user.servers } });
       callback({ success: true, username: user.username, displayName: socket.displayName, role: socket.role, color: socket.color, avatarUrl: socket.avatarUrl, servers: servers || [], joinedServers: user.servers });
     } catch (err) { callback({ error: 'Login failed.' }); }
   });
@@ -586,8 +590,10 @@ function createConnectionHandler({
       }
       callback({ success: true, server: srv });
       
-      const sockets = await ioInstance.fetchSockets();
-      sockets.forEach(s => { if (onlineUsersMap.has(s.id) && onlineUsersMap.get(s.id).role === 'admin') s.emit('admin_new_server', srv); });
+      try {
+        const sockets = await ioInstance.fetchSockets();
+        sockets.forEach(s => { if (onlineUsersMap.has(s.id) && onlineUsersMap.get(s.id).role === 'admin') s.emit('admin_new_server', srv); });
+      } catch (err) {}
     } catch (err) { callback({ error: 'Creation failed.' }); }
   });
 
@@ -622,22 +628,27 @@ function createConnectionHandler({
     if (!serverCode || serverCode === 'global') return callback({ error: 'Cannot leave global.' });
     try {
       const user = await UserModel.findOne({ username: socket.username });
-      if (user.servers.includes(serverCode)) {
+      const isMember = user.servers.includes(serverCode);
+      if (isMember) {
         user.servers = user.servers.filter(s => s !== serverCode); await user.save();
         socket.joinedServers = user.servers;
         if(onlineUsersMap.has(socket.id)) onlineUsersMap.get(socket.id).joinedServers = user.servers;
         await ChatServerModel.updateOne({ code: serverCode }, { $pull: { moderators: socket.username } });
-        
-        broadcastOnlineUsersFn(serverCode);
+      }
 
-        if (socket.serverCode === serverCode) {
-            socket.to(serverCode).emit('system_message', `${socket.displayName} left the server.`);
-            socket.leave(serverCode);
-            socket.serverCode = 'global';
-            socket.join('global');
-            if (onlineUsersMap.has(socket.id)) onlineUsersMap.get(socket.id).serverCode = 'global';
-            broadcastOnlineUsersFn('global');
-        }
+      const wasActive = socket.serverCode === serverCode;
+      if (wasActive) {
+          socket.to(serverCode).emit('system_message', `${socket.displayName} left the server.`);
+          socket.leave(serverCode);
+          socket.serverCode = 'global';
+          socket.join('global');
+          if (onlineUsersMap.has(socket.id)) onlineUsersMap.get(socket.id).serverCode = 'global';
+      }
+      if (isMember || wasActive) {
+        broadcastOnlineUsersFn(serverCode);
+      }
+      if (wasActive) {
+        broadcastOnlineUsersFn('global');
       }
       callback({ success: true });
     } catch (err) { callback({ error: 'Failed to leave.' }); }
@@ -664,7 +675,12 @@ function createConnectionHandler({
              s.joinedServers = s.joinedServers.filter(c => c !== serverCode);
              if (onlineUsersMap.has(s.id)) onlineUsersMap.get(s.id).joinedServers = s.joinedServers;
           }
-          if (s.serverCode === serverCode) { s.leave(serverCode); s.serverCode = 'global'; s.join('global'); }
+          if (s.serverCode === serverCode) {
+            s.leave(serverCode);
+            s.serverCode = 'global';
+            s.join('global');
+            if (onlineUsersMap.has(s.id)) onlineUsersMap.get(s.id).serverCode = 'global';
+          }
         });
         broadcastOnlineUsersFn('global'); callback({ success: true });
       } else { callback({ error: 'Permission denied.' }); }
