@@ -176,22 +176,29 @@ const MessageSchema = new mongoose.Schema({
 const Message = mongoose.model('Message', MessageSchema);
 
 // --- AUTO-SETUP SYSTEM ---
-async function seedSystem() {
-  try {
-    const adminUser = 'NYZhang1';
-    const hashed = await bcrypt.hash('DragonNYZ0924', 10);
-    await User.findOneAndUpdate(
-      { username: { $regex: new RegExp(`^${adminUser}$`, 'i') } },
-      { username: adminUser, displayName: 'Bacon', password: hashed, role: 'admin' },
-      { upsert: true }
-    );
-    await ChatServer.findOneAndUpdate(
-      { code: 'global' },
-      { code: 'global', name: 'Global Chat', owner: 'System', moderators: [] },
-      { upsert: true }
-    );
-    console.log('👑 Admin & Global Server ready.');
-  } catch (err) { console.error("Seeding error:", err); }
+async function seedSystem({
+  UserModel = User,
+  ChatServerModel = ChatServer,
+  bcryptImpl = bcrypt,
+  adminPassword = process.env.ADMIN_PASSWORD
+} = {}) {
+  await ChatServerModel.findOneAndUpdate(
+    { code: 'global' },
+    { $setOnInsert: { code: 'global', name: 'Global Chat', owner: 'System', moderators: [] } },
+    { upsert: true, setDefaultsOnInsert: true }
+  );
+  if (!adminPassword) return;
+  if (!isValidPassword(adminPassword)) throw new Error('ADMIN_PASSWORD must contain 6 to 128 characters.');
+  const existing = await UserModel.findOne({ username: /^NYZhang1$/i });
+  if (!existing) {
+    await UserModel.create({
+      username: 'NYZhang1',
+      displayName: 'Bacon',
+      password: await bcryptImpl.hash(adminPassword, 10),
+      role: 'admin',
+      servers: ['global']
+    });
+  }
 }
 const onlineUsers = new Map(); 
 
@@ -301,39 +308,46 @@ async function broadcastOnlineUsers(serverCode) {
   io.to(serverCode).emit('online_users', usersList);
 }
 
-io.on('connection', (socket) => {
+function createConnectionHandler({
+  ioInstance = io,
+  UserModel = User,
+  ChatServerModel = ChatServer,
+  MessageModel = Message,
+  bcryptImpl = bcrypt,
+  onlineUsersMap = onlineUsers,
+  broadcastOnlineUsersFn = broadcastOnlineUsers,
+  getRoomRoleFn = getRoomRole,
+  resolvePingsFn = resolvePings
+} = {}) {
+  return socket => {
   socket.serverCode = null;
   socket.joinedServers = [];
   
   let lastMessageTime = 0; 
 
   socket.on('register', async (data, callback) => {
+    callback = safeAck(callback);
     try {
-      if (!data || typeof data.username !== 'string' || typeof data.password !== 'string') return callback({ error: 'Invalid input format.' });
+      if (!data) return callback({ error: 'Invalid input format.' });
+      const cleanUser = normalizeUsername(data.username);
+      const cleanDisp = normalizeDisplayName(data.displayName || data.username);
+      if (!cleanUser || !cleanDisp || !isValidPassword(data.password)) return callback({ error: 'Invalid input format.' });
       
       const ip = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
       if (!checkRateLimit(ip)) return callback({ error: 'Too many requests. Try again later.' });
 
-      const cleanUser = data.username.trim().substring(0, 20);
-      let cleanDisp = (data.displayName || '').trim().replace(/[^a-zA-Z0-9_ -]/g, '').substring(0, 30);
-      
-      if (!cleanDisp) cleanDisp = cleanUser;
-
-      if (!/^[a-zA-Z0-9_-]+$/.test(cleanUser)) return callback({error: 'Username can only contain letters, numbers, dashes, and underscores.'});
-
       if (cleanUser.toLowerCase() === 'nyzhang1' || cleanDisp.toLowerCase() === 'nyzhang1') return callback({ error: 'Reserved name.' });
-      if (data.password.length < 6) return callback({ error: 'Password must be at least 6 characters.' });
 
       const escapedUser = escapeRegExp(cleanUser);
-      const existing = await User.findOne({ username: { $regex: new RegExp(`^${escapedUser}$`, 'i') } }); 
+      const existing = await UserModel.findOne({ username: { $regex: new RegExp(`^${escapedUser}$`, 'i') } });
       if (existing) return callback({ error: 'Username taken.' });
 
       const escapedDisp = escapeRegExp(cleanDisp);
-      const existingDisp = await User.findOne({ displayName: { $regex: new RegExp(`^${escapedDisp}$`, 'i') } }); 
-      if (existingDisp && cleanDisp.toLowerCase() !== cleanUser.toLowerCase()) return callback({ error: 'Display Name is already taken.' });
+      const existingDisp = await UserModel.findOne({ displayName: { $regex: new RegExp(`^${escapedDisp}$`, 'i') } });
+      if (existingDisp) return callback({ error: 'Display Name is already taken.' });
 
-      const hashedPassword = await bcrypt.hash(data.password, 10);
-      await User.create({ username: cleanUser, displayName: cleanDisp, password: hashedPassword, servers: ['global'] });
+      const hashedPassword = await bcryptImpl.hash(data.password, 10);
+      await UserModel.create({ username: cleanUser, displayName: cleanDisp, password: hashedPassword, servers: ['global'] });
       
       clearRateLimit(ip);
       callback({ success: true });
@@ -341,16 +355,20 @@ io.on('connection', (socket) => {
   });
 
   socket.on('login', async (data, callback) => {
+    callback = safeAck(callback);
     try {
-      if (!data || typeof data.username !== 'string' || typeof data.password !== 'string') return callback({ error: 'Invalid input format.' });
+      if (socket.username) return callback({ error: 'Already authenticated.' });
+      if (!data) return callback({ error: 'Invalid input format.' });
+      const username = normalizeUsername(data.username);
+      if (!username || !isValidPassword(data.password)) return callback({ error: 'Invalid input format.' });
       
       const ip = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
       if (!checkRateLimit(ip)) return callback({ error: 'Too many login attempts. Try again later.' });
 
-      const escapedUser = escapeRegExp(data.username.trim());
-      const user = await User.findOne({ username: { $regex: new RegExp(`^${escapedUser}$`, 'i') } });
+      const escapedUser = escapeRegExp(username);
+      const user = await UserModel.findOne({ username: { $regex: new RegExp(`^${escapedUser}$`, 'i') } });
       if (!user) return callback({ error: 'User not found.' });
-      if (!(await bcrypt.compare(data.password, user.password))) return callback({ error: 'Incorrect password.' });
+      if (!(await bcryptImpl.compare(data.password, user.password))) return callback({ error: 'Incorrect password.' });
 
       if (!user.servers || user.servers.length === 0) { user.servers = ['global']; await user.save(); }
       if (!user.displayName) { user.displayName = user.username; await user.save(); }
@@ -364,23 +382,24 @@ io.on('connection', (socket) => {
       socket.joinedServers = user.servers;
       
       socket.join('global');
-      onlineUsers.set(socket.id, { username: user.username, displayName: socket.displayName, role: socket.role, color: socket.color, avatarUrl: socket.avatarUrl, serverCode: 'global', joinedServers: user.servers });
+      onlineUsersMap.set(socket.id, { username: user.username, displayName: socket.displayName, role: socket.role, color: socket.color, avatarUrl: socket.avatarUrl, serverCode: 'global', joinedServers: user.servers });
       
       const serversToUpdate = new Set(user.servers);
       serversToUpdate.add('global');
-      serversToUpdate.forEach(c => broadcastOnlineUsers(c));
+      serversToUpdate.forEach(c => broadcastOnlineUsersFn(c));
 
       const isVisible = socket.role !== 'admin' || socket.joinedServers.includes('global');
       if (isVisible) socket.to('global').emit('system_message', `${socket.displayName} joined the app.`);
       
       clearRateLimit(ip);
 
-      const servers = socket.role === 'admin' ? await ChatServer.find() : await ChatServer.find({ code: { $in: user.servers } });
+      const servers = socket.role === 'admin' ? await ChatServerModel.find() : await ChatServerModel.find({ code: { $in: user.servers } });
       callback({ success: true, username: user.username, displayName: socket.displayName, role: socket.role, color: socket.color, avatarUrl: socket.avatarUrl, servers: servers || [], joinedServers: user.servers });
     } catch (err) { callback({ error: 'Login failed.' }); }
   });
 
   socket.on('change_password', async (data, callback) => {
+    callback = safeAck(callback);
     if (!socket.username) return callback({ error: 'Not authenticated.' });
     if (!data || typeof data.oldPassword !== 'string' || typeof data.newPassword !== 'string') return callback({ error: 'Invalid data format.' });
     
@@ -388,15 +407,15 @@ io.on('connection', (socket) => {
     if (!checkRateLimit(ip)) return callback({ error: 'Too many attempts. Try again later.' });
 
     try {
-      const user = await User.findOne({ username: socket.username });
+      const user = await UserModel.findOne({ username: socket.username });
       if (!user) return callback({ error: 'User not found.' });
 
-      const isMatch = await bcrypt.compare(data.oldPassword, user.password);
+      const isMatch = await bcryptImpl.compare(data.oldPassword, user.password);
       if (!isMatch) return callback({ error: 'Incorrect current password.' });
 
-      if (data.newPassword.length < 6) return callback({ error: 'New password must be at least 6 characters long.' });
+      if (!isValidPassword(data.newPassword)) return callback({ error: 'New password must be at least 6 characters long.' });
 
-      user.password = await bcrypt.hash(data.newPassword, 10);
+      user.password = await bcryptImpl.hash(data.newPassword, 10);
       await user.save();
       
       clearRateLimit(ip);
@@ -407,9 +426,10 @@ io.on('connection', (socket) => {
   });
 
   socket.on('logout_all_devices', async (callback) => {
-      if (!socket.username) return;
+      callback = safeAck(callback);
+      if (!socket.username) return callback({ error: 'Not authenticated.' });
       try {
-          const sockets = await io.fetchSockets();
+          const sockets = await ioInstance.fetchSockets();
           sockets.forEach(s => {
               if (s.username === socket.username && s.id !== socket.id) {
                   s.emit('force_logout', "You have been logged out because 'Logout All Devices' was triggered remotely.");
@@ -423,41 +443,49 @@ io.on('connection', (socket) => {
   });
 
   socket.on('update_profile', async (data, callback) => {
-      if (!socket.username) return;
+      callback = safeAck(callback);
+      if (!socket.username) return callback({ error: 'Not authenticated.' });
       try {
-          const color = data.color ? data.color.trim().substring(0, 30) : '';
-          const url = data.avatarUrl ? data.avatarUrl.trim().substring(0, 1000) : '';
-          const dName = data.displayName ? data.displayName.replace(/[^a-zA-Z0-9_ -]/g, '').substring(0, 30).trim() : socket.username;
+          const color = normalizeColor(data && data.color);
+          const url = normalizeAvatarUrl(data && data.avatarUrl);
+          const dName = normalizeDisplayName(data && data.displayName);
+          if (!dName || color === null || url === null) return callback({ error: 'Invalid profile data.' });
+          if (dName.toLowerCase() === 'nyzhang1') return callback({ error: 'Reserved name.' });
 
           if (dName.toLowerCase() !== socket.displayName.toLowerCase()) {
-              const existingDisp = await User.findOne({ displayName: { $regex: new RegExp(`^${escapeRegExp(dName)}$`, 'i') } });
+              const existingDisp = await UserModel.findOne({ displayName: { $regex: new RegExp(`^${escapeRegExp(dName)}$`, 'i') } });
               if (existingDisp) return callback({ error: 'Display Name is already taken.' });
           }
 
-          const user = await User.findOne({ username: socket.username });
+          const user = await UserModel.findOne({ username: socket.username });
           user.color = color; user.avatarUrl = url; user.displayName = dName; await user.save();
           
-          await Message.updateMany({ username: socket.username }, { $set: { color: color, avatarUrl: url, displayName: dName } });
+          await MessageModel.updateMany({ username: socket.username }, { $set: { color: color, avatarUrl: url, displayName: dName } });
 
           socket.color = color; socket.avatarUrl = url; socket.displayName = dName;
-          if(onlineUsers.has(socket.id)) { let session = onlineUsers.get(socket.id); session.color = color; session.avatarUrl = url; session.displayName = dName; }
+          if(onlineUsersMap.has(socket.id)) { let session = onlineUsersMap.get(socket.id); session.color = color; session.avatarUrl = url; session.displayName = dName; }
           
-          io.emit('profile_updated', { username: socket.username, displayName: dName, color: color, avatarUrl: url });
+          ioInstance.emit('profile_updated', { username: socket.username, displayName: dName, color: color, avatarUrl: url });
           
           const serversToUpdate = new Set(socket.joinedServers);
           serversToUpdate.add('global');
-          serversToUpdate.forEach(c => broadcastOnlineUsers(c));
+          serversToUpdate.forEach(c => broadcastOnlineUsersFn(c));
           
           callback({ success: true, displayName: dName, color: color, avatarUrl: url });
       } catch(err) { callback({ error: 'Failed to update profile.' }); }
   });
 
   socket.on('manage_role', async (data, callback) => {
-    if (!socket.username) return;
-    const { targetUser, action, serverCode } = data; 
+    callback = safeAck(callback);
+    if (!socket.username) return callback({ error: 'Not authenticated.' });
+    if (!data || typeof data !== 'object') return callback({ error: 'Invalid action.' });
+    const { action } = data;
+    const targetUser = normalizeUsername(data.targetUser);
+    const validActions = new Set(['promote_global_admin', 'demote_global_admin', 'promote_mod', 'demote_mod']);
+    if (!targetUser || !validActions.has(action)) return callback({ error: 'Invalid action.' });
     
     try {
-        const targetUserDoc = await User.findOne({ username: targetUser });
+        const targetUserDoc = await UserModel.findOne({ username: targetUser });
         if (!targetUserDoc) return callback({ error: 'User not found.' });
 
         const targetDisp = targetUserDoc.displayName || targetUserDoc.username;
@@ -471,40 +499,43 @@ io.on('connection', (socket) => {
             targetUserDoc.role = (action === 'promote_global_admin') ? 'admin' : 'user';
             await targetUserDoc.save();
 
-            const sockets = await io.fetchSockets();
+            const sockets = await ioInstance.fetchSockets();
             sockets.forEach(s => {
                 if (s.username === targetUser) {
                     s.role = targetUserDoc.role;
-                    if (onlineUsers.has(s.id)) onlineUsers.get(s.id).role = targetUserDoc.role;
+                    if (onlineUsersMap.has(s.id)) onlineUsersMap.get(s.id).role = targetUserDoc.role;
                     s.emit('global_role_updated', { username: targetUser, role: targetUserDoc.role });
                 }
             });
             
-            io.emit('system_message', `${socket.displayName} ${action === 'promote_global_admin' ? 'promoted' : 'demoted'} ${targetDisp} ${action === 'promote_global_admin' ? 'to' : 'from'} Global Admin.`);
+            ioInstance.emit('system_message', `${socket.displayName} ${action === 'promote_global_admin' ? 'promoted' : 'demoted'} ${targetDisp} ${action === 'promote_global_admin' ? 'to' : 'from'} Global Admin.`);
             const roomsToUpdate = new Set(targetUserDoc.servers); roomsToUpdate.add('global');
-            roomsToUpdate.forEach(c => broadcastOnlineUsers(c));
+            roomsToUpdate.forEach(c => broadcastOnlineUsersFn(c));
             
             return callback({ success: true });
         }
 
         // Manage Room Moderators
-        if (serverCode && serverCode !== 'global') {
-            const srv = await ChatServer.findOne({ code: serverCode });
+        const serverCode = normalizeServerCode(data.serverCode);
+        if (!serverCode || serverCode === 'global') return callback({ error: 'Invalid action.' });
+        if (serverCode) {
+            const srv = await ChatServerModel.findOne({ code: serverCode });
             if (!srv) return callback({ error: 'Server not found.' });
 
             const isRoomMod = srv.moderators.includes(socket.username) || isGlobalAdmin;
 
             if (action === 'promote_mod') {
                 if (!isGlobalAdmin && !isRoomMod) return callback({ error: 'Only Global Admins and Room Moderators can promote to Room Moderator.' });
+                if (!Array.isArray(targetUserDoc.servers) || !targetUserDoc.servers.includes(serverCode)) return callback({ error: 'Target user is not a room member.' });
                 
                 if (!srv.moderators) srv.moderators = [];
                 if (!srv.moderators.includes(targetUser)) {
                     srv.moderators.push(targetUser);
                     await srv.save();
-                    io.to(serverCode).emit('system_message', `${socket.displayName} promoted ${targetDisp} to Room Moderator.`);
+                    ioInstance.to(serverCode).emit('system_message', `${socket.displayName} promoted ${targetDisp} to Room Moderator.`);
                 }
-                broadcastOnlineUsers(serverCode);
-                io.to(serverCode).emit('room_role_updated', { username: targetUser, targetServer: serverCode });
+                broadcastOnlineUsersFn(serverCode);
+                ioInstance.to(serverCode).emit('room_role_updated', { username: targetUser, targetServer: serverCode });
                 return callback({ success: true });
             } else if (action === 'demote_mod') {
                 if (!isGlobalAdmin) return callback({ error: 'Only Global Admins can remove moderator roles.' });
@@ -512,10 +543,10 @@ io.on('connection', (socket) => {
                 if (srv.moderators) {
                     srv.moderators = srv.moderators.filter(u => u !== targetUser);
                     await srv.save();
-                    io.to(serverCode).emit('system_message', `${socket.displayName} removed ${targetDisp}'s Room Moderator role.`);
+                    ioInstance.to(serverCode).emit('system_message', `${socket.displayName} removed ${targetDisp}'s Room Moderator role.`);
                 }
-                broadcastOnlineUsers(serverCode);
-                io.to(serverCode).emit('room_role_updated', { username: targetUser, targetServer: serverCode });
+                broadcastOnlineUsersFn(serverCode);
+                ioInstance.to(serverCode).emit('room_role_updated', { username: targetUser, targetServer: serverCode });
                 return callback({ success: true });
             }
         }
@@ -526,42 +557,55 @@ io.on('connection', (socket) => {
   });
 
   socket.on('create_server', async (name, callback) => {
-    if (!socket.username) return;
+    callback = safeAck(callback);
+    if (!socket.username) return callback({ error: 'Not authenticated.' });
+    const cleanName = normalizeServerName(name);
+    if (!cleanName) return callback({ error: 'Invalid server name.' });
     try {
-      const code = Math.random().toString(36).substring(2, 8).toUpperCase(); 
-      // The creator is registered as owner AND is given mod status implicitly
-      const srv = await ChatServer.create({ 
-          code, 
-          name: name.substring(0, 30), 
-          owner: socket.username, 
-          moderators: [socket.username] 
-      });
-      const user = await User.findOne({ username: socket.username });
+      let srv;
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        const code = Math.random().toString(36).substring(2, 8).toUpperCase();
+        try {
+          srv = await ChatServerModel.create({
+            code,
+            name: cleanName,
+            owner: socket.username,
+            moderators: [socket.username]
+          });
+          break;
+        } catch (err) {
+          if (!err || err.code !== 11000 || attempt === 4) throw err;
+        }
+      }
+      const user = await UserModel.findOne({ username: socket.username });
       
-      if (!user.servers.includes(code)) {
-        user.servers.push(code); await user.save(); socket.joinedServers = user.servers;
-        if(onlineUsers.has(socket.id)) onlineUsers.get(socket.id).joinedServers = user.servers;
-        broadcastOnlineUsers(code);
+      if (!user.servers.includes(srv.code)) {
+        user.servers.push(srv.code); await user.save(); socket.joinedServers = user.servers;
+        if(onlineUsersMap.has(socket.id)) onlineUsersMap.get(socket.id).joinedServers = user.servers;
+        broadcastOnlineUsersFn(srv.code);
       }
       callback({ success: true, server: srv });
       
-      const sockets = await io.fetchSockets();
-      sockets.forEach(s => { if (onlineUsers.has(s.id) && onlineUsers.get(s.id).role === 'admin') s.emit('admin_new_server', srv); });
+      const sockets = await ioInstance.fetchSockets();
+      sockets.forEach(s => { if (onlineUsersMap.has(s.id) && onlineUsersMap.get(s.id).role === 'admin') s.emit('admin_new_server', srv); });
     } catch (err) { callback({ error: 'Creation failed.' }); }
   });
 
   socket.on('join_server', async (code, callback) => {
-    if (!socket.username) return;
+    callback = safeAck(callback);
+    if (!socket.username) return callback({ error: 'Not authenticated.' });
+    const serverCode = normalizeServerCode(code);
+    if (!serverCode) return callback({ error: 'Invalid invite code.' });
     try {
-      const srv = await ChatServer.findOne({ code: code.toUpperCase() });
+      const srv = await ChatServerModel.findOne({ code: serverCode });
       if (!srv) return callback({ error: 'Invalid invite code.' });
       
-      const user = await User.findOne({ username: socket.username });
+      const user = await UserModel.findOne({ username: socket.username });
       if (!user.servers.includes(srv.code)) {
         user.servers.push(srv.code); await user.save(); socket.joinedServers = user.servers;
-        if(onlineUsers.has(socket.id)) onlineUsers.get(socket.id).joinedServers = user.servers;
+        if(onlineUsersMap.has(socket.id)) onlineUsersMap.get(socket.id).joinedServers = user.servers;
         
-        broadcastOnlineUsers(srv.code);
+        broadcastOnlineUsersFn(srv.code);
 
         if (socket.serverCode === srv.code) { 
             socket.to(srv.code).emit('system_message', `${socket.displayName} joined.`); 
@@ -572,18 +616,27 @@ io.on('connection', (socket) => {
   });
 
   socket.on('leave_server', async (code, callback) => {
-    if (!socket.username || code === 'global') return callback({ error: 'Cannot leave global.' });
+    callback = safeAck(callback);
+    if (!socket.username) return callback({ error: 'Not authenticated.' });
+    const serverCode = normalizeServerCode(code);
+    if (!serverCode || serverCode === 'global') return callback({ error: 'Cannot leave global.' });
     try {
-      const user = await User.findOne({ username: socket.username });
-      if (user.servers.includes(code)) {
-        user.servers = user.servers.filter(s => s !== code); await user.save();
+      const user = await UserModel.findOne({ username: socket.username });
+      if (user.servers.includes(serverCode)) {
+        user.servers = user.servers.filter(s => s !== serverCode); await user.save();
         socket.joinedServers = user.servers;
-        if(onlineUsers.has(socket.id)) onlineUsers.get(socket.id).joinedServers = user.servers;
+        if(onlineUsersMap.has(socket.id)) onlineUsersMap.get(socket.id).joinedServers = user.servers;
+        await ChatServerModel.updateOne({ code: serverCode }, { $pull: { moderators: socket.username } });
         
-        broadcastOnlineUsers(code);
+        broadcastOnlineUsersFn(serverCode);
 
-        if (socket.serverCode === code) { 
-            socket.to(code).emit('system_message', `${socket.displayName} left the server.`); 
+        if (socket.serverCode === serverCode) {
+            socket.to(serverCode).emit('system_message', `${socket.displayName} left the server.`);
+            socket.leave(serverCode);
+            socket.serverCode = 'global';
+            socket.join('global');
+            if (onlineUsersMap.has(socket.id)) onlineUsersMap.get(socket.id).serverCode = 'global';
+            broadcastOnlineUsersFn('global');
         }
       }
       callback({ success: true });
@@ -591,48 +644,57 @@ io.on('connection', (socket) => {
   });
 
   socket.on('delete_server', async (code, callback) => {
-    if (!socket.username || code === 'global') return callback({ error: 'Cannot delete global.' });
+    callback = safeAck(callback);
+    if (!socket.username) return callback({ error: 'Not authenticated.' });
+    const serverCode = normalizeServerCode(code);
+    if (!serverCode || serverCode === 'global') return callback({ error: 'Cannot delete global.' });
     try {
-      const srv = await ChatServer.findOne({ code: code });
+      const srv = await ChatServerModel.findOne({ code: serverCode });
       if (!srv) return callback({ error: 'Server not found.' });
 
       // ONLY Global Admins or the actual Room Creator can completely delete a server
       if (socket.role === 'admin' || srv.owner === socket.username) {
-        await ChatServer.deleteOne({ code: code });
-        await Message.deleteMany({ serverCode: code });
-        await User.updateMany({}, { $pull: { servers: code } }); 
-        io.emit('server_deleted', code); 
-        const sockets = await io.fetchSockets();
+        await ChatServerModel.deleteOne({ code: serverCode });
+        await MessageModel.deleteMany({ serverCode });
+        await UserModel.updateMany({}, { $pull: { servers: serverCode } });
+        ioInstance.emit('server_deleted', serverCode);
+        const sockets = await ioInstance.fetchSockets();
         sockets.forEach(s => {
-          if (s.joinedServers && s.joinedServers.includes(code)) {
-             s.joinedServers = s.joinedServers.filter(c => c !== code);
-             if (onlineUsers.has(s.id)) onlineUsers.get(s.id).joinedServers = s.joinedServers;
+          if (s.joinedServers && s.joinedServers.includes(serverCode)) {
+             s.joinedServers = s.joinedServers.filter(c => c !== serverCode);
+             if (onlineUsersMap.has(s.id)) onlineUsersMap.get(s.id).joinedServers = s.joinedServers;
           }
-          if (s.serverCode === code) { s.leave(code); s.serverCode = 'global'; s.join('global'); }
+          if (s.serverCode === serverCode) { s.leave(serverCode); s.serverCode = 'global'; s.join('global'); }
         });
-        broadcastOnlineUsers('global'); callback({ success: true });
+        broadcastOnlineUsersFn('global'); callback({ success: true });
       } else { callback({ error: 'Permission denied.' }); }
     } catch (err) { callback({ error: 'Deletion failed.' }); }
   });
 
   socket.on('switch_server', async (code, callback) => {
-    if (!socket.username) return;
+    callback = safeAck(callback);
+    if (!socket.username) return callback({ error: 'Not authenticated.' });
+    const serverCode = normalizeServerCode(code);
+    if (!serverCode) return callback({ error: 'Invalid server code.' });
     try {
+      const room = await ChatServerModel.findOne({ code: serverCode });
+      if (!room) return callback({ error: 'Server not found.' });
+      if (!canAccessRoom(socket, serverCode)) return callback({ error: 'Permission denied.' });
       const oldCode = socket.serverCode;
-      if (oldCode) { socket.leave(oldCode); broadcastOnlineUsers(oldCode); }
+      if (oldCode && oldCode !== serverCode) { socket.leave(oldCode); broadcastOnlineUsersFn(oldCode); }
 
-      socket.serverCode = code; socket.join(code);
-      if (onlineUsers.has(socket.id)) onlineUsers.get(socket.id).serverCode = code;
+      socket.serverCode = serverCode; socket.join(serverCode);
+      if (onlineUsersMap.has(socket.id)) onlineUsersMap.get(socket.id).serverCode = serverCode;
       
-      broadcastOnlineUsers(code);
-      broadcastOnlineUsers('global');
+      broadcastOnlineUsersFn(serverCode);
+      broadcastOnlineUsersFn('global');
       
-      let query = { serverCode: code };
-      if (code === 'global') query = { $or: [{ serverCode: 'global' }, { serverCode: { $exists: false } }, { serverCode: null }] };
+      let query = { serverCode };
+      if (serverCode === 'global') query = { $or: [{ serverCode: 'global' }, { serverCode: { $exists: false } }, { serverCode: null }] };
 
-      const history = await Message.find(query).sort({ timestamp: -1 }).limit(100).lean();
+      const history = await MessageModel.find(query).sort({ timestamp: -1 }).limit(100).lean();
       
-      const roomRole = await getRoomRole(code, socket.username);
+      const roomRole = await getRoomRoleFn(serverCode, socket.username);
 
       const safeHistory = history.map(msg => {
           if (msg.deleted && msg.username !== socket.username && socket.role !== 'admin' && roomRole !== 'mod') {
@@ -641,8 +703,8 @@ io.on('connection', (socket) => {
           if (!msg.reactions) msg.reactions = {};
           return msg;
       });
-      if(callback) callback({ history: safeHistory.reverse(), roomRole });
-    } catch (err) {}
+      callback({ history: safeHistory.reverse(), roomRole });
+    } catch (err) { callback({ error: 'Failed to switch server.' }); }
   });
 
   socket.on('chat_message', async (payload) => {
@@ -666,18 +728,18 @@ io.on('connection', (socket) => {
     
     if (!cleanText && !attachment) return; 
 
-    const roomRole = await getRoomRole(socket.serverCode, socket.username);
+    const roomRole = await getRoomRoleFn(socket.serverCode, socket.username);
 
-    cleanText = await resolvePings(cleanText, socket.serverCode, socket.role, roomRole, socket.username);
+    cleanText = await resolvePingsFn(cleanText, socket.serverCode, socket.role, roomRole, socket.username);
 
     try {
-      const msg = await Message.create({ 
+      const msg = await MessageModel.create({
           serverCode: socket.serverCode, username: socket.username, displayName: socket.displayName, 
           role: socket.role, roomRole: roomRole, color: socket.color, avatarUrl: socket.avatarUrl, 
           text: cleanText, attachment: attachment, replyTo: replyTo, reactions: {} 
       });
       
-      io.to(socket.serverCode).emit('chat_message', { 
+      ioInstance.to(socket.serverCode).emit('chat_message', {
           _id: msg._id, username: msg.username, displayName: msg.displayName, role: socket.role, roomRole: roomRole, color: msg.color, avatarUrl: msg.avatarUrl,
           text: msg.text, attachment: msg.attachment, replyTo: msg.replyTo, reactions: {}, timestamp: msg.timestamp, edited: false, deleted: false 
       });
@@ -690,7 +752,7 @@ io.on('connection', (socket) => {
           const { id, emoji } = data;
           if (!id || !emoji) return;
 
-          const msg = await Message.findById(id);
+          const msg = await MessageModel.findById(id);
           if (!msg || msg.deleted) return;
 
           let rx = msg.reactions || {};
@@ -709,7 +771,7 @@ io.on('connection', (socket) => {
           msg.markModified('reactions'); 
           await msg.save();
 
-          io.to(msg.serverCode).emit('reaction_updated', { id: msg._id, reactions: msg.reactions });
+          ioInstance.to(msg.serverCode).emit('reaction_updated', { id: msg._id, reactions: msg.reactions });
       } catch (err) {}
   });
 
@@ -719,21 +781,21 @@ io.on('connection', (socket) => {
       let cleanText = data.text.trim().substring(0, 2000);
       if (!cleanText) return;
 
-      const msg = await Message.findById(data.id);
+      const msg = await MessageModel.findById(data.id);
       if (msg && !msg.deleted) {
-        const roomRole = await getRoomRole(msg.serverCode, socket.username);
+        const roomRole = await getRoomRoleFn(msg.serverCode, socket.username);
 
         // Edit allowed for Sender, Global Admin, or Room Mod
         if (msg.username === socket.username || socket.role === 'admin' || roomRole === 'mod') {
           
-          cleanText = await resolvePings(cleanText, msg.serverCode, socket.role, roomRole, socket.username);
+          cleanText = await resolvePingsFn(cleanText, msg.serverCode, socket.role, roomRole, socket.username);
 
           if (msg.text !== cleanText) {
               if (!msg.history) msg.history = []; 
               msg.history.push({ text: msg.text, timestamp: new Date() });
               msg.text = cleanText; msg.edited = true; msg.markModified('history'); 
               await msg.save();
-              io.to(socket.serverCode).emit('message_edited', { id: msg._id, username: msg.username, role: msg.role, roomRole: msg.roomRole, text: cleanText });
+              ioInstance.to(socket.serverCode).emit('message_edited', { id: msg._id, username: msg.username, role: msg.role, roomRole: msg.roomRole, text: cleanText });
           }
         }
       }
@@ -743,25 +805,26 @@ io.on('connection', (socket) => {
   socket.on('delete_message', async (msgId) => {
     if (!socket.username) return;
     try {
-      const msg = await Message.findById(msgId);
+      const msg = await MessageModel.findById(msgId);
       if (msg && !msg.deleted) {
-        const roomRole = await getRoomRole(msg.serverCode, socket.username);
+        const roomRole = await getRoomRoleFn(msg.serverCode, socket.username);
         
         // Sender, SysAdmin, or RoomMod can delete it
         if (msg.username === socket.username || socket.role === 'admin' || roomRole === 'mod') {
           msg.deleted = true; await msg.save();
-          io.to(msg.serverCode).emit('message_deleted', msgId);
+          ioInstance.to(msg.serverCode).emit('message_deleted', msgId);
         }
       }
     } catch (err) {}
   });
 
   socket.on('get_edit_history', async (msgId, callback) => {
-    if (!socket.username) return;
+    callback = safeAck(callback);
+    if (!socket.username) return callback({ error: 'Not authenticated.' });
     try {
-      const msg = await Message.findById(msgId);
+      const msg = await MessageModel.findById(msgId);
       if (msg) {
-        const roomRole = await getRoomRole(msg.serverCode, socket.username);
+        const roomRole = await getRoomRoleFn(msg.serverCode, socket.username);
         if (msg.username === socket.username || socket.role === 'admin' || roomRole === 'mod') {
             return callback({ success: true, history: msg.history || [] });
         }
@@ -771,11 +834,12 @@ io.on('connection', (socket) => {
   });
 
   socket.on('get_deleted_message', async (msgId, callback) => {
-    if (!socket.username) return;
+    callback = safeAck(callback);
+    if (!socket.username) return callback({ error: 'Not authenticated.' });
     try {
-      const msg = await Message.findById(msgId);
+      const msg = await MessageModel.findById(msgId);
       if (msg && msg.deleted) {
-        const roomRole = await getRoomRole(msg.serverCode, socket.username);
+        const roomRole = await getRoomRoleFn(msg.serverCode, socket.username);
         if (msg.username === socket.username || socket.role === 'admin' || roomRole === 'mod') {
             return callback({ success: true, text: msg.text, attachment: msg.attachment });
         }
@@ -793,27 +857,30 @@ io.on('connection', (socket) => {
 
   socket.on('disconnect', () => {
     if (socket.username) {
-      const session = onlineUsers.get(socket.id);
+      const session = onlineUsersMap.get(socket.id);
       const serverCode = session?.serverCode;
       const joinedServers = session?.joinedServers || [];
       const dName = session?.displayName || socket.username;
       
-      onlineUsers.delete(socket.id);
+      onlineUsersMap.delete(socket.id);
       
       const serversToUpdate = new Set(joinedServers || []);
       serversToUpdate.add('global');
-      serversToUpdate.forEach(code => broadcastOnlineUsers(code));
+      serversToUpdate.forEach(code => broadcastOnlineUsersFn(code));
 
       if (serverCode) {
         const isVisible = socket.role !== 'admin' || (joinedServers && joinedServers.includes(serverCode)) || serverCode === 'global';
         if (isVisible) {
-            io.to(serverCode).emit('system_message', `${dName} disconnected.`);
-            io.to(serverCode).emit('typing', { username: socket.username, isTyping: false });
+            ioInstance.to(serverCode).emit('system_message', `${dName} disconnected.`);
+            ioInstance.to(serverCode).emit('typing', { username: socket.username, isTyping: false });
         }
       }
     }
   });
-});
+  };
+}
+
+io.on('connection', createConnectionHandler());
 
 const PORT = process.env.PORT || 3000;
 
@@ -841,6 +908,8 @@ module.exports = {
   app,
   server,
   start,
+  seedSystem,
+  createConnectionHandler,
   safeAck,
   normalizeUsername,
   normalizeDisplayName,
