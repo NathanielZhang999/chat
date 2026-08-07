@@ -6,7 +6,7 @@
     <title>Pro Global Chat</title>
     <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
     <style>
-        :root { --primary: #5865F2; --bg: #202225; --surface: #36393f; --surface-dark: #2f3136; --text: #dcddde; --text-muted: #8e9297; --border: #202225; --error: #ed4245; --warning: #faa61a; }
+        :root { --primary: #5865F2; --bg: #202225; --surface: #36393f; --surface-dark: #2f3136; --text: #dcddde; --text-muted: #8e9297; --border: #202225; --error: #ed4245; --warning: #faa61a; --success: #3ba55c; }
         * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
         body { background: var(--bg); color: var(--text); height: 100vh; display: flex; align-items: center; justify-content: center; overflow: hidden; }
         
@@ -456,6 +456,46 @@
 </div>
 
 <script>
+    // TESTABLE_CLIENT_HELPERS_START
+    const ChatClientHelpers = {
+        normalizeBackendUrl(value) {
+            const rawUrl = typeof value === 'string' ? value.trim() : '';
+            if (!rawUrl) return null;
+            if (/^[a-z][a-z\d+.-]*:(?!\d)/i.test(rawUrl) && !/^https?:\/\//i.test(rawUrl)) return null;
+
+            try {
+                const parsed = new URL(/^https?:\/\//i.test(rawUrl) ? rawUrl : `https://${rawUrl}`);
+                if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+                return parsed.href.replace(/\/$/, '');
+            } catch {
+                return null;
+            }
+        },
+
+        replaceSocket(oldSocket, oldUrl, newUrl, ioFactory) {
+            if (oldSocket && oldUrl === newUrl) return { socket: oldSocket, socketUrl: oldUrl };
+            if (oldSocket) oldSocket.disconnect();
+            return {
+                socket: ioFactory(newUrl, { reconnectionAttempts: Infinity }),
+                socketUrl: newUrl
+            };
+        },
+
+        appendTextElement(doc, parent, tagName, className, value) {
+            const element = doc.createElement(tagName);
+            element.className = className || '';
+            element.textContent = value == null ? '' : String(value);
+            parent.appendChild(element);
+            return element;
+        },
+
+        typingDisplayName(data) {
+            return data.displayName || data.username;
+        }
+    };
+    globalThis.ChatClientHelpers = ChatClientHelpers;
+    // TESTABLE_CLIENT_HELPERS_END
+
     // --- ATTACHMENT & PICKER STATE ---
     let pendingAttachmentBase64 = null; 
     let activeReactMessageId = null; 
@@ -523,6 +563,9 @@
 
     // --- MAIN STATE ---
     let socket;
+    let socketUrl = null;
+    let pendingAuthSocket = null;
+    let pendingAuthConnectHandler = null;
     let myUsername = "";
     let myDisplayName = "";
     let myRole = "user"; 
@@ -674,6 +717,7 @@
 
         socket.emit('update_profile', { displayName: dName, avatarUrl, color: color }, (res) => {
             btn.textContent = "Save Profile"; btn.disabled = false;
+            res = res || { error: 'No response from server.' };
             if(res.error) { showAppAlert("Error", res.error || "Failed to update profile."); } 
             else {
                 myDisplayName = res.displayName || myUsername;
@@ -696,6 +740,7 @@
 
         socket.emit('change_password', { oldPassword, newPassword }, (res) => {
             btn.textContent = "Change Password"; btn.disabled = false;
+            res = res || { error: 'No response from server.' };
             if(res.error) { showAppAlert("Error", res.error); } 
             else {
                 document.getElementById('setting-old-password').value = '';
@@ -708,8 +753,9 @@
     document.getElementById('logout-all-btn').onclick = async () => {
         if (await showAppConfirm("Logout Everywhere", "Are you sure you want to log out of all other devices you've signed into?", "Logout All", true)) {
             socket.emit('logout_all_devices', (res) => {
-                if (res && res.success) showAppAlert("Success", "Logged out of all other active sessions.");
-                else showAppAlert("Error", res ? res.error : "Failed to execute request.");
+                res = res || { error: 'No response from server.' };
+                if (res.success) showAppAlert("Success", "Logged out of all other active sessions.");
+                else showAppAlert("Error", res.error || "Failed to execute request.");
             });
         }
     };
@@ -760,30 +806,37 @@
 
     // --- AUTHENTICATION ---
     authBtn.addEventListener('click', () => {
-        let url = document.getElementById('url-input').value.trim();
+        const rawUrl = document.getElementById('url-input').value.trim();
         const user = document.getElementById('username-input').value.trim();
         const pass = document.getElementById('password-input').value;
         const dName = document.getElementById('displayname-input').value.trim();
 
-        if (!url || !user || !pass) return showError('All required fields missing.', false);
+        if (!rawUrl || !user || !pass) return showError('All required fields missing.', false);
         if (!isLoginMode && !dName) return showError('Please set a Display Name.', false);
-        
-        if (!url.startsWith('http')) url = 'https://' + url;
-        url = url.replace(/\/$/, ''); 
+
+        const url = ChatClientHelpers.normalizeBackendUrl(rawUrl);
+        if (!url) return showError('Backend URL must use HTTP or HTTPS.', false);
         
         localStorage.setItem('pro_chat_url', url);
         localStorage.setItem('pro_chat_user', user);
         
         authError.style.color = "var(--text)"; authError.textContent = "Connecting to server..."; authBtn.disabled = true;
 
-        if (!socket) { socket = io(url, { reconnectionAttempts: Infinity }); setupSocket(); }
+        const previousSocket = socket;
+        const replacement = ChatClientHelpers.replaceSocket(socket, socketUrl, url, io);
+        socket = replacement.socket;
+        socketUrl = replacement.socketUrl;
+        if (socket !== previousSocket) setupSocket(socket);
+        const authSocket = socket;
 
         const action = isLoginMode ? 'login' : 'register';
         const payload = isLoginMode ? { username: user, password: pass } : { username: user, password: pass, displayName: dName };
         
         const doAuth = () => {
-            socket.emit(action, payload, (res) => {
+            authSocket.emit(action, payload, (res) => {
+                if (authSocket !== socket) return;
                 authBtn.disabled = false;
+                res = res || { error: 'No response from server.' };
                 if (res.error) return showError(res.error, false);
                 
                 if (action === 'register') {
@@ -805,23 +858,43 @@
                     msgInput.disabled = false; sendBtn.disabled = false;
                     
                     renderServers(res.servers || []);
-                    currentServerCode = null; switchServer('global');
+                    switchServer('global');
                 }
             });
         };
-        if (socket.connected) doAuth(); else socket.once('connect', doAuth);
+        if (pendingAuthSocket && pendingAuthConnectHandler) {
+            pendingAuthSocket.off('connect', pendingAuthConnectHandler);
+            pendingAuthSocket = null;
+            pendingAuthConnectHandler = null;
+        }
+        if (authSocket.connected) {
+            doAuth();
+        } else {
+            pendingAuthSocket = authSocket;
+            pendingAuthConnectHandler = () => {
+                pendingAuthSocket = null;
+                pendingAuthConnectHandler = null;
+                doAuth();
+            };
+            authSocket.once('connect', pendingAuthConnectHandler);
+        }
     });
 
     function showError(msg, success) { authError.style.color = success ? "var(--success)" : "var(--error)"; authError.textContent = msg; }
 
-    function setupSocket() {
-        socket.on('connect_error', () => { if (authModal.classList.contains('active')) showError("Waking server up... (~50s)", false); });
+    function setupSocket(activeSocket) {
+        activeSocket.on('connect_error', () => {
+            if (activeSocket === socket && authModal.classList.contains('active')) {
+                authBtn.disabled = false;
+                showError('Unable to connect. Check the backend URL and try again.', false);
+            }
+        });
         
-        socket.on('force_logout', (msg) => {
+        activeSocket.on('force_logout', (msg) => {
             localStorage.removeItem('pro_chat_user'); alert(msg || "You have been logged out remotely."); location.reload(); 
         });
 
-        socket.on('chat_message', (msg) => { 
+        activeSocket.on('chat_message', (msg) => {
             const isMe = msg.username === myUsername;
             appendMessage(msg, isMe); 
             typingUsers.delete(msg.username); updateTypingUI(); 
@@ -833,9 +906,9 @@
             }
         });
         
-        socket.on('system_message', (txt) => appendSystemMessage(txt));
+        activeSocket.on('system_message', (txt) => appendSystemMessage(txt));
 
-        socket.on('global_role_updated', (data) => {
+        activeSocket.on('global_role_updated', (data) => {
             if (data.username === myUsername) {
                 myRole = data.role;
                 showAppAlert(data.role === 'admin' ? "Promoted!" : "Demoted", `You have been ${data.role === 'admin' ? 'promoted to' : 'demoted from'} Global Admin!`);
@@ -843,13 +916,13 @@
             }
         });
         
-        socket.on('room_role_updated', (data) => {
+        activeSocket.on('room_role_updated', (data) => {
             if (data.username === myUsername && data.targetServer === currentServerCode) {
                 switchServer(currentServerCode);
             }
         });
         
-        socket.on('profile_updated', (data) => {
+        activeSocket.on('profile_updated', (data) => {
             if (data.username === myUsername) { myColor = data.color; myAvatarUrl = data.avatarUrl; myDisplayName = data.displayName || data.username; }
             document.querySelectorAll(`.msg[data-author="${data.username}"]`).forEach(el => {
                 if (el.classList.contains('deleted-compact')) return;
@@ -876,7 +949,7 @@
             });
         });
 
-        socket.on('message_edited', (data) => {
+        activeSocket.on('message_edited', (data) => {
             document.querySelectorAll(`.msg[data-id="${data.id}"]`).forEach(el => {
                 el.setAttribute('data-raw-text', data.text); 
                 el.classList.remove('pinged'); 
@@ -913,7 +986,7 @@
             });
         });
 
-        socket.on('message_deleted', (id) => { 
+        activeSocket.on('message_deleted', (id) => {
             document.querySelectorAll(`.msg[data-id="${id}"]`).forEach(el => {
                 const authorName = el.getAttribute('data-display') || el.getAttribute('data-author') || 'Someone';
                 const isMe = el.getAttribute('data-author') === myUsername;
@@ -923,7 +996,11 @@
                 el.style.animation = 'messageSlideIn 0.3s cubic-bezier(0.18, 0.89, 0.32, 1.28) forwards';
                 
                 el.className = 'msg deleted-compact is-deleted';
-                el.innerHTML = `<span style="margin-right: 6px; font-size:0.9rem;">🗑️</span> <span class="deleted-text">${authorName} deleted a message.</span>`;
+                el.textContent = '';
+                const deletedIcon = ChatClientHelpers.appendTextElement(document, el, 'span', '', '🗑️');
+                deletedIcon.style.marginRight = '6px';
+                deletedIcon.style.fontSize = '0.9rem';
+                ChatClientHelpers.appendTextElement(document, el, 'span', 'deleted-text', `${authorName} deleted a message.`);
                 
                 if (isMe || myRole === 'admin' || myRoomRole === 'mod') {
                     const viewTag = document.createElement('span'); 
@@ -935,7 +1012,7 @@
             }); 
         });
 
-        socket.on('reaction_updated', (data) => {
+        activeSocket.on('reaction_updated', (data) => {
             const msgEl = document.querySelector(`.msg[data-id="${data.id}"]`);
             if (msgEl && !msgEl.classList.contains('deleted-compact')) {
                 let container = msgEl.querySelector('.msg-reactions');
@@ -949,22 +1026,21 @@
             }
         });
         
-        socket.on('admin_new_server', (srv) => { if (myRole === 'admin') addServerToList(srv.code, srv.name, srv.owner); });
+        activeSocket.on('admin_new_server', (srv) => { if (myRole === 'admin') addServerToList(srv.code, srv.name, srv.owner); });
 
-        socket.on('server_deleted', (code) => {
+        activeSocket.on('server_deleted', (code) => {
             myJoinedServers = myJoinedServers.filter(c => c !== code);
             const icon = document.getElementById(`srv-${code}`);
             if (icon) icon.remove();
             
             if (currentServerCode === code) {
-                currentServerCode = null;
                 switchServer('global');
                 showAppAlert("Server Deleted", "The server you were viewing was permanently deleted by its Owner or a Global Admin.");
             }
         });
 
         // --- ONLINE USERS RENDERER & ROLE SYNC ---
-        socket.on('online_users', (users) => {
+        activeSocket.on('online_users', (users) => {
             const list = document.getElementById('online-list');
             list.innerHTML = '';
             
@@ -982,12 +1058,21 @@
             const isHiddenAdmin = myRole === 'admin' && !myJoinedServers.includes(currentServerCode) && !isGlobal;
             const displayCount = isGlobal ? onlineCount + (isHiddenAdmin ? 1 : 0) : totalCount + (isHiddenAdmin ? 1 : 0);
             
-            document.getElementById('online-header').innerHTML = `${roomType} — <span id="online-count">${displayCount}</span>`;
+            const onlineHeader = document.getElementById('online-header');
+            onlineHeader.textContent = `${roomType} — `;
+            const countSpan = ChatClientHelpers.appendTextElement(document, onlineHeader, 'span', '', displayCount);
+            countSpan.id = 'online-count';
 
             if (isHiddenAdmin) {
                 const li = document.createElement('li'); 
                 li.className = "user-item stealth-admin"; 
-                li.innerHTML = `<div class="avatar" style="background:var(--error)">A<div class="status-dot online" style="background:var(--warning);"></div></div><div style="color:var(--warning); font-style:italic;">${myDisplayName} (Ghost)</div>`;
+                const avatar = ChatClientHelpers.appendTextElement(document, li, 'div', 'avatar', 'A');
+                avatar.style.background = 'var(--error)';
+                const statusDot = ChatClientHelpers.appendTextElement(document, avatar, 'div', 'status-dot online', '');
+                statusDot.style.background = 'var(--warning)';
+                const ghostLabel = ChatClientHelpers.appendTextElement(document, li, 'div', '', `${myDisplayName} (Ghost)`);
+                ghostLabel.style.color = 'var(--warning)';
+                ghostLabel.style.fontStyle = 'italic';
                 list.appendChild(li);
                 usersCache[myUsername] = myDisplayName;
             }
@@ -1000,22 +1085,46 @@
                 if (u.online === false && !isGlobal) li.classList.add('offline');
                 li.style.animationDelay = `${index * 30}ms`; 
                 
-                let roleBadge = '';
-                if (u.role === 'admin') roleBadge = `<span class="admin-badge" style="background:#ed4245; border-color:#ed4245; font-size:0.5rem; margin-left:8px;">ADMIN</span>`;
-                else if (!isGlobal && u.roomRole === 'mod') roleBadge = `<span class="admin-badge mod-badge" style="font-size:0.5rem; margin-left:8px;">MOD</span>`;
-
                 const cToUse = u.color || getUserColor(u.username);
                 const dotClass = u.online !== false ? 'online' : 'offline';
                 const dName = u.displayName || u.username;
-                
-                let avatarHTML = '';
-                if (u.avatarUrl && u.avatarUrl.startsWith('http')) {
-                    avatarHTML = `<div class="avatar" style="background:transparent;"><img src="${u.avatarUrl.replace(/"/g, '&quot;')}" onerror="this.style.display='none'; this.parentNode.textContent='${dName.charAt(0).toUpperCase()}'; this.parentNode.style.background='${cToUse}';"><div class="status-dot ${dotClass}"></div></div>`;
-                } else {
-                    avatarHTML = `<div class="avatar" style="background:${cToUse}">${dName.charAt(0).toUpperCase()}<div class="status-dot ${dotClass}"></div></div>`;
-                }
 
-                li.innerHTML = `${avatarHTML}<div style="color:${cToUse}; font-weight:600;">${dName}${u.username === myUsername ? " (You)" : ""}${roleBadge}</div>`;
+                const avatar = document.createElement('div');
+                avatar.className = 'avatar';
+                if (u.avatarUrl && /^https?:\/\//i.test(u.avatarUrl)) {
+                    avatar.style.background = 'transparent';
+                    const img = document.createElement('img');
+                    img.src = u.avatarUrl;
+                    img.onerror = () => {
+                        img.remove();
+                        avatar.textContent = dName.charAt(0).toUpperCase();
+                        avatar.style.background = cToUse;
+                        avatar.appendChild(statusDot);
+                    };
+                    avatar.appendChild(img);
+                } else {
+                    avatar.style.background = cToUse;
+                    avatar.textContent = dName.charAt(0).toUpperCase();
+                }
+                const statusDot = document.createElement('div');
+                statusDot.className = `status-dot ${dotClass}`;
+                avatar.appendChild(statusDot);
+                li.appendChild(avatar);
+
+                const userLabel = ChatClientHelpers.appendTextElement(document, li, 'div', '', `${dName}${u.username === myUsername ? " (You)" : ""}`);
+                userLabel.style.color = cToUse;
+                userLabel.style.fontWeight = '600';
+                if (u.role === 'admin') {
+                    const badge = ChatClientHelpers.appendTextElement(document, userLabel, 'span', 'admin-badge', 'ADMIN');
+                    badge.style.background = '#ed4245';
+                    badge.style.borderColor = '#ed4245';
+                    badge.style.fontSize = '0.5rem';
+                    badge.style.marginLeft = '8px';
+                } else if (!isGlobal && u.roomRole === 'mod') {
+                    const badge = ChatClientHelpers.appendTextElement(document, userLabel, 'span', 'admin-badge mod-badge', 'MOD');
+                    badge.style.fontSize = '0.5rem';
+                    badge.style.marginLeft = '8px';
+                }
                 
                 li.onclick = (e) => { openRoleManager(e, u); };
 
@@ -1023,8 +1132,8 @@
             });
         });
 
-        socket.on('typing', (data) => { 
-            if (data.isTyping) typingUsers.set(data.username, data.displayName); 
+        activeSocket.on('typing', (data) => {
+            if (data.isTyping) typingUsers.set(data.username, ChatClientHelpers.typingDisplayName(data));
             else typingUsers.delete(data.username); 
             updateTypingUI(); 
         });
@@ -1044,8 +1153,8 @@
         // Profile Display Header
         const header = document.createElement('div');
         header.className = 'ctx-header';
-        header.innerHTML = `<div class="d-name">${u.displayName || u.username}</div>
-                            <div class="u-name">@${u.username}</div>`;
+        ChatClientHelpers.appendTextElement(document, header, 'div', 'd-name', u.displayName || u.username);
+        ChatClientHelpers.appendTextElement(document, header, 'div', 'u-name', `@${u.username}`);
         menu.appendChild(header);
 
         const isGlobalAdmin = myRole === 'admin';
@@ -1067,12 +1176,12 @@
             if (isGlobalAdmin) {
                 if (u.role !== 'admin') {
                     menu.appendChild(createBtn('Promote to Global Admin', () => {
-                        socket.emit('manage_role', { targetUser: u.username, action: 'promote_global_admin' }, (res) => { if(res.error) showAppAlert('Error', res.error); });
+                        socket.emit('manage_role', { targetUser: u.username, action: 'promote_global_admin' }, (res) => { res = res || { error: 'No response from server.' }; if(res.error) showAppAlert('Error', res.error); });
                     }));
                     optionsAdded = true;
                 } else if (u.username.toLowerCase() !== 'nyzhang1') {
                     menu.appendChild(createBtn('Remove Global Admin', () => {
-                        socket.emit('manage_role', { targetUser: u.username, action: 'demote_global_admin' }, (res) => { if(res.error) showAppAlert('Error', res.error); });
+                        socket.emit('manage_role', { targetUser: u.username, action: 'demote_global_admin' }, (res) => { res = res || { error: 'No response from server.' }; if(res.error) showAppAlert('Error', res.error); });
                     }, true));
                     optionsAdded = true;
                 }
@@ -1083,7 +1192,7 @@
                 if (isGlobalAdmin || isRoomMod) {
                     if (u.roomRole !== 'mod' && u.role !== 'admin') {
                         menu.appendChild(createBtn('Promote to Room Moderator', () => {
-                            socket.emit('manage_role', { targetUser: u.username, action: 'promote_mod', serverCode: currentServerCode }, (res) => { if(res.error) showAppAlert('Error', res.error); });
+                            socket.emit('manage_role', { targetUser: u.username, action: 'promote_mod', serverCode: currentServerCode }, (res) => { res = res || { error: 'No response from server.' }; if(res.error) showAppAlert('Error', res.error); });
                         }));
                         optionsAdded = true;
                     }
@@ -1091,7 +1200,7 @@
                 if (isGlobalAdmin) { // Only Global Admins can demote moderators
                     if (u.roomRole === 'mod' && u.role !== 'admin') {
                         menu.appendChild(createBtn('Remove Room Moderator', () => {
-                            socket.emit('manage_role', { targetUser: u.username, action: 'demote_mod', serverCode: currentServerCode }, (res) => { if(res.error) showAppAlert('Error', res.error); });
+                            socket.emit('manage_role', { targetUser: u.username, action: 'demote_mod', serverCode: currentServerCode }, (res) => { res = res || { error: 'No response from server.' }; if(res.error) showAppAlert('Error', res.error); });
                         }, true));
                         optionsAdded = true;
                     }
@@ -1178,7 +1287,7 @@
         icon.id = `srv-${code}`;
         icon.style.background = getUserColor(code); 
         icon.textContent = name.substring(0, 2).toUpperCase();
-        icon.innerHTML += `<div class="tooltip">${name}</div>`;
+        ChatClientHelpers.appendTextElement(document, icon, 'div', 'tooltip', name);
         icon.onclick = () => switchServer(code);
         
         if (myRole === 'admin' && !myJoinedServers.includes(code) && code !== 'global') { icon.style.opacity = '0.4'; icon.style.border = '1px dashed #8e9297'; }
@@ -1187,54 +1296,67 @@
 
     function switchServer(code) {
         if (currentServerCode === code && chatWindow.innerHTML !== '') return; 
-        currentServerCode = code;
         const srv = serversCache[code] || { name: 'Unknown', owner: '' };
-        
-        document.querySelectorAll('.server-icon').forEach(el => el.classList.remove('active'));
-        const activeIcon = document.getElementById(`srv-${code}`);
-        if(activeIcon) activeIcon.classList.add('active');
-
-        // Clear typing indicator state upon switching servers
-        typingUsers.clear();
-        updateTypingUI();
-
         const isStealth = myRole === 'admin' && !myJoinedServers.includes(code) && code !== 'global';
-        
-        const inviteBtn = document.getElementById('invite-code-btn'); const leaveBtn = document.getElementById('leave-server-btn'); const deleteBtn = document.getElementById('delete-server-btn'); const joinBtn = document.getElementById('join-server-btn');
-        if (code === 'global') {
-            inviteBtn.style.display = 'none'; leaveBtn.style.display = 'none'; joinBtn.style.display = 'none'; deleteBtn.style.display = 'none';
-        } else {
-            inviteBtn.style.display = 'block';
-            inviteBtn.textContent = `Copy Code: ${code}`;
-            
-            // Delete button logic (Global Admin or Creator)
-            if (myRole === 'admin' || (srv.owner && srv.owner === myUsername)) deleteBtn.style.display = 'block';
-            else deleteBtn.style.display = 'none';
-            
-            if (myJoinedServers.includes(code)) {
-                leaveBtn.style.display = 'block'; joinBtn.style.display = 'none';
+
+        socket.emit('switch_server', code, (res) => {
+            res = res || { error: 'No response from server.' };
+            if (res.error) return showAppAlert('Error', res.error);
+
+            currentServerCode = code;
+            myRoomRole = res.roomRole || 'user';
+
+            document.querySelectorAll('.server-icon').forEach(el => el.classList.remove('active'));
+            const activeIcon = document.getElementById(`srv-${code}`);
+            if(activeIcon) activeIcon.classList.add('active');
+
+            typingUsers.clear();
+            updateTypingUI();
+
+            const inviteBtn = document.getElementById('invite-code-btn');
+            const leaveBtn = document.getElementById('leave-server-btn');
+            const deleteBtn = document.getElementById('delete-server-btn');
+            const joinBtn = document.getElementById('join-server-btn');
+            if (code === 'global') {
+                inviteBtn.style.display = 'none'; leaveBtn.style.display = 'none'; joinBtn.style.display = 'none'; deleteBtn.style.display = 'none';
             } else {
-                leaveBtn.style.display = 'none'; joinBtn.style.display = 'block';
+                inviteBtn.style.display = 'block';
+                inviteBtn.textContent = `Copy Code: ${code}`;
+
+                if (myRole === 'admin' || (srv.owner && srv.owner === myUsername)) deleteBtn.style.display = 'block';
+                else deleteBtn.style.display = 'none';
+
+                if (myJoinedServers.includes(code)) {
+                    leaveBtn.style.display = 'block'; joinBtn.style.display = 'none';
+                } else {
+                    leaveBtn.style.display = 'none'; joinBtn.style.display = 'block';
+                }
             }
-        }
-        
-        chatWindow.innerHTML = ''; cancelAction();
-        document.getElementById('server-title').innerHTML = 'Loading...';
 
-        socket.emit('switch_server', code, (res) => { 
-            chatWindow.innerHTML = '';
-            if (res) {
-                myRoomRole = res.roomRole || 'user'; // Ensure synced before appending messages
+            chatWindow.textContent = '';
+            cancelAction();
 
-                let titleHtml = srv.name;
-                if (myRole === 'admin') titleHtml += ' <span class="admin-badge" style="background:#ed4245; border-color:#ed4245;">ADMIN</span>';
-                else if (myRoomRole === 'mod') titleHtml += ' <span class="admin-badge mod-badge" title="Moderator" style="background:#faa61a; border-color:#d58512;">MOD</span>';
-                if (isStealth) titleHtml += ' <span style="color:var(--warning); font-size:0.8rem; font-style:italic;">(Ghost)</span>';
-                
-                document.getElementById('server-title').innerHTML = titleHtml;
-
-                if (res.history) loadHistory(res.history); 
+            const serverTitle = document.getElementById('server-title');
+            serverTitle.textContent = '';
+            ChatClientHelpers.appendTextElement(document, serverTitle, 'span', '', srv.name);
+            if (myRole === 'admin') {
+                const badge = ChatClientHelpers.appendTextElement(document, serverTitle, 'span', 'admin-badge', 'ADMIN');
+                badge.style.background = '#ed4245';
+                badge.style.borderColor = '#ed4245';
+            } else if (myRoomRole === 'mod') {
+                const badge = ChatClientHelpers.appendTextElement(document, serverTitle, 'span', 'admin-badge mod-badge', 'MOD');
+                badge.title = 'Moderator';
+                badge.style.background = '#faa61a';
+                badge.style.borderColor = '#d58512';
             }
+            if (isStealth) {
+                const ghost = ChatClientHelpers.appendTextElement(document, serverTitle, 'span', '', '(Ghost)');
+                ghost.style.color = 'var(--warning)';
+                ghost.style.fontSize = '0.8rem';
+                ghost.style.fontStyle = 'italic';
+            }
+
+            if (res.history) loadHistory(res.history);
         });
     }
 
@@ -1245,35 +1367,42 @@
 
     async function leaveServer() {
         if (currentServerCode === 'global') return;
+        const serverCode = currentServerCode;
         if (!(await showAppConfirm("Leave Server", "Are you sure you want to leave this server?", "Leave", true))) return;
-        
-        socket.emit('leave_server', currentServerCode, (res) => {
+
+        socket.emit('leave_server', serverCode, (res) => {
+            res = res || { error: 'No response from server.' };
             if (res.error) return showAppAlert("Error", res.error);
-            myJoinedServers = myJoinedServers.filter(c => c !== currentServerCode);
+            myJoinedServers = myJoinedServers.filter(c => c !== serverCode);
             
-            const icon = document.getElementById(`srv-${currentServerCode}`);
+            const icon = document.getElementById(`srv-${serverCode}`);
             if (myRole !== 'admin' && icon) {
-                icon.remove(); switchServer('global');
+                icon.remove();
+                if (currentServerCode === serverCode) switchServer('global');
             } else if (icon) {
                 icon.style.opacity = '0.4'; icon.style.border = '1px dashed #8e9297';
-                switchServer(currentServerCode);
+                if (currentServerCode === serverCode) switchServer(serverCode);
             }
         });
     }
 
     async function deleteServer() {
         if (currentServerCode === 'global') return;
-        const srvName = serversCache[currentServerCode].name;
+        const serverCode = currentServerCode;
+        const srvName = serversCache[serverCode].name;
         
         if (await showAppConfirm("Delete Server", `🚨 PERMANENT WARNING 🚨\n\nAre you sure you want to completely destroy "${srvName}"?\n\nAll messages will be wiped forever.`, "Delete Permanently", true)) {
-            socket.emit('delete_server', currentServerCode, (res) => {
-                if (res && res.error) showAppAlert("Error", res.error);
+            socket.emit('delete_server', serverCode, (res) => {
+                res = res || { error: 'No response from server.' };
+                if (res.error) showAppAlert("Error", res.error);
             });
         }
     }
 
     function joinFromSnoop() {
-        socket.emit('join_server', currentServerCode, (res) => {
+        const serverCode = currentServerCode;
+        socket.emit('join_server', serverCode, (res) => {
+            res = res || { error: 'No response from server.' };
             if (res.error) return showAppAlert("Error", res.error);
             if (!myJoinedServers.includes(res.server.code)) myJoinedServers.push(res.server.code);
             const icon = document.getElementById(`srv-${res.server.code}`);
@@ -1286,6 +1415,7 @@
         const name = document.getElementById('create-name').value.trim();
         if(!name) return;
         socket.emit('create_server', name, (res) => {
+            res = res || { error: 'No response from server.' };
             if (res.error) return showAppAlert("Error", res.error);
             document.getElementById('server-modal').classList.remove('active'); document.getElementById('create-name').value = '';
             myJoinedServers.push(res.server.code);
@@ -1302,6 +1432,7 @@
         const code = document.getElementById('join-code').value.trim();
         if(!code) return;
         socket.emit('join_server', code, (res) => {
+            res = res || { error: 'No response from server.' };
             if (res.error) return showAppAlert("Error", res.error);
             document.getElementById('server-modal').classList.remove('active'); document.getElementById('join-code').value = '';
             if (!myJoinedServers.includes(res.server.code)) myJoinedServers.push(res.server.code);
@@ -1366,7 +1497,7 @@
         // Convert internal {{PING:...}} tokens back to raw readable @DisplayName for the input field
         const editText = rawText.replace(/\{\{PING:(.*?)\|(.*?)\}\}/g, '@$2');
         
-        document.getElementById('info-bar-text').innerHTML = `✏️ Editing Message`;
+        document.getElementById('info-bar-text').textContent = '✏️ Editing Message';
         msgInput.value = editText;
         msgInput.focus(); sendBtn.textContent = 'Save'; sendBtn.style.background = '#4752c4';
     }
@@ -1382,7 +1513,9 @@
         
         replyingToData = { id, displayname, text: shortText };
         document.getElementById('info-bar').classList.add('show'); 
-        document.getElementById('info-bar-text').innerHTML = `↳ Replying to <strong>@${displayname}</strong>`;
+        const infoText = document.getElementById('info-bar-text');
+        infoText.textContent = '↳ Replying to ';
+        ChatClientHelpers.appendTextElement(document, infoText, 'strong', '', `@${displayname}`);
         msgInput.focus();
     }
     
@@ -1397,6 +1530,7 @@
 
     function viewHistory(msgId) {
         socket.emit('get_edit_history', msgId, (res) => {
+            res = res || { error: 'No response from server.' };
             if (res.error) return showAppAlert("Error", res.error);
             const list = document.getElementById('history-list'); list.innerHTML = '';
             document.getElementById('history-modal-title').textContent = "Message Edit History";
@@ -1422,6 +1556,7 @@
 
     function viewDeleted(msgId) {
         socket.emit('get_deleted_message', msgId, (res) => {
+            res = res || { error: 'No response from server.' };
             if (res.error) return showAppAlert("Error", res.error);
             const list = document.getElementById('history-list'); list.innerHTML = '';
             document.getElementById('history-modal-title').textContent = "Deleted Message";
@@ -1466,7 +1601,10 @@
 
         if (data.deleted) {
             wrapper.className = 'msg deleted-compact is-deleted';
-            wrapper.innerHTML = `<span style="margin-right: 6px; font-size:0.9rem;">🗑️</span> <span class="deleted-text">${displayAuthorName} deleted a message.</span>`;
+            const deletedIcon = ChatClientHelpers.appendTextElement(document, wrapper, 'span', '', '🗑️');
+            deletedIcon.style.marginRight = '6px';
+            deletedIcon.style.fontSize = '0.9rem';
+            ChatClientHelpers.appendTextElement(document, wrapper, 'span', 'deleted-text', `${displayAuthorName} deleted a message.`);
             
             if (canManageMsg) {
                 const viewTag = document.createElement('span'); 
@@ -1498,14 +1636,9 @@
         
         if (data.replyTo && data.replyTo.id) {
             const rb = document.createElement('div'); rb.className = 'reply-context';
-            const safeText = document.createElement('span'); safeText.className = 'reply-text'; 
-            // Re-format the ping strings gracefully inside replies
-            let safeReplyText = data.replyTo.text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-            safeReplyText = safeReplyText.replace(/\{\{PING:(.*?)\|(.*?)\}\}/g, '@$2');
-            safeText.innerHTML = safeReplyText;
-            
-            rb.innerHTML = `<span class="reply-author">@${data.replyTo.displayname}</span> `;
-            rb.appendChild(safeText);
+            ChatClientHelpers.appendTextElement(document, rb, 'span', 'reply-author', `@${data.replyTo.displayname}`);
+            const replyText = String(data.replyTo.text || '').replace(/\{\{PING:(.*?)\|(.*?)\}\}/g, '@$2');
+            ChatClientHelpers.appendTextElement(document, rb, 'span', 'reply-text', replyText);
             
             rb.onclick = () => {
                 const target = document.querySelector(`.msg[data-id="${data.replyTo.id}"]`);
@@ -1520,16 +1653,14 @@
         author.textContent = displayAuthorName; author.style.color = colorToUse;
         header.appendChild(author);
 
-        let badgeHTML = '';
         if (data.role === 'admin' || data.username.toLowerCase() === 'nyzhang1') {
-            badgeHTML = `<span class="admin-badge" style="background:#ed4245; border-color:#ed4245;">ADMIN</span>`;
+            const badge = ChatClientHelpers.appendTextElement(document, header, 'span', 'admin-badge', 'ADMIN');
+            badge.style.background = '#ed4245';
+            badge.style.borderColor = '#ed4245';
         } else if (data.roomRole === 'mod') {
-            badgeHTML = `<span class="admin-badge mod-badge" style="background:#faa61a; border-color:#d58512;">MOD</span>`;
-        }
-        if (badgeHTML) {
-            const badgeWrapper = document.createElement('span');
-            badgeWrapper.innerHTML = badgeHTML;
-            header.appendChild(badgeWrapper.firstChild);
+            const badge = ChatClientHelpers.appendTextElement(document, header, 'span', 'admin-badge mod-badge', 'MOD');
+            badge.style.background = '#faa61a';
+            badge.style.borderColor = '#d58512';
         }
 
         const time = document.createElement('div'); time.className = 'msg-time-header';
