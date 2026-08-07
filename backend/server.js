@@ -16,6 +16,100 @@ const io = new Server(server, {
 
 const MONGO_URI = process.env.MONGO_URI; 
 
+const USERNAME_RE = /^[A-Za-z0-9_-]{1,20}$/;
+const DISPLAY_NAME_RE = /^[A-Za-z0-9_ -]{1,30}$/;
+const SERVER_NAME_RE = /^[A-Za-z0-9_ -]{1,30}$/;
+const SERVER_CODE_RE = /^[A-Z0-9]{6}$/;
+const COLOR_RE = /^#[0-9a-fA-F]{6}$/;
+const OBJECT_ID_RE = /^[0-9a-fA-F]{24}$/;
+const ATTACHMENT_RE = /^data:image\/(?:jpeg|png|gif|webp);base64,[A-Za-z0-9+/=]+$/;
+const REACTION_RE = /^(?:\p{Extended_Pictographic}|\p{Emoji_Modifier}|\uFE0F|\u200D)+$/u;
+
+function safeAck(callback) {
+  return typeof callback === 'function' ? callback : () => {};
+}
+
+function normalizeWith(value, pattern) {
+  if (typeof value !== 'string') return null;
+  const normalized = value.trim();
+  return pattern.test(normalized) ? normalized : null;
+}
+
+function normalizeUsername(value) { return normalizeWith(value, USERNAME_RE); }
+function normalizeDisplayName(value) { return normalizeWith(value, DISPLAY_NAME_RE); }
+function normalizeServerName(value) { return normalizeWith(value, SERVER_NAME_RE); }
+
+function normalizeServerCode(value) {
+  if (typeof value !== 'string') return null;
+  const normalized = value.trim();
+  if (normalized.toLowerCase() === 'global') return 'global';
+  const upper = normalized.toUpperCase();
+  return SERVER_CODE_RE.test(upper) ? upper : null;
+}
+
+function isValidPassword(value) {
+  return typeof value === 'string' && value.length >= 6 && value.length <= 128;
+}
+
+function normalizeColor(value) {
+  if (value === '' || value === undefined || value === null) return '';
+  if (typeof value !== 'string') return null;
+  const normalized = value.trim();
+  return COLOR_RE.test(normalized) ? normalized.toLowerCase() : null;
+}
+
+function normalizeAvatarUrl(value) {
+  if (value === '' || value === undefined || value === null) return '';
+  if (typeof value !== 'string') return null;
+  const normalized = value.trim();
+  if (normalized.length > 1000) return null;
+  try {
+    const parsed = new URL(normalized);
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:' ? normalized : null;
+  } catch {
+    return null;
+  }
+}
+
+function isValidAttachment(value) {
+  return value === null || value === undefined || value === '' ||
+    (typeof value === 'string' && value.length <= 8_000_000 && ATTACHMENT_RE.test(value));
+}
+
+function isValidReaction(value) {
+  return typeof value === 'string' && value.length > 0 && value.length <= 64 && REACTION_RE.test(value);
+}
+
+function isValidObjectId(value) {
+  return typeof value === 'string' && OBJECT_ID_RE.test(value);
+}
+
+function neutralizePingTokens(text) {
+  if (typeof text !== 'string') return '';
+  return text.replace(/\{\{PING:([^|{}]*)\|([^{}]*)\}\}/gi, (_match, username, displayName) => {
+    return `@${displayName || username}`;
+  });
+}
+
+function canAccessRoom(identity, serverCode) {
+  if (serverCode === 'global') return true;
+  if (!identity || !Array.isArray(identity.joinedServers)) return false;
+  return identity.role === 'admin' || identity.joinedServers.includes(serverCode);
+}
+
+function appendBoundedHistory(history, entry, limit = 20) {
+  return [...(Array.isArray(history) ? history : []), entry].slice(-limit);
+}
+
+function createReplySnapshot(message) {
+  const text = typeof message.text === 'string' ? message.text.slice(0, 100) : '';
+  return {
+    id: String(message._id),
+    displayname: message.displayName || message.username,
+    text: text || (message.attachment ? 'Image Attachment' : '')
+  };
+}
+
 // --- SECURITY: REGEX ESCAPE ---
 function escapeRegExp(string) {
   return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); 
@@ -40,7 +134,7 @@ setInterval(() => {
         if (recent.length === 0) authAttempts.delete(ip);
         else authAttempts.set(ip, recent);
     }
-}, 15 * 60 * 1000);
+}, 15 * 60 * 1000).unref();
 
 // --- DATABASE SCHEMAS ---
 const UserSchema = new mongoose.Schema({
@@ -99,8 +193,6 @@ async function seedSystem() {
     console.log('👑 Admin & Global Server ready.');
   } catch (err) { console.error("Seeding error:", err); }
 }
-if (MONGO_URI) mongoose.connect(MONGO_URI).then(seedSystem).catch(console.error);
-
 const onlineUsers = new Map(); 
 
 // --- DYNAMIC ROOM PERMISSION UTILITY ---
@@ -724,4 +816,43 @@ io.on('connection', (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`🚀 Server on port ${PORT}`));
+
+async function start() {
+  if (MONGO_URI) {
+    await mongoose.connect(MONGO_URI);
+    await seedSystem();
+  }
+  return new Promise(resolve => {
+    server.listen(PORT, () => {
+      console.log(`🚀 Server on port ${PORT}`);
+      resolve(server);
+    });
+  });
+}
+
+if (require.main === module) {
+  start().catch(err => {
+    console.error('Database startup failed:', err);
+    process.exitCode = 1;
+  });
+}
+
+module.exports = {
+  server,
+  start,
+  safeAck,
+  normalizeUsername,
+  normalizeDisplayName,
+  normalizeServerName,
+  normalizeServerCode,
+  isValidPassword,
+  normalizeColor,
+  normalizeAvatarUrl,
+  isValidAttachment,
+  isValidReaction,
+  isValidObjectId,
+  neutralizePingTokens,
+  canAccessRoom,
+  appendBoundedHistory,
+  createReplySnapshot
+};
