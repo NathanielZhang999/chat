@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const security = require('../server');
 
 test('requiring server.js does not start the HTTP server', () => {
+  assert.equal(typeof security.app, 'function');
   assert.equal(typeof security.start, 'function');
   assert.equal(security.server.listening, false);
 });

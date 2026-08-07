@@ -838,6 +838,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  app,
   server,
   start,
   safeAck,
