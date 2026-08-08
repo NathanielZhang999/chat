@@ -1,6 +1,7 @@
 {
   "name": "chat-backend-pro",
   "version": "2.0.0",
+  "description": "Three-file Socket.IO chat; requires MONGO_URI, supports optional ADMIN_PASSWORD (6-128 characters), and defaults PORT to 3000",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
