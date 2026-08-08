@@ -171,7 +171,7 @@
         .msg.deleted-compact .deleted-text { font-style: italic; }
         .view-deleted-tag { cursor: pointer; font-size: 0.75rem; text-decoration: underline; color: var(--error); margin-left: 4px; }
 
-        .system-msg { text-align: center; font-size: 0.85rem; color: var(--text-muted); margin: 1rem 0; font-weight: 600; display: flex; align-items: center; justify-content: center; gap: 10px; animation: fadePop 0.4s ease-out;}
+        .system-msg { text-align: center; font-size: 0.85rem; color: var(--text-muted); margin: 1rem 0; font-weight: 600; display: flex; align-items: center; justify-content: center; gap: 10px; animation: fadePop var(--motion-base) var(--ease-standard);}
         .system-msg::before, .system-msg::after { content: ""; flex: 1; border-bottom: 1px solid var(--surface-dark); max-width: 50px; }
         
         /* Updated Hideable Typing Indicator */
@@ -293,6 +293,7 @@
             animation-duration: 0.01ms !important;
             animation-iteration-count: 1 !important;
             transition-duration: 0.01ms !important;
+            transition-delay: 0s !important;
           }
 
           #chat-window { scroll-behavior: auto !important; }
@@ -300,6 +301,8 @@
             animation: none !important;
             transform: none !important;
           }
+          .user-item { opacity: 1 !important; }
+          .user-item.offline { opacity: 0.5 !important; }
         }
     </style>
 </head>
@@ -624,6 +627,14 @@
                 shouldScroll: !history && wasNearBottom,
                 behavior: history ? 'auto' : 'smooth'
             };
+        },
+
+        motionBaseDuration() {
+            return 220;
+        },
+
+        removeAfterBaseMotion(schedule, remove) {
+            return schedule(remove, this.motionBaseDuration());
         },
 
         createScrollCoordinator(scheduleFrame, getScroller, shouldReduceMotion = () => false) {
@@ -1398,7 +1409,7 @@
             document.addEventListener('click', function closeMenu(evt) {
                 if (!menu.contains(evt.target)) {
                     menu.classList.remove('show');
-                    setTimeout(() => menu.remove(), 200);
+                    ChatClientHelpers.removeAfterBaseMotion(setTimeout, () => menu.remove());
                     document.removeEventListener('click', closeMenu);
                 }
             });

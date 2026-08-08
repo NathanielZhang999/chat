@@ -42,6 +42,45 @@ test('client motion policy avoids broad transitions and respects reduced motion'
   assert.match(source, /#chat-window\s*\{[^}]*scroll-behavior:\s*auto/s);
 });
 
+test('reduced motion keeps user rows visible without transition delays', () => {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  const reducedMotionStart = source.indexOf('@media (prefers-reduced-motion: reduce)');
+  const reducedMotionRule = source.slice(reducedMotionStart, source.indexOf('</style>', reducedMotionStart));
+
+  assert.notEqual(reducedMotionStart, -1, 'reduced-motion rule is present');
+  assert.match(reducedMotionRule, /transition-delay:\s*0s\s*!important/);
+  assert.match(reducedMotionRule, /\.user-item\s*\{[^}]*opacity:\s*1\s*!important/s);
+  assert.match(reducedMotionRule, /\.user-item\.offline\s*\{[^}]*opacity:\s*0\.5\s*!important/s);
+});
+
+test('system messages use the shared base motion timing', () => {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  assert.match(
+    source,
+    /\.system-msg\s*\{[^}]*animation:\s*fadePop\s+var\(--motion-base\)\s+var\(--ease-standard\)/s
+  );
+});
+
+test('context-menu removal waits for the shared base motion duration', () => {
+  const helpers = loadHelpers();
+  let scheduled;
+  let removed = false;
+
+  const timerId = helpers.removeAfterBaseMotion(
+    (callback, delay) => {
+      scheduled = { callback, delay };
+      return 'timer-id';
+    },
+    () => { removed = true; }
+  );
+
+  assert.equal(timerId, 'timer-id');
+  assert.equal(scheduled.delay, 220);
+  assert.equal(removed, false);
+  scheduled.callback();
+  assert.equal(removed, true);
+});
+
 test('scroll policy preserves readers and separates history from live motion', () => {
   const helpers = loadHelpers();
   assert.equal(helpers.isNearScrollEnd({ scrollHeight: 1000, scrollTop: 600, clientHeight: 320 }), true);
