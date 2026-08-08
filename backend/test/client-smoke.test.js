@@ -78,6 +78,23 @@ test('scroll coordinator coalesces requests and gives instant scroll priority', 
   assert.deepEqual({ ...calls[0] }, { top: 900, behavior: 'auto' });
 });
 
+test('scroll coordinator makes smooth requests instant for reduced motion', () => {
+  const helpers = loadHelpers();
+  const frames = [];
+  const calls = [];
+  const scroller = { scrollHeight: 900, scrollTo(options) { calls.push(options); } };
+  const coordinator = helpers.createScrollCoordinator(
+    callback => frames.push(callback),
+    () => scroller,
+    () => true
+  );
+
+  coordinator.request('smooth');
+  frames.shift()();
+
+  assert.deepEqual({ ...calls[0] }, { top: 900, behavior: 'auto' });
+});
+
 test('backend URLs allow only HTTP and HTTPS', () => {
   const helpers = loadHelpers();
   assert.equal(helpers.normalizeBackendUrl('example.com/'), 'https://example.com');

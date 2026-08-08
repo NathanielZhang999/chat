@@ -626,7 +626,7 @@
             };
         },
 
-        createScrollCoordinator(scheduleFrame, getScroller) {
+        createScrollCoordinator(scheduleFrame, getScroller, shouldReduceMotion = () => false) {
             let scheduled = false;
             let pendingBehavior = null;
 
@@ -641,7 +641,10 @@
                         scheduled = false;
                         const scroller = getScroller();
                         if (!scroller) return;
-                        scroller.scrollTo({ top: scroller.scrollHeight, behavior: requestedBehavior });
+                        const behavior = requestedBehavior === 'smooth' && shouldReduceMotion()
+                            ? 'auto'
+                            : requestedBehavior;
+                        scroller.scrollTo({ top: scroller.scrollHeight, behavior });
                     });
                 }
             };
@@ -745,9 +748,12 @@
     const scheduleAnimationFrame = window.requestAnimationFrame
         ? callback => window.requestAnimationFrame(callback)
         : callback => setTimeout(callback, 0);
+    const prefersReducedMotion = () =>
+        typeof window.matchMedia === 'function' && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
     const chatScrollCoordinator = ChatClientHelpers.createScrollCoordinator(
         scheduleAnimationFrame,
-        () => chatWindow
+        () => chatWindow,
+        prefersReducedMotion
     );
     const msgInput = document.getElementById('msg-input');
     const sendBtn = document.getElementById('send-btn');
