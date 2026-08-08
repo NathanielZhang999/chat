@@ -540,12 +540,19 @@
             });
         },
 
-        evaluateSwitchResult(currentServerCode, targetServerCode, response, showAlert) {
+        applySwitchResult({
+            currentServerCode,
+            targetServerCode,
+            response,
+            showAlert,
+            applySuccess
+        }) {
             const normalizedResponse = response || { error: 'No response from server.' };
             if (normalizedResponse.error) {
                 showAlert('Error', normalizedResponse.error);
                 return { accepted: false, currentServerCode, response: normalizedResponse };
             }
+            applySuccess(targetServerCode, normalizedResponse);
             return { accepted: true, currentServerCode: targetServerCode, response: normalizedResponse };
         },
 
@@ -1392,67 +1399,71 @@
     }
 
     function handleSwitchResult(code, res) {
-        const srv = serversCache[code] || { name: 'Unknown', owner: '' };
-        const isStealth = myRole === 'admin' && !myJoinedServers.includes(code) && code !== 'global';
+        return ChatClientHelpers.applySwitchResult({
+            currentServerCode,
+            targetServerCode: code,
+            response: res,
+            showAlert: showAppAlert,
+            applySuccess(targetServerCode, response) {
+                const srv = serversCache[targetServerCode] || { name: 'Unknown', owner: '' };
+                const isStealth = myRole === 'admin' && !myJoinedServers.includes(targetServerCode) && targetServerCode !== 'global';
 
-        const outcome = ChatClientHelpers.evaluateSwitchResult(currentServerCode, code, res, showAppAlert);
-        if (!outcome.accepted) return;
-        res = outcome.response;
+                currentServerCode = targetServerCode;
+                myRoomRole = response.roomRole || 'user';
 
-        currentServerCode = outcome.currentServerCode;
-        myRoomRole = res.roomRole || 'user';
+                document.querySelectorAll('.server-icon').forEach(el => el.classList.remove('active'));
+                const activeIcon = document.getElementById(`srv-${targetServerCode}`);
+                if(activeIcon) activeIcon.classList.add('active');
 
-        document.querySelectorAll('.server-icon').forEach(el => el.classList.remove('active'));
-        const activeIcon = document.getElementById(`srv-${code}`);
-        if(activeIcon) activeIcon.classList.add('active');
+                typingUsers.clear();
+                updateTypingUI();
 
-        typingUsers.clear();
-        updateTypingUI();
+                const inviteBtn = document.getElementById('invite-code-btn');
+                const leaveBtn = document.getElementById('leave-server-btn');
+                const deleteBtn = document.getElementById('delete-server-btn');
+                const joinBtn = document.getElementById('join-server-btn');
+                if (targetServerCode === 'global') {
+                    inviteBtn.style.display = 'none'; leaveBtn.style.display = 'none'; joinBtn.style.display = 'none'; deleteBtn.style.display = 'none';
+                } else {
+                    inviteBtn.style.display = 'block';
+                    inviteBtn.textContent = `Copy Code: ${targetServerCode}`;
 
-        const inviteBtn = document.getElementById('invite-code-btn');
-        const leaveBtn = document.getElementById('leave-server-btn');
-        const deleteBtn = document.getElementById('delete-server-btn');
-        const joinBtn = document.getElementById('join-server-btn');
-        if (code === 'global') {
-            inviteBtn.style.display = 'none'; leaveBtn.style.display = 'none'; joinBtn.style.display = 'none'; deleteBtn.style.display = 'none';
-        } else {
-            inviteBtn.style.display = 'block';
-            inviteBtn.textContent = `Copy Code: ${code}`;
+                    if (myRole === 'admin' || (srv.owner && srv.owner === myUsername)) deleteBtn.style.display = 'block';
+                    else deleteBtn.style.display = 'none';
 
-            if (myRole === 'admin' || (srv.owner && srv.owner === myUsername)) deleteBtn.style.display = 'block';
-            else deleteBtn.style.display = 'none';
+                    if (myJoinedServers.includes(targetServerCode)) {
+                        leaveBtn.style.display = 'block'; joinBtn.style.display = 'none';
+                    } else {
+                        leaveBtn.style.display = 'none'; joinBtn.style.display = 'block';
+                    }
+                }
 
-            if (myJoinedServers.includes(code)) {
-                leaveBtn.style.display = 'block'; joinBtn.style.display = 'none';
-            } else {
-                leaveBtn.style.display = 'none'; joinBtn.style.display = 'block';
+                chatWindow.textContent = '';
+                cancelAction();
+
+                const serverTitle = document.getElementById('server-title');
+                serverTitle.textContent = '';
+                ChatClientHelpers.appendTextElement(document, serverTitle, 'span', '', srv.name);
+                if (myRole === 'admin') {
+                    const badge = ChatClientHelpers.appendTextElement(document, serverTitle, 'span', 'admin-badge', 'ADMIN');
+                    badge.style.background = '#ed4245';
+                    badge.style.borderColor = '#ed4245';
+                } else if (myRoomRole === 'mod') {
+                    const badge = ChatClientHelpers.appendTextElement(document, serverTitle, 'span', 'admin-badge mod-badge', 'MOD');
+                    badge.title = 'Moderator';
+                    badge.style.background = '#faa61a';
+                    badge.style.borderColor = '#d58512';
+                }
+                if (isStealth) {
+                    const ghost = ChatClientHelpers.appendTextElement(document, serverTitle, 'span', '', '(Ghost)');
+                    ghost.style.color = 'var(--warning)';
+                    ghost.style.fontSize = '0.8rem';
+                    ghost.style.fontStyle = 'italic';
+                }
+
+                if (response.history) loadHistory(response.history);
             }
-        }
-
-        chatWindow.textContent = '';
-        cancelAction();
-
-        const serverTitle = document.getElementById('server-title');
-        serverTitle.textContent = '';
-        ChatClientHelpers.appendTextElement(document, serverTitle, 'span', '', srv.name);
-        if (myRole === 'admin') {
-            const badge = ChatClientHelpers.appendTextElement(document, serverTitle, 'span', 'admin-badge', 'ADMIN');
-            badge.style.background = '#ed4245';
-            badge.style.borderColor = '#ed4245';
-        } else if (myRoomRole === 'mod') {
-            const badge = ChatClientHelpers.appendTextElement(document, serverTitle, 'span', 'admin-badge mod-badge', 'MOD');
-            badge.title = 'Moderator';
-            badge.style.background = '#faa61a';
-            badge.style.borderColor = '#d58512';
-        }
-        if (isStealth) {
-            const ghost = ChatClientHelpers.appendTextElement(document, serverTitle, 'span', '', '(Ghost)');
-            ghost.style.color = 'var(--warning)';
-            ghost.style.fontSize = '0.8rem';
-            ghost.style.fontStyle = 'italic';
-        }
-
-        if (res.history) loadHistory(res.history);
+        });
     }
 
     function copyCode() {

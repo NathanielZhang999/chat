@@ -92,47 +92,65 @@ test('client attachment validation accepts only bounded raster data URLs', () =>
   assert.equal(helpers.sanitizeAttachment('https://example.test/image.png'), null);
 });
 
-test('production connect-error binding re-enables authentication while the active modal is open', () => {
+test('production connect-error binding mutates auth controls only for the active socket and modal', () => {
   const helpers = loadHelpers();
-  assert.equal(typeof helpers.bindConnectErrorRecovery, 'function');
-  const handlers = {};
-  const activeSocket = { on(event, handler) { handlers[event] = handler; } };
-  const authButton = { disabled: true };
-  const errors = [];
-  helpers.bindConnectErrorRecovery({
-    activeSocket,
-    getCurrentSocket: () => activeSocket,
-    isAuthModalActive: () => true,
-    authButton,
-    showError: (message, success) => errors.push({ message, success })
-  });
 
-  handlers.connect_error();
-  assert.equal(authButton.disabled, false);
-  assert.deepEqual(errors, [{
-    message: 'Unable to connect. Check the backend URL and try again.',
-    success: false
-  }]);
+  for (const scenario of [
+    { name: 'active socket and modal', current: true, modal: true, expectedDisabled: false, expectedErrors: 1 },
+    { name: 'stale socket', current: false, modal: true, expectedDisabled: true, expectedErrors: 0 },
+    { name: 'closed modal', current: true, modal: false, expectedDisabled: true, expectedErrors: 0 }
+  ]) {
+    const handlers = {};
+    const activeSocket = { on(event, handler) { handlers[event] = handler; } };
+    const otherSocket = {};
+    const authButton = { disabled: true };
+    const errors = [];
+
+    helpers.bindConnectErrorRecovery({
+      activeSocket,
+      getCurrentSocket: () => scenario.current ? activeSocket : otherSocket,
+      isAuthModalActive: () => scenario.modal,
+      authButton,
+      showError: (message, success) => errors.push({ message, success })
+    });
+    assert.equal(typeof handlers.connect_error, 'function', scenario.name);
+    handlers.connect_error();
+    assert.equal(authButton.disabled, scenario.expectedDisabled, scenario.name);
+    assert.equal(errors.length, scenario.expectedErrors, scenario.name);
+    if (scenario.expectedErrors) {
+      assert.deepEqual(errors[0], {
+        message: 'Unable to connect. Check the backend URL and try again.',
+        success: false
+      });
+    }
+  }
 });
 
-test('production rejected-switch gate preserves displayed room and DOM state', () => {
+test('production switch helper owns rejection and success mutation boundaries', () => {
   const helpers = loadHelpers();
-  assert.equal(typeof helpers.evaluateSwitchResult, 'function');
   const alerts = [];
-  const currentRoom = 'AAAAAA';
-  const chatWindow = { textContent: 'existing history' };
-  const result = helpers.evaluateSwitchResult(
-    currentRoom,
-    'BBBBBB',
-    { error: 'Permission denied.' },
-    (title, message) => alerts.push({ title, message })
-  );
+  const mutations = [];
 
-  assert.equal(result.accepted, false);
-  assert.equal(result.currentServerCode, 'AAAAAA');
-  assert.equal(result.response.error, 'Permission denied.');
-  assert.equal(chatWindow.textContent, 'existing history');
-  assert.deepEqual(alerts, [{ title: 'Error', message: 'Permission denied.' }]);
+  const rejected = helpers.applySwitchResult({
+    currentServerCode: 'AAAAAA',
+    targetServerCode: 'BBBBBB',
+    response: { error: 'Denied.' },
+    showAlert: (...args) => alerts.push(args),
+    applySuccess: (...args) => mutations.push(args)
+  });
+  assert.equal(rejected.currentServerCode, 'AAAAAA');
+  assert.deepEqual(alerts, [['Error', 'Denied.']]);
+  assert.deepEqual(mutations, []);
+
+  const accepted = helpers.applySwitchResult({
+    currentServerCode: 'AAAAAA',
+    targetServerCode: 'BBBBBB',
+    response: { history: [], roomRole: 'user' },
+    showAlert: () => { throw new Error('must not alert'); },
+    applySuccess: (code, response) => mutations.push([code, response.roomRole])
+  });
+  assert.equal(accepted.currentServerCode, 'BBBBBB');
+  assert.deepEqual(mutations, [['BBBBBB', 'user']]);
 });
 
 test('room switches serialize and retain only the latest queued target', () => {
