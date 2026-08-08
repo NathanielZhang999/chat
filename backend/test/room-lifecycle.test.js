@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { createConnectionHandler, seedSystem } = require('../server');
+const { createConnectionHandler, seedSystem, withAccountTransitionLock } = require('../server');
 const { FakeSocket, FakeIo, queryResult, acknowledge, deferred } = require('./support/fakes');
 
 function register(overrides = {}) {
@@ -16,6 +16,44 @@ function register(overrides = {}) {
   })(socket);
   return { socket, ioInstance };
 }
+
+function registerSharedSocket(overrides, id) {
+  const socket = new FakeSocket();
+  socket.id = id;
+  createConnectionHandler({
+    broadcastOnlineUsersFn: async () => {},
+    getRoomRoleFn: async () => 'user',
+    resolvePingsFn: async text => text,
+    ...overrides
+  })(socket);
+  return socket;
+}
+
+test('account transition locks serialize one normalized account and release after failure', async () => {
+  const firstGate = deferred();
+  const events = [];
+
+  const first = withAccountTransitionLock('Alice', async () => {
+    events.push('alice:first:start');
+    await firstGate.promise;
+    events.push('alice:first:end');
+  });
+  const second = withAccountTransitionLock('alice', async () => {
+    events.push('alice:second');
+  });
+  const bob = withAccountTransitionLock('bob', async () => {
+    events.push('bob');
+  });
+
+  await bob;
+  assert.deepEqual(events, ['alice:first:start', 'bob']);
+  firstGate.resolve();
+  await Promise.all([first, second]);
+  assert.deepEqual(events, ['alice:first:start', 'bob', 'alice:first:end', 'alice:second']);
+
+  await assert.rejects(withAccountTransitionLock('alice', async () => { throw new Error('expected'); }));
+  await assert.doesNotReject(withAccountTransitionLock('ALICE', async () => {}));
+});
 
 test('login rejects replacing an authenticated socket identity', async () => {
   const { socket } = register();
@@ -50,6 +88,392 @@ test('a late login server query failure leaves socket, rooms, presence, and broa
   assert.equal(socket.joinedRooms.has('global'), false);
   assert.equal(onlineUsersMap.size, 0);
   assert.deepEqual(broadcasts, []);
+});
+
+test('login cannot publish membership removed by a concurrent leave', async () => {
+  const compareStarted = deferred();
+  const releaseCompare = deferred();
+  const persisted = {
+    username: 'Alice', displayName: 'Alice', password: 'hash', role: 'user',
+    color: '', avatarUrl: '', servers: ['global', 'ABC123']
+  };
+  const staleLoginSnapshot = { ...persisted, servers: [...persisted.servers] };
+  let regexReads = 0;
+  let compareCalls = 0;
+
+  function readUser(source = persisted) {
+    const document = { ...source, servers: [...source.servers] };
+    document.save = async () => {
+      Object.assign(persisted, document, { servers: [...document.servers] });
+    };
+    return document;
+  }
+
+  const UserModel = {
+    async findOne(query) {
+      if (query.username && typeof query.username === 'object') {
+        regexReads += 1;
+        return readUser(regexReads === 1 ? staleLoginSnapshot : persisted);
+      }
+      return readUser();
+    }
+  };
+  const bcryptImpl = {
+    async compare() {
+      compareCalls += 1;
+      if (compareCalls === 1) {
+        compareStarted.resolve();
+        await releaseCompare.promise;
+      }
+      return true;
+    }
+  };
+  const ioInstance = new FakeIo();
+  const onlineUsersMap = new Map();
+  const shared = {
+    ioInstance,
+    onlineUsersMap,
+    UserModel,
+    bcryptImpl,
+    ChatServerModel: { async find() { return []; }, async updateOne() {} }
+  };
+  const loginSocket = registerSharedSocket(shared, 'socket-login');
+  const liveSocket = registerSharedSocket(shared, 'socket-live');
+  Object.assign(liveSocket, {
+    username: 'Alice', displayName: 'Alice', role: 'user', serverCode: 'ABC123',
+    joinedServers: ['global', 'ABC123']
+  });
+  liveSocket.joinedRooms.add('ABC123');
+  onlineUsersMap.set(liveSocket.id, {
+    username: 'Alice', displayName: 'Alice', role: 'user', serverCode: 'ABC123',
+    joinedServers: ['global', 'ABC123']
+  });
+  onlineUsersMap.set('map-only', {
+    username: 'alice', displayName: 'Alice', role: 'user', serverCode: 'ABC123',
+    joinedServers: ['global', 'ABC123']
+  });
+  ioInstance.sockets = [loginSocket, liveSocket];
+
+  const loginAck = acknowledge();
+  const loginPending = loginSocket.trigger('login', {
+    username: 'alice', password: '123456'
+  }, loginAck.callback);
+  await compareStarted.promise;
+
+  const leaveAck = acknowledge();
+  await liveSocket.trigger('leave_server', 'ABC123', leaveAck.callback);
+  assert.deepEqual(leaveAck.value(), { success: true });
+
+  releaseCompare.resolve();
+  await loginPending;
+
+  assert.deepEqual(loginAck.value().joinedServers, ['global']);
+  for (const live of [loginSocket, liveSocket]) {
+    assert.deepEqual(live.joinedServers, ['global']);
+    assert.equal(live.joinedRooms.has('ABC123'), false);
+    assert.deepEqual(onlineUsersMap.get(live.id).joinedServers, ['global']);
+  }
+  assert.deepEqual(onlineUsersMap.get('map-only').joinedServers, ['global']);
+  assert.equal(onlineUsersMap.get('map-only').serverCode, 'global');
+});
+
+test('login cannot retain ghost access after concurrent global-admin demotion', async () => {
+  const compareStarted = deferred();
+  const releaseCompare = deferred();
+  const persisted = {
+    username: 'Alice', displayName: 'Alice', password: 'hash', role: 'admin',
+    color: '', avatarUrl: '', servers: ['global']
+  };
+  const staleLoginSnapshot = { ...persisted, servers: [...persisted.servers] };
+  let regexReads = 0;
+  let compareCalls = 0;
+
+  function readUser(source = persisted) {
+    const document = { ...source, servers: [...source.servers] };
+    document.save = async () => {
+      Object.assign(persisted, document, { servers: [...document.servers] });
+    };
+    return document;
+  }
+
+  const UserModel = {
+    async findOne(query) {
+      if (query.username && typeof query.username === 'object') {
+        regexReads += 1;
+        return readUser(regexReads === 1 ? staleLoginSnapshot : persisted);
+      }
+      return readUser();
+    }
+  };
+  const bcryptImpl = {
+    async compare() {
+      compareCalls += 1;
+      if (compareCalls === 1) {
+        compareStarted.resolve();
+        await releaseCompare.promise;
+      }
+      return true;
+    }
+  };
+  const ioInstance = new FakeIo();
+  const onlineUsersMap = new Map();
+  const shared = {
+    ioInstance,
+    onlineUsersMap,
+    UserModel,
+    bcryptImpl,
+    ChatServerModel: {
+      async find() { return []; },
+      async findOne() { return { code: 'ABC123', moderators: [] }; }
+    },
+    MessageModel: { find: () => queryResult([]) }
+  };
+  const loginSocket = registerSharedSocket(shared, 'socket-login');
+  const liveSocket = registerSharedSocket(shared, 'socket-live');
+  Object.assign(liveSocket, {
+    username: 'Alice', displayName: 'Alice', role: 'admin', serverCode: 'ABC123',
+    joinedServers: ['global']
+  });
+  liveSocket.joinedRooms.add('ABC123');
+  onlineUsersMap.set(liveSocket.id, {
+    username: 'Alice', displayName: 'Alice', role: 'admin', serverCode: 'ABC123',
+    joinedServers: ['global']
+  });
+  onlineUsersMap.set('map-only', {
+    username: 'alice', displayName: 'Alice', role: 'admin', serverCode: 'ABC123',
+    joinedServers: ['global']
+  });
+  ioInstance.sockets = [loginSocket, liveSocket];
+
+  const loginAck = acknowledge();
+  const loginPending = loginSocket.trigger('login', {
+    username: 'alice', password: '123456'
+  }, loginAck.callback);
+  await compareStarted.promise;
+
+  const roleAck = acknowledge();
+  await liveSocket.trigger('manage_role', {
+    targetUser: 'Alice', action: 'demote_global_admin'
+  }, roleAck.callback);
+  assert.deepEqual(roleAck.value(), { success: true });
+
+  releaseCompare.resolve();
+  await loginPending;
+
+  assert.equal(loginAck.value().role, 'user');
+  for (const live of [loginSocket, liveSocket]) {
+    assert.equal(live.role, 'user');
+    assert.equal(onlineUsersMap.get(live.id).role, 'user');
+    assert.equal(live.joinedRooms.has('ABC123'), false);
+  }
+  assert.equal(onlineUsersMap.get('map-only').role, 'user');
+  assert.equal(onlineUsersMap.get('map-only').serverCode, 'global');
+
+  const switchAck = acknowledge();
+  await loginSocket.trigger('switch_server', 'ABC123', switchAck.callback);
+  assert.deepEqual(switchAck.value(), { error: 'Permission denied.' });
+  assert.equal(loginSocket.joinedRooms.has('ABC123'), false);
+});
+
+test('login overlapping profile update publishes the final profile', async () => {
+  const compareStarted = deferred();
+  const releaseCompare = deferred();
+  const persisted = {
+    username: 'Alice', displayName: 'Old Alice', password: 'hash', role: 'user',
+    color: '#111111', avatarUrl: 'https://example.test/old.png', servers: ['global']
+  };
+  const staleLoginSnapshot = { ...persisted, servers: [...persisted.servers] };
+  let regexReads = 0;
+  let compareCalls = 0;
+
+  function readUser(source = persisted) {
+    const document = { ...source, servers: [...source.servers] };
+    document.save = async () => {
+      Object.assign(persisted, document, { servers: [...document.servers] });
+    };
+    return document;
+  }
+
+  const UserModel = {
+    async findOne(query) {
+      if (query.displayName && typeof query.displayName === 'object') return null;
+      if (query.username && typeof query.username === 'object') {
+        regexReads += 1;
+        return readUser(regexReads === 1 ? staleLoginSnapshot : persisted);
+      }
+      return readUser();
+    }
+  };
+  const bcryptImpl = {
+    async compare() {
+      compareCalls += 1;
+      if (compareCalls === 1) {
+        compareStarted.resolve();
+        await releaseCompare.promise;
+      }
+      return true;
+    }
+  };
+  const ioInstance = new FakeIo();
+  const onlineUsersMap = new Map();
+  const shared = {
+    ioInstance,
+    onlineUsersMap,
+    UserModel,
+    bcryptImpl,
+    ChatServerModel: { async find() { return []; } },
+    MessageModel: { async updateMany() {} }
+  };
+  const loginSocket = registerSharedSocket(shared, 'socket-login');
+  const liveSocket = registerSharedSocket(shared, 'socket-live');
+  Object.assign(liveSocket, {
+    username: 'Alice', displayName: 'Old Alice', role: 'user', color: '#111111',
+    avatarUrl: 'https://example.test/old.png', serverCode: 'global', joinedServers: ['global']
+  });
+  onlineUsersMap.set(liveSocket.id, {
+    username: 'Alice', displayName: 'Old Alice', role: 'user', color: '#111111',
+    avatarUrl: 'https://example.test/old.png', serverCode: 'global', joinedServers: ['global']
+  });
+  onlineUsersMap.set('map-only', {
+    username: 'alice', displayName: 'Old Alice', role: 'user', color: '#111111',
+    avatarUrl: 'https://example.test/old.png', serverCode: 'global', joinedServers: ['global']
+  });
+  ioInstance.sockets = [loginSocket, liveSocket];
+
+  const loginAck = acknowledge();
+  const loginPending = loginSocket.trigger('login', {
+    username: 'alice', password: '123456'
+  }, loginAck.callback);
+  await compareStarted.promise;
+
+  const profileAck = acknowledge();
+  await liveSocket.trigger('update_profile', {
+    displayName: 'New Alice', color: '#aabbcc', avatarUrl: 'https://example.test/new.png'
+  }, profileAck.callback);
+  assert.deepEqual(profileAck.value(), {
+    success: true,
+    displayName: 'New Alice',
+    color: '#aabbcc',
+    avatarUrl: 'https://example.test/new.png'
+  });
+
+  releaseCompare.resolve();
+  await loginPending;
+
+  const expectedProfile = {
+    displayName: 'New Alice', color: '#aabbcc', avatarUrl: 'https://example.test/new.png'
+  };
+  assert.deepEqual({
+    displayName: loginAck.value().displayName,
+    color: loginAck.value().color,
+    avatarUrl: loginAck.value().avatarUrl
+  }, expectedProfile);
+  for (const live of [loginSocket, liveSocket]) {
+    assert.deepEqual({
+      displayName: live.displayName, color: live.color, avatarUrl: live.avatarUrl
+    }, expectedProfile);
+    const session = onlineUsersMap.get(live.id);
+    assert.deepEqual({
+      displayName: session.displayName, color: session.color, avatarUrl: session.avatarUrl
+    }, expectedProfile);
+  }
+  const mapOnly = onlineUsersMap.get('map-only');
+  assert.deepEqual({
+    displayName: mapOnly.displayName, color: mapOnly.color, avatarUrl: mapOnly.avatarUrl
+  }, expectedProfile);
+});
+
+test('profile update reconciles a session that becomes live during the write', async () => {
+  const saveStarted = deferred();
+  const releaseSave = deferred();
+  const persisted = {
+    username: 'Alice', displayName: 'Old Alice', password: 'hash', role: 'user',
+    color: '#111111', avatarUrl: 'https://example.test/old.png', servers: ['global']
+  };
+
+  function readUser() {
+    const document = { ...persisted, servers: [...persisted.servers] };
+    document.save = async () => {
+      saveStarted.resolve();
+      await releaseSave.promise;
+      Object.assign(persisted, document, { servers: [...document.servers] });
+    };
+    return document;
+  }
+
+  const UserModel = {
+    async findOne(query) {
+      if (query.displayName && typeof query.displayName === 'object') return null;
+      return readUser();
+    }
+  };
+  const ioInstance = new FakeIo();
+  const onlineUsersMap = new Map();
+  const shared = {
+    ioInstance,
+    onlineUsersMap,
+    UserModel,
+    MessageModel: { async updateMany() {} }
+  };
+  const updater = registerSharedSocket(shared, 'socket-updater');
+  const arriving = registerSharedSocket(shared, 'socket-arriving');
+  Object.assign(updater, {
+    username: 'Alice', displayName: 'Old Alice', role: 'user', color: '#111111',
+    avatarUrl: 'https://example.test/old.png', serverCode: 'global', joinedServers: ['global']
+  });
+  onlineUsersMap.set(updater.id, {
+    username: 'Alice', displayName: 'Old Alice', role: 'user', color: '#111111',
+    avatarUrl: 'https://example.test/old.png', serverCode: 'global', joinedServers: ['global']
+  });
+  onlineUsersMap.set('map-only', {
+    username: 'alice', displayName: 'Old Alice', role: 'user', color: '#111111',
+    avatarUrl: 'https://example.test/old.png', serverCode: 'global', joinedServers: ['global']
+  });
+  ioInstance.sockets = [updater];
+
+  let acknowledgement;
+  let profilesAtAcknowledgement;
+  const pending = updater.trigger('update_profile', {
+    displayName: 'New Alice', color: '#aabbcc', avatarUrl: 'https://example.test/new.png'
+  }, value => {
+    acknowledgement = value;
+    profilesAtAcknowledgement = [updater, arriving].map(live => ({
+      displayName: live.displayName,
+      color: live.color,
+      avatarUrl: live.avatarUrl,
+      session: { ...onlineUsersMap.get(live.id) }
+    }));
+    profilesAtAcknowledgement.push({ session: { ...onlineUsersMap.get('map-only') } });
+  });
+  await saveStarted.promise;
+
+  Object.assign(arriving, {
+    username: 'Alice', displayName: 'Old Alice', role: 'user', color: '#111111',
+    avatarUrl: 'https://example.test/old.png', serverCode: 'global', joinedServers: ['global']
+  });
+  onlineUsersMap.set(arriving.id, {
+    username: 'Alice', displayName: 'Old Alice', role: 'user', color: '#111111',
+    avatarUrl: 'https://example.test/old.png', serverCode: 'global', joinedServers: ['global']
+  });
+  ioInstance.sockets = [updater, arriving];
+  releaseSave.resolve();
+  await pending;
+
+  assert.deepEqual(acknowledgement, {
+    success: true,
+    displayName: 'New Alice',
+    color: '#aabbcc',
+    avatarUrl: 'https://example.test/new.png'
+  });
+  for (const snapshot of profilesAtAcknowledgement) {
+    const liveProfile = snapshot.displayName === undefined ? snapshot.session : snapshot;
+    assert.equal(liveProfile.displayName, 'New Alice');
+    assert.equal(liveProfile.color, '#aabbcc');
+    assert.equal(liveProfile.avatarUrl, 'https://example.test/new.png');
+    assert.equal(snapshot.session.displayName, 'New Alice');
+    assert.equal(snapshot.session.color, '#aabbcc');
+    assert.equal(snapshot.session.avatarUrl, 'https://example.test/new.png');
+  }
 });
 
 test('unauthorized room switch leaves current membership unchanged', async () => {

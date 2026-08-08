@@ -201,6 +201,24 @@ async function withIdentityMutationLock(operation) {
   }
 }
 
+const accountTransitionTails = new Map();
+
+async function withAccountTransitionLock(username, operation) {
+  const key = String(username || '').trim().toLowerCase();
+  if (!key) return operation();
+  const previous = accountTransitionTails.get(key) || Promise.resolve();
+  let release;
+  const current = new Promise(resolve => { release = resolve; });
+  accountTransitionTails.set(key, current);
+  await previous.catch(() => {});
+  try {
+    return await operation();
+  } finally {
+    release();
+    if (accountTransitionTails.get(key) === current) accountTransitionTails.delete(key);
+  }
+}
+
 const roomMutationTails = new Map();
 async function withRoomMutationLock(serverCode, operation) {
   const previous = roomMutationTails.get(serverCode) || Promise.resolve();
@@ -445,16 +463,25 @@ function createConnectionHandler({
   async function synchronizeMembership(sockets, username, joinedServers, evictedRoom = null) {
     const authoritativeServers = [...new Set(Array.isArray(joinedServers) ? joinedServers : ['global'])];
     if (!authoritativeServers.includes('global')) authoritativeServers.unshift('global');
+    const normalizedUsername = String(username || '').trim().toLowerCase();
     let synchronized = true;
     const accountSockets = [];
 
     for (const live of sockets) {
       const session = onlineUsersMap.get(live.id);
-      if ((live.username || session?.username) !== username) continue;
+      const liveUsername = String(live.username || session?.username || '').trim().toLowerCase();
+      if (liveUsername !== normalizedUsername) continue;
 
       live.joinedServers = [...authoritativeServers];
       if (session) session.joinedServers = [...authoritativeServers];
       accountSockets.push({ live, session });
+    }
+
+    const liveSessionIds = new Set(accountSockets.map(({ live }) => live.id));
+    for (const [id, session] of onlineUsersMap.entries()) {
+      if (String(session?.username || '').trim().toLowerCase() !== normalizedUsername) continue;
+      session.joinedServers = [...authoritativeServers];
+      if (evictedRoom && !liveSessionIds.has(id) && session.serverCode === evictedRoom) session.serverCode = 'global';
     }
 
     for (const { live, session } of accountSockets) {
@@ -477,9 +504,11 @@ function createConnectionHandler({
   }
 
   async function synchronizeProfile(sockets, username, profile) {
+    const normalizedUsername = String(username || '').trim().toLowerCase();
     for (const live of sockets) {
       const session = onlineUsersMap.get(live.id);
-      if ((live.username || session?.username) !== username) continue;
+      const liveUsername = String(live.username || session?.username || '').trim().toLowerCase();
+      if (liveUsername !== normalizedUsername) continue;
       live.displayName = profile.displayName;
       live.color = profile.color;
       live.avatarUrl = profile.avatarUrl;
@@ -488,6 +517,13 @@ function createConnectionHandler({
         session.color = profile.color;
         session.avatarUrl = profile.avatarUrl;
       }
+    }
+
+    for (const session of onlineUsersMap.values()) {
+      if (String(session?.username || '').trim().toLowerCase() !== normalizedUsername) continue;
+      session.displayName = profile.displayName;
+      session.color = profile.color;
+      session.avatarUrl = profile.avatarUrl;
     }
   }
 
@@ -542,39 +578,71 @@ function createConnectionHandler({
       if (!rateLimiter.check(rateKey)) return callback({ error: 'Too many login attempts. Try again later.' });
 
       const escapedUser = escapeRegExp(username);
-      const user = await UserModel.findOne({ username: { $regex: new RegExp(`^${escapedUser}$`, 'i') } });
-      if (!user) return callback({ error: 'User not found.' });
-      if (!(await bcryptImpl.compare(data.password, user.password))) return callback({ error: 'Incorrect password.' });
+      const initialUser = await UserModel.findOne({ username: { $regex: new RegExp(`^${escapedUser}$`, 'i') } });
+      if (!initialUser) return callback({ error: 'User not found.' });
+      if (!(await bcryptImpl.compare(data.password, initialUser.password))) return callback({ error: 'Incorrect password.' });
 
-      if (!user.servers || user.servers.length === 0) { user.servers = ['global']; await user.save(); }
-      if (!user.displayName) { user.displayName = user.username; await user.save(); }
+      const result = await withAccountTransitionLock(initialUser.username, async () => {
+        const user = await UserModel.findOne({ username: { $regex: new RegExp(`^${escapedUser}$`, 'i') } });
+        if (!user) return { error: 'User not found.' };
+        if (!(await bcryptImpl.compare(data.password, user.password))) return { error: 'Incorrect password.' };
 
-      const role = user.role || 'user';
-      const servers = role === 'admin'
-        ? await ChatServerModel.find()
-        : await ChatServerModel.find({ code: { $in: user.servers } });
+        let needsSave = false;
+        if (!user.servers || user.servers.length === 0) {
+          user.servers = ['global'];
+          needsSave = true;
+        }
+        if (!user.displayName) {
+          user.displayName = user.username;
+          needsSave = true;
+        }
+        if (needsSave) await user.save();
 
-      socket.username = user.username;
-      socket.displayName = user.displayName;
-      socket.role = role;
-      socket.color = user.color || '';
-      socket.avatarUrl = user.avatarUrl || '';
-      socket.serverCode = 'global'; 
-      socket.joinedServers = user.servers;
-      
-      socket.join('global');
-      onlineUsersMap.set(socket.id, { username: user.username, displayName: socket.displayName, role: socket.role, color: socket.color, avatarUrl: socket.avatarUrl, serverCode: 'global', joinedServers: user.servers });
-      
-      const serversToUpdate = new Set(user.servers);
-      serversToUpdate.add('global');
-      serversToUpdate.forEach(c => broadcastOnlineUsersFn(c));
+        const role = user.role || 'user';
+        const servers = role === 'admin'
+          ? await ChatServerModel.find()
+          : await ChatServerModel.find({ code: { $in: user.servers } });
 
-      const isVisible = socket.role !== 'admin' || socket.joinedServers.includes('global');
-      if (isVisible) socket.to('global').emit('system_message', `${socket.displayName} joined the app.`);
-      
-      rateLimiter.clear(rateKey);
+        socket.username = user.username;
+        socket.displayName = user.displayName;
+        socket.role = role;
+        socket.color = user.color || '';
+        socket.avatarUrl = user.avatarUrl || '';
+        socket.serverCode = 'global';
+        socket.joinedServers = [...user.servers];
 
-      callback({ success: true, username: user.username, displayName: socket.displayName, role: socket.role, color: socket.color, avatarUrl: socket.avatarUrl, servers: servers || [], joinedServers: user.servers });
+        await Promise.resolve(socket.join('global'));
+        onlineUsersMap.set(socket.id, {
+          username: user.username,
+          displayName: socket.displayName,
+          role: socket.role,
+          color: socket.color,
+          avatarUrl: socket.avatarUrl,
+          serverCode: 'global',
+          joinedServers: [...user.servers]
+        });
+
+        const serversToUpdate = new Set(user.servers);
+        serversToUpdate.add('global');
+        serversToUpdate.forEach(c => broadcastOnlineUsersFn(c));
+
+        const isVisible = socket.role !== 'admin' || socket.joinedServers.includes('global');
+        if (isVisible) socket.to('global').emit('system_message', `${socket.displayName} joined the app.`);
+
+        return {
+          success: true,
+          username: user.username,
+          displayName: socket.displayName,
+          role: socket.role,
+          color: socket.color,
+          avatarUrl: socket.avatarUrl,
+          servers: servers || [],
+          joinedServers: [...user.servers]
+        };
+      });
+
+      if (result.success) rateLimiter.clear(rateKey);
+      callback(result);
     } catch (err) {
       logUnexpectedError(logger, 'login', err);
       callback({ error: 'Login failed.' });
@@ -637,42 +705,50 @@ function createConnectionHandler({
           if (!dName || color === null || url === null) return callback({ error: 'Invalid input format.' });
           if (dName.toLowerCase() === 'nyzhang1') return callback({ error: 'Reserved name.' });
 
-          const sockets = await fetchLiveSockets();
           const result = await withIdentityMutationLock(async () => {
-              if (dName.toLowerCase() !== socket.displayName.toLowerCase()) {
+            return withAccountTransitionLock(socket.username, async () => {
+              const user = await UserModel.findOne({ username: socket.username });
+              if (!user) return { error: 'User not found.' };
+
+              const currentDisplayName = user.displayName || user.username || '';
+              if (dName.toLowerCase() !== currentDisplayName.toLowerCase()) {
                   const existingDisp = await UserModel.findOne({ displayName: { $regex: new RegExp(`^${escapeRegExp(dName)}$`, 'i') } });
                   if (existingDisp) return { error: 'Display Name is already taken.' };
               }
 
-              const user = await UserModel.findOne({ username: socket.username });
-              if (!user) return { error: 'User not found.' };
               user.color = color;
               user.avatarUrl = url;
               user.displayName = dName;
               await user.save();
-              return { success: true };
-          });
-          if (result.error) return callback(result);
 
-          await synchronizeProfile(sockets, socket.username, {
-              color,
-              avatarUrl: url,
-              displayName: dName
-          });
+              const sockets = await fetchLiveSockets();
+              await synchronizeProfile(sockets, socket.username, {
+                  color,
+                  avatarUrl: url,
+                  displayName: dName
+              });
 
-          try {
-              await MessageModel.updateMany({ username: socket.username }, { $set: { color: color, avatarUrl: url, displayName: dName } });
-          } catch (err) {
-              logUnexpectedError(logger, 'update_profile_message_snapshots', err);
-          }
-          
-          ioInstance.emit('profile_updated', { username: socket.username, displayName: dName, color: color, avatarUrl: url });
-          
-          const serversToUpdate = new Set(socket.joinedServers);
-          serversToUpdate.add('global');
-          serversToUpdate.forEach(c => broadcastOnlineUsersFn(c));
-          
-          callback({ success: true, displayName: dName, color: color, avatarUrl: url });
+              try {
+                  await MessageModel.updateMany({ username: socket.username }, { $set: { color: color, avatarUrl: url, displayName: dName } });
+              } catch (err) {
+                  logUnexpectedError(logger, 'update_profile_message_snapshots', err);
+              }
+
+              ioInstance.emit('profile_updated', { username: socket.username, displayName: dName, color: color, avatarUrl: url });
+
+              const serversToUpdate = new Set(socket.joinedServers);
+              serversToUpdate.add('global');
+              serversToUpdate.forEach(c => broadcastOnlineUsersFn(c));
+
+              return {
+                  success: true,
+                  displayName: dName,
+                  color,
+                  avatarUrl: url
+              };
+            });
+          });
+          callback(result);
       } catch(err) {
           logUnexpectedError(logger, 'update_profile', err);
           callback({ error: 'Failed to update profile.' });
@@ -689,10 +765,6 @@ function createConnectionHandler({
     if (!targetUser || !validActions.has(action)) return callback({ error: 'Invalid input format.' });
     
     try {
-        const targetUserDoc = await UserModel.findOne({ username: targetUser });
-        if (!targetUserDoc) return callback({ error: 'User not found.' });
-
-        const targetDisp = targetUserDoc.displayName || targetUserDoc.username;
         const isGlobalAdmin = socket.role === 'admin';
 
         // Manage Global Admins
@@ -700,57 +772,79 @@ function createConnectionHandler({
             if (!isGlobalAdmin) return callback({ error: 'Only Global Admins can modify global roles.' });
             if (action === 'demote_global_admin' && targetUser.toLowerCase() === 'nyzhang1') return callback({ error: 'Cannot modify system owner.' });
 
-            const sockets = await fetchLiveSockets();
-            targetUserDoc.role = (action === 'promote_global_admin') ? 'admin' : 'user';
-            await targetUserDoc.save();
+            const result = await withAccountTransitionLock(targetUser, async () => {
+                const targetUserDoc = await UserModel.findOne({ username: targetUser });
+                if (!targetUserDoc) return { error: 'User not found.' };
 
-            const joinedServers = Array.isArray(targetUserDoc.servers) ? targetUserDoc.servers : ['global'];
-            let roleSyncFailed = false;
-            const targetSessions = [];
-            for (const live of sockets) {
-                const session = onlineUsersMap.get(live.id);
-                if ((live.username || session?.username) !== targetUser) continue;
-                live.role = targetUserDoc.role;
-                live.joinedServers = [...joinedServers];
-                if (session) {
+                const targetDisp = targetUserDoc.displayName || targetUserDoc.username;
+                targetUserDoc.role = (action === 'promote_global_admin') ? 'admin' : 'user';
+                await targetUserDoc.save();
+
+                const sockets = await fetchLiveSockets();
+                const normalizedTarget = targetUser.toLowerCase();
+                const joinedServers = Array.isArray(targetUserDoc.servers) ? targetUserDoc.servers : ['global'];
+                let roleSyncFailed = false;
+                const targetSessions = [];
+                for (const live of sockets) {
+                    const session = onlineUsersMap.get(live.id);
+                    const liveUsername = String(live.username || session?.username || '').trim().toLowerCase();
+                    if (liveUsername !== normalizedTarget) continue;
+                    live.role = targetUserDoc.role;
+                    live.joinedServers = [...joinedServers];
+                    if (session) {
+                        session.role = targetUserDoc.role;
+                        session.joinedServers = [...joinedServers];
+                    }
+
+                    targetSessions.push({ live, session });
+                }
+
+                const liveSessionIds = new Set(targetSessions.map(({ live }) => live.id));
+                for (const [id, session] of onlineUsersMap.entries()) {
+                    if (String(session?.username || '').trim().toLowerCase() !== normalizedTarget) continue;
                     session.role = targetUserDoc.role;
                     session.joinedServers = [...joinedServers];
-                }
-
-                targetSessions.push({ live, session });
-            }
-
-            for (const { live, session } of targetSessions) {
-                const activeRoom = live.serverCode || session?.serverCode;
-                let wasEvicted = false;
-                if (targetUserDoc.role !== 'admin' && activeRoom && activeRoom !== 'global' && !joinedServers.includes(activeRoom)) {
-                    roleSyncFailed = !(await evictLiveSocket(live, session, activeRoom)) || roleSyncFailed;
-                    wasEvicted = true;
-                }
-
-                try {
-                    live.emit('global_role_updated', { username: targetUser, role: targetUserDoc.role });
-                    if (wasEvicted) {
-                        live.emit('room_access_updated', {
-                            username: targetUser,
-                            joinedServers: [...joinedServers],
-                            serverCode: 'global'
-                        });
+                    if (!liveSessionIds.has(id) && targetUserDoc.role !== 'admin' && session.serverCode && session.serverCode !== 'global' && !joinedServers.includes(session.serverCode)) {
+                        session.serverCode = 'global';
                     }
-                } catch (err) {
-                    roleSyncFailed = true;
-                    logUnexpectedError(logger, 'manage_role_notification', err);
                 }
-            }
-            
-            ioInstance.emit('system_message', `${socket.displayName} ${action === 'promote_global_admin' ? 'promoted' : 'demoted'} ${targetDisp} ${action === 'promote_global_admin' ? 'to' : 'from'} Global Admin.`);
-            const roomsToUpdate = new Set(targetUserDoc.servers); roomsToUpdate.add('global');
-            roomsToUpdate.forEach(c => broadcastOnlineUsersFn(c));
-            
-            return callback(roleSyncFailed ? { error: 'Failed to manage role.' } : { success: true });
+
+                for (const { live, session } of targetSessions) {
+                    const activeRoom = live.serverCode || session?.serverCode;
+                    let wasEvicted = false;
+                    if (targetUserDoc.role !== 'admin' && activeRoom && activeRoom !== 'global' && !joinedServers.includes(activeRoom)) {
+                        roleSyncFailed = !(await evictLiveSocket(live, session, activeRoom)) || roleSyncFailed;
+                        wasEvicted = true;
+                    }
+
+                    try {
+                        live.emit('global_role_updated', { username: targetUser, role: targetUserDoc.role });
+                        if (wasEvicted) {
+                            live.emit('room_access_updated', {
+                                username: targetUser,
+                                joinedServers: [...joinedServers],
+                                serverCode: 'global'
+                            });
+                        }
+                    } catch (err) {
+                        roleSyncFailed = true;
+                        logUnexpectedError(logger, 'manage_role_notification', err);
+                    }
+                }
+
+                ioInstance.emit('system_message', `${socket.displayName} ${action === 'promote_global_admin' ? 'promoted' : 'demoted'} ${targetDisp} ${action === 'promote_global_admin' ? 'to' : 'from'} Global Admin.`);
+                const roomsToUpdate = new Set(targetUserDoc.servers); roomsToUpdate.add('global');
+                roomsToUpdate.forEach(c => broadcastOnlineUsersFn(c));
+
+                return roleSyncFailed ? { error: 'Failed to manage role.' } : { success: true };
+            });
+            return callback(result);
         }
 
         // Manage Room Moderators
+        const targetUserDoc = await UserModel.findOne({ username: targetUser });
+        if (!targetUserDoc) return callback({ error: 'User not found.' });
+        const targetDisp = targetUserDoc.displayName || targetUserDoc.username;
         const serverCode = normalizeServerCode(data.serverCode);
         if (!serverCode || serverCode === 'global') return callback({ error: 'Invalid input format.' });
         if (serverCode) {
@@ -891,37 +985,40 @@ function createConnectionHandler({
     if (!serverCode) return callback({ error: 'Invalid input format.' });
     if (serverCode === 'global') return callback({ error: 'Cannot leave global.' });
     try {
-      const user = await UserModel.findOne({ username: socket.username });
-      if (!user) return callback({ error: 'User not found.' });
-      const sockets = await fetchLiveSockets();
-      const isMember = Array.isArray(user.servers) && user.servers.includes(serverCode);
-      const wasActive = socket.serverCode === serverCode;
-      if (isMember) {
-        user.servers = user.servers.filter(s => s !== serverCode);
-        await user.save();
-      }
-
-      if (wasActive) {
-          socket.to(serverCode).emit('system_message', `${socket.displayName} left the server.`);
-      }
-      const transportSynchronized = await synchronizeMembership(sockets, socket.username, user.servers, serverCode);
-
-      let cleanupFailed = !transportSynchronized;
-      if (isMember) {
-        try {
-          await ChatServerModel.updateOne({ code: serverCode }, { $pull: { moderators: socket.username } });
-        } catch (err) {
-          cleanupFailed = true;
-          logUnexpectedError(logger, 'leave_server_moderator_cleanup', err);
+      const result = await withAccountTransitionLock(socket.username, async () => {
+        const user = await UserModel.findOne({ username: socket.username });
+        if (!user) return { error: 'User not found.' };
+        const isMember = Array.isArray(user.servers) && user.servers.includes(serverCode);
+        const wasActive = socket.serverCode === serverCode;
+        if (isMember) {
+          user.servers = user.servers.filter(s => s !== serverCode);
+          await user.save();
         }
-      }
-      if (isMember || wasActive) {
-        broadcastOnlineUsersFn(serverCode);
-      }
-      if (wasActive) {
-        broadcastOnlineUsersFn('global');
-      }
-      callback(cleanupFailed ? { error: 'Failed to leave.' } : { success: true });
+
+        const sockets = await fetchLiveSockets();
+        if (wasActive) {
+            socket.to(serverCode).emit('system_message', `${socket.displayName} left the server.`);
+        }
+        const transportSynchronized = await synchronizeMembership(sockets, socket.username, user.servers, serverCode);
+
+        let cleanupFailed = !transportSynchronized;
+        if (isMember) {
+          try {
+            await ChatServerModel.updateOne({ code: serverCode }, { $pull: { moderators: socket.username } });
+          } catch (err) {
+            cleanupFailed = true;
+            logUnexpectedError(logger, 'leave_server_moderator_cleanup', err);
+          }
+        }
+        if (isMember || wasActive) {
+          broadcastOnlineUsersFn(serverCode);
+        }
+        if (wasActive) {
+          broadcastOnlineUsersFn('global');
+        }
+        return cleanupFailed ? { error: 'Failed to leave.' } : { success: true };
+      });
+      callback(result);
     } catch (err) {
       logUnexpectedError(logger, 'leave_server', err);
       callback({ error: 'Failed to leave.' });
@@ -1351,6 +1448,7 @@ module.exports = {
   start,
   seedSystem,
   createConnectionHandler,
+  withAccountTransitionLock,
   safeAck,
   normalizeUsername,
   normalizeDisplayName,
