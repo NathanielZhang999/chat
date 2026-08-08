@@ -549,6 +549,70 @@ test('room switch history failure preserves transport, socket, and presence stat
   assert.deepEqual(broadcasts, []);
 });
 
+for (const scenario of [
+  { stage: 'leave', failure: 'synchronous throw' },
+  { stage: 'leave', failure: 'rejected promise' },
+  { stage: 'join', failure: 'synchronous throw' },
+  { stage: 'join', failure: 'rejected promise' }
+]) {
+  test(`room switch rolls back when ${scenario.stage} has a ${scenario.failure}`, async () => {
+    const events = [];
+    const broadcasts = [];
+    const onlineUsersMap = new Map([['socket-1', {
+      username: 'alice', serverCode: 'OLD123', joinedServers: ['global', 'OLD123', 'ABC123']
+    }]]);
+    const ChatServerModel = { findOne: () => queryResult({ code: 'ABC123', moderators: [] }) };
+    const MessageModel = { find: () => queryResult([]) };
+    const { socket } = register({
+      ChatServerModel,
+      MessageModel,
+      onlineUsersMap,
+      broadcastOnlineUsersFn: code => broadcasts.push(code),
+      logger: { error() {} }
+    });
+    socket.username = 'alice';
+    socket.role = 'user';
+    socket.joinedServers = ['global', 'OLD123', 'ABC123'];
+    socket.serverCode = 'OLD123';
+    socket.joinedRooms.add('OLD123');
+
+    const originalLeave = socket.leave.bind(socket);
+    const originalJoin = socket.join.bind(socket);
+    let failed = false;
+    socket.leave = roomCode => {
+      events.push(`leave:${roomCode}`);
+      originalLeave(roomCode);
+      if (!failed && scenario.stage === 'leave' && roomCode === 'OLD123') {
+        failed = true;
+        if (scenario.failure === 'synchronous throw') throw new Error('leave failed');
+        return Promise.reject(new Error('leave failed'));
+      }
+    };
+    socket.join = roomCode => {
+      events.push(`join:${roomCode}`);
+      originalJoin(roomCode);
+      if (!failed && scenario.stage === 'join' && roomCode === 'ABC123') {
+        failed = true;
+        if (scenario.failure === 'synchronous throw') throw new Error('join failed');
+        return Promise.reject(new Error('join failed'));
+      }
+    };
+
+    const ack = acknowledge();
+    await socket.trigger('switch_server', 'ABC123', ack.callback);
+
+    assert.deepEqual(ack.value(), { error: 'Failed to switch server.' });
+    assert.equal(socket.serverCode, 'OLD123');
+    assert.equal(onlineUsersMap.get(socket.id).serverCode, 'OLD123');
+    assert.deepEqual([...socket.joinedRooms], ['OLD123']);
+    assert.deepEqual(socket.joinedServers, ['global', 'OLD123', 'ABC123']);
+    assert.deepEqual(broadcasts, []);
+    assert.deepEqual(events, scenario.stage === 'leave'
+      ? ['leave:OLD123', 'leave:ABC123', 'join:OLD123']
+      : ['leave:OLD123', 'join:ABC123', 'leave:ABC123', 'join:OLD123']);
+  });
+}
+
 test('room switch acknowledges success before broadcasting target presence', async () => {
   const events = [];
   const onlineUsersMap = new Map([['socket-1', {
@@ -1113,7 +1177,12 @@ test('deletion snapshots after a queued switch commits', async () => {
   await mutationPending;
   await Promise.all([switchPending, deletePending]);
 
-  assert.ok(order.indexOf('late:join:ABC123') < order.indexOf('delete:fetchSockets'));
+  const joinIndex = order.indexOf('late:join:ABC123');
+  const fetchIndex = order.indexOf('delete:fetchSockets');
+  assert.notEqual(joinIndex, -1);
+  assert.notEqual(fetchIndex, -1);
+  assert.ok(joinIndex < fetchIndex);
+  assert.deepEqual(switchAck.value(), { history: [], roomRole: 'user' });
   assert.deepEqual(deleteAck.value(), { success: true });
   assert.equal(late.serverCode, 'global');
   assert.equal(onlineUsersMap.get(late.id).serverCode, 'global');

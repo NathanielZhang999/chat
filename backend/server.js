@@ -1141,10 +1141,30 @@ function createConnectionHandler({
         if (!canAccessRoom(socket, serverCode)) return { error: 'Permission denied.' };
 
         const oldCode = socket.serverCode;
-        if (oldCode && oldCode !== serverCode) await Promise.resolve(socket.leave(oldCode));
+        const session = onlineUsersMap.get(socket.id);
+        const cachedServerCode = session?.serverCode;
+        try {
+          if (oldCode && oldCode !== serverCode) await Promise.resolve(socket.leave(oldCode));
+          await Promise.resolve(socket.join(serverCode));
+        } catch (err) {
+          try {
+            await Promise.resolve(socket.leave(serverCode));
+          } catch (rollbackError) {
+            logUnexpectedError(logger, 'switch_server_target_rollback', rollbackError);
+          }
+          if (oldCode) {
+            try {
+              await Promise.resolve(socket.join(oldCode));
+            } catch (rollbackError) {
+              logUnexpectedError(logger, 'switch_server_source_rollback', rollbackError);
+            }
+          }
+          socket.serverCode = oldCode;
+          if (session) session.serverCode = cachedServerCode;
+          throw err;
+        }
         socket.serverCode = serverCode;
-        await Promise.resolve(socket.join(serverCode));
-        if (onlineUsersMap.has(socket.id)) onlineUsersMap.get(socket.id).serverCode = serverCode;
+        if (session) session.serverCode = serverCode;
         return { success: true, oldCode };
       });
     } catch (err) {
