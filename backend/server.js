@@ -29,6 +29,14 @@ const MAX_RATE_LIMIT_KEYS = 10_000;
 const MAX_REACTION_KEYS = 20;
 const MAX_REACTION_USERS = 200;
 const MAX_REACTIONS_PER_USER = 20;
+const MODERATION_ACTIONS = new Set(['kick', 'timeout', 'clear_timeout', 'ban', 'unban']);
+const MODERATION_DURATIONS = Object.freeze({
+  '10m': 10 * 60 * 1000,
+  '1h': 60 * 60 * 1000,
+  '24h': 24 * 60 * 60 * 1000,
+  '7d': 7 * 24 * 60 * 60 * 1000
+});
+const PROTECTED_USERNAMES = new Set(['nyzhang1', 'system']);
 
 function safeAck(callback) {
   return typeof callback === 'function' ? callback : () => {};
@@ -50,6 +58,51 @@ function normalizeServerCode(value) {
   if (normalized.toLowerCase() === 'global') return 'global';
   const upper = normalized.toUpperCase();
   return SERVER_CODE_RE.test(upper) ? upper : null;
+}
+
+function normalizeModerationAction(value) {
+  if (typeof value !== 'string') return null;
+  const action = value.trim().toLowerCase();
+  return MODERATION_ACTIONS.has(action) ? action : null;
+}
+
+function normalizeModerationReason(value, maxLength = 200) {
+  if (typeof value !== 'string') return null;
+  const reason = value.normalize('NFKC').trim();
+  return reason.length >= 1 && reason.length <= maxLength ? reason : null;
+}
+
+function normalizeAccountKey(value) {
+  return String(value || '').normalize('NFKC').trim().toLowerCase();
+}
+
+function normalizeAutoModSettings(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || !Array.isArray(value.blockedKeywords)) return null;
+  const boundedIntegers = [
+    ['mentionLimit', 1, 20],
+    ['repeatLimit', 2, 10],
+    ['repeatWindowSeconds', 5, 300]
+  ];
+  if (boundedIntegers.some(([key, min, max]) => !Number.isInteger(value[key]) || value[key] < min || value[key] > max)) return null;
+
+  const blockedKeywords = [];
+  const seen = new Set();
+  for (const candidate of value.blockedKeywords) {
+    if (typeof candidate !== 'string') return null;
+    const keyword = candidate.normalize('NFKC').trim().toLowerCase();
+    if (keyword.length < 1 || keyword.length > 40) return null;
+    if (!seen.has(keyword)) {
+      seen.add(keyword);
+      blockedKeywords.push(keyword);
+    }
+  }
+  if (blockedKeywords.length > 50) return null;
+  return {
+    blockedKeywords,
+    mentionLimit: value.mentionLimit,
+    repeatLimit: value.repeatLimit,
+    repeatWindowSeconds: value.repeatWindowSeconds
+  };
 }
 
 function isValidPassword(value) {
@@ -121,6 +174,13 @@ function createReplySnapshot(message) {
 // --- SECURITY: REGEX ESCAPE ---
 function escapeRegExp(string) {
   return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); 
+}
+
+async function findUserByUsername(UserModel, value) {
+  const username = normalizeUsername(value);
+  if (!username) return null;
+  const escaped = escapeRegExp(username);
+  return UserModel.findOne({ username: { $regex: new RegExp(`^${escaped}$`, 'i') } });
 }
 
 // --- SECURITY: RATE LIMITING ---
@@ -207,17 +267,53 @@ const accountTransitionTails = new Map();
 async function withAccountTransitionLock(username, operation) {
   const key = String(username || '').trim().toLowerCase();
   if (!key) return operation();
-  const previous = accountTransitionTails.get(key) || Promise.resolve();
+  const previous = accountTransitionTails.get(key);
   let release;
   const current = new Promise(resolve => { release = resolve; });
   accountTransitionTails.set(key, current);
-  await previous.catch(() => {});
+  if (previous) await previous.catch(() => {});
   try {
     return await operation();
   } finally {
     release();
     if (accountTransitionTails.get(key) === current) accountTransitionTails.delete(key);
   }
+}
+
+async function withAccountTransitionLocks(usernames, operation) {
+  const keys = [...new Set((Array.isArray(usernames) ? usernames : [])
+    .map(normalizeAccountKey).filter(Boolean))].sort();
+  async function acquire(index) {
+    if (index >= keys.length) return operation();
+    return withAccountTransitionLock(keys[index], () => acquire(index + 1));
+  }
+  return acquire(0);
+}
+
+function isCurrentRoomModerator(room, username) {
+  const key = normalizeAccountKey(username);
+  return Boolean(room && Array.isArray(room.moderators) &&
+    room.moderators.some(candidate => normalizeAccountKey(candidate) === key));
+}
+
+function canModerateTarget({ serverCode, action, actorUser, targetUser, room }) {
+  if (!actorUser || !targetUser || !room || room.code !== serverCode) return false;
+  const actorKey = normalizeAccountKey(actorUser.username);
+  const targetKey = normalizeAccountKey(targetUser.username);
+  if (!actorKey || !targetKey || actorKey === targetKey || PROTECTED_USERNAMES.has(targetKey)) return false;
+  if (serverCode === 'global' && action === 'kick') return false;
+  const actorIsAdmin = actorUser.role === 'admin';
+  const actorIsRoomMod = serverCode !== 'global' && isCurrentRoomModerator(room, actorUser.username);
+  if (!actorIsAdmin && !actorIsRoomMod) return false;
+  if (targetUser.role === 'admin') return false;
+  if (!actorIsAdmin && isCurrentRoomModerator(room, targetUser.username)) return false;
+  return true;
+}
+
+function activeRestrictionState(restriction, now = new Date()) {
+  const timeoutUntil = restriction && restriction.timeoutUntil instanceof Date && restriction.timeoutUntil > now
+    ? restriction.timeoutUntil : null;
+  return { banned: Boolean(restriction && restriction.bannedAt), timedOut: Boolean(timeoutUntil), timeoutUntil };
 }
 
 const roomMutationTails = new Map();
@@ -256,9 +352,98 @@ const ChatServerSchema = new mongoose.Schema({
   code: { type: String, required: true, unique: true },
   name: { type: String, required: true, maxLength: 30 },
   owner: { type: String, required: true },
-  moderators: { type: [String], default: [] }
+  moderators: { type: [String], default: [] },
+  autoMod: {
+    blockedKeywords: {
+      type: [{ type: String, maxLength: 40 }],
+      default: [],
+      validate: value => Array.isArray(value) && value.length <= 50
+    },
+    mentionLimit: { type: Number, min: 1, max: 20, default: 8 },
+    repeatLimit: { type: Number, min: 2, max: 10, default: 3 },
+    repeatWindowSeconds: { type: Number, min: 5, max: 300, default: 30 }
+  }
 });
 const ChatServer = mongoose.model('ChatServer', ChatServerSchema);
+
+const RoomRestrictionSchema = new mongoose.Schema({
+  serverCode: { type: String, required: true, maxLength: 6 },
+  username: { type: String, required: true, maxLength: 20 },
+  bannedAt: { type: Date, default: null },
+  bannedBy: { type: String, default: null, maxLength: 20 },
+  banReason: { type: String, default: null, maxLength: 200 },
+  timeoutUntil: { type: Date, default: null },
+  timeoutBy: { type: String, default: null, maxLength: 20 },
+  timeoutReason: { type: String, default: null, maxLength: 200 }
+}, { timestamps: true });
+RoomRestrictionSchema.index({ serverCode: 1, username: 1 }, { unique: true });
+RoomRestrictionSchema.index({ username: 1, serverCode: 1 });
+RoomRestrictionSchema.index(
+  { serverCode: 1, bannedAt: -1 },
+  { partialFilterExpression: { bannedAt: { $type: 'date' } } }
+);
+RoomRestrictionSchema.index(
+  { serverCode: 1, timeoutUntil: 1 },
+  { partialFilterExpression: { timeoutUntil: { $type: 'date' } } }
+);
+const RoomRestriction = mongoose.model('RoomRestriction', RoomRestrictionSchema);
+
+function rejectAuditMutation(next) {
+  const error = new Error('ModerationAudit is append-only.');
+  if (typeof next === 'function') return next(error);
+  throw error;
+}
+
+const ModerationAuditSchema = new mongoose.Schema({
+  correlationId: { type: String, required: true, unique: true, maxLength: 64 },
+  action: { type: String, required: true, maxLength: 40 },
+  serverCode: { type: String, required: true, maxLength: 6 },
+  actorUsername: { type: String, required: true, maxLength: 20 },
+  actorRole: { type: String, required: true, maxLength: 20 },
+  actorRoomRole: { type: String, required: true, maxLength: 20 },
+  targetUsername: { type: String, default: null, maxLength: 20 },
+  targetRole: { type: String, default: null, maxLength: 20 },
+  targetRoomRole: { type: String, default: null, maxLength: 20 },
+  reason: { type: String, required: true, maxLength: 300 },
+  duration: { type: String, default: null, maxLength: 8 },
+  expiresAt: { type: Date, default: null },
+  messageId: { type: mongoose.Schema.Types.ObjectId, default: null },
+  reportId: { type: mongoose.Schema.Types.ObjectId, default: null },
+  metadata: { type: Object, default: {} }
+}, { timestamps: { createdAt: true, updatedAt: false } });
+ModerationAuditSchema.index({ serverCode: 1, createdAt: -1, _id: -1 });
+ModerationAuditSchema.pre('updateOne', rejectAuditMutation);
+ModerationAuditSchema.pre('updateMany', rejectAuditMutation);
+ModerationAuditSchema.pre('findOneAndUpdate', rejectAuditMutation);
+ModerationAuditSchema.pre('replaceOne', rejectAuditMutation);
+ModerationAuditSchema.pre('deleteOne', rejectAuditMutation);
+ModerationAuditSchema.pre('deleteMany', rejectAuditMutation);
+ModerationAuditSchema.pre('findOneAndDelete', rejectAuditMutation);
+ModerationAuditSchema.pre('save', function rejectAuditSave(next) {
+  if (!this.isNew) return rejectAuditMutation(next);
+  next();
+});
+ModerationAuditSchema.pre('deleteOne', { document: true, query: false }, rejectAuditMutation);
+const ModerationAudit = mongoose.model('ModerationAudit', ModerationAuditSchema);
+
+const ModerationReportSchema = new mongoose.Schema({
+  serverCode: { type: String, required: true, maxLength: 6 },
+  reporterUsername: { type: String, required: true, maxLength: 20 },
+  targetUsername: { type: String, required: true, maxLength: 20 },
+  messageId: { type: mongoose.Schema.Types.ObjectId, default: null },
+  reason: { type: String, required: true, maxLength: 300 },
+  status: { type: String, enum: ['open', 'resolved', 'dismissed'], default: 'open' },
+  resolvedBy: { type: String, default: null, maxLength: 20 },
+  resolution: { type: String, default: null, maxLength: 300 },
+  resolvedAt: { type: Date, default: null }
+}, { timestamps: true });
+ModerationReportSchema.index({ serverCode: 1, status: 1, createdAt: -1, _id: -1 });
+ModerationReportSchema.index({ reporterUsername: 1, createdAt: -1 });
+ModerationReportSchema.index(
+  { reporterUsername: 1, serverCode: 1, targetUsername: 1, messageId: 1, status: 1 },
+  { unique: true, partialFilterExpression: { status: 'open' } }
+);
+const ModerationReport = mongoose.model('ModerationReport', ModerationReportSchema);
 
 const MessageSchema = new mongoose.Schema({
   serverCode: { type: String, required: true, default: 'global' },
@@ -417,6 +602,9 @@ function createConnectionHandler({
   UserModel = User,
   ChatServerModel = ChatServer,
   MessageModel = Message,
+  RoomRestrictionModel = RoomRestriction,
+  ModerationAuditModel = ModerationAudit,
+  ModerationReportModel = ModerationReport,
   bcryptImpl = bcrypt,
   onlineUsersMap = onlineUsers,
   broadcastOnlineUsersFn = broadcastOnlineUsers,
@@ -1498,11 +1686,24 @@ module.exports = {
   seedSystem,
   createConnectionHandler,
   withAccountTransitionLock,
+  withAccountTransitionLocks,
   safeAck,
   normalizeUsername,
   normalizeDisplayName,
   normalizeServerName,
   normalizeServerCode,
+  normalizeModerationAction,
+  normalizeModerationReason,
+  normalizeAutoModSettings,
+  normalizeAccountKey,
+  findUserByUsername,
+  canModerateTarget,
+  activeRestrictionState,
+  rejectAuditMutation,
+  MODERATION_DURATIONS,
+  RoomRestriction,
+  ModerationAudit,
+  ModerationReport,
   isValidPassword,
   normalizeColor,
   normalizeAvatarUrl,
