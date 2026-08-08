@@ -555,7 +555,7 @@ for (const scenario of [
   { stage: 'join', failure: 'synchronous throw' },
   { stage: 'join', failure: 'rejected promise' }
 ]) {
-  test(`room switch rolls back when ${scenario.stage} has a ${scenario.failure}`, async () => {
+  test(`room switch fails closed when ${scenario.stage} has a ${scenario.failure}`, async () => {
     const events = [];
     const broadcasts = [];
     const onlineUsersMap = new Map([['socket-1', {
@@ -597,71 +597,6 @@ for (const scenario of [
         return Promise.reject(new Error('join failed'));
       }
     };
-
-    const ack = acknowledge();
-    await socket.trigger('switch_server', 'ABC123', ack.callback);
-
-    assert.deepEqual(ack.value(), { error: 'Failed to switch server.' });
-    assert.equal(socket.serverCode, 'OLD123');
-    assert.equal(onlineUsersMap.get(socket.id).serverCode, 'OLD123');
-    assert.deepEqual([...socket.joinedRooms], ['OLD123']);
-    assert.deepEqual(socket.joinedServers, ['global', 'OLD123', 'ABC123']);
-    assert.deepEqual(broadcasts, []);
-    assert.deepEqual(events, scenario.stage === 'leave'
-      ? ['leave:OLD123', 'leave:ABC123', 'join:OLD123']
-      : ['leave:OLD123', 'join:ABC123', 'leave:ABC123', 'join:OLD123']);
-  });
-}
-
-for (const scenario of [
-  { compensation: 'target leave', failure: 'synchronous throw' },
-  { compensation: 'target leave', failure: 'rejected promise' },
-  { compensation: 'source join', failure: 'synchronous throw' },
-  { compensation: 'source join', failure: 'rejected promise' }
-]) {
-  test(`room switch disconnects when ${scenario.compensation} compensation has a ${scenario.failure}`, async () => {
-    const events = [];
-    const broadcasts = [];
-    const onlineUsersMap = new Map([['socket-1', {
-      username: 'alice', serverCode: 'OLD123', joinedServers: ['global', 'OLD123', 'ABC123']
-    }]]);
-    const ChatServerModel = { findOne: () => queryResult({ code: 'ABC123', moderators: [] }) };
-    const MessageModel = { find: () => queryResult([]) };
-    const { socket } = register({
-      ChatServerModel,
-      MessageModel,
-      onlineUsersMap,
-      broadcastOnlineUsersFn: code => broadcasts.push(code),
-      logger: { error() {} }
-    });
-    socket.username = 'alice';
-    socket.role = 'user';
-    socket.joinedServers = ['global', 'OLD123', 'ABC123'];
-    socket.serverCode = 'OLD123';
-    socket.joinedRooms.add('OLD123');
-
-    const originalLeave = socket.leave.bind(socket);
-    const originalJoin = socket.join.bind(socket);
-    socket.leave = roomCode => {
-      events.push(`leave:${roomCode}`);
-      if (scenario.compensation === 'target leave' && roomCode === 'ABC123') {
-        if (scenario.failure === 'synchronous throw') throw new Error('target rollback failed');
-        return Promise.reject(new Error('target rollback failed'));
-      }
-      originalLeave(roomCode);
-    };
-    socket.join = roomCode => {
-      events.push(`join:${roomCode}`);
-      if (roomCode === 'ABC123') {
-        originalJoin(roomCode);
-        return Promise.reject(new Error('primary join failed'));
-      }
-      if (scenario.compensation === 'source join' && roomCode === 'OLD123') {
-        if (scenario.failure === 'synchronous throw') throw new Error('source rollback failed');
-        return Promise.reject(new Error('source rollback failed'));
-      }
-      originalJoin(roomCode);
-    };
     socket.disconnect = force => {
       events.push(`disconnect:${force}`);
       socket.joinedRooms.clear();
@@ -677,13 +612,358 @@ for (const scenario of [
     assert.equal(socket.serverCode, null);
     assert.equal(onlineUsersMap.has(socket.id), false);
     assert.deepEqual([...socket.joinedRooms], []);
-    assert.equal(socket.joinedRooms.has('ABC123'), false);
+    assert.deepEqual(socket.joinedServers, []);
+    assert.deepEqual(broadcasts, []);
+    assert.deepEqual(events, scenario.stage === 'leave'
+      ? ['leave:OLD123', 'leave:ABC123', 'leave:OLD123', 'disconnect:true']
+      : ['leave:OLD123', 'join:ABC123', 'leave:ABC123', 'leave:OLD123', 'disconnect:true']);
+  });
+}
+
+for (const failure of ['synchronous throw', 'rejected promise']) {
+  test(`failed target join clears authorization and transport when disconnect has a ${failure}`, async () => {
+    const events = [];
+    const broadcasts = [];
+    let userLookups = 0;
+    let userCreates = 0;
+    let passwordComparisons = 0;
+    let passwordHashes = 0;
+    const onlineUsersMap = new Map([['socket-1', {
+      username: 'alice', displayName: 'Alice', role: 'admin', serverCode: 'OLD123',
+      joinedServers: ['global', 'OLD123', 'ABC123']
+    }]]);
+    const room = { code: 'ABC123', owner: 'owner', moderators: [] };
+    const readUser = () => ({
+      username: 'alice', displayName: 'Alice', password: 'hash', role: 'user',
+      color: '', avatarUrl: '', servers: ['global'], async save() {}
+    });
+    const { socket } = register({
+      onlineUsersMap,
+      UserModel: {
+        async findOne(query) {
+          userLookups += 1;
+          if (query.username && typeof query.username === 'object') {
+            return query.username.$regex.test('alice') ? readUser() : null;
+          }
+          if (query.displayName) return null;
+          return query.username === 'alice' ? readUser() : null;
+        },
+        async create() { userCreates += 1; }
+      },
+      bcryptImpl: {
+        async compare() { passwordComparisons += 1; return true; },
+        async hash() { passwordHashes += 1; return 'hash'; }
+      },
+      ChatServerModel: {
+        async findOne() { return room; },
+        async find() { return []; }
+      },
+      MessageModel: { find: () => queryResult([]) },
+      broadcastOnlineUsersFn: code => broadcasts.push(code),
+      logger: { error() {} }
+    });
+    Object.assign(socket, {
+      username: 'alice', displayName: 'Alice', role: 'admin', serverCode: 'OLD123',
+      joinedServers: ['global', 'OLD123', 'ABC123']
+    });
+    socket.joinedRooms.add('OLD123');
+
+    socket.leave = roomCode => {
+      events.push(`leave:${roomCode}`);
+      FakeSocket.prototype.leave.call(socket, roomCode);
+    };
+    socket.join = roomCode => {
+      events.push(`join:${roomCode}`);
+      FakeSocket.prototype.join.call(socket, roomCode);
+      if (roomCode === 'ABC123') return Promise.reject(new Error('target join failed'));
+    };
+    socket.disconnect = force => {
+      events.push(`disconnect:${force}`);
+      if (failure === 'synchronous throw') throw new Error('disconnect failed');
+      return Promise.reject(new Error('disconnect failed'));
+    };
+
+    const switchAck = acknowledge();
+    await socket.trigger('switch_server', 'ABC123', switchAck.callback);
+
+    assert.deepEqual(switchAck.value(), { error: 'Failed to switch server.' });
+    assert.equal(socket.username, null);
+    assert.equal(socket.displayName, null);
+    assert.equal(socket.role, null);
+    assert.deepEqual(socket.joinedServers, []);
+    assert.equal(socket.serverCode, null);
+    assert.equal(onlineUsersMap.has(socket.id), false);
+    assert.deepEqual([...socket.joinedRooms], []);
+
+    const authenticatedAck = acknowledge();
+    await socket.trigger('join_server', 'ABC123', authenticatedAck.callback);
+    assert.deepEqual(authenticatedAck.value(), { error: 'Not authenticated.' });
+
+    const loginAck = acknowledge();
+    await socket.trigger('login', {
+      username: 'alice', password: '123456'
+    }, loginAck.callback);
+    const registerAck = acknowledge();
+    await socket.trigger('register', {
+      username: 'bob', displayName: 'Bob', password: '123456'
+    }, registerAck.callback);
+    assert.deepEqual(loginAck.value(), { error: 'Connection unavailable.' });
+    assert.deepEqual(registerAck.value(), { error: 'Connection unavailable.' });
+    assert.equal(userLookups, 0);
+    assert.equal(userCreates, 0);
+    assert.equal(passwordComparisons, 0);
+    assert.equal(passwordHashes, 0);
+    assert.equal(socket.username, null);
+    assert.deepEqual(socket.joinedServers, []);
+    assert.equal(onlineUsersMap.has(socket.id), false);
+
+    socket.handlers.get('disconnect')();
+
     assert.deepEqual(broadcasts, []);
     assert.deepEqual(events, [
-      'leave:OLD123', 'join:ABC123', 'leave:ABC123', 'join:OLD123', 'disconnect:true'
+      'leave:OLD123', 'join:ABC123', 'leave:ABC123', 'leave:OLD123', 'disconnect:true'
     ]);
   });
 }
+
+test('failed target join cannot restore source access revoked by a concurrent leave', async () => {
+  const targetJoinStarted = deferred();
+  const releaseTargetJoin = deferred();
+  const persisted = {
+    username: 'alice', servers: ['global', 'OLD123', 'NEW123']
+  };
+  const readUser = () => {
+    const document = { ...persisted, servers: [...persisted.servers] };
+    document.save = async () => {
+      persisted.servers = [...document.servers];
+    };
+    return document;
+  };
+  const ioInstance = new FakeIo();
+  const onlineUsersMap = new Map();
+  const shared = {
+    ioInstance,
+    onlineUsersMap,
+    UserModel: { async findOne() { return readUser(); } },
+    ChatServerModel: {
+      async findOne({ code }) { return { code, owner: 'owner', moderators: [] }; },
+      async updateOne() {}
+    },
+    MessageModel: { find: () => queryResult([]) },
+    logger: { error() {} }
+  };
+  const switcher = registerSharedSocket(shared, 'socket-switcher');
+  Object.assign(switcher, {
+    username: 'alice', displayName: 'Alice', role: 'user', serverCode: 'OLD123',
+    joinedServers: ['global', 'OLD123', 'NEW123']
+  });
+  switcher.joinedRooms.add('OLD123');
+  const revoker = registerSharedSocket(shared, 'socket-revoker');
+  Object.assign(revoker, {
+    username: 'alice', displayName: 'Alice', role: 'user', serverCode: 'global',
+    joinedServers: ['global', 'OLD123', 'NEW123']
+  });
+  revoker.joinedRooms.add('global');
+  for (const live of [switcher, revoker]) {
+    onlineUsersMap.set(live.id, {
+      username: 'alice', displayName: 'Alice', role: 'user', serverCode: live.serverCode,
+      joinedServers: ['global', 'OLD123', 'NEW123']
+    });
+  }
+  ioInstance.sockets = [switcher, revoker];
+
+  let targetAttempted = false;
+  switcher.join = async roomCode => {
+    FakeSocket.prototype.join.call(switcher, roomCode);
+    if (roomCode === 'NEW123' && !targetAttempted) {
+      targetAttempted = true;
+      targetJoinStarted.resolve();
+      await releaseTargetJoin.promise;
+      throw new Error('target join failed');
+    }
+  };
+  switcher.disconnect = force => {
+    switcher.joinedRooms.clear();
+    switcher.disconnected = force;
+    return switcher.handlers.get('disconnect')();
+  };
+
+  const switchAck = acknowledge();
+  const switchPending = switcher.trigger('switch_server', 'NEW123', switchAck.callback);
+  await targetJoinStarted.promise;
+
+  const leaveAck = acknowledge();
+  await revoker.trigger('leave_server', 'OLD123', leaveAck.callback);
+  assert.deepEqual(leaveAck.value(), { success: true });
+  assert.deepEqual(persisted.servers, ['global', 'NEW123']);
+
+  releaseTargetJoin.resolve();
+  await switchPending;
+
+  assert.deepEqual(switchAck.value(), { error: 'Failed to switch server.' });
+  assert.equal(switcher.disconnected, true);
+  assert.equal(switcher.serverCode, null);
+  assert.equal(onlineUsersMap.has(switcher.id), false);
+  assert.equal(switcher.joinedRooms.has('OLD123'), false);
+});
+
+test('failed target join cannot restore source access revoked by a concurrent demotion', async () => {
+  const targetJoinStarted = deferred();
+  const releaseTargetJoin = deferred();
+  const targetUser = {
+    username: 'bob', displayName: 'Bob', role: 'admin', servers: ['global'],
+    async save() {}
+  };
+  const ioInstance = new FakeIo();
+  const onlineUsersMap = new Map();
+  const shared = {
+    ioInstance,
+    onlineUsersMap,
+    UserModel: { async findOne() { return targetUser; } },
+    ChatServerModel: {
+      async findOne({ code }) { return { code, owner: 'owner', moderators: [] }; }
+    },
+    MessageModel: { find: () => queryResult([]) },
+    logger: { error() {} }
+  };
+  const switcher = registerSharedSocket(shared, 'socket-switcher');
+  Object.assign(switcher, {
+    username: 'bob', displayName: 'Bob', role: 'admin', serverCode: 'OLD123',
+    joinedServers: ['global']
+  });
+  switcher.joinedRooms.add('OLD123');
+  const administrator = registerSharedSocket(shared, 'socket-admin');
+  Object.assign(administrator, {
+    username: 'alice', displayName: 'Alice', role: 'admin', serverCode: 'global',
+    joinedServers: ['global']
+  });
+  administrator.joinedRooms.add('global');
+  onlineUsersMap.set(switcher.id, {
+    username: 'bob', displayName: 'Bob', role: 'admin', serverCode: 'OLD123',
+    joinedServers: ['global']
+  });
+  onlineUsersMap.set(administrator.id, {
+    username: 'alice', displayName: 'Alice', role: 'admin', serverCode: 'global',
+    joinedServers: ['global']
+  });
+  ioInstance.sockets = [switcher, administrator];
+
+  let targetAttempted = false;
+  switcher.join = async roomCode => {
+    FakeSocket.prototype.join.call(switcher, roomCode);
+    if (roomCode === 'NEW123' && !targetAttempted) {
+      targetAttempted = true;
+      targetJoinStarted.resolve();
+      await releaseTargetJoin.promise;
+      throw new Error('target join failed');
+    }
+  };
+  switcher.disconnect = force => {
+    switcher.joinedRooms.clear();
+    switcher.disconnected = force;
+    return switcher.handlers.get('disconnect')();
+  };
+
+  const switchAck = acknowledge();
+  const switchPending = switcher.trigger('switch_server', 'NEW123', switchAck.callback);
+  await targetJoinStarted.promise;
+
+  const roleAck = acknowledge();
+  await administrator.trigger('manage_role', {
+    targetUser: 'bob', action: 'demote_global_admin'
+  }, roleAck.callback);
+  assert.deepEqual(roleAck.value(), { success: true });
+  assert.equal(targetUser.role, 'user');
+
+  releaseTargetJoin.resolve();
+  await switchPending;
+
+  assert.deepEqual(switchAck.value(), { error: 'Failed to switch server.' });
+  assert.equal(switcher.disconnected, true);
+  assert.equal(switcher.serverCode, null);
+  assert.equal(onlineUsersMap.has(switcher.id), false);
+  assert.equal(switcher.joinedRooms.has('OLD123'), false);
+});
+
+test('failed target join cannot restore a concurrently deleted source room', async () => {
+  const targetJoinStarted = deferred();
+  const releaseTargetJoin = deferred();
+  const rooms = new Map([
+    ['OLD123', { code: 'OLD123', owner: 'alice', moderators: [] }],
+    ['NEW123', { code: 'NEW123', owner: 'owner', moderators: [] }]
+  ]);
+  const ioInstance = new FakeIo();
+  const onlineUsersMap = new Map();
+  const shared = {
+    ioInstance,
+    onlineUsersMap,
+    ChatServerModel: {
+      async findOne({ code }) { return rooms.get(code) || null; },
+      async deleteOne({ code }) { rooms.delete(code); }
+    },
+    UserModel: { async updateMany() {} },
+    MessageModel: {
+      find: () => queryResult([]),
+      async deleteMany() {}
+    },
+    logger: { error() {} }
+  };
+  const switcher = registerSharedSocket(shared, 'socket-switcher');
+  Object.assign(switcher, {
+    username: 'bob', displayName: 'Bob', role: 'user', serverCode: 'OLD123',
+    joinedServers: ['global', 'OLD123', 'NEW123']
+  });
+  switcher.joinedRooms.add('OLD123');
+  const deleter = registerSharedSocket(shared, 'socket-deleter');
+  Object.assign(deleter, {
+    username: 'alice', displayName: 'Alice', role: 'admin', serverCode: 'global',
+    joinedServers: ['global']
+  });
+  deleter.joinedRooms.add('global');
+  onlineUsersMap.set(switcher.id, {
+    username: 'bob', displayName: 'Bob', role: 'user', serverCode: 'OLD123',
+    joinedServers: ['global', 'OLD123', 'NEW123']
+  });
+  onlineUsersMap.set(deleter.id, {
+    username: 'alice', displayName: 'Alice', role: 'admin', serverCode: 'global',
+    joinedServers: ['global']
+  });
+  ioInstance.sockets = [switcher, deleter];
+
+  let targetAttempted = false;
+  switcher.join = async roomCode => {
+    FakeSocket.prototype.join.call(switcher, roomCode);
+    if (roomCode === 'NEW123' && !targetAttempted) {
+      targetAttempted = true;
+      targetJoinStarted.resolve();
+      await releaseTargetJoin.promise;
+      throw new Error('target join failed');
+    }
+  };
+  switcher.disconnect = force => {
+    switcher.joinedRooms.clear();
+    switcher.disconnected = force;
+    return switcher.handlers.get('disconnect')();
+  };
+
+  const switchAck = acknowledge();
+  const switchPending = switcher.trigger('switch_server', 'NEW123', switchAck.callback);
+  await targetJoinStarted.promise;
+
+  const deleteAck = acknowledge();
+  await deleter.trigger('delete_server', 'OLD123', deleteAck.callback);
+  assert.deepEqual(deleteAck.value(), { success: true });
+  assert.equal(rooms.has('OLD123'), false);
+
+  releaseTargetJoin.resolve();
+  await switchPending;
+
+  assert.deepEqual(switchAck.value(), { error: 'Failed to switch server.' });
+  assert.equal(switcher.disconnected, true);
+  assert.equal(switcher.serverCode, null);
+  assert.equal(onlineUsersMap.has(switcher.id), false);
+  assert.equal(switcher.joinedRooms.has('OLD123'), false);
+});
 
 test('room switch acknowledges success before broadcasting target presence', async () => {
   const events = [];
@@ -1065,6 +1345,180 @@ for (const failedStage of ['message cleanup', 'membership cleanup']) {
     assert.equal(membershipCleanupCalls, 1);
   });
 }
+
+test('join grant cannot resurrect a detached membership removed by a concurrent leave', async () => {
+  const grantSaveStarted = deferred();
+  const releaseGrantSave = deferred();
+  const persisted = { username: 'alice', servers: ['global', 'SECRET'] };
+
+  function readUser() {
+    const document = { ...persisted, servers: [...persisted.servers] };
+    document.save = async () => {
+      const proposedServers = [...document.servers];
+      if (proposedServers.includes('OTHER1')) {
+        grantSaveStarted.resolve();
+        await releaseGrantSave.promise;
+      }
+      persisted.servers = proposedServers;
+    };
+    return document;
+  }
+
+  const joinedRoom = { code: 'OTHER1', owner: 'owner', moderators: [] };
+  const ioInstance = new FakeIo();
+  const onlineUsersMap = new Map();
+  const shared = {
+    ioInstance,
+    onlineUsersMap,
+    UserModel: { async findOne() { return readUser(); } },
+    ChatServerModel: {
+      async findOne({ code }) { return code === joinedRoom.code ? joinedRoom : null; },
+      async updateOne() {}
+    },
+    logger: { error() {} }
+  };
+  const joiner = registerSharedSocket(shared, 'socket-joiner');
+  const leaver = registerSharedSocket(shared, 'socket-leaver');
+  for (const live of [joiner, leaver]) {
+    Object.assign(live, {
+      username: 'alice', displayName: 'Alice', role: 'user', serverCode: 'SECRET',
+      joinedServers: ['global', 'SECRET']
+    });
+    live.joinedRooms.add('SECRET');
+    onlineUsersMap.set(live.id, {
+      username: 'alice', displayName: 'Alice', role: 'user', serverCode: 'SECRET',
+      joinedServers: ['global', 'SECRET']
+    });
+  }
+  onlineUsersMap.set('map-only', {
+    username: 'ALICE', displayName: 'Alice', role: 'user', serverCode: 'SECRET',
+    joinedServers: ['global', 'SECRET']
+  });
+  ioInstance.sockets = [joiner, leaver];
+
+  const joinAck = acknowledge();
+  const joinPending = joiner.trigger('join_server', 'OTHER1', joinAck.callback);
+  await grantSaveStarted.promise;
+
+  const arriving = registerSharedSocket(shared, 'socket-arriving');
+  Object.assign(arriving, {
+    username: 'Alice', displayName: 'Alice', role: 'user', serverCode: 'SECRET',
+    joinedServers: ['global', 'SECRET']
+  });
+  arriving.joinedRooms.add('SECRET');
+  onlineUsersMap.set(arriving.id, {
+    username: 'Alice', displayName: 'Alice', role: 'user', serverCode: 'SECRET',
+    joinedServers: ['global', 'SECRET']
+  });
+  ioInstance.sockets = [joiner, leaver, arriving];
+
+  const leaveAck = acknowledge();
+  const leavePending = leaver.trigger('leave_server', 'SECRET', leaveAck.callback);
+  await new Promise(resolve => setImmediate(resolve));
+  const leaveCompletedBeforeGrant = leaveAck.value() !== undefined;
+  releaseGrantSave.resolve();
+  await Promise.all([joinPending, leavePending]);
+
+  assert.equal(leaveCompletedBeforeGrant, false);
+  assert.deepEqual(joinAck.value(), { success: true, server: joinedRoom });
+  assert.deepEqual(leaveAck.value(), { success: true });
+  assert.deepEqual(persisted.servers, ['global', 'OTHER1']);
+  for (const live of [joiner, leaver, arriving]) {
+    assert.deepEqual(live.joinedServers, ['global', 'OTHER1']);
+    assert.equal(live.serverCode, 'global');
+    assert.equal(live.joinedRooms.has('SECRET'), false);
+    assert.deepEqual(onlineUsersMap.get(live.id).joinedServers, ['global', 'OTHER1']);
+  }
+  assert.deepEqual(onlineUsersMap.get('map-only').joinedServers, ['global', 'OTHER1']);
+  assert.equal(onlineUsersMap.get('map-only').serverCode, 'global');
+});
+
+test('create grant cannot resurrect a detached membership removed by a concurrent leave', async () => {
+  const grantSaveStarted = deferred();
+  const releaseGrantSave = deferred();
+  const persisted = { username: 'alice', servers: ['global', 'SECRET'] };
+
+  function readUser() {
+    const document = { ...persisted, servers: [...persisted.servers] };
+    document.save = async () => {
+      const proposedServers = [...document.servers];
+      if (proposedServers.includes('NEW123')) {
+        grantSaveStarted.resolve();
+        await releaseGrantSave.promise;
+      }
+      persisted.servers = proposedServers;
+    };
+    return document;
+  }
+
+  const createdRoom = { code: 'NEW123', name: 'Team', owner: 'alice', moderators: ['alice'] };
+  const ioInstance = new FakeIo();
+  const onlineUsersMap = new Map();
+  const shared = {
+    ioInstance,
+    onlineUsersMap,
+    UserModel: { async findOne() { return readUser(); } },
+    ChatServerModel: {
+      async create() { return createdRoom; },
+      async updateOne() {}
+    },
+    logger: { error() {} }
+  };
+  const creator = registerSharedSocket(shared, 'socket-creator');
+  const leaver = registerSharedSocket(shared, 'socket-leaver');
+  for (const live of [creator, leaver]) {
+    Object.assign(live, {
+      username: 'alice', displayName: 'Alice', role: 'user', serverCode: 'SECRET',
+      joinedServers: ['global', 'SECRET']
+    });
+    live.joinedRooms.add('SECRET');
+    onlineUsersMap.set(live.id, {
+      username: 'alice', displayName: 'Alice', role: 'user', serverCode: 'SECRET',
+      joinedServers: ['global', 'SECRET']
+    });
+  }
+  onlineUsersMap.set('map-only', {
+    username: 'ALICE', displayName: 'Alice', role: 'user', serverCode: 'SECRET',
+    joinedServers: ['global', 'SECRET']
+  });
+  ioInstance.sockets = [creator, leaver];
+
+  const createAck = acknowledge();
+  const createPending = creator.trigger('create_server', 'Team', createAck.callback);
+  await grantSaveStarted.promise;
+
+  const arriving = registerSharedSocket(shared, 'socket-arriving');
+  Object.assign(arriving, {
+    username: 'Alice', displayName: 'Alice', role: 'user', serverCode: 'SECRET',
+    joinedServers: ['global', 'SECRET']
+  });
+  arriving.joinedRooms.add('SECRET');
+  onlineUsersMap.set(arriving.id, {
+    username: 'Alice', displayName: 'Alice', role: 'user', serverCode: 'SECRET',
+    joinedServers: ['global', 'SECRET']
+  });
+  ioInstance.sockets = [creator, leaver, arriving];
+
+  const leaveAck = acknowledge();
+  const leavePending = leaver.trigger('leave_server', 'SECRET', leaveAck.callback);
+  await new Promise(resolve => setImmediate(resolve));
+  const leaveCompletedBeforeGrant = leaveAck.value() !== undefined;
+  releaseGrantSave.resolve();
+  await Promise.all([createPending, leavePending]);
+
+  assert.equal(leaveCompletedBeforeGrant, false);
+  assert.deepEqual(createAck.value(), { success: true, server: createdRoom });
+  assert.deepEqual(leaveAck.value(), { success: true });
+  assert.deepEqual(persisted.servers, ['global', 'NEW123']);
+  for (const live of [creator, leaver, arriving]) {
+    assert.deepEqual(live.joinedServers, ['global', 'NEW123']);
+    assert.equal(live.serverCode, 'global');
+    assert.equal(live.joinedRooms.has('SECRET'), false);
+    assert.deepEqual(onlineUsersMap.get(live.id).joinedServers, ['global', 'NEW123']);
+  }
+  assert.deepEqual(onlineUsersMap.get('map-only').joinedServers, ['global', 'NEW123']);
+  assert.equal(onlineUsersMap.get('map-only').serverCode, 'global');
+});
 
 test('room deletion serializes against an in-flight membership join', async () => {
   const saveStarted = deferred();

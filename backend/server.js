@@ -188,6 +188,7 @@ function logUnexpectedError(logger, event, error) {
   logger.error('Chat operation failed.', { event, errorType });
 }
 
+// Combined mutations lock in this order: identity allocation -> account transition -> room mutation; never reverse.
 let identityMutationTail = Promise.resolve();
 async function withIdentityMutationLock(operation) {
   const previous = identityMutationTail;
@@ -430,6 +431,7 @@ function createConnectionHandler({
   
   let lastMessageTime = 0; 
   let suppressDisconnectPresence = false;
+  let terminallyClosed = false;
 
   async function fetchLiveSockets() {
     const fetched = await ioInstance.fetchSockets();
@@ -534,6 +536,7 @@ function createConnectionHandler({
 
   socket.on('register', async (data, callback) => {
     callback = safeAck(callback);
+    if (terminallyClosed) return callback({ error: 'Connection unavailable.' });
     try {
       if (!data) return callback({ error: 'Invalid input format.' });
       const cleanUser = normalizeUsername(data.username);
@@ -569,6 +572,7 @@ function createConnectionHandler({
 
   socket.on('login', async (data, callback) => {
     callback = safeAck(callback);
+    if (terminallyClosed) return callback({ error: 'Connection unavailable.' });
     try {
       if (socket.username) return callback({ error: 'Already authenticated.' });
       if (!data) return callback({ error: 'Invalid input format.' });
@@ -913,20 +917,25 @@ function createConnectionHandler({
           if (!err || err.code !== 11000 || attempt === 4) throw err;
         }
       }
-      const user = await UserModel.findOne({ username: socket.username });
-      
-      if (!user.servers.includes(srv.code)) {
-        let sockets = [socket];
-        try {
-          sockets = await fetchLiveSockets();
-        } catch (err) {
-          logUnexpectedError(logger, 'create_server_membership_sync', err);
+      await withAccountTransitionLock(socket.username, async () => {
+        const user = await UserModel.findOne({ username: socket.username });
+        if (!user) throw new Error('User not found.');
+
+        if (!user.servers.includes(srv.code)) {
+          if (typeof user.servers.addToSet === 'function') user.servers.addToSet(srv.code);
+          else user.servers.push(srv.code);
+          await user.save();
+
+          let sockets = [socket];
+          try {
+            sockets = await fetchLiveSockets();
+          } catch (err) {
+            logUnexpectedError(logger, 'create_server_membership_sync', err);
+          }
+          await synchronizeMembership(sockets, socket.username, user.servers);
+          broadcastOnlineUsersFn(srv.code);
         }
-        user.servers.push(srv.code);
-        await user.save();
-        await synchronizeMembership(sockets, socket.username, user.servers);
-        broadcastOnlineUsersFn(srv.code);
-      }
+      });
       callback({ success: true, server: srv });
       
       try {
@@ -947,30 +956,34 @@ function createConnectionHandler({
     const serverCode = normalizeServerCode(code);
     if (!serverCode) return callback({ error: 'Invalid input format.' });
     try {
-      const result = await withRoomMutationLock(serverCode, async () => {
-        const srv = await ChatServerModel.findOne({ code: serverCode });
-        if (!srv) return { error: 'Invalid invite code.' };
+      const result = await withAccountTransitionLock(socket.username, async () => {
+        return withRoomMutationLock(serverCode, async () => {
+          const srv = await ChatServerModel.findOne({ code: serverCode });
+          if (!srv) return { error: 'Invalid invite code.' };
 
-        const user = await UserModel.findOne({ username: socket.username });
-        if (!user) return { error: 'User not found.' };
-        if (!user.servers.includes(srv.code)) {
-          let sockets = [socket];
-          try {
-            sockets = await fetchLiveSockets();
-          } catch (err) {
-            logUnexpectedError(logger, 'join_server_membership_sync', err);
+          const user = await UserModel.findOne({ username: socket.username });
+          if (!user) return { error: 'User not found.' };
+          if (!user.servers.includes(srv.code)) {
+            if (typeof user.servers.addToSet === 'function') user.servers.addToSet(srv.code);
+            else user.servers.push(srv.code);
+            await user.save();
+
+            let sockets = [socket];
+            try {
+              sockets = await fetchLiveSockets();
+            } catch (err) {
+              logUnexpectedError(logger, 'join_server_membership_sync', err);
+            }
+            await synchronizeMembership(sockets, socket.username, user.servers);
+
+            broadcastOnlineUsersFn(srv.code);
+
+            if (socket.serverCode === srv.code) {
+                socket.to(srv.code).emit('system_message', `${socket.displayName} joined.`);
+            }
           }
-          user.servers.push(srv.code);
-          await user.save();
-          await synchronizeMembership(sockets, socket.username, user.servers);
-
-          broadcastOnlineUsersFn(srv.code);
-
-          if (socket.serverCode === srv.code) {
-              socket.to(srv.code).emit('system_message', `${socket.displayName} joined.`);
-          }
-        }
-        return { success: true, server: srv };
+          return { success: true, server: srv };
+        });
       });
       callback(result);
     } catch (err) {
@@ -1143,39 +1156,37 @@ function createConnectionHandler({
 
         const oldCode = socket.serverCode;
         const session = onlineUsersMap.get(socket.id);
-        const cachedServerCode = session?.serverCode;
         try {
           if (oldCode && oldCode !== serverCode) await Promise.resolve(socket.leave(oldCode));
           await Promise.resolve(socket.join(serverCode));
         } catch (err) {
-          let rollbackFailed = false;
+          terminallyClosed = true;
+          socket.username = null;
+          socket.displayName = null;
+          socket.role = null;
+          socket.joinedServers = [];
+          socket.serverCode = null;
+          if (session) {
+            session.username = null;
+            session.displayName = null;
+            session.role = null;
+            session.joinedServers = [];
+            session.serverCode = null;
+          }
+          onlineUsersMap.delete(socket.id);
+          suppressDisconnectPresence = true;
+          for (const roomCode of new Set([serverCode, oldCode].filter(Boolean))) {
+            try {
+              await Promise.resolve(socket.leave(roomCode));
+            } catch (leaveError) {
+              logUnexpectedError(logger, 'switch_server_failure_leave', leaveError);
+            }
+          }
           try {
-            await Promise.resolve(socket.leave(serverCode));
-          } catch (rollbackError) {
-            rollbackFailed = true;
-            logUnexpectedError(logger, 'switch_server_target_rollback', rollbackError);
+            await Promise.resolve(socket.disconnect(true));
+          } catch (disconnectError) {
+            logUnexpectedError(logger, 'switch_server_failure_disconnect', disconnectError);
           }
-          if (oldCode) {
-            try {
-              await Promise.resolve(socket.join(oldCode));
-            } catch (rollbackError) {
-              rollbackFailed = true;
-              logUnexpectedError(logger, 'switch_server_source_rollback', rollbackError);
-            }
-          }
-          if (rollbackFailed) {
-            socket.serverCode = null;
-            onlineUsersMap.delete(socket.id);
-            suppressDisconnectPresence = true;
-            try {
-              await Promise.resolve(socket.disconnect(true));
-            } catch (disconnectError) {
-              logUnexpectedError(logger, 'switch_server_rollback_disconnect', disconnectError);
-            }
-            throw err;
-          }
-          socket.serverCode = oldCode;
-          if (session) session.serverCode = cachedServerCode;
           throw err;
         }
         socket.serverCode = serverCode;
