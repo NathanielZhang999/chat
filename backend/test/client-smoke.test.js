@@ -34,6 +34,8 @@ test('new users receive the deployed Render backend URL by default', () => {
 test('client motion policy avoids broad transitions and respects reduced motion', () => {
   const source = fs.readFileSync(chatPath, 'utf8');
   assert.doesNotMatch(source, /transition:\s*all\b/);
+  assert.doesNotMatch(source, /transition:\s*(?:\d+(?:\.\d+)?s|var\(--motion-[^)]+\))(?:\s|;|})/);
+  assert.doesNotMatch(source, /cubic-bezier\([^)]*,\s*1\.[0-9]+\s*\)/);
   assert.match(source, /--ease-standard:\s*cubic-bezier\(0\.2,\s*0\.8,\s*0\.2,\s*1\)/);
   assert.match(source, /@media\s*\(prefers-reduced-motion:\s*reduce\)/);
   assert.match(source, /\.no-enter-animation\s*\{[^}]*animation:\s*none/s);
