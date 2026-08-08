@@ -56,6 +56,85 @@ test('typing display falls back to username', () => {
   assert.equal(helpers.typingDisplayName({ username: 'alice' }), 'alice');
 });
 
+test('client renders and sounds only exact canonical ping tokens', () => {
+  const helpers = loadHelpers();
+  assert.equal(typeof helpers.formatTrustedPings, 'function');
+  assert.equal(typeof helpers.hasTrustedPing, 'function');
+
+  const canonical = helpers.formatTrustedPings(
+    'hello {{PING:alice|Alice Smith}}', 'alice', 'Alice Smith'
+  );
+  assert.equal(canonical.isPinged, true);
+  assert.equal(canonical.html.includes('<span class="ping-tag">@Alice Smith</span>'), true);
+  assert.equal(helpers.hasTrustedPing('{{PING:alice|Alice Smith}}', 'alice', 'Alice Smith'), true);
+  assert.equal(helpers.hasTrustedPing('{{PING:everyone|everyone}}', 'alice', 'Alice Smith'), true);
+
+  for (const malformed of [
+    '{{PING:alice|A{lice}}}',
+    '{{PING:alice|Alice|extra}}',
+    '{{PING:alice|{{PING:bob|Bob}}}}',
+    '{{PING:alice|Alice Smith',
+    '{{PING:alice|Alice Smith}}}'
+  ]) {
+    const result = helpers.formatTrustedPings(malformed, 'alice', 'Alice Smith');
+    assert.equal(result.isPinged, false, malformed);
+    assert.equal(result.html.includes('ping-tag'), false, malformed);
+    assert.equal(helpers.hasTrustedPing(malformed, 'alice', 'Alice Smith'), false, malformed);
+  }
+});
+
+test('client attachment validation accepts only bounded raster data URLs', () => {
+  const helpers = loadHelpers();
+  assert.equal(typeof helpers.sanitizeAttachment, 'function');
+  assert.equal(helpers.sanitizeAttachment('data:image/png;base64,AAAA'), 'data:image/png;base64,AAAA');
+  assert.equal(helpers.sanitizeAttachment('data:image/svg+xml;base64,AAAA'), null);
+  assert.equal(helpers.sanitizeAttachment('javascript:alert(1)'), null);
+  assert.equal(helpers.sanitizeAttachment('https://example.test/image.png'), null);
+});
+
+test('production connect-error binding re-enables authentication while the active modal is open', () => {
+  const helpers = loadHelpers();
+  assert.equal(typeof helpers.bindConnectErrorRecovery, 'function');
+  const handlers = {};
+  const activeSocket = { on(event, handler) { handlers[event] = handler; } };
+  const authButton = { disabled: true };
+  const errors = [];
+  helpers.bindConnectErrorRecovery({
+    activeSocket,
+    getCurrentSocket: () => activeSocket,
+    isAuthModalActive: () => true,
+    authButton,
+    showError: (message, success) => errors.push({ message, success })
+  });
+
+  handlers.connect_error();
+  assert.equal(authButton.disabled, false);
+  assert.deepEqual(errors, [{
+    message: 'Unable to connect. Check the backend URL and try again.',
+    success: false
+  }]);
+});
+
+test('production rejected-switch gate preserves displayed room and DOM state', () => {
+  const helpers = loadHelpers();
+  assert.equal(typeof helpers.evaluateSwitchResult, 'function');
+  const alerts = [];
+  const currentRoom = 'AAAAAA';
+  const chatWindow = { textContent: 'existing history' };
+  const result = helpers.evaluateSwitchResult(
+    currentRoom,
+    'BBBBBB',
+    { error: 'Permission denied.' },
+    (title, message) => alerts.push({ title, message })
+  );
+
+  assert.equal(result.accepted, false);
+  assert.equal(result.currentServerCode, 'AAAAAA');
+  assert.equal(result.response.error, 'Permission denied.');
+  assert.equal(chatWindow.textContent, 'existing history');
+  assert.deepEqual(alerts, [{ title: 'Error', message: 'Permission denied.' }]);
+});
+
 test('room switches serialize and retain only the latest queued target', () => {
   const helpers = loadHelpers();
   const acknowledgements = [];

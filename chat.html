@@ -493,6 +493,62 @@
             return data.displayName || data.username;
         },
 
+        sanitizeAttachment(value) {
+            if (typeof value !== 'string' || value.length === 0 || value.length > 8000000) return null;
+            return /^data:image\/(?:jpeg|png|gif|webp);base64,[A-Za-z0-9+/=]+$/.test(value) ? value : null;
+        },
+
+        formatTrustedPings(text, username, displayName) {
+            let isPinged = false;
+            const html = String(text || '').replace(
+                /(?<!\{)\{\{PING:([A-Za-z0-9_-]{1,20})\|([A-Za-z0-9_ -]{1,30})\}\}(?!\})/g,
+                (match, pingUsername, pingDisplayName) => {
+                    const isEveryone = pingUsername === 'everyone' && pingDisplayName === 'everyone';
+                    if ((pingUsername === 'everyone' || pingDisplayName === 'everyone') && !isEveryone) return match;
+                    if (pingUsername === username || pingDisplayName === displayName || isEveryone) isPinged = true;
+                    return isEveryone
+                        ? '<span class="ping-tag everyone">@everyone</span>'
+                        : `<span class="ping-tag">@${pingDisplayName}</span>`;
+                }
+            );
+            return { html, isPinged };
+        },
+
+        hasTrustedPing(text, username, displayName) {
+            const tokenPattern = /(?<!\{)\{\{PING:([A-Za-z0-9_-]{1,20})\|([A-Za-z0-9_ -]{1,30})\}\}(?!\})/g;
+            let match;
+            while ((match = tokenPattern.exec(String(text || ''))) !== null) {
+                const isEveryone = match[1] === 'everyone' && match[2] === 'everyone';
+                if ((match[1] === 'everyone' || match[2] === 'everyone') && !isEveryone) continue;
+                if (match[1] === username || match[2] === displayName || isEveryone) return true;
+            }
+            return false;
+        },
+
+        bindConnectErrorRecovery({
+            activeSocket,
+            getCurrentSocket,
+            isAuthModalActive,
+            authButton,
+            showError
+        }) {
+            activeSocket.on('connect_error', () => {
+                if (activeSocket === getCurrentSocket() && isAuthModalActive()) {
+                    authButton.disabled = false;
+                    showError('Unable to connect. Check the backend URL and try again.', false);
+                }
+            });
+        },
+
+        evaluateSwitchResult(currentServerCode, targetServerCode, response, showAlert) {
+            const normalizedResponse = response || { error: 'No response from server.' };
+            if (normalizedResponse.error) {
+                showAlert('Error', normalizedResponse.error);
+                return { accepted: false, currentServerCode, response: normalizedResponse };
+            }
+            return { accepted: true, currentServerCode: targetServerCode, response: normalizedResponse };
+        },
+
         createSwitchCoordinator(emitSwitch, handleResult) {
             let inFlightTarget = null;
             let queuedTarget = null;
@@ -820,23 +876,10 @@
         safeText = safeText.replace(/~~(.*?)~~/g, '<del>$1</del>');               
         safeText = safeText.replace(/`(.*?)`/g, '<code>$1</code>');               
 
-        let isPinged = false;
-        
-        // Render exactly verified pings from the backend
-        safeText = safeText.replace(/\{\{PING:(.*?)\|(.*?)\}\}/g, (match, uname, dname) => {
-            // Check if WE are pinged so we can highlight the entire message
-            if (uname === myUsername || dname === myDisplayName || uname === 'everyone') {
-                isPinged = true;
-            }
-            
-            if (uname === 'everyone') {
-                return `<span class="ping-tag everyone">@everyone</span>`;
-            } else {
-                return `<span class="ping-tag">@${dname}</span>`;
-            }
-        });
+        const pingResult = ChatClientHelpers.formatTrustedPings(safeText, myUsername, myDisplayName);
+        safeText = pingResult.html;
 
-        return { html: safeText, autoEmbeds: autoEmbeds, isPinged };
+        return { html: safeText, autoEmbeds: autoEmbeds, isPinged: pingResult.isPinged };
     }
 
     async function logoutApp() {
@@ -924,11 +967,12 @@
     function showError(msg, success) { authError.style.color = success ? "var(--success)" : "var(--error)"; authError.textContent = msg; }
 
     function setupSocket(activeSocket) {
-        activeSocket.on('connect_error', () => {
-            if (activeSocket === socket && authModal.classList.contains('active')) {
-                authBtn.disabled = false;
-                showError('Unable to connect. Check the backend URL and try again.', false);
-            }
+        ChatClientHelpers.bindConnectErrorRecovery({
+            activeSocket,
+            getCurrentSocket: () => socket,
+            isAuthModalActive: () => authModal.classList.contains('active'),
+            authButton: authBtn,
+            showError
         });
         
         activeSocket.on('force_logout', (msg) => {
@@ -942,7 +986,7 @@
             
             if (!isMe) {
                 // Determine if we need to play the special Ping sound
-                const isPinged = (msg.text||'').includes(`{{PING:${myUsername}|`) || (msg.text||'').includes(`|${myDisplayName}}}`) || (msg.text||'').includes('{{PING:everyone|everyone}}');
+                const isPinged = ChatClientHelpers.hasTrustedPing(msg.text, myUsername, myDisplayName);
                 playSound(isPinged ? 'ping' : 'msg');
             }
         });
@@ -961,6 +1005,12 @@
             if (data.username === myUsername && data.targetServer === currentServerCode) {
                 switchServer(currentServerCode);
             }
+        });
+
+        activeSocket.on('room_access_updated', (data) => {
+            if (!data || data.username !== myUsername) return;
+            myJoinedServers = Array.isArray(data.joinedServers) ? data.joinedServers : ['global'];
+            if (data.serverCode && data.serverCode !== currentServerCode) switchServer(data.serverCode);
         });
         
         activeSocket.on('profile_updated', (data) => {
@@ -1345,13 +1395,11 @@
         const srv = serversCache[code] || { name: 'Unknown', owner: '' };
         const isStealth = myRole === 'admin' && !myJoinedServers.includes(code) && code !== 'global';
 
-        res = res || { error: 'No response from server.' };
-        if (res.error) {
-            showAppAlert('Error', res.error);
-            return;
-        }
+        const outcome = ChatClientHelpers.evaluateSwitchResult(currentServerCode, code, res, showAppAlert);
+        if (!outcome.accepted) return;
+        res = outcome.response;
 
-        currentServerCode = code;
+        currentServerCode = outcome.currentServerCode;
         myRoomRole = res.roomRole || 'user';
 
         document.querySelectorAll('.server-icon').forEach(el => el.classList.remove('active'));
@@ -1619,8 +1667,9 @@
                 const span = document.createElement('span'); span.innerHTML = html;
                 textDiv.appendChild(span);
             }
-            if(res.attachment) {
-                const imgEl = document.createElement('img'); imgEl.className = 'chat-img'; imgEl.src = res.attachment;
+            const safeAttachment = ChatClientHelpers.sanitizeAttachment(res.attachment);
+            if(safeAttachment) {
+                const imgEl = document.createElement('img'); imgEl.className = 'chat-img'; imgEl.src = safeAttachment;
                 textDiv.appendChild(document.createElement('br')); textDiv.appendChild(imgEl);
             }
 
@@ -1774,12 +1823,13 @@
             }
         }
         
-        if (data.attachment) {
+        const safeAttachment = ChatClientHelpers.sanitizeAttachment(data.attachment);
+        if (safeAttachment) {
             if(data.text) textDiv.appendChild(document.createElement('br'));
             const imgEl = document.createElement('img');
-            imgEl.src = data.attachment;
+            imgEl.src = safeAttachment;
             imgEl.className = 'chat-img attached-img';
-            imgEl.onclick = () => window.open(data.attachment, '_blank');
+            imgEl.onclick = () => window.open(safeAttachment, '_blank', 'noopener,noreferrer');
             textDiv.appendChild(imgEl);
         }
 

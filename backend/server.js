@@ -24,6 +24,11 @@ const COLOR_RE = /^#[0-9a-fA-F]{6}$/;
 const OBJECT_ID_RE = /^[0-9a-fA-F]{24}$/;
 const ATTACHMENT_RE = /^data:image\/(?:jpeg|png|gif|webp);base64,[A-Za-z0-9+/=]+$/;
 const REACTION_RE = /^(?:\p{Extended_Pictographic}|\p{Emoji_Modifier}|\uFE0F|\u200D)+$/u;
+const RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000;
+const MAX_RATE_LIMIT_KEYS = 10_000;
+const MAX_REACTION_KEYS = 20;
+const MAX_REACTION_USERS = 200;
+const MAX_REACTIONS_PER_USER = 20;
 
 function safeAck(callback) {
   return typeof callback === 'function' ? callback : () => {};
@@ -76,6 +81,10 @@ function isValidAttachment(value) {
     (typeof value === 'string' && value.length <= 8_000_000 && ATTACHMENT_RE.test(value));
 }
 
+function sanitizeAttachment(value) {
+  return typeof value === 'string' && value.length > 0 && isValidAttachment(value) ? value : null;
+}
+
 function isValidReaction(value) {
   return typeof value === 'string' && value.length > 0 && value.length <= 64 &&
     REACTION_RE.test(value) && /\p{Extended_Pictographic}/u.test(value);
@@ -87,9 +96,7 @@ function isValidObjectId(value) {
 
 function neutralizePingTokens(text) {
   if (typeof text !== 'string') return '';
-  return text.replace(/\{\{PING:([^|{}]*)\|([^{}]*)\}\}/gi, (_match, username, displayName) => {
-    return `@${displayName || username}`;
-  });
+  return text.replace(/\{\{PING:/gi, '{{ PING:');
 }
 
 function canAccessRoom(identity, serverCode) {
@@ -117,25 +124,102 @@ function escapeRegExp(string) {
 }
 
 // --- SECURITY: RATE LIMITING ---
-const authAttempts = new Map();
-function checkRateLimit(ip) {
-    const now = Date.now();
-    const attempts = authAttempts.get(ip) || [];
-    const recent = attempts.filter(time => now - time < 15 * 60 * 1000); 
-    if (recent.length >= 10) return false;
-    recent.push(now);
-    authAttempts.set(ip, recent);
-    return true;
+function normalizeTransportAddress(value) {
+  let address = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  if (address.startsWith('[') && address.endsWith(']')) address = address.slice(1, -1);
+  if (address.startsWith('::ffff:')) address = address.slice(7);
+  return (address || 'unknown').slice(0, 128);
 }
-function clearRateLimit(ip) { authAttempts.delete(ip); }
-setInterval(() => {
-    const now = Date.now();
-    for (const [ip, attempts] of authAttempts.entries()) {
-        const recent = attempts.filter(time => now - time < 15 * 60 * 1000);
-        if (recent.length === 0) authAttempts.delete(ip);
-        else authAttempts.set(ip, recent);
+
+function createRateLimiter({
+  maxEntries = MAX_RATE_LIMIT_KEYS,
+  maxAttempts = 10,
+  windowMs = RATE_LIMIT_WINDOW_MS,
+  now = () => Date.now()
+} = {}) {
+  const attemptsByKey = new Map();
+
+  function prune(currentTime = now()) {
+    for (const [key, attempts] of attemptsByKey.entries()) {
+      const recent = attempts.filter(time => currentTime - time < windowMs);
+      if (recent.length === 0) attemptsByKey.delete(key);
+      else attemptsByKey.set(key, recent);
     }
-}, 15 * 60 * 1000).unref();
+  }
+
+  function check(key) {
+    const currentTime = now();
+    const existing = attemptsByKey.get(key);
+    const recent = (existing || []).filter(time => currentTime - time < windowMs);
+    if (recent.length >= maxAttempts) return false;
+
+    if (!existing && attemptsByKey.size >= maxEntries) {
+      prune(currentTime);
+      while (attemptsByKey.size >= maxEntries) {
+        const oldestKey = attemptsByKey.keys().next().value;
+        attemptsByKey.delete(oldestKey);
+      }
+    }
+
+    recent.push(currentTime);
+    attemptsByKey.set(key, recent);
+    return true;
+  }
+
+  return {
+    check,
+    clear(key) { attemptsByKey.delete(key); },
+    prune
+  };
+}
+
+function authRateLimitKey(socket, action, account) {
+  const address = normalizeTransportAddress(socket && socket.handshake && socket.handshake.address);
+  const normalizedAccount = typeof account === 'string' && account
+    ? account.toLowerCase().slice(0, 30)
+    : '-';
+  return `${action}:${normalizedAccount}:${address}`;
+}
+
+function logUnexpectedError(logger, event, error) {
+  if (!logger || typeof logger.error !== 'function') return;
+  const candidate = error instanceof Error ? error.name : 'UnknownError';
+  const errorType = /^[A-Za-z0-9_.-]{1,64}$/.test(candidate) ? candidate : 'Error';
+  logger.error('Chat operation failed.', { event, errorType });
+}
+
+let identityMutationTail = Promise.resolve();
+async function withIdentityMutationLock(operation) {
+  const previous = identityMutationTail;
+  let release;
+  identityMutationTail = new Promise(resolve => { release = resolve; });
+  await previous;
+  try {
+    return await operation();
+  } finally {
+    release();
+  }
+}
+
+const roomMutationTails = new Map();
+async function withRoomMutationLock(serverCode, operation) {
+  const previous = roomMutationTails.get(serverCode) || Promise.resolve();
+  let release;
+  const current = new Promise(resolve => { release = resolve; });
+  roomMutationTails.set(serverCode, current);
+  await previous;
+  try {
+    return await operation();
+  } finally {
+    release();
+    if (roomMutationTails.get(serverCode) === current) roomMutationTails.delete(serverCode);
+  }
+}
+
+const authRateLimiter = createRateLimiter();
+setInterval(() => {
+  authRateLimiter.prune();
+}, RATE_LIMIT_WINDOW_MS).unref();
 
 // --- DATABASE SCHEMAS ---
 const UserSchema = new mongoose.Schema({
@@ -303,7 +387,7 @@ async function broadcastOnlineUsers(serverCode) {
               if (a.online === b.online) return (a.displayName||a.username).localeCompare(b.displayName||b.username);
               return a.online ? -1 : 1; 
           });
-      } catch (err) { console.error(err); }
+      } catch (err) { logUnexpectedError(console, 'broadcast_online_users', err); }
   }
 
   io.to(serverCode).emit('online_users', usersList);
@@ -318,13 +402,98 @@ function createConnectionHandler({
   onlineUsersMap = onlineUsers,
   broadcastOnlineUsersFn = broadcastOnlineUsers,
   getRoomRoleFn = getRoomRole,
-  resolvePingsFn = resolvePings
+  resolvePingsFn = resolvePings,
+  rateLimiter = authRateLimiter,
+  logger = console
 } = {}) {
   return socket => {
   socket.serverCode = null;
   socket.joinedServers = [];
   
   let lastMessageTime = 0; 
+
+  async function fetchLiveSockets() {
+    const fetched = await ioInstance.fetchSockets();
+    const byId = new Map((Array.isArray(fetched) ? fetched : []).map(live => [live.id, live]));
+    byId.set(socket.id, socket);
+    return [...byId.values()];
+  }
+
+  async function evictLiveSocket(live, session, serverCode) {
+    const activeRoom = live.serverCode || session?.serverCode;
+    try {
+      await Promise.resolve(live.leave(serverCode));
+      if (activeRoom === serverCode) {
+        live.serverCode = 'global';
+        await Promise.resolve(live.join('global'));
+        if (session) session.serverCode = 'global';
+      }
+      return true;
+    } catch (err) {
+      logUnexpectedError(logger, 'room_transport_eviction', err);
+      live.serverCode = 'global';
+      if (session) session.serverCode = 'global';
+      try {
+        await Promise.resolve(live.disconnect(true));
+      } catch (disconnectError) {
+        logUnexpectedError(logger, 'room_transport_disconnect', disconnectError);
+      }
+      return false;
+    }
+  }
+
+  async function synchronizeMembership(sockets, username, joinedServers, evictedRoom = null) {
+    const authoritativeServers = [...new Set(Array.isArray(joinedServers) ? joinedServers : ['global'])];
+    if (!authoritativeServers.includes('global')) authoritativeServers.unshift('global');
+    let synchronized = true;
+    const accountSockets = [];
+
+    for (const live of sockets) {
+      const session = onlineUsersMap.get(live.id);
+      if ((live.username || session?.username) !== username) continue;
+
+      live.joinedServers = [...authoritativeServers];
+      if (session) session.joinedServers = [...authoritativeServers];
+      accountSockets.push({ live, session });
+    }
+
+    for (const { live, session } of accountSockets) {
+      if (evictedRoom) {
+        synchronized = (await evictLiveSocket(live, session, evictedRoom)) && synchronized;
+      }
+
+      try {
+        live.emit('room_access_updated', {
+          username,
+          joinedServers: [...authoritativeServers],
+          serverCode: live.serverCode || session?.serverCode || 'global'
+        });
+      } catch (err) {
+        synchronized = false;
+        logUnexpectedError(logger, 'room_access_notification', err);
+      }
+    }
+    return synchronized;
+  }
+
+  async function synchronizeProfile(sockets, username, profile) {
+    for (const live of sockets) {
+      const session = onlineUsersMap.get(live.id);
+      if ((live.username || session?.username) !== username) continue;
+      live.displayName = profile.displayName;
+      live.color = profile.color;
+      live.avatarUrl = profile.avatarUrl;
+      if (session) {
+        session.displayName = profile.displayName;
+        session.color = profile.color;
+        session.avatarUrl = profile.avatarUrl;
+      }
+    }
+  }
+
+  async function roomExists(serverCode) {
+    return Boolean(await ChatServerModel.findOne({ code: serverCode }));
+  }
 
   socket.on('register', async (data, callback) => {
     callback = safeAck(callback);
@@ -334,25 +503,31 @@ function createConnectionHandler({
       const cleanDisp = normalizeDisplayName(data.displayName || data.username);
       if (!cleanUser || !cleanDisp || !isValidPassword(data.password)) return callback({ error: 'Invalid input format.' });
       
-      const ip = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
-      if (!checkRateLimit(ip)) return callback({ error: 'Too many requests. Try again later.' });
+      const rateKey = authRateLimitKey(socket, 'register', cleanUser);
+      if (!rateLimiter.check(rateKey)) return callback({ error: 'Too many requests. Try again later.' });
 
       if (cleanUser.toLowerCase() === 'nyzhang1' || cleanDisp.toLowerCase() === 'nyzhang1') return callback({ error: 'Reserved name.' });
 
-      const escapedUser = escapeRegExp(cleanUser);
-      const existing = await UserModel.findOne({ username: { $regex: new RegExp(`^${escapedUser}$`, 'i') } });
-      if (existing) return callback({ error: 'Username taken.' });
+      const result = await withIdentityMutationLock(async () => {
+        const escapedUser = escapeRegExp(cleanUser);
+        const existing = await UserModel.findOne({ username: { $regex: new RegExp(`^${escapedUser}$`, 'i') } });
+        if (existing) return { error: 'Username taken.' };
 
-      const escapedDisp = escapeRegExp(cleanDisp);
-      const existingDisp = await UserModel.findOne({ displayName: { $regex: new RegExp(`^${escapedDisp}$`, 'i') } });
-      if (existingDisp) return callback({ error: 'Display Name is already taken.' });
+        const escapedDisp = escapeRegExp(cleanDisp);
+        const existingDisp = await UserModel.findOne({ displayName: { $regex: new RegExp(`^${escapedDisp}$`, 'i') } });
+        if (existingDisp) return { error: 'Display Name is already taken.' };
 
-      const hashedPassword = await bcryptImpl.hash(data.password, 10);
-      await UserModel.create({ username: cleanUser, displayName: cleanDisp, password: hashedPassword, servers: ['global'] });
-      
-      clearRateLimit(ip);
-      callback({ success: true });
-    } catch (err) { callback({ error: 'Registration failed.' }); }
+        const hashedPassword = await bcryptImpl.hash(data.password, 10);
+        await UserModel.create({ username: cleanUser, displayName: cleanDisp, password: hashedPassword, servers: ['global'] });
+        return { success: true };
+      });
+
+      if (result.success) rateLimiter.clear(rateKey);
+      callback(result);
+    } catch (err) {
+      logUnexpectedError(logger, 'register', err);
+      callback({ error: 'Registration failed.' });
+    }
   });
 
   socket.on('login', async (data, callback) => {
@@ -363,8 +538,8 @@ function createConnectionHandler({
       const username = normalizeUsername(data.username);
       if (!username || !isValidPassword(data.password)) return callback({ error: 'Invalid input format.' });
       
-      const ip = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
-      if (!checkRateLimit(ip)) return callback({ error: 'Too many login attempts. Try again later.' });
+      const rateKey = authRateLimitKey(socket, 'login', username);
+      if (!rateLimiter.check(rateKey)) return callback({ error: 'Too many login attempts. Try again later.' });
 
       const escapedUser = escapeRegExp(username);
       const user = await UserModel.findOne({ username: { $regex: new RegExp(`^${escapedUser}$`, 'i') } });
@@ -397,19 +572,22 @@ function createConnectionHandler({
       const isVisible = socket.role !== 'admin' || socket.joinedServers.includes('global');
       if (isVisible) socket.to('global').emit('system_message', `${socket.displayName} joined the app.`);
       
-      clearRateLimit(ip);
+      rateLimiter.clear(rateKey);
 
       callback({ success: true, username: user.username, displayName: socket.displayName, role: socket.role, color: socket.color, avatarUrl: socket.avatarUrl, servers: servers || [], joinedServers: user.servers });
-    } catch (err) { callback({ error: 'Login failed.' }); }
+    } catch (err) {
+      logUnexpectedError(logger, 'login', err);
+      callback({ error: 'Login failed.' });
+    }
   });
 
   socket.on('change_password', async (data, callback) => {
     callback = safeAck(callback);
     if (!socket.username) return callback({ error: 'Not authenticated.' });
-    if (!data || typeof data.oldPassword !== 'string' || typeof data.newPassword !== 'string') return callback({ error: 'Invalid data format.' });
+    if (!data || typeof data.oldPassword !== 'string' || typeof data.newPassword !== 'string') return callback({ error: 'Invalid input format.' });
     
-    const ip = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
-    if (!checkRateLimit(ip)) return callback({ error: 'Too many attempts. Try again later.' });
+    const rateKey = authRateLimitKey(socket, 'change_password', socket.username);
+    if (!rateLimiter.check(rateKey)) return callback({ error: 'Too many attempts. Try again later.' });
 
     try {
       const user = await UserModel.findOne({ username: socket.username });
@@ -418,14 +596,15 @@ function createConnectionHandler({
       const isMatch = await bcryptImpl.compare(data.oldPassword, user.password);
       if (!isMatch) return callback({ error: 'Incorrect current password.' });
 
-      if (!isValidPassword(data.newPassword)) return callback({ error: 'New password must be at least 6 characters long.' });
+      if (!isValidPassword(data.newPassword)) return callback({ error: 'Invalid input format.' });
 
       user.password = await bcryptImpl.hash(data.newPassword, 10);
       await user.save();
       
-      clearRateLimit(ip);
+      rateLimiter.clear(rateKey);
       callback({ success: true });
     } catch (err) {
+      logUnexpectedError(logger, 'change_password', err);
       callback({ error: 'Failed to update password.' });
     }
   });
@@ -443,6 +622,7 @@ function createConnectionHandler({
           });
           callback({ success: true });
       } catch(err) {
+          logUnexpectedError(logger, 'logout_all_devices', err);
           callback({ error: 'Failed to execute remote logout.'});
       }
   });
@@ -454,21 +634,37 @@ function createConnectionHandler({
           const color = normalizeColor(data && data.color);
           const url = normalizeAvatarUrl(data && data.avatarUrl);
           const dName = normalizeDisplayName(data && data.displayName);
-          if (!dName || color === null || url === null) return callback({ error: 'Invalid profile data.' });
+          if (!dName || color === null || url === null) return callback({ error: 'Invalid input format.' });
           if (dName.toLowerCase() === 'nyzhang1') return callback({ error: 'Reserved name.' });
 
-          if (dName.toLowerCase() !== socket.displayName.toLowerCase()) {
-              const existingDisp = await UserModel.findOne({ displayName: { $regex: new RegExp(`^${escapeRegExp(dName)}$`, 'i') } });
-              if (existingDisp) return callback({ error: 'Display Name is already taken.' });
+          const sockets = await fetchLiveSockets();
+          const result = await withIdentityMutationLock(async () => {
+              if (dName.toLowerCase() !== socket.displayName.toLowerCase()) {
+                  const existingDisp = await UserModel.findOne({ displayName: { $regex: new RegExp(`^${escapeRegExp(dName)}$`, 'i') } });
+                  if (existingDisp) return { error: 'Display Name is already taken.' };
+              }
+
+              const user = await UserModel.findOne({ username: socket.username });
+              if (!user) return { error: 'User not found.' };
+              user.color = color;
+              user.avatarUrl = url;
+              user.displayName = dName;
+              await user.save();
+              return { success: true };
+          });
+          if (result.error) return callback(result);
+
+          await synchronizeProfile(sockets, socket.username, {
+              color,
+              avatarUrl: url,
+              displayName: dName
+          });
+
+          try {
+              await MessageModel.updateMany({ username: socket.username }, { $set: { color: color, avatarUrl: url, displayName: dName } });
+          } catch (err) {
+              logUnexpectedError(logger, 'update_profile_message_snapshots', err);
           }
-
-          const user = await UserModel.findOne({ username: socket.username });
-          user.color = color; user.avatarUrl = url; user.displayName = dName; await user.save();
-          
-          await MessageModel.updateMany({ username: socket.username }, { $set: { color: color, avatarUrl: url, displayName: dName } });
-
-          socket.color = color; socket.avatarUrl = url; socket.displayName = dName;
-          if(onlineUsersMap.has(socket.id)) { let session = onlineUsersMap.get(socket.id); session.color = color; session.avatarUrl = url; session.displayName = dName; }
           
           ioInstance.emit('profile_updated', { username: socket.username, displayName: dName, color: color, avatarUrl: url });
           
@@ -477,17 +673,20 @@ function createConnectionHandler({
           serversToUpdate.forEach(c => broadcastOnlineUsersFn(c));
           
           callback({ success: true, displayName: dName, color: color, avatarUrl: url });
-      } catch(err) { callback({ error: 'Failed to update profile.' }); }
+      } catch(err) {
+          logUnexpectedError(logger, 'update_profile', err);
+          callback({ error: 'Failed to update profile.' });
+      }
   });
 
   socket.on('manage_role', async (data, callback) => {
     callback = safeAck(callback);
     if (!socket.username) return callback({ error: 'Not authenticated.' });
-    if (!data || typeof data !== 'object') return callback({ error: 'Invalid action.' });
+    if (!data || typeof data !== 'object' || Array.isArray(data)) return callback({ error: 'Invalid input format.' });
     const { action } = data;
     const targetUser = normalizeUsername(data.targetUser);
     const validActions = new Set(['promote_global_admin', 'demote_global_admin', 'promote_mod', 'demote_mod']);
-    if (!targetUser || !validActions.has(action)) return callback({ error: 'Invalid action.' });
+    if (!targetUser || !validActions.has(action)) return callback({ error: 'Invalid input format.' });
     
     try {
         const targetUserDoc = await UserModel.findOne({ username: targetUser });
@@ -500,37 +699,73 @@ function createConnectionHandler({
         if (action === 'promote_global_admin' || action === 'demote_global_admin') {
             if (!isGlobalAdmin) return callback({ error: 'Only Global Admins can modify global roles.' });
             if (action === 'demote_global_admin' && targetUser.toLowerCase() === 'nyzhang1') return callback({ error: 'Cannot modify system owner.' });
-            
+
+            const sockets = await fetchLiveSockets();
             targetUserDoc.role = (action === 'promote_global_admin') ? 'admin' : 'user';
             await targetUserDoc.save();
 
-            const sockets = await ioInstance.fetchSockets();
-            sockets.forEach(s => {
-                if (s.username === targetUser) {
-                    s.role = targetUserDoc.role;
-                    if (onlineUsersMap.has(s.id)) onlineUsersMap.get(s.id).role = targetUserDoc.role;
-                    s.emit('global_role_updated', { username: targetUser, role: targetUserDoc.role });
+            const joinedServers = Array.isArray(targetUserDoc.servers) ? targetUserDoc.servers : ['global'];
+            let roleSyncFailed = false;
+            const targetSessions = [];
+            for (const live of sockets) {
+                const session = onlineUsersMap.get(live.id);
+                if ((live.username || session?.username) !== targetUser) continue;
+                live.role = targetUserDoc.role;
+                live.joinedServers = [...joinedServers];
+                if (session) {
+                    session.role = targetUserDoc.role;
+                    session.joinedServers = [...joinedServers];
                 }
-            });
+
+                targetSessions.push({ live, session });
+            }
+
+            for (const { live, session } of targetSessions) {
+                const activeRoom = live.serverCode || session?.serverCode;
+                let wasEvicted = false;
+                if (targetUserDoc.role !== 'admin' && activeRoom && activeRoom !== 'global' && !joinedServers.includes(activeRoom)) {
+                    roleSyncFailed = !(await evictLiveSocket(live, session, activeRoom)) || roleSyncFailed;
+                    wasEvicted = true;
+                }
+
+                try {
+                    live.emit('global_role_updated', { username: targetUser, role: targetUserDoc.role });
+                    if (wasEvicted) {
+                        live.emit('room_access_updated', {
+                            username: targetUser,
+                            joinedServers: [...joinedServers],
+                            serverCode: 'global'
+                        });
+                    }
+                } catch (err) {
+                    roleSyncFailed = true;
+                    logUnexpectedError(logger, 'manage_role_notification', err);
+                }
+            }
             
             ioInstance.emit('system_message', `${socket.displayName} ${action === 'promote_global_admin' ? 'promoted' : 'demoted'} ${targetDisp} ${action === 'promote_global_admin' ? 'to' : 'from'} Global Admin.`);
             const roomsToUpdate = new Set(targetUserDoc.servers); roomsToUpdate.add('global');
             roomsToUpdate.forEach(c => broadcastOnlineUsersFn(c));
             
-            return callback({ success: true });
+            return callback(roleSyncFailed ? { error: 'Failed to manage role.' } : { success: true });
         }
 
         // Manage Room Moderators
         const serverCode = normalizeServerCode(data.serverCode);
-        if (!serverCode || serverCode === 'global') return callback({ error: 'Invalid action.' });
+        if (!serverCode || serverCode === 'global') return callback({ error: 'Invalid input format.' });
         if (serverCode) {
             const srv = await ChatServerModel.findOne({ code: serverCode });
             if (!srv) return callback({ error: 'Server not found.' });
 
-            const isRoomMod = srv.moderators.includes(socket.username) || isGlobalAdmin;
+            const isRoomMod = Array.isArray(srv.moderators) && srv.moderators.includes(socket.username);
 
             if (action === 'promote_mod') {
-                if (!isGlobalAdmin && !isRoomMod) return callback({ error: 'Only Global Admins and Room Moderators can promote to Room Moderator.' });
+                if (!isGlobalAdmin) {
+                    const actor = await UserModel.findOne({ username: socket.username });
+                    const isCurrentMember = Array.isArray(actor?.servers) && actor.servers.includes(serverCode) &&
+                        Array.isArray(socket.joinedServers) && socket.joinedServers.includes(serverCode);
+                    if (!isRoomMod || !isCurrentMember) return callback({ error: 'Permission denied.' });
+                }
                 if (!Array.isArray(targetUserDoc.servers) || !targetUserDoc.servers.includes(serverCode)) return callback({ error: 'Target user is not a room member.' });
                 
                 if (!srv.moderators) srv.moderators = [];
@@ -555,8 +790,9 @@ function createConnectionHandler({
                 return callback({ success: true });
             }
         }
-        callback({ error: 'Invalid action.' });
+        callback({ error: 'Invalid input format.' });
     } catch (err) {
+        logUnexpectedError(logger, 'manage_role', err);
         callback({ error: 'Failed to manage role.' });
     }
   });
@@ -565,7 +801,7 @@ function createConnectionHandler({
     callback = safeAck(callback);
     if (!socket.username) return callback({ error: 'Not authenticated.' });
     const cleanName = normalizeServerName(name);
-    if (!cleanName) return callback({ error: 'Invalid server name.' });
+    if (!cleanName) return callback({ error: 'Invalid input format.' });
     try {
       let srv;
       for (let attempt = 0; attempt < 5; attempt += 1) {
@@ -585,8 +821,15 @@ function createConnectionHandler({
       const user = await UserModel.findOne({ username: socket.username });
       
       if (!user.servers.includes(srv.code)) {
-        user.servers.push(srv.code); await user.save(); socket.joinedServers = user.servers;
-        if(onlineUsersMap.has(socket.id)) onlineUsersMap.get(socket.id).joinedServers = user.servers;
+        let sockets = [socket];
+        try {
+          sockets = await fetchLiveSockets();
+        } catch (err) {
+          logUnexpectedError(logger, 'create_server_membership_sync', err);
+        }
+        user.servers.push(srv.code);
+        await user.save();
+        await synchronizeMembership(sockets, socket.username, user.servers);
         broadcastOnlineUsersFn(srv.code);
       }
       callback({ success: true, server: srv });
@@ -594,56 +837,83 @@ function createConnectionHandler({
       try {
         const sockets = await ioInstance.fetchSockets();
         sockets.forEach(s => { if (onlineUsersMap.has(s.id) && onlineUsersMap.get(s.id).role === 'admin') s.emit('admin_new_server', srv); });
-      } catch (err) {}
-    } catch (err) { callback({ error: 'Creation failed.' }); }
+      } catch (err) {
+        logUnexpectedError(logger, 'create_server_admin_notification', err);
+      }
+    } catch (err) {
+      logUnexpectedError(logger, 'create_server', err);
+      callback({ error: 'Creation failed.' });
+    }
   });
 
   socket.on('join_server', async (code, callback) => {
     callback = safeAck(callback);
     if (!socket.username) return callback({ error: 'Not authenticated.' });
     const serverCode = normalizeServerCode(code);
-    if (!serverCode) return callback({ error: 'Invalid invite code.' });
+    if (!serverCode) return callback({ error: 'Invalid input format.' });
     try {
-      const srv = await ChatServerModel.findOne({ code: serverCode });
-      if (!srv) return callback({ error: 'Invalid invite code.' });
-      
-      const user = await UserModel.findOne({ username: socket.username });
-      if (!user.servers.includes(srv.code)) {
-        user.servers.push(srv.code); await user.save(); socket.joinedServers = user.servers;
-        if(onlineUsersMap.has(socket.id)) onlineUsersMap.get(socket.id).joinedServers = user.servers;
-        
-        broadcastOnlineUsersFn(srv.code);
+      const result = await withRoomMutationLock(serverCode, async () => {
+        const srv = await ChatServerModel.findOne({ code: serverCode });
+        if (!srv) return { error: 'Invalid invite code.' };
 
-        if (socket.serverCode === srv.code) { 
-            socket.to(srv.code).emit('system_message', `${socket.displayName} joined.`); 
+        const user = await UserModel.findOne({ username: socket.username });
+        if (!user) return { error: 'User not found.' };
+        if (!user.servers.includes(srv.code)) {
+          let sockets = [socket];
+          try {
+            sockets = await fetchLiveSockets();
+          } catch (err) {
+            logUnexpectedError(logger, 'join_server_membership_sync', err);
+          }
+          user.servers.push(srv.code);
+          await user.save();
+          await synchronizeMembership(sockets, socket.username, user.servers);
+
+          broadcastOnlineUsersFn(srv.code);
+
+          if (socket.serverCode === srv.code) {
+              socket.to(srv.code).emit('system_message', `${socket.displayName} joined.`);
+          }
         }
-      }
-      callback({ success: true, server: srv });
-    } catch (err) { callback({ error: 'Join failed.' }); }
+        return { success: true, server: srv };
+      });
+      callback(result);
+    } catch (err) {
+      logUnexpectedError(logger, 'join_server', err);
+      callback({ error: 'Join failed.' });
+    }
   });
 
   socket.on('leave_server', async (code, callback) => {
     callback = safeAck(callback);
     if (!socket.username) return callback({ error: 'Not authenticated.' });
     const serverCode = normalizeServerCode(code);
-    if (!serverCode || serverCode === 'global') return callback({ error: 'Cannot leave global.' });
+    if (!serverCode) return callback({ error: 'Invalid input format.' });
+    if (serverCode === 'global') return callback({ error: 'Cannot leave global.' });
     try {
       const user = await UserModel.findOne({ username: socket.username });
-      const isMember = user.servers.includes(serverCode);
+      if (!user) return callback({ error: 'User not found.' });
+      const sockets = await fetchLiveSockets();
+      const isMember = Array.isArray(user.servers) && user.servers.includes(serverCode);
+      const wasActive = socket.serverCode === serverCode;
       if (isMember) {
-        user.servers = user.servers.filter(s => s !== serverCode); await user.save();
-        socket.joinedServers = user.servers;
-        if(onlineUsersMap.has(socket.id)) onlineUsersMap.get(socket.id).joinedServers = user.servers;
-        await ChatServerModel.updateOne({ code: serverCode }, { $pull: { moderators: socket.username } });
+        user.servers = user.servers.filter(s => s !== serverCode);
+        await user.save();
       }
 
-      const wasActive = socket.serverCode === serverCode;
       if (wasActive) {
           socket.to(serverCode).emit('system_message', `${socket.displayName} left the server.`);
-          socket.leave(serverCode);
-          socket.serverCode = 'global';
-          socket.join('global');
-          if (onlineUsersMap.has(socket.id)) onlineUsersMap.get(socket.id).serverCode = 'global';
+      }
+      const transportSynchronized = await synchronizeMembership(sockets, socket.username, user.servers, serverCode);
+
+      let cleanupFailed = !transportSynchronized;
+      if (isMember) {
+        try {
+          await ChatServerModel.updateOne({ code: serverCode }, { $pull: { moderators: socket.username } });
+        } catch (err) {
+          cleanupFailed = true;
+          logUnexpectedError(logger, 'leave_server_moderator_cleanup', err);
+        }
       }
       if (isMember || wasActive) {
         broadcastOnlineUsersFn(serverCode);
@@ -651,48 +921,100 @@ function createConnectionHandler({
       if (wasActive) {
         broadcastOnlineUsersFn('global');
       }
-      callback({ success: true });
-    } catch (err) { callback({ error: 'Failed to leave.' }); }
+      callback(cleanupFailed ? { error: 'Failed to leave.' } : { success: true });
+    } catch (err) {
+      logUnexpectedError(logger, 'leave_server', err);
+      callback({ error: 'Failed to leave.' });
+    }
   });
 
   socket.on('delete_server', async (code, callback) => {
     callback = safeAck(callback);
     if (!socket.username) return callback({ error: 'Not authenticated.' });
     const serverCode = normalizeServerCode(code);
-    if (!serverCode || serverCode === 'global') return callback({ error: 'Cannot delete global.' });
+    if (!serverCode) return callback({ error: 'Invalid input format.' });
+    if (serverCode === 'global') return callback({ error: 'Cannot delete global.' });
     try {
       const srv = await ChatServerModel.findOne({ code: serverCode });
       if (!srv) return callback({ error: 'Server not found.' });
 
       // ONLY Global Admins or the actual Room Creator can completely delete a server
       if (socket.role === 'admin' || srv.owner === socket.username) {
-        await ChatServerModel.deleteOne({ code: serverCode });
-        await MessageModel.deleteMany({ serverCode });
-        await UserModel.updateMany({}, { $pull: { servers: serverCode } });
-        ioInstance.emit('server_deleted', serverCode);
-        const sockets = await ioInstance.fetchSockets();
-        sockets.forEach(s => {
-          if (s.joinedServers && s.joinedServers.includes(serverCode)) {
-             s.joinedServers = s.joinedServers.filter(c => c !== serverCode);
-             if (onlineUsersMap.has(s.id)) onlineUsersMap.get(s.id).joinedServers = s.joinedServers;
+        const sockets = await fetchLiveSockets();
+        const result = await withRoomMutationLock(serverCode, async () => {
+          const currentRoom = await ChatServerModel.findOne({ code: serverCode });
+          if (!currentRoom) return { error: 'Server not found.' };
+          if (socket.role !== 'admin' && currentRoom.owner !== socket.username) return { error: 'Permission denied.' };
+
+          await ChatServerModel.deleteOne({ code: serverCode });
+
+          let cleanupFailed = false;
+          const affectedSockets = [];
+          for (const live of sockets) {
+            const session = onlineUsersMap.get(live.id);
+            const currentMemberships = Array.isArray(live.joinedServers)
+              ? live.joinedServers
+              : (Array.isArray(session?.joinedServers) ? session.joinedServers : ['global']);
+            const hadMembership = currentMemberships.includes(serverCode);
+            const nextMemberships = currentMemberships.filter(roomCode => roomCode !== serverCode);
+            if (!nextMemberships.includes('global')) nextMemberships.unshift('global');
+            live.joinedServers = [...nextMemberships];
+            if (session) session.joinedServers = [...nextMemberships];
+
+            affectedSockets.push({ live, session, hadMembership, nextMemberships });
           }
-          if (s.serverCode === serverCode) {
-            s.leave(serverCode);
-            s.serverCode = 'global';
-            s.join('global');
-            if (onlineUsersMap.has(s.id)) onlineUsersMap.get(s.id).serverCode = 'global';
+
+          for (const { live, session, hadMembership, nextMemberships } of affectedSockets) {
+            const activeRoom = live.serverCode || session?.serverCode;
+            cleanupFailed = !(await evictLiveSocket(live, session, serverCode)) || cleanupFailed;
+            if (hadMembership || activeRoom === serverCode) {
+              try {
+                live.emit('room_access_updated', {
+                  username: live.username || session?.username,
+                  joinedServers: [...nextMemberships],
+                  serverCode: live.serverCode || session?.serverCode || 'global'
+                });
+              } catch (err) {
+                cleanupFailed = true;
+                logUnexpectedError(logger, 'delete_server_access_notification', err);
+              }
+            }
           }
+
+          try {
+            ioInstance.emit('server_deleted', serverCode);
+          } catch (err) {
+            cleanupFailed = true;
+            logUnexpectedError(logger, 'delete_server_notification', err);
+          }
+          try {
+            await MessageModel.deleteMany({ serverCode });
+          } catch (err) {
+            cleanupFailed = true;
+            logUnexpectedError(logger, 'delete_server_message_cleanup', err);
+          }
+          try {
+            await UserModel.updateMany({}, { $pull: { servers: serverCode } });
+          } catch (err) {
+            cleanupFailed = true;
+            logUnexpectedError(logger, 'delete_server_membership_cleanup', err);
+          }
+          broadcastOnlineUsersFn('global');
+          return cleanupFailed ? { error: 'Deletion failed.' } : { success: true };
         });
-        broadcastOnlineUsersFn('global'); callback({ success: true });
+        callback(result);
       } else { callback({ error: 'Permission denied.' }); }
-    } catch (err) { callback({ error: 'Deletion failed.' }); }
+    } catch (err) {
+      logUnexpectedError(logger, 'delete_server', err);
+      callback({ error: 'Deletion failed.' });
+    }
   });
 
   socket.on('switch_server', async (code, callback) => {
     callback = safeAck(callback);
     if (!socket.username) return callback({ error: 'Not authenticated.' });
     const serverCode = normalizeServerCode(code);
-    if (!serverCode) return callback({ error: 'Invalid server code.' });
+    if (!serverCode) return callback({ error: 'Invalid input format.' });
 
     let safeHistory;
     let roomRole;
@@ -707,7 +1029,8 @@ function createConnectionHandler({
       roomRole = await getRoomRoleFn(serverCode, socket.username);
       const history = await MessageModel.find(query).sort({ timestamp: -1 }).limit(100).lean();
 
-      safeHistory = history.map(msg => {
+      safeHistory = history.map(storedMessage => {
+          const msg = { ...storedMessage, attachment: sanitizeAttachment(storedMessage.attachment) };
           if (msg.deleted && msg.username !== socket.username && socket.role !== 'admin' && roomRole !== 'mod') {
               msg.text = ''; msg.attachment = null; msg.reactions = {};
           }
@@ -715,6 +1038,16 @@ function createConnectionHandler({
           return msg;
       }).reverse();
     } catch (err) {
+      logUnexpectedError(logger, 'switch_server_history', err);
+      return callback({ error: 'Failed to switch server.' });
+    }
+
+    try {
+      const currentRoom = await ChatServerModel.findOne({ code: serverCode });
+      if (!currentRoom) return callback({ error: 'Server not found.' });
+      if (!canAccessRoom(socket, serverCode)) return callback({ error: 'Permission denied.' });
+    } catch (err) {
+      logUnexpectedError(logger, 'switch_server_recheck', err);
       return callback({ error: 'Failed to switch server.' });
     }
 
@@ -731,15 +1064,20 @@ function createConnectionHandler({
     broadcastCodes.push(serverCode, 'global');
     [...new Set(broadcastCodes)].forEach(broadcastCode => {
       try {
-        Promise.resolve(broadcastOnlineUsersFn(broadcastCode)).catch(() => {});
-      } catch {}
+        Promise.resolve(broadcastOnlineUsersFn(broadcastCode)).catch(err => {
+          logUnexpectedError(logger, 'switch_server_presence_broadcast', err);
+        });
+      } catch (err) {
+        logUnexpectedError(logger, 'switch_server_presence_broadcast', err);
+      }
     });
   });
 
   socket.on('chat_message', async (payload) => {
     try {
+      const serverCode = socket.serverCode;
       const identity = { role: socket.role, joinedServers: socket.joinedServers || [] };
-      if (!socket.username || !socket.serverCode || !canAccessRoom(identity, socket.serverCode)) return;
+      if (!socket.username || !serverCode || !canAccessRoom(identity, serverCode)) return;
       if (!payload || typeof payload !== 'object' || Array.isArray(payload) || typeof payload.text !== 'string') return;
       if (!isValidAttachment(payload.attachment)) return;
 
@@ -749,34 +1087,49 @@ function createConnectionHandler({
       }
       lastMessageTime = now;
 
-      const attachment = payload.attachment || null;
+      const attachment = sanitizeAttachment(payload.attachment);
       let cleanText = payload.text.trim().substring(0, 2000);
       if (!cleanText && !attachment) return;
 
       let replyTo = null;
       if (payload.replyTo && typeof payload.replyTo === 'object' && isValidObjectId(payload.replyTo.id)) {
         const referenced = await MessageModel.findById(payload.replyTo.id);
-        if (referenced && !referenced.deleted && referenced.serverCode === socket.serverCode) {
+        if (referenced && !referenced.deleted && referenced.serverCode === serverCode) {
           replyTo = createReplySnapshot(referenced);
         }
       }
 
-      const roomRole = await getRoomRoleFn(socket.serverCode, socket.username);
+      const roomRole = await getRoomRoleFn(serverCode, socket.username);
       cleanText = neutralizePingTokens(cleanText);
-      cleanText = await resolvePingsFn(cleanText, socket.serverCode, socket.role, roomRole, socket.username);
+      cleanText = await resolvePingsFn(cleanText, serverCode, socket.role, roomRole, socket.username);
       if (typeof cleanText !== 'string' || cleanText.length > 2000) return;
 
-      const msg = await MessageModel.create({
-          serverCode: socket.serverCode, username: socket.username, displayName: socket.displayName, 
-          role: socket.role, roomRole: roomRole, color: socket.color, avatarUrl: socket.avatarUrl, 
-          text: cleanText, attachment: attachment, replyTo: replyTo, reactions: {} 
+      await withRoomMutationLock(serverCode, async () => {
+        const [currentRoom, currentUser] = await Promise.all([
+          ChatServerModel.findOne({ code: serverCode }),
+          UserModel.findOne({ username: socket.username })
+        ]);
+        const authoritativeIdentity = {
+          role: currentUser?.role || 'user',
+          joinedServers: Array.isArray(currentUser?.servers) ? currentUser.servers : []
+        };
+        if (!currentRoom || !currentUser || !canAccessRoom(authoritativeIdentity, serverCode) ||
+            !canAccessRoom(socket, serverCode)) return;
+
+        const msg = await MessageModel.create({
+            serverCode, username: socket.username, displayName: socket.displayName,
+            role: socket.role, roomRole: roomRole, color: socket.color, avatarUrl: socket.avatarUrl,
+            text: cleanText, attachment, replyTo, reactions: {}
+        });
+
+        ioInstance.to(msg.serverCode || serverCode).emit('chat_message', {
+            _id: msg._id, username: msg.username, displayName: msg.displayName, role: msg.role, roomRole: msg.roomRole, color: msg.color, avatarUrl: msg.avatarUrl,
+            text: msg.text, attachment: sanitizeAttachment(msg.attachment), replyTo: msg.replyTo, reactions: {}, timestamp: msg.timestamp, edited: false, deleted: false
+        });
       });
-      
-      ioInstance.to(socket.serverCode).emit('chat_message', {
-          _id: msg._id, username: msg.username, displayName: msg.displayName, role: socket.role, roomRole: roomRole, color: msg.color, avatarUrl: msg.avatarUrl,
-          text: msg.text, attachment: msg.attachment, replyTo: msg.replyTo, reactions: {}, timestamp: msg.timestamp, edited: false, deleted: false 
-      });
-    } catch (err) { console.error('chat_message failed:', err); }
+    } catch (err) {
+      logUnexpectedError(logger, 'chat_message', err);
+    }
   });
 
   socket.on('toggle_reaction', async (data) => {
@@ -789,25 +1142,37 @@ function createConnectionHandler({
           if (!msg || msg.deleted) return;
           const identity = { role: socket.role, joinedServers: socket.joinedServers || [] };
           if (!canAccessRoom(identity, msg.serverCode)) return;
+          await withRoomMutationLock(msg.serverCode, async () => {
+            if (msg.deleted || !(await roomExists(msg.serverCode)) || !canAccessRoom(socket, msg.serverCode)) return;
 
-          let rx = msg.reactions || {};
-          let users = rx[emoji] || [];
+            let rx = msg.reactions || {};
+            let users = Array.isArray(rx[emoji]) ? rx[emoji] : [];
 
-          if (users.includes(socket.username)) {
-              users = users.filter(u => u !== socket.username); 
-              if (users.length === 0) delete rx[emoji];
-              else rx[emoji] = users;
-          } else {
-              users.push(socket.username); 
-              rx[emoji] = users;
-          }
+            if (users.includes(socket.username)) {
+                users = users.filter(u => u !== socket.username);
+                if (users.length === 0) delete rx[emoji];
+                else rx[emoji] = users;
+            } else {
+                const reactionKeys = Object.keys(rx);
+                if (!Object.prototype.hasOwnProperty.call(rx, emoji) && reactionKeys.length >= MAX_REACTION_KEYS) return;
+                if (users.length >= MAX_REACTION_USERS) return;
+                const reactionsByUser = Object.values(rx).filter(reactionUsers =>
+                  Array.isArray(reactionUsers) && reactionUsers.includes(socket.username)
+                ).length;
+                if (reactionsByUser >= MAX_REACTIONS_PER_USER) return;
+                users.push(socket.username);
+                rx[emoji] = users;
+            }
 
-          msg.reactions = rx;
-          msg.markModified('reactions'); 
-          await msg.save();
+            msg.reactions = rx;
+            msg.markModified('reactions');
+            await msg.save();
 
-          ioInstance.to(msg.serverCode).emit('reaction_updated', { id: msg._id, reactions: msg.reactions });
-      } catch (err) { console.error('toggle_reaction failed:', err); }
+            ioInstance.to(msg.serverCode).emit('reaction_updated', { id: msg._id, reactions: msg.reactions });
+          });
+      } catch (err) {
+          logUnexpectedError(logger, 'toggle_reaction', err);
+      }
   });
 
   socket.on('edit_message', async (data) => {
@@ -829,16 +1194,23 @@ function createConnectionHandler({
           cleanText = neutralizePingTokens(cleanText);
           cleanText = await resolvePingsFn(cleanText, msg.serverCode, socket.role, roomRole, socket.username);
           if (typeof cleanText !== 'string' || cleanText.length > 2000) return;
+          await withRoomMutationLock(msg.serverCode, async () => {
+            if (msg.deleted || !(await roomExists(msg.serverCode)) || !canAccessRoom(socket, msg.serverCode)) return;
+            const currentRoomRole = await getRoomRoleFn(msg.serverCode, socket.username);
+            if (msg.username !== socket.username && socket.role !== 'admin' && currentRoomRole !== 'mod') return;
 
-          if (msg.text !== cleanText) {
-              msg.history = appendBoundedHistory(msg.history, { text: msg.text, timestamp: new Date() });
-              msg.text = cleanText; msg.edited = true; msg.markModified('history'); 
-              await msg.save();
-              ioInstance.to(msg.serverCode).emit('message_edited', { id: msg._id, username: msg.username, role: msg.role, roomRole: msg.roomRole, text: cleanText });
-          }
+            if (msg.text !== cleanText) {
+                msg.history = appendBoundedHistory(msg.history, { text: msg.text, timestamp: new Date() });
+                msg.text = cleanText; msg.edited = true; msg.markModified('history');
+                await msg.save();
+                ioInstance.to(msg.serverCode).emit('message_edited', { id: msg._id, username: msg.username, role: msg.role, roomRole: msg.roomRole, text: cleanText });
+            }
+          });
         }
       }
-    } catch (err) { console.error('edit_message failed:', err); }
+    } catch (err) {
+      logUnexpectedError(logger, 'edit_message', err);
+    }
   });
 
   socket.on('delete_message', async (msgId) => {
@@ -848,51 +1220,64 @@ function createConnectionHandler({
       if (msg && !msg.deleted) {
         const identity = { role: socket.role, joinedServers: socket.joinedServers || [] };
         if (!canAccessRoom(identity, msg.serverCode)) return;
-        const roomRole = await getRoomRoleFn(msg.serverCode, socket.username);
-        
-        // Sender, SysAdmin, or RoomMod can delete it
-        if (msg.username === socket.username || socket.role === 'admin' || roomRole === 'mod') {
-          msg.deleted = true; await msg.save();
-          ioInstance.to(msg.serverCode).emit('message_deleted', msgId);
-        }
+        await withRoomMutationLock(msg.serverCode, async () => {
+          if (msg.deleted || !(await roomExists(msg.serverCode)) || !canAccessRoom(socket, msg.serverCode)) return;
+          const roomRole = await getRoomRoleFn(msg.serverCode, socket.username);
+
+          // Sender, SysAdmin, or RoomMod can delete it
+          if (msg.username === socket.username || socket.role === 'admin' || roomRole === 'mod') {
+            msg.deleted = true; await msg.save();
+            ioInstance.to(msg.serverCode).emit('message_deleted', msgId);
+          }
+        });
       }
-    } catch (err) { console.error('delete_message failed:', err); }
+    } catch (err) {
+      logUnexpectedError(logger, 'delete_message', err);
+    }
   });
 
   socket.on('get_edit_history', async (msgId, callback) => {
     callback = safeAck(callback);
     if (!socket.username) return callback({ error: 'Not authenticated.' });
     try {
-      if (!isValidObjectId(msgId)) return callback({ error: 'Permission denied.' });
+      if (!isValidObjectId(msgId)) return callback({ error: 'Invalid input format.' });
       const msg = await MessageModel.findById(msgId);
       if (msg) {
         const identity = { role: socket.role, joinedServers: socket.joinedServers || [] };
         if (!canAccessRoom(identity, msg.serverCode)) return callback({ error: 'Permission denied.' });
+        if (!(await roomExists(msg.serverCode))) return callback({ error: 'Permission denied.' });
         const roomRole = await getRoomRoleFn(msg.serverCode, socket.username);
         if (msg.username === socket.username || socket.role === 'admin' || roomRole === 'mod') {
             return callback({ success: true, history: (Array.isArray(msg.history) ? msg.history : []).slice(-20) });
         }
       }
       callback({ error: 'Permission denied.' });
-    } catch (err) { console.error('get_edit_history failed:', err); callback({ error: 'Failed to load history.' }); }
+    } catch (err) {
+      logUnexpectedError(logger, 'get_edit_history', err);
+      callback({ error: 'Failed to load history.' });
+    }
   });
 
   socket.on('get_deleted_message', async (msgId, callback) => {
     callback = safeAck(callback);
     if (!socket.username) return callback({ error: 'Not authenticated.' });
     try {
-      if (!isValidObjectId(msgId)) return callback({ error: 'Permission denied.' });
+      if (!isValidObjectId(msgId)) return callback({ error: 'Invalid input format.' });
       const msg = await MessageModel.findById(msgId);
       if (msg && msg.deleted) {
         const identity = { role: socket.role, joinedServers: socket.joinedServers || [] };
         if (!canAccessRoom(identity, msg.serverCode)) return callback({ error: 'Permission denied.' });
+        if (!(await roomExists(msg.serverCode))) return callback({ error: 'Permission denied.' });
         const roomRole = await getRoomRoleFn(msg.serverCode, socket.username);
         if (msg.username === socket.username || socket.role === 'admin' || roomRole === 'mod') {
-            return callback({ success: true, text: msg.text, attachment: msg.attachment });
+            return callback({ success: true, text: msg.text, attachment: sanitizeAttachment(msg.attachment) });
         }
       }
       callback({ error: 'Permission denied.' });
-    } catch (err) { console.error('get_deleted_message failed:', err); callback({ error: 'Failed to load deleted message.' }); }
+    } catch (err) {
+      logUnexpectedError(logger, 'get_deleted_message', err);
+      callback({ error: 'Failed to load deleted message.' });
+    }
   });
 
   socket.on('typing', (isTyping) => {
@@ -934,22 +1319,28 @@ io.on('connection', createConnectionHandler());
 
 const PORT = process.env.PORT || 3000;
 
-async function start() {
-  if (MONGO_URI) {
-    await mongoose.connect(MONGO_URI);
-    await seedSystem();
-  }
+async function start({
+  mongoUri = MONGO_URI,
+  mongooseImpl = mongoose,
+  seedSystemFn = seedSystem,
+  serverInstance = server,
+  port = PORT,
+  logger = console
+} = {}) {
+  if (!mongoUri) throw new Error('MONGO_URI is required before server startup.');
+  await mongooseImpl.connect(mongoUri);
+  await seedSystemFn();
   return new Promise(resolve => {
-    server.listen(PORT, () => {
-      console.log(`🚀 Server on port ${PORT}`);
-      resolve(server);
+    serverInstance.listen(port, () => {
+      if (logger && typeof logger.log === 'function') logger.log(`🚀 Server on port ${port}`);
+      resolve(serverInstance);
     });
   });
 }
 
 if (require.main === module) {
   start().catch(err => {
-    console.error('Database startup failed:', err);
+    logUnexpectedError(console, 'startup', err);
     process.exitCode = 1;
   });
 }
@@ -969,9 +1360,12 @@ module.exports = {
   normalizeColor,
   normalizeAvatarUrl,
   isValidAttachment,
+  sanitizeAttachment,
   isValidReaction,
   isValidObjectId,
   neutralizePingTokens,
+  normalizeTransportAddress,
+  createRateLimiter,
   canAccessRoom,
   appendBoundedHistory,
   createReplySnapshot

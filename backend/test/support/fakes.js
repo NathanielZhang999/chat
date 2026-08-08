@@ -39,4 +39,14 @@ function acknowledge() {
   return { callback(result) { value = result; }, value() { return value; } };
 }
 
-module.exports = { FakeSocket, FakeIo, queryResult, acknowledge };
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+module.exports = { FakeSocket, FakeIo, queryResult, acknowledge, deferred };

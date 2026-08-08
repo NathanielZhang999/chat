@@ -50,9 +50,54 @@ test('attachment, reaction, and object-id validators reject unsafe values', () =
 test('client ping tokens become ordinary text before mention resolution', () => {
   assert.equal(
     security.neutralizePingTokens('hello {{PING:everyone|everyone}}'),
-    'hello @everyone'
+    'hello {{ PING:everyone|everyone}}'
   );
-  assert.equal(security.neutralizePingTokens('{{PING:alice|Alice Smith}}'), '@Alice Smith');
+  assert.equal(
+    security.neutralizePingTokens('{{PING:alice|Alice Smith}}'),
+    '{{ PING:alice|Alice Smith}}'
+  );
+});
+
+test('malformed and nested client ping sentinels cannot retain trusted grammar', () => {
+  const inputs = [
+    '{{PING:alice|A{lice}}}',
+    '{{PING:alice|Alice|extra}}',
+    '{{PING:alice|{{PING:bob|Bob}}}}',
+    '{{ping:alice|Alice',
+    '{{PING:alice|Alice}}}'
+  ];
+
+  for (const input of inputs) {
+    const neutralized = security.neutralizePingTokens(input);
+    assert.equal(/\{\{PING:/i.test(neutralized), false, neutralized);
+  }
+});
+
+test('rate limiter evicts the deterministic oldest key when its bounded storage is full', () => {
+  assert.equal(typeof security.createRateLimiter, 'function');
+  let now = 0;
+  const limiter = security.createRateLimiter({
+    maxEntries: 2,
+    maxAttempts: 2,
+    windowMs: 1_000,
+    now: () => now
+  });
+
+  assert.equal(limiter.check('oldest'), true);
+  assert.equal(limiter.check('newer'), true);
+  assert.equal(limiter.check('newest'), true);
+  assert.equal(limiter.check('oldest'), true);
+  assert.equal(limiter.check('oldest'), true);
+  assert.equal(limiter.check('oldest'), false);
+  now = 2_000;
+  assert.equal(limiter.check('newest'), true);
+});
+
+test('transport addresses are canonicalized and bounded independently of forwarded headers', () => {
+  assert.equal(typeof security.normalizeTransportAddress, 'function');
+  assert.equal(security.normalizeTransportAddress(' ::FFFF:127.0.0.1 '), '127.0.0.1');
+  assert.equal(security.normalizeTransportAddress('[::1]'), '::1');
+  assert.equal(security.normalizeTransportAddress('x'.repeat(200)).length, 128);
 });
 
 test('room access preserves global and administrator access only', () => {
@@ -81,4 +126,47 @@ test('history and reply snapshots derive bounded stored data', () => {
     displayname: 'Alice',
     text: 'x'.repeat(100)
   });
+});
+
+test('start fails before listening when MONGO_URI is missing', async () => {
+  const originalListen = security.server.listen;
+  let listened = false;
+  security.server.listen = (_port, callback) => {
+    listened = true;
+    callback();
+  };
+  try {
+    await assert.rejects(
+      security.start({ mongoUri: '' }),
+      /MONGO_URI.*required/i
+    );
+    assert.equal(listened, false);
+  } finally {
+    security.server.listen = originalListen;
+  }
+});
+
+test('start connects and seeds before it begins listening', async () => {
+  const events = [];
+  const fakeServer = {
+    listen(_port, callback) {
+      events.push('listen');
+      callback();
+    }
+  };
+  const originalListen = security.server.listen;
+  security.server.listen = fakeServer.listen.bind(fakeServer);
+  try {
+    await security.start({
+      mongoUri: 'mongodb://database/chat',
+      mongooseImpl: { async connect() { events.push('connect'); } },
+      seedSystemFn: async () => { events.push('seed'); },
+      serverInstance: fakeServer,
+      port: 4321,
+      logger: { log() {} }
+    });
+  } finally {
+    security.server.listen = originalListen;
+  }
+  assert.deepEqual(events, ['connect', 'seed', 'listen']);
 });
