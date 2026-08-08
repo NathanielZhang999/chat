@@ -23,6 +23,14 @@ function loadHelpers() {
   return context.ChatClientHelpers;
 }
 
+test('new users receive the deployed Render backend URL by default', () => {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  assert.match(
+    source,
+    /id="url-input"[^>]*value="https:\/\/chat-backend-iekp\.onrender\.com"/
+  );
+});
+
 test('backend URLs allow only HTTP and HTTPS', () => {
   const helpers = loadHelpers();
   assert.equal(helpers.normalizeBackendUrl('example.com/'), 'https://example.com');
