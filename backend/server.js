@@ -298,10 +298,12 @@ function isCurrentRoomModerator(room, username) {
 
 function canModerateTarget({ serverCode, action, actorUser, targetUser, room }) {
   if (!actorUser || !targetUser || !room || room.code !== serverCode) return false;
+  const normalizedAction = normalizeModerationAction(action);
+  if (!normalizedAction) return false;
   const actorKey = normalizeAccountKey(actorUser.username);
   const targetKey = normalizeAccountKey(targetUser.username);
   if (!actorKey || !targetKey || actorKey === targetKey || PROTECTED_USERNAMES.has(targetKey)) return false;
-  if (serverCode === 'global' && action === 'kick') return false;
+  if (serverCode === 'global' && normalizedAction === 'kick') return false;
   const actorIsAdmin = actorUser.role === 'admin';
   const actorIsRoomMod = serverCode !== 'global' && isCurrentRoomModerator(room, actorUser.username);
   if (!actorIsAdmin && !actorIsRoomMod) return false;

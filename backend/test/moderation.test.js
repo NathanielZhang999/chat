@@ -16,23 +16,34 @@ const { FakeSocket, FakeIo, createMemoryModel, deferred } = require('./support/f
 
 const VALID_MESSAGE_ID = '507f1f77bcf86cd799439011';
 
+function saveableDocument(value) {
+  const document = { ...value };
+  Object.defineProperties(document, {
+    markModified: { value: () => {}, enumerable: false },
+    save: { value: async () => document, enumerable: false }
+  });
+  return document;
+}
+
 function userDocument(overrides = {}) {
-  return {
+  return saveableDocument({
     username: 'Alice', displayName: 'Alice', password: 'hash', role: 'user', servers: ['global'],
     ...overrides
-  };
+  });
 }
 
 function roomDocument(code, overrides = {}) {
-  return {
+  return saveableDocument({
     code, name: code === 'global' ? 'Global Chat' : code, owner: 'Owner', moderators: [],
     autoMod: { blockedKeywords: [], mentionLimit: 8, repeatLimit: 3, repeatWindowSeconds: 30 },
     ...overrides
-  };
+  });
 }
 
 function restrictionDocument(serverCode, username, overrides = {}) {
-  return { serverCode, username: username.normalize('NFKC').trim().toLowerCase(), bannedAt: null, timeoutUntil: null, ...overrides };
+  return saveableDocument({
+    serverCode, username: username.normalize('NFKC').trim().toLowerCase(), bannedAt: null, timeoutUntil: null, ...overrides
+  });
 }
 
 function registerWithModels(seed = {}) {
@@ -88,6 +99,44 @@ test('moderation authority is exact-room and respects the global/private action 
   assert.equal(canModerateTarget({ serverCode: room.code, action: 'ban', actorUser: mod, targetUser: admin, room }), false);
   assert.equal(canModerateTarget({ serverCode: room.code, action: 'ban', actorUser: admin, targetUser: { username: 'SecondAdmin', role: 'admin' }, room }), false);
   assert.equal(canModerateTarget({ serverCode: room.code, action: 'ban', actorUser: admin, targetUser: { username: 'NYZhang1', role: 'user' }, room }), false);
+});
+
+test('moderation authority rejects missing and unsupported actions', () => {
+  const context = {
+    serverCode: 'ABC123',
+    actorUser: { username: 'Admin', role: 'admin' },
+    targetUser: { username: 'Member', role: 'user' },
+    room: { code: 'ABC123', moderators: [] }
+  };
+
+  for (const action of [null, undefined, '', 'suspend', 'erase']) {
+    assert.equal(canModerateTarget({ ...context, action }), false);
+  }
+});
+
+test('moderation fixture documents can be marked and saved directly', async () => {
+  const fixtures = [
+    userDocument(),
+    roomDocument('ABC123'),
+    restrictionDocument('ABC123', 'Alice')
+  ];
+
+  for (const fixture of fixtures) {
+    fixture.label = 'changed';
+    assert.doesNotThrow(() => fixture.markModified('label'));
+    assert.equal(await fixture.save(), fixture);
+    assert.equal(fixture.label, 'changed');
+  }
+});
+
+test('memory model save persists data without storing helper methods', async () => {
+  const UserModel = createMemoryModel([{ username: 'Alice', displayName: 'Alice' }]);
+  const user = await UserModel.findOne({ username: 'Alice' });
+  user.displayName = 'Updated';
+  user.markModified('displayName');
+  await user.save();
+
+  assert.deepEqual(UserModel.rows, [{ username: 'Alice', displayName: 'Updated' }]);
 });
 
 test('multiple account locks normalize, de-duplicate, sort, serialize overlap, and release after rejection', async () => {

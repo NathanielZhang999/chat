@@ -61,12 +61,17 @@ function createMemoryModel(initialRows = []) {
   function documentFor(row) {
     if (!row) return null;
     const document = { ...row };
-    document.markModified = () => {};
-    document.save = async () => {
-      const index = rows.indexOf(row);
-      if (index >= 0) Object.assign(row, document);
-      return document;
-    };
+    Object.defineProperties(document, {
+      markModified: { value: () => {}, enumerable: false },
+      save: {
+        value: async () => {
+          const index = rows.indexOf(row);
+          if (index >= 0) Object.assign(row, document);
+          return document;
+        },
+        enumerable: false
+      }
+    });
     return document;
   }
 
