@@ -429,6 +429,7 @@ function createConnectionHandler({
   socket.joinedServers = [];
   
   let lastMessageTime = 0; 
+  let suppressDisconnectPresence = false;
 
   async function fetchLiveSockets() {
     const fetched = await ioInstance.fetchSockets();
@@ -1147,17 +1148,31 @@ function createConnectionHandler({
           if (oldCode && oldCode !== serverCode) await Promise.resolve(socket.leave(oldCode));
           await Promise.resolve(socket.join(serverCode));
         } catch (err) {
+          let rollbackFailed = false;
           try {
             await Promise.resolve(socket.leave(serverCode));
           } catch (rollbackError) {
+            rollbackFailed = true;
             logUnexpectedError(logger, 'switch_server_target_rollback', rollbackError);
           }
           if (oldCode) {
             try {
               await Promise.resolve(socket.join(oldCode));
             } catch (rollbackError) {
+              rollbackFailed = true;
               logUnexpectedError(logger, 'switch_server_source_rollback', rollbackError);
             }
+          }
+          if (rollbackFailed) {
+            socket.serverCode = null;
+            onlineUsersMap.delete(socket.id);
+            suppressDisconnectPresence = true;
+            try {
+              await Promise.resolve(socket.disconnect(true));
+            } catch (disconnectError) {
+              logUnexpectedError(logger, 'switch_server_rollback_disconnect', disconnectError);
+            }
+            throw err;
           }
           socket.serverCode = oldCode;
           if (session) session.serverCode = cachedServerCode;
@@ -1407,6 +1422,10 @@ function createConnectionHandler({
   });
 
   socket.on('disconnect', () => {
+    if (suppressDisconnectPresence) {
+      onlineUsersMap.delete(socket.id);
+      return;
+    }
     if (socket.username) {
       const session = onlineUsersMap.get(socket.id);
       const serverCode = session?.serverCode;

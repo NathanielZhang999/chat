@@ -613,6 +613,78 @@ for (const scenario of [
   });
 }
 
+for (const scenario of [
+  { compensation: 'target leave', failure: 'synchronous throw' },
+  { compensation: 'target leave', failure: 'rejected promise' },
+  { compensation: 'source join', failure: 'synchronous throw' },
+  { compensation: 'source join', failure: 'rejected promise' }
+]) {
+  test(`room switch disconnects when ${scenario.compensation} compensation has a ${scenario.failure}`, async () => {
+    const events = [];
+    const broadcasts = [];
+    const onlineUsersMap = new Map([['socket-1', {
+      username: 'alice', serverCode: 'OLD123', joinedServers: ['global', 'OLD123', 'ABC123']
+    }]]);
+    const ChatServerModel = { findOne: () => queryResult({ code: 'ABC123', moderators: [] }) };
+    const MessageModel = { find: () => queryResult([]) };
+    const { socket } = register({
+      ChatServerModel,
+      MessageModel,
+      onlineUsersMap,
+      broadcastOnlineUsersFn: code => broadcasts.push(code),
+      logger: { error() {} }
+    });
+    socket.username = 'alice';
+    socket.role = 'user';
+    socket.joinedServers = ['global', 'OLD123', 'ABC123'];
+    socket.serverCode = 'OLD123';
+    socket.joinedRooms.add('OLD123');
+
+    const originalLeave = socket.leave.bind(socket);
+    const originalJoin = socket.join.bind(socket);
+    socket.leave = roomCode => {
+      events.push(`leave:${roomCode}`);
+      if (scenario.compensation === 'target leave' && roomCode === 'ABC123') {
+        if (scenario.failure === 'synchronous throw') throw new Error('target rollback failed');
+        return Promise.reject(new Error('target rollback failed'));
+      }
+      originalLeave(roomCode);
+    };
+    socket.join = roomCode => {
+      events.push(`join:${roomCode}`);
+      if (roomCode === 'ABC123') {
+        originalJoin(roomCode);
+        return Promise.reject(new Error('primary join failed'));
+      }
+      if (scenario.compensation === 'source join' && roomCode === 'OLD123') {
+        if (scenario.failure === 'synchronous throw') throw new Error('source rollback failed');
+        return Promise.reject(new Error('source rollback failed'));
+      }
+      originalJoin(roomCode);
+    };
+    socket.disconnect = force => {
+      events.push(`disconnect:${force}`);
+      socket.joinedRooms.clear();
+      socket.disconnected = force;
+      return socket.handlers.get('disconnect')();
+    };
+
+    const ack = acknowledge();
+    await socket.trigger('switch_server', 'ABC123', ack.callback);
+
+    assert.deepEqual(ack.value(), { error: 'Failed to switch server.' });
+    assert.equal(socket.disconnected, true);
+    assert.equal(socket.serverCode, null);
+    assert.equal(onlineUsersMap.has(socket.id), false);
+    assert.deepEqual([...socket.joinedRooms], []);
+    assert.equal(socket.joinedRooms.has('ABC123'), false);
+    assert.deepEqual(broadcasts, []);
+    assert.deepEqual(events, [
+      'leave:OLD123', 'join:ABC123', 'leave:ABC123', 'join:OLD123', 'disconnect:true'
+    ]);
+  });
+}
+
 test('room switch acknowledges success before broadcasting target presence', async () => {
   const events = [];
   const onlineUsersMap = new Map([['socket-1', {
