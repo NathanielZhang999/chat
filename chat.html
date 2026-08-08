@@ -610,6 +610,41 @@
                     start(target);
                 }
             };
+        },
+
+        isNearScrollEnd(element, threshold = 96) {
+            if (!element) return false;
+            const remaining = element.scrollHeight - element.scrollTop - element.clientHeight;
+            return remaining <= threshold;
+        },
+
+        messageRenderPolicy({ history = false, wasNearBottom = false } = {}) {
+            return {
+                animate: !history,
+                shouldScroll: !history && wasNearBottom,
+                behavior: history ? 'auto' : 'smooth'
+            };
+        },
+
+        createScrollCoordinator(scheduleFrame, getScroller) {
+            let scheduled = false;
+            let pendingBehavior = null;
+
+            return {
+                request(behavior = 'smooth') {
+                    pendingBehavior = pendingBehavior === 'auto' || behavior === 'auto' ? 'auto' : 'smooth';
+                    if (scheduled) return;
+                    scheduled = true;
+                    scheduleFrame(() => {
+                        const requestedBehavior = pendingBehavior;
+                        pendingBehavior = null;
+                        scheduled = false;
+                        const scroller = getScroller();
+                        if (!scroller) return;
+                        scroller.scrollTo({ top: scroller.scrollHeight, behavior: requestedBehavior });
+                    });
+                }
+            };
         }
     };
     globalThis.ChatClientHelpers = ChatClientHelpers;
@@ -707,6 +742,13 @@
     const authBtn = document.getElementById('auth-btn');
     const authError = document.getElementById('auth-error');
     const chatWindow = document.getElementById('chat-window');
+    const scheduleAnimationFrame = window.requestAnimationFrame
+        ? callback => window.requestAnimationFrame(callback)
+        : callback => setTimeout(callback, 0);
+    const chatScrollCoordinator = ChatClientHelpers.createScrollCoordinator(
+        scheduleAnimationFrame,
+        () => chatWindow
+    );
     const msgInput = document.getElementById('msg-input');
     const sendBtn = document.getElementById('send-btn');
     const infoBar = document.getElementById('info-bar');
@@ -1710,11 +1752,15 @@
 
     function loadHistory(msgs) {
         if (!msgs || !Array.isArray(msgs)) return; 
-        msgs.forEach(m => appendMessage(m, m.username === myUsername));
-        setTimeout(() => chatWindow.scrollTo({ top: chatWindow.scrollHeight, behavior: 'smooth' }), 50);
+        msgs.forEach(message => appendMessage(message, message.username === myUsername, { history: true }));
+        chatScrollCoordinator.request('auto');
     }
 
-    function appendMessage(data, isMe) {
+    function appendMessage(data, isMe, { history = false } = {}) {
+        const renderPolicy = ChatClientHelpers.messageRenderPolicy({
+            history,
+            wasNearBottom: ChatClientHelpers.isNearScrollEnd(chatWindow)
+        });
         const wrapper = document.createElement('div');
         wrapper.setAttribute('data-id', data._id); 
         wrapper.setAttribute('data-author', data.username);
@@ -1727,6 +1773,7 @@
 
         if (data.deleted) {
             wrapper.className = 'msg deleted-compact is-deleted';
+            if (!renderPolicy.animate) wrapper.classList.add('no-enter-animation');
             const deletedIcon = ChatClientHelpers.appendTextElement(document, wrapper, 'span', '', '🗑️');
             deletedIcon.style.marginRight = '6px';
             deletedIcon.style.fontSize = '0.9rem';
@@ -1739,10 +1786,13 @@
                 viewTag.onclick = () => viewDeleted(data._id); 
                 wrapper.appendChild(viewTag);
             }
-            chatWindow.appendChild(wrapper); setTimeout(() => chatWindow.scrollTo({ top: chatWindow.scrollHeight, behavior: 'smooth' }), 50); return;
+            chatWindow.appendChild(wrapper);
+            if (renderPolicy.shouldScroll) chatScrollCoordinator.request(renderPolicy.behavior);
+            return;
         }
 
         wrapper.className = `msg`; 
+        if (!renderPolicy.animate) wrapper.classList.add('no-enter-animation');
 
         const avatarDiv = document.createElement('div'); 
         avatarDiv.className = 'msg-avatar';
@@ -1874,12 +1924,14 @@
 
         wrapper.appendChild(avatarDiv); wrapper.appendChild(bodyDiv);
         chatWindow.appendChild(wrapper); 
-        setTimeout(() => chatWindow.scrollTo({ top: chatWindow.scrollHeight, behavior: 'smooth' }), 50); 
+        if (renderPolicy.shouldScroll) chatScrollCoordinator.request(renderPolicy.behavior);
     }
 
     function appendSystemMessage(txt) {
+        const wasNearBottom = ChatClientHelpers.isNearScrollEnd(chatWindow);
         const el = document.createElement('div'); el.className = 'system-msg'; el.textContent = txt;
-        chatWindow.appendChild(el); setTimeout(() => chatWindow.scrollTo({ top: chatWindow.scrollHeight, behavior: 'smooth' }), 50);
+        chatWindow.appendChild(el);
+        if (wasNearBottom) chatScrollCoordinator.request('smooth');
     }
 
     function updateTypingUI() {

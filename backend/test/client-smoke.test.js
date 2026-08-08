@@ -42,6 +42,42 @@ test('client motion policy avoids broad transitions and respects reduced motion'
   assert.match(source, /#chat-window\s*\{[^}]*scroll-behavior:\s*auto/s);
 });
 
+test('scroll policy preserves readers and separates history from live motion', () => {
+  const helpers = loadHelpers();
+  assert.equal(helpers.isNearScrollEnd({ scrollHeight: 1000, scrollTop: 600, clientHeight: 320 }), true);
+  assert.equal(helpers.isNearScrollEnd({ scrollHeight: 1000, scrollTop: 300, clientHeight: 320 }), false);
+
+  assert.deepEqual(
+    { ...helpers.messageRenderPolicy({ history: true, wasNearBottom: true }) },
+    { animate: false, shouldScroll: false, behavior: 'auto' }
+  );
+  assert.deepEqual(
+    { ...helpers.messageRenderPolicy({ history: false, wasNearBottom: true }) },
+    { animate: true, shouldScroll: true, behavior: 'smooth' }
+  );
+  assert.deepEqual(
+    { ...helpers.messageRenderPolicy({ history: false, wasNearBottom: false }) },
+    { animate: true, shouldScroll: false, behavior: 'smooth' }
+  );
+});
+
+test('scroll coordinator coalesces requests and gives instant scroll priority', () => {
+  const helpers = loadHelpers();
+  const frames = [];
+  const calls = [];
+  const scroller = { scrollHeight: 900, scrollTo(options) { calls.push(options); } };
+  const coordinator = helpers.createScrollCoordinator(callback => frames.push(callback), () => scroller);
+
+  coordinator.request('smooth');
+  coordinator.request('smooth');
+  coordinator.request('auto');
+  assert.equal(frames.length, 1);
+  assert.equal(calls.length, 0);
+
+  frames.shift()();
+  assert.deepEqual({ ...calls[0] }, { top: 900, behavior: 'auto' });
+});
+
 test('backend URLs allow only HTTP and HTTPS', () => {
   const helpers = loadHelpers();
   assert.equal(helpers.normalizeBackendUrl('example.com/'), 'https://example.com');
