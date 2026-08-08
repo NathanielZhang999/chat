@@ -1032,75 +1032,69 @@ function createConnectionHandler({
     if (!serverCode) return callback({ error: 'Invalid input format.' });
     if (serverCode === 'global') return callback({ error: 'Cannot delete global.' });
     try {
-      const srv = await ChatServerModel.findOne({ code: serverCode });
-      if (!srv) return callback({ error: 'Server not found.' });
+      const result = await withRoomMutationLock(serverCode, async () => {
+        const currentRoom = await ChatServerModel.findOne({ code: serverCode });
+        if (!currentRoom) return { error: 'Server not found.' };
+        if (socket.role !== 'admin' && currentRoom.owner !== socket.username) return { error: 'Permission denied.' };
 
-      // ONLY Global Admins or the actual Room Creator can completely delete a server
-      if (socket.role === 'admin' || srv.owner === socket.username) {
         const sockets = await fetchLiveSockets();
-        const result = await withRoomMutationLock(serverCode, async () => {
-          const currentRoom = await ChatServerModel.findOne({ code: serverCode });
-          if (!currentRoom) return { error: 'Server not found.' };
-          if (socket.role !== 'admin' && currentRoom.owner !== socket.username) return { error: 'Permission denied.' };
+        await ChatServerModel.deleteOne({ code: serverCode });
 
-          await ChatServerModel.deleteOne({ code: serverCode });
+        let cleanupFailed = false;
+        const affectedSockets = [];
+        for (const live of sockets) {
+          const session = onlineUsersMap.get(live.id);
+          const currentMemberships = Array.isArray(live.joinedServers)
+            ? live.joinedServers
+            : (Array.isArray(session?.joinedServers) ? session.joinedServers : ['global']);
+          const hadMembership = currentMemberships.includes(serverCode);
+          const nextMemberships = currentMemberships.filter(roomCode => roomCode !== serverCode);
+          if (!nextMemberships.includes('global')) nextMemberships.unshift('global');
+          live.joinedServers = [...nextMemberships];
+          if (session) session.joinedServers = [...nextMemberships];
 
-          let cleanupFailed = false;
-          const affectedSockets = [];
-          for (const live of sockets) {
-            const session = onlineUsersMap.get(live.id);
-            const currentMemberships = Array.isArray(live.joinedServers)
-              ? live.joinedServers
-              : (Array.isArray(session?.joinedServers) ? session.joinedServers : ['global']);
-            const hadMembership = currentMemberships.includes(serverCode);
-            const nextMemberships = currentMemberships.filter(roomCode => roomCode !== serverCode);
-            if (!nextMemberships.includes('global')) nextMemberships.unshift('global');
-            live.joinedServers = [...nextMemberships];
-            if (session) session.joinedServers = [...nextMemberships];
+          affectedSockets.push({ live, session, hadMembership, nextMemberships });
+        }
 
-            affectedSockets.push({ live, session, hadMembership, nextMemberships });
-          }
-
-          for (const { live, session, hadMembership, nextMemberships } of affectedSockets) {
-            const activeRoom = live.serverCode || session?.serverCode;
-            cleanupFailed = !(await evictLiveSocket(live, session, serverCode)) || cleanupFailed;
-            if (hadMembership || activeRoom === serverCode) {
-              try {
-                live.emit('room_access_updated', {
-                  username: live.username || session?.username,
-                  joinedServers: [...nextMemberships],
-                  serverCode: live.serverCode || session?.serverCode || 'global'
-                });
-              } catch (err) {
-                cleanupFailed = true;
-                logUnexpectedError(logger, 'delete_server_access_notification', err);
-              }
+        for (const { live, session, hadMembership, nextMemberships } of affectedSockets) {
+          const activeRoom = live.serverCode || session?.serverCode;
+          cleanupFailed = !(await evictLiveSocket(live, session, serverCode)) || cleanupFailed;
+          if (hadMembership || activeRoom === serverCode) {
+            try {
+              live.emit('room_access_updated', {
+                username: live.username || session?.username,
+                joinedServers: [...nextMemberships],
+                serverCode: live.serverCode || session?.serverCode || 'global'
+              });
+            } catch (err) {
+              cleanupFailed = true;
+              logUnexpectedError(logger, 'delete_server_access_notification', err);
             }
           }
+        }
 
-          try {
-            ioInstance.emit('server_deleted', serverCode);
-          } catch (err) {
-            cleanupFailed = true;
-            logUnexpectedError(logger, 'delete_server_notification', err);
-          }
-          try {
-            await MessageModel.deleteMany({ serverCode });
-          } catch (err) {
-            cleanupFailed = true;
-            logUnexpectedError(logger, 'delete_server_message_cleanup', err);
-          }
-          try {
-            await UserModel.updateMany({}, { $pull: { servers: serverCode } });
-          } catch (err) {
-            cleanupFailed = true;
-            logUnexpectedError(logger, 'delete_server_membership_cleanup', err);
-          }
-          broadcastOnlineUsersFn('global');
-          return cleanupFailed ? { error: 'Deletion failed.' } : { success: true };
-        });
-        callback(result);
-      } else { callback({ error: 'Permission denied.' }); }
+        try {
+          ioInstance.emit('server_deleted', serverCode);
+        } catch (err) {
+          cleanupFailed = true;
+          logUnexpectedError(logger, 'delete_server_notification', err);
+        }
+        try {
+          await MessageModel.deleteMany({ serverCode });
+        } catch (err) {
+          cleanupFailed = true;
+          logUnexpectedError(logger, 'delete_server_message_cleanup', err);
+        }
+        try {
+          await UserModel.updateMany({}, { $pull: { servers: serverCode } });
+        } catch (err) {
+          cleanupFailed = true;
+          logUnexpectedError(logger, 'delete_server_membership_cleanup', err);
+        }
+        broadcastOnlineUsersFn('global');
+        return cleanupFailed ? { error: 'Deletion failed.' } : { success: true };
+      });
+      callback(result);
     } catch (err) {
       logUnexpectedError(logger, 'delete_server', err);
       callback({ error: 'Deletion failed.' });
@@ -1139,25 +1133,30 @@ function createConnectionHandler({
       return callback({ error: 'Failed to switch server.' });
     }
 
+    let result;
     try {
-      const currentRoom = await ChatServerModel.findOne({ code: serverCode });
-      if (!currentRoom) return callback({ error: 'Server not found.' });
-      if (!canAccessRoom(socket, serverCode)) return callback({ error: 'Permission denied.' });
+      result = await withRoomMutationLock(serverCode, async () => {
+        const currentRoom = await ChatServerModel.findOne({ code: serverCode });
+        if (!currentRoom) return { error: 'Server not found.' };
+        if (!canAccessRoom(socket, serverCode)) return { error: 'Permission denied.' };
+
+        const oldCode = socket.serverCode;
+        if (oldCode && oldCode !== serverCode) await Promise.resolve(socket.leave(oldCode));
+        socket.serverCode = serverCode;
+        await Promise.resolve(socket.join(serverCode));
+        if (onlineUsersMap.has(socket.id)) onlineUsersMap.get(socket.id).serverCode = serverCode;
+        return { success: true, oldCode };
+      });
     } catch (err) {
       logUnexpectedError(logger, 'switch_server_recheck', err);
       return callback({ error: 'Failed to switch server.' });
     }
-
-    const oldCode = socket.serverCode;
-    if (oldCode && oldCode !== serverCode) socket.leave(oldCode);
-    socket.serverCode = serverCode;
-    socket.join(serverCode);
-    if (onlineUsersMap.has(socket.id)) onlineUsersMap.get(socket.id).serverCode = serverCode;
+    if (result.error) return callback(result);
 
     callback({ history: safeHistory, roomRole });
 
     const broadcastCodes = [];
-    if (oldCode && oldCode !== serverCode) broadcastCodes.push(oldCode);
+    if (result.oldCode && result.oldCode !== serverCode) broadcastCodes.push(result.oldCode);
     broadcastCodes.push(serverCode, 'global');
     [...new Set(broadcastCodes)].forEach(broadcastCode => {
       try {

@@ -1002,6 +1002,206 @@ test('room deletion serializes against an in-flight membership join', async () =
   assert.deepEqual(deleteAck.value(), { success: true });
 });
 
+test('deletion snapshots after a queued switch commits', async () => {
+  const mutationEntered = deferred();
+  const historyEntered = deferred();
+  const historyPrepared = deferred();
+  const releaseMutation = deferred();
+  const deletionFinished = deferred();
+  const order = [];
+  const state = { roomExists: true, mutationReleased: false, roomReads: 0 };
+  const room = { code: 'ABC123', owner: 'alice', moderators: [] };
+  const ioInstance = new FakeIo();
+  ioInstance.fetchSockets = async () => {
+    order.push('delete:fetchSockets');
+    return ioInstance.sockets;
+  };
+  const onlineUsersMap = new Map();
+  const ChatServerModel = {
+    async findOne() {
+      state.roomReads += 1;
+      if (state.roomReads === 3 && !state.mutationReleased) {
+        await deletionFinished.promise;
+        return room;
+      }
+      return state.roomExists ? room : null;
+    },
+    async deleteOne() { state.roomExists = false; }
+  };
+  const MessageModel = {
+    async create(data) {
+      mutationEntered.resolve();
+      await releaseMutation.promise;
+      return { _id: 'message-1', ...data };
+    },
+    find() {
+      return {
+        sort() { return this; },
+        limit() { return this; },
+        lean() {
+          historyEntered.resolve();
+          return historyPrepared.promise;
+        }
+      };
+    },
+    async deleteMany() {}
+  };
+  const UserModel = {
+    async findOne() { return { username: 'alice', role: 'admin', servers: ['global', 'ABC123'] }; },
+    async updateMany() { deletionFinished.resolve(); }
+  };
+  const shared = {
+    ioInstance,
+    onlineUsersMap,
+    ChatServerModel,
+    MessageModel,
+    UserModel,
+    getRoomRoleFn: async () => 'user',
+    resolvePingsFn: async text => text,
+    broadcastOnlineUsersFn: async () => {},
+    logger: { error() {} }
+  };
+  const holder = registerSharedSocket(shared, 'socket-holder');
+  holder.username = 'alice';
+  holder.displayName = 'Alice';
+  holder.role = 'admin';
+  holder.serverCode = 'ABC123';
+  holder.joinedServers = ['global', 'ABC123'];
+  holder.joinedRooms.add('ABC123');
+  const late = registerSharedSocket(shared, 'socket-late');
+  late.username = 'bob';
+  late.displayName = 'Bob';
+  late.role = 'admin';
+  late.serverCode = 'global';
+  late.joinedServers = ['global'];
+  late.joinedRooms.add('global');
+  const originalLateJoin = late.join.bind(late);
+  late.join = roomCode => {
+    if (roomCode === 'ABC123') order.push('late:join:ABC123');
+    originalLateJoin(roomCode);
+  };
+  const deleter = registerSharedSocket(shared, 'socket-deleter');
+  deleter.username = 'alice';
+  deleter.role = 'admin';
+  deleter.serverCode = 'global';
+  deleter.joinedServers = ['global'];
+  deleter.joinedRooms.add('global');
+  for (const live of [holder, late, deleter]) {
+    onlineUsersMap.set(live.id, {
+      username: live.username,
+      role: live.role,
+      serverCode: live.serverCode,
+      joinedServers: [...live.joinedServers]
+    });
+  }
+  ioInstance.sockets = [holder, late, deleter];
+
+  const mutationPending = holder.trigger('chat_message', { text: 'held mutation' });
+  await mutationEntered.promise;
+  const switchAck = acknowledge();
+  const switchPending = late.trigger('switch_server', 'ABC123', switchAck.callback);
+  await historyEntered.promise;
+  historyPrepared.resolve([]);
+  await Promise.resolve();
+  await Promise.resolve();
+  const deleteAck = acknowledge();
+  const deletePending = deleter.trigger('delete_server', 'ABC123', deleteAck.callback);
+  await Promise.resolve();
+  await Promise.resolve();
+  state.mutationReleased = true;
+  releaseMutation.resolve();
+  await mutationPending;
+  await Promise.all([switchPending, deletePending]);
+
+  assert.ok(order.indexOf('late:join:ABC123') < order.indexOf('delete:fetchSockets'));
+  assert.deepEqual(deleteAck.value(), { success: true });
+  assert.equal(late.serverCode, 'global');
+  assert.equal(onlineUsersMap.get(late.id).serverCode, 'global');
+  assert.equal(late.joinedRooms.has('ABC123'), false);
+  assert.equal(late.joinedRooms.has('global'), true);
+  assert.equal(late.joinedServers.includes('ABC123'), false);
+  assert.equal(onlineUsersMap.get(late.id).joinedServers.includes('ABC123'), false);
+});
+
+test('a switch waiting behind deletion cannot join the deleted room', async () => {
+  const deleteEntered = deferred();
+  const historyEntered = deferred();
+  const historyPrepared = deferred();
+  const releaseDelete = deferred();
+  const state = { roomExists: true };
+  const room = { code: 'ABC123', owner: 'alice', moderators: [] };
+  const ioInstance = new FakeIo();
+  const onlineUsersMap = new Map();
+  const ChatServerModel = {
+    async findOne() { return state.roomExists ? room : null; },
+    async deleteOne() {
+      deleteEntered.resolve();
+      await releaseDelete.promise;
+      state.roomExists = false;
+    }
+  };
+  const MessageModel = {
+    find() {
+      return {
+        sort() { return this; },
+        limit() { return this; },
+        lean() {
+          historyEntered.resolve();
+          return historyPrepared.promise;
+        }
+      };
+    },
+    async deleteMany() {}
+  };
+  const shared = {
+    ioInstance,
+    onlineUsersMap,
+    ChatServerModel,
+    MessageModel,
+    UserModel: { async updateMany() {} },
+    broadcastOnlineUsersFn: async () => {},
+    getRoomRoleFn: async () => 'user',
+    logger: { error() {} }
+  };
+  const deleter = registerSharedSocket(shared, 'socket-deleter');
+  deleter.username = 'alice';
+  deleter.role = 'admin';
+  deleter.serverCode = 'global';
+  deleter.joinedServers = ['global'];
+  deleter.joinedRooms.add('global');
+  ioInstance.sockets = [deleter];
+  const switcher = registerSharedSocket(shared, 'socket-switcher');
+  switcher.username = 'bob';
+  switcher.role = 'user';
+  switcher.serverCode = 'OLD123';
+  switcher.joinedServers = ['global', 'OLD123', 'ABC123'];
+  switcher.joinedRooms.add('OLD123');
+  onlineUsersMap.set(switcher.id, {
+    username: 'bob', role: 'user', serverCode: 'OLD123',
+    joinedServers: ['global', 'OLD123', 'ABC123']
+  });
+
+  const deleteAck = acknowledge();
+  const deletePending = deleter.trigger('delete_server', 'ABC123', deleteAck.callback);
+  await deleteEntered.promise;
+  const switchAck = acknowledge();
+  const switchPending = switcher.trigger('switch_server', 'ABC123', switchAck.callback);
+  await historyEntered.promise;
+  historyPrepared.resolve([]);
+  await Promise.resolve();
+  await Promise.resolve();
+  releaseDelete.resolve();
+  await Promise.all([deletePending, switchPending]);
+
+  assert.deepEqual(deleteAck.value(), { success: true });
+  assert.deepEqual(switchAck.value(), { error: 'Server not found.' });
+  assert.equal(switcher.serverCode, 'OLD123');
+  assert.equal(onlineUsersMap.get(switcher.id).serverCode, 'OLD123');
+  assert.equal(switcher.joinedRooms.has('OLD123'), true);
+  assert.equal(switcher.joinedRooms.has('ABC123'), false);
+  assert.deepEqual(switcher.leftRooms, []);
+});
+
 test('room deletion clears every session cache before awaiting transport eviction', async () => {
   const firstLeaveStarted = deferred();
   const releaseFirstLeave = deferred();
