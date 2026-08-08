@@ -31,6 +31,15 @@ test('new users receive the deployed Render backend URL by default', () => {
   );
 });
 
+test('client motion policy avoids broad transitions and respects reduced motion', () => {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  assert.doesNotMatch(source, /transition:\s*all\b/);
+  assert.match(source, /--ease-standard:\s*cubic-bezier\(0\.2,\s*0\.8,\s*0\.2,\s*1\)/);
+  assert.match(source, /@media\s*\(prefers-reduced-motion:\s*reduce\)/);
+  assert.match(source, /\.no-enter-animation\s*\{[^}]*animation:\s*none/s);
+  assert.match(source, /#chat-window\s*\{[^}]*scroll-behavior:\s*auto/s);
+});
+
 test('backend URLs allow only HTTP and HTTPS', () => {
   const helpers = loadHelpers();
   assert.equal(helpers.normalizeBackendUrl('example.com/'), 'https://example.com');
