@@ -351,6 +351,43 @@ test('timeout blocks send edit reaction and typing but allows own delete', async
   assert.equal(setup.message.deleted, true);
 });
 
+test('timed-out room moderator cannot delete another user message', async () => {
+  const message = saveableDocument({
+    _id: VALID_MESSAGE_ID,
+    serverCode: 'ABC123',
+    username: 'Bob',
+    displayName: 'Bob',
+    role: 'user',
+    roomRole: 'user',
+    text: 'belongs to Bob',
+    history: [],
+    reactions: {},
+    deleted: false
+  });
+  const setup = registerWithModels({
+    user: userDocument({ username: 'Alice', servers: ['global', 'ABC123'] }),
+    rooms: [roomDocument('global'), roomDocument('ABC123', { moderators: ['Alice'] })],
+    restrictions: [restrictionDocument('ABC123', 'alice', {
+      timeoutUntil: new Date(Date.now() + 60_000)
+    })],
+    getRoomRoleFn: async () => 'mod'
+  });
+  Object.assign(setup.socket, {
+    username: 'Alice',
+    displayName: 'Alice',
+    role: 'user',
+    serverCode: 'ABC123',
+    joinedServers: ['global', 'ABC123']
+  });
+  setup.socket.joinedRooms.add('ABC123');
+  setup.MessageModel.findById = async () => message;
+
+  await setup.socket.trigger('delete_message', VALID_MESSAGE_ID);
+
+  assert.equal(message.deleted, false);
+  assert.equal(setup.ioInstance.outbound.some(item => item.event === 'message_deleted'), false);
+});
+
 test('join_server rejects a ban committed before its account and room critical section', async () => {
   const setup = authenticatedRoomSocket({ joinedServers: ['global'] });
   setup.ChatServerModel.rows.push(roomDocument('ABC123'));

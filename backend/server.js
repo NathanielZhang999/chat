@@ -1651,6 +1651,7 @@ function createConnectionHandler({
             username: socket.username, serverCode: msg.serverCode
           });
           if (msg.deleted || !access.allowed || !canAccessRoom(socket, msg.serverCode)) return;
+          if (access.restriction.timedOut && msg.username !== socket.username) return;
           const roomRole = await getRoomRoleFn(msg.serverCode, socket.username);
 
           // Sender, SysAdmin, or RoomMod can delete it
