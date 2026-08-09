@@ -11,6 +11,9 @@ const {
   safeMessageForViewer,
   createRateLimiter,
   createMessageSearchRateLimiter,
+  createRoomSearchGate,
+  loadBoundedMessagePage,
+  HISTORY_RESPONSE_LIMITS,
   MessageSchema,
   decodeCursor
 } = require('../server');
@@ -187,6 +190,7 @@ const matchingSearchRow = {
   color: '#123456',
   avatarUrl: '',
   text: 'literal a+b match',
+  searchText: 'literal a+b match',
   attachment: 'data:image/png;base64,AAAA',
   replyTo: { id: '507f1f77bcf86cd799439012', displayname: 'Bob', text: 'private reply' },
   reactions: { '👍': ['bob'] },
@@ -204,9 +208,68 @@ function boundedSearchQuery(rows, observed = {}) {
     select(value) { observed.select = value; return this; },
     sort(value) { observed.sort = value; return this; },
     limit(value) { observed.limit = value; maximum = value; return this; },
+    maxTimeMS(value) { observed.maxTimeMS = value; return this; },
     async lean() { return rows.slice(0, maximum); }
   };
 }
+
+test('history pages never materialize bulk attachment bodies and stay within byte budgets', async () => {
+  const oversizedAttachment = `data:image/png;base64,${'A'.repeat(8_000_000 - 22)}`;
+  const rows = Array.from({ length: 51 }, (_, index) => ({
+    _id: (index + 1).toString(16).padStart(24, '0'),
+    serverCode: 'ABC123', username: 'alice', displayName: 'Alice',
+    role: 'user', roomRole: 'user', color: '', avatarUrl: '',
+    text: 'x'.repeat(2_000), attachment: oversizedAttachment,
+    replyTo: null, reactions: {}, edited: false, deleted: false,
+    history: [{ text: 'legacy history must not load' }],
+    timestamp: new Date(1_800_000_000_000 - index)
+  }));
+  const smallAttachment = `data:image/png;base64,${'A'.repeat(200_000)}`;
+  const observed = { select: null, aggregate: null };
+  const MessageModel = {
+    find() {
+      let projected = false;
+      return {
+        select(value) { observed.select = value; projected = value?.attachment === 0; return this; },
+        sort() { return this; },
+        limit() { return this; },
+        async lean() {
+          assert.equal(projected, true, 'attachment exclusion happens in Mongo before materialization');
+          return rows.map(({ attachment, history, ...row }) => row);
+        }
+      };
+    },
+    async aggregate(pipeline) {
+      observed.aggregate = pipeline;
+      return rows.slice(0, 4).map(row => ({ _id: row._id, attachment: smallAttachment }));
+    }
+  };
+
+  const page = await loadBoundedMessagePage({
+    MessageModel,
+    filter: { serverCode: 'ABC123' },
+    limit: 50,
+    viewer: { username: 'alice', role: 'user', roomRole: 'user' }
+  });
+
+  assert.equal(observed.select.attachment, 0);
+  assert.equal(observed.select.history, 0);
+  assert.equal(page.messages.length, 50);
+  assert.ok(page.nextCursor);
+  assert.ok(
+    Buffer.byteLength(JSON.stringify(page.messages), 'utf8') <= HISTORY_RESPONSE_LIMITS.pageBytes
+  );
+  assert.ok(page.messages.filter(message => message.attachment).length <=
+    HISTORY_RESPONSE_LIMITS.attachmentsPerPage);
+  for (const message of page.messages) {
+    assert.ok(Buffer.byteLength(message.attachment || '', 'utf8') <=
+      HISTORY_RESPONSE_LIMITS.attachmentBytes);
+    assert.equal('history' in message, false);
+  }
+  const finalLimit = observed.aggregate.find(stage => stage.$limit)?.$limit;
+  assert.equal(finalLimit, HISTORY_RESPONSE_LIMITS.attachmentsPerPage);
+  assert.equal(JSON.stringify(observed.aggregate).includes('8000000'), false);
+});
 
 function registerMessages(overrides = {}) {
   const socket = new FakeSocket();
@@ -231,12 +294,14 @@ function registerMessages(overrides = {}) {
   return { socket, ioInstance };
 }
 
-function registerPrivilegedReadRevocationRace({ revocation, message }) {
+function registerPrivilegedReadRevocationRace({ revocation, message, stage = 'preflight' }) {
   const lookupStarted = deferred();
   const releaseLookup = deferred();
   const ioInstance = new FakeIo();
   const onlineUsersMap = new Map();
   const readerIsAdmin = revocation === 'demotion';
+  let lookups = 0;
+  const projections = [];
   const UserModel = createMemoryModel([
     {
       username: 'admin', displayName: 'Admin', role: 'admin',
@@ -262,8 +327,13 @@ function registerPrivilegedReadRevocationRace({ revocation, message }) {
     ChatServerModel,
     RoomRestrictionModel,
     MessageModel: {
-      async findById(id) {
+      async findById(id, projection) {
         assert.equal(id, message._id);
+        lookups += 1;
+        projections.push(projection);
+        if (stage === 'post-access' && lookups === 1) {
+          return { _id: message._id, serverCode: message.serverCode };
+        }
         lookupStarted.resolve();
         await releaseLookup.promise;
         return message;
@@ -312,17 +382,27 @@ function registerPrivilegedReadRevocationRace({ revocation, message }) {
     reader,
     lookupStarted,
     releaseLookup,
-    async completeRevocation() {
+    lookups: () => lookups,
+    projections,
+    beginRevocation() {
       const ack = acknowledge();
+      let pending;
       if (revocation === 'ban') {
-        await actor.trigger('moderate_user', {
+        pending = actor.trigger('moderate_user', {
           serverCode: 'ABC123', targetUser: 'alice', action: 'ban', reason: 'matrix ban'
         }, ack.callback);
-      } else {
-        await actor.trigger('manage_role', {
+      } else if (revocation === 'demotion') {
+        pending = actor.trigger('manage_role', {
           targetUser: 'alice', action: 'demote_global_admin'
         }, ack.callback);
+      } else {
+        pending = reader.trigger('leave_server', 'ABC123', ack.callback);
       }
+      return { ack, pending };
+    },
+    async completeRevocation() {
+      const { ack, pending } = this.beginRevocation();
+      await pending;
       assert.deepEqual(ack.value(), { success: true });
     }
   };
@@ -355,10 +435,11 @@ test('search_messages escapes substring input and isolates the active room', asy
     { serverCode: 'ABC123' },
     { deleted: { $ne: true } }
   ]);
-  assert.equal(observedFilter.$and[2].text.source, 'a\\+b');
-  assert.equal(observedFilter.$and[2].text.flags, 'i');
+  assert.equal(observedFilter.$and[2].searchText.source, 'a\\+b');
+  assert.equal(observedFilter.$and[2].searchText.flags, 'i');
   assert.deepEqual(observedQuery.sort, { timestamp: -1, _id: -1 });
   assert.equal(observedQuery.limit, 20);
+  assert.ok(observedQuery.maxTimeMS > 0 && observedQuery.maxTimeMS <= 2_000);
   assert.deepEqual(observedQuery.select, {
     _id: 1,
     serverCode: 1,
@@ -408,6 +489,25 @@ test('search_messages excludes deleted rows before matching current text or hist
   assert.equal(JSON.stringify(observedFilter).includes('history'), false);
 });
 
+test('search_messages matches normalized stored text across canonical Unicode forms', async () => {
+  const row = {
+    ...matchingSearchRow,
+    _id: '507f1f77bcf86cd799439099',
+    text: 'cafe\u0301 and ＡＢ',
+    searchText: 'café and AB'
+  };
+  const { socket } = registerMessages({ MessageModel: createMemoryModel([row]) });
+  authenticate(socket, { serverCode: 'ABC123', joinedServers: ['global', 'ABC123'] });
+
+  for (const [requestId, query] of [[1, 'cafe\u0301'], [2, 'ａｂ']]) {
+    const ack = acknowledge();
+    await socket.trigger('search_messages', {
+      serverCode: 'ABC123', clientContextId: 4, query, requestId
+    }, ack.callback);
+    assert.deepEqual(ack.value().results.map(result => result._id), [row._id]);
+  }
+});
+
 test('search_messages identifies missing and null legacy Global rows with the active room code', async () => {
   const missingGlobalRow = { ...matchingSearchRow, _id: 'missing-global-id' };
   delete missingGlobalRow.serverCode;
@@ -445,7 +545,7 @@ test('search_messages validates plain payloads, active room, contexts, request I
     MessageModel: {
       find(filter) {
         queries += 1;
-        observedPatterns.push(filter.$and[2].text.source);
+        observedPatterns.push(filter.$and[2].searchText.source);
         return boundedSearchQuery([]);
       }
     }
@@ -716,6 +816,155 @@ test('search_messages logs only generic error metadata without query or message 
   assert.equal(JSON.stringify(logged).includes(secretText), false);
 });
 
+test('a worst-case search is deadline-bounded and queued searches cannot overtake a room mutation', async () => {
+  const firstQueryStarted = deferred();
+  const releaseFirstQuery = deferred();
+  const events = [];
+  const deadlines = [];
+  let searchQueries = 0;
+  const MessageModel = {
+    find() {
+      searchQueries += 1;
+      const queryNumber = searchQueries;
+      return {
+        select() { return this; },
+        sort() { return this; },
+        limit() { return this; },
+        maxTimeMS(value) { deadlines.push(value); return this; },
+        async lean() {
+          events.push(`search:${queryNumber}:start`);
+          if (queryNumber === 1) {
+            firstQueryStarted.resolve();
+            await releaseFirstQuery.promise;
+          }
+          events.push(`search:${queryNumber}:end`);
+          return [];
+        }
+      };
+    },
+    async create(value) {
+      events.push('mutation:create');
+      return { ...value, _id: '507f1f77bcf86cd799439088', timestamp: new Date() };
+    }
+  };
+  const UserModel = createMemoryModel([
+    { username: 'alice', role: 'user', servers: ['global', 'ABC123'] },
+    { username: 'bob', role: 'user', servers: ['global', 'ABC123'] },
+    { username: 'charlie', role: 'user', servers: ['global', 'ABC123'] }
+  ]);
+  const ChatServerModel = createMemoryModel([
+    { code: 'global', owner: 'System', moderators: [] },
+    { code: 'ABC123', owner: 'owner', moderators: [] }
+  ]);
+  const shared = {
+    ioInstance: new FakeIo(),
+    UserModel,
+    ChatServerModel,
+    RoomRestrictionModel: createMemoryModel([]),
+    MessageModel,
+    onlineUsersMap: new Map(),
+    broadcastOnlineUsersFn: async () => {},
+    getRoomRoleFn: async () => 'user',
+    resolvePingsFn: async text => text,
+    searchRateLimiter: { check() { return true; } },
+    searchGate: createRoomSearchGate({ minStartIntervalMs: 0 }),
+    autoModTracker: createAutoModTracker(),
+    logger: { error() {} }
+  };
+  const socketFor = username => {
+    const socket = new FakeSocket();
+    socket.id = `socket-${username}`;
+    createConnectionHandler(shared)(socket);
+    Object.assign(socket, {
+      username, displayName: username, role: 'user',
+      serverCode: 'ABC123', joinedServers: ['global', 'ABC123']
+    });
+    socket.joinedRooms.add('ABC123');
+    return socket;
+  };
+  const alice = socketFor('alice');
+  const bob = socketFor('bob');
+  const charlie = socketFor('charlie');
+
+  const firstAck = acknowledge();
+  const first = alice.trigger('search_messages', {
+    serverCode: 'ABC123', clientContextId: 1, query: 'no match', requestId: 1
+  }, firstAck.callback);
+  await firstQueryStarted.promise;
+
+  const mutation = bob.trigger('chat_message', {
+    serverCode: 'ABC123', clientContextId: 1, text: 'mutation waits fairly'
+  });
+  await new Promise(resolve => setImmediate(resolve));
+  const secondAck = acknowledge();
+  const second = charlie.trigger('search_messages', {
+    serverCode: 'ABC123', clientContextId: 1, query: 'also absent', requestId: 1
+  }, secondAck.callback);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(searchQueries, 1, 'the second search has not entered the room-lock queue');
+
+  releaseFirstQuery.resolve();
+  await Promise.all([first, mutation, second]);
+  assert.deepEqual(events, [
+    'search:1:start', 'search:1:end', 'mutation:create', 'search:2:start', 'search:2:end'
+  ]);
+  assert.equal(deadlines.length, 2);
+  assert.ok(deadlines.every(value => value > 0 && value <= 2_000));
+  assert.deepEqual(firstAck.value().results, []);
+  assert.deepEqual(secondAck.value().results, []);
+});
+
+test('same-account search bursts enter the bounded room gate before waiting on account state', async () => {
+  const firstQueryStarted = deferred();
+  const releaseFirstQuery = deferred();
+  let searchQueries = 0;
+  const MessageModel = {
+    find() {
+      searchQueries += 1;
+      const queryNumber = searchQueries;
+      return {
+        select() { return this; },
+        sort() { return this; },
+        limit() { return this; },
+        maxTimeMS() { return this; },
+        async lean() {
+          if (queryNumber === 1) {
+            firstQueryStarted.resolve();
+            await releaseFirstQuery.promise;
+          }
+          return [];
+        }
+      };
+    }
+  };
+  const gate = createRoomSearchGate({ maxPendingPerRoom: 2, minStartIntervalMs: 0 });
+  const { socket } = registerMessages({
+    MessageModel,
+    searchRateLimiter: { check() { return true; } },
+    searchGate: gate
+  });
+  authenticate(socket, { serverCode: 'ABC123', joinedServers: ['global', 'ABC123'] });
+
+  const acknowledgements = Array.from({ length: 4 }, acknowledge);
+  const requests = acknowledgements.map((ack, index) => socket.trigger('search_messages', {
+    serverCode: 'ABC123', clientContextId: 1, query: 'no match', requestId: index + 1
+  }, ack.callback));
+  await firstQueryStarted.promise;
+  await new Promise(resolve => setImmediate(resolve));
+  const fourthSettledWhileFirstBlocked = await Promise.race([
+    requests[3].then(() => true),
+    new Promise(resolve => setImmediate(() => resolve(false)))
+  ]);
+
+  releaseFirstQuery.resolve();
+  await Promise.all(requests);
+  assert.equal(fourthSettledWhileFirstBlocked, true,
+    'overflow is rejected at admission instead of hiding behind the account lock');
+  assert.deepEqual(acknowledgements[3].value(), { error: 'Search busy. Try again.' });
+  assert.equal(searchQueries, 3, 'one in-flight and two pending searches reach Mongo');
+  assert.deepEqual(gate.status('ABC123'), { inFlight: 0, pending: 0 });
+});
+
 function authenticate(socket, { serverCode = 'global', joinedServers = ['global'] } = {}) {
   socket.username = 'alice';
   socket.displayName = 'Alice';
@@ -750,6 +999,7 @@ test('editing emits only to the active stored message room', async () => {
   await socket.trigger('edit_message', { id: message._id, text: 'after' });
   assert.equal(ioInstance.outbound.at(-1).room, 'ABC123');
   assert.equal(ioInstance.outbound.at(-1).event, 'message_edited');
+  assert.equal(message.searchText, 'after');
 });
 
 test('message reply snapshot comes from the stored same-room message', async () => {
@@ -776,6 +1026,7 @@ test('message reply snapshot comes from the stored same-room message', async () 
     displayname: 'Bob',
     text: 'trusted stored text'
   });
+  assert.equal(created.searchText, 'reply');
 });
 
 test('chat message is rejected when its active room changes while mention resolution is pending', async () => {
@@ -1032,6 +1283,9 @@ test('room history strips unsafe legacy attachments before acknowledgement', asy
           limit() { return this; },
           async lean() { return history; }
         };
+      },
+      async aggregate() {
+        return history.map(message => ({ _id: message._id, attachment: message.attachment }));
       }
     }
   });
@@ -1113,6 +1367,63 @@ test('complete message read policy matrix makes completed detail revocations win
   }
 });
 
+test('privileged detail reads linearize post-access ban, membership, and demotion races', async t => {
+  const cases = [];
+  for (const event of ['get_edit_history', 'get_deleted_message']) {
+    for (const revocation of ['ban', 'leave', 'demotion']) {
+      cases.push({ event, revocation });
+    }
+  }
+
+  for (const { event, revocation } of cases) {
+    await t.test(`${event} before queued ${revocation}`, async () => {
+      const message = event === 'get_edit_history'
+        ? {
+            _id: `507f1f77bcf86cd7994391${String(cases.findIndex(item =>
+              item.event === event && item.revocation === revocation) + 30).padStart(2, '0')}`,
+            serverCode: 'ABC123', username: 'bob',
+            history: [{ text: `${revocation} history value` }], deleted: false
+          }
+        : {
+            _id: `507f1f77bcf86cd7994391${String(cases.findIndex(item =>
+              item.event === event && item.revocation === revocation) + 40).padStart(2, '0')}`,
+            serverCode: 'ABC123', username: 'bob',
+            text: `${revocation} deleted value`, attachment: null, deleted: true
+          };
+      const race = registerPrivilegedReadRevocationRace({
+        revocation, message, stage: 'post-access'
+      });
+      const readAck = acknowledge();
+      const readPending = race.reader.trigger(event, message._id, readAck.callback);
+      const reachedLockedLookup = await Promise.race([
+        race.lookupStarted.promise.then(() => true),
+        readPending.then(() => false)
+      ]);
+      assert.equal(reachedLockedLookup, true,
+        'the canonical-room preflight is followed by a locked message re-fetch');
+      assert.equal(race.lookups(), 2);
+      assert.deepEqual(race.projections[0], { _id: 1, serverCode: 1 });
+
+      const revoking = race.beginRevocation();
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(revoking.ack.value(), undefined,
+        'a post-access revocation cannot commit inside the read authorization boundary');
+
+      race.releaseLookup.resolve();
+      await readPending;
+      if (event === 'get_edit_history') {
+        assert.deepEqual(readAck.value(), { success: true, history: message.history });
+      } else {
+        assert.deepEqual(readAck.value(), {
+          success: true, text: message.text, attachment: null
+        });
+      }
+      await revoking.pending;
+      assert.deepEqual(revoking.ack.value(), { success: true });
+    });
+  }
+});
+
 test('complete message read policy matrix allows privileged reads during active timeouts', async t => {
   const messages = {
     get_edit_history: {
@@ -1129,6 +1440,9 @@ test('complete message read policy matrix allows privileged reads during active 
     await t.test(event, async () => {
       const { socket } = registerMessages({
         MessageModel: { async findById() { return message; } },
+        ChatServerModel: {
+          async findOne(query) { return { code: query.code, moderators: ['alice'] }; }
+        },
         RoomRestrictionModel: {
           async findOne() {
             return { bannedAt: null, timeoutUntil: new Date(Date.now() + 60_000) };

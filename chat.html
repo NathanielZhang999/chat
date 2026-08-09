@@ -331,6 +331,35 @@
         #sm-join-ui.active, #sm-create-ui.active { display: block; animation: fadePop var(--motion-base) var(--ease-standard) forwards; }
         .no-enter-animation { animation: none !important; }
 
+        @media (max-width: 480px) {
+          header {
+            height: auto;
+            min-height: 50px;
+            padding: 5px 8px;
+            flex-direction: column;
+            align-items: stretch;
+            justify-content: center;
+            gap: 4px;
+          }
+          #server-title {
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+          }
+          .header-actions {
+            width: 100%;
+            min-width: 0;
+            flex-wrap: nowrap;
+            overflow-x: auto;
+            overflow-y: hidden;
+            padding-bottom: 2px;
+            scrollbar-width: thin;
+            overscroll-behavior-x: contain;
+          }
+          .header-btn { flex: 0 0 auto; padding: 6px 10px; }
+        }
+
         @media (prefers-reduced-motion: reduce) {
           *, *::before, *::after {
             animation-duration: 0.01ms !important;
@@ -450,10 +479,10 @@
         </div>
     </div>
 
-    <div id="message-search-modal" class="modal">
+    <div id="message-search-modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="message-search-title" aria-hidden="true">
         <div class="modal-box" style="max-width: 560px;">
             <button class="close-btn" id="message-search-x" type="button" aria-label="Close message search">&times;</button>
-            <h2>Search Messages</h2>
+            <h2 id="message-search-title">Search Messages</h2>
             <form id="message-search-form" class="message-search-form">
                 <input type="text" id="message-search-input" class="text-input" maxlength="80" autocomplete="off" aria-label="Search the current room" placeholder="Search this room">
                 <button type="submit" id="message-search-submit" class="btn-primary">Search</button>
@@ -1933,6 +1962,7 @@
     });
     let olderRequestHandle = null;
     let searchRequestHandle = null;
+    let messageSearchReturnFocus = null;
     let stopOlderAnchor = () => {};
     const olderRequestTimeoutMs = 10000;
     const searchRequestTimeoutMs = 10000;
@@ -2047,30 +2077,68 @@
             bannedRooms: [...myBannedRooms]
         });
         messageSearchButton.style.display = accessible ? 'block' : 'none';
-        if (!accessible && messageSearchModal.classList.contains('active')) closeMessageSearch();
+        if (!accessible && messageSearchModal.classList.contains('active')) {
+            closeMessageSearch({ restoreFocus: false });
+        }
+    }
+
+    function messageSearchFocusableElements() {
+        if (!messageSearchModal || typeof messageSearchModal.querySelectorAll !== 'function') return [];
+        return [...messageSearchModal.querySelectorAll(
+            'button:not([disabled]), input:not([disabled]), [href], [tabindex]:not([tabindex="-1"])'
+        )].filter(element => !element.hidden && element.getAttribute?.('aria-hidden') !== 'true');
+    }
+
+    function setMessageSearchBackgroundBlocked(blocked) {
+        if (typeof document === 'undefined') return;
+        for (const id of ['servers-sidebar', 'chat-area']) {
+            const element = document.getElementById(id);
+            if (!element) continue;
+            element.inert = Boolean(blocked);
+            if (blocked) element.setAttribute('aria-hidden', 'true');
+            else element.removeAttribute('aria-hidden');
+        }
     }
 
     function openMessageSearch() {
         if (!currentServerCode || messageSearchButton.style.display === 'none') return false;
         messageReadCoordinator.closeSearch();
+        messageSearchReturnFocus = messageSearchButton;
         messageSearchInput.value = '';
         messageSearchResults.textContent = '';
         messageSearchStatus.textContent = 'Enter 2–80 characters to search this room.';
         messageSearchModal.classList.add('active');
+        messageSearchModal.setAttribute?.('aria-hidden', 'false');
+        if (typeof setMessageSearchBackgroundBlocked === 'function') {
+            setMessageSearchBackgroundBlocked(true);
+        }
         messageSearchInput.focus();
         return true;
     }
 
-    function closeMessageSearch() {
+    function closeMessageSearch({ restoreFocus = true } = {}) {
+        const wasActive = messageSearchModal.classList.contains('active');
+        const returnFocus = typeof messageSearchReturnFocus === 'undefined'
+            ? null
+            : messageSearchReturnFocus;
+        messageSearchReturnFocus = null;
         if (searchRequestHandle) searchRequestHandle.cancel();
         searchRequestHandle = null;
         messageReadCoordinator.closeSearch();
         messageSearchModal.classList.remove('active');
+        messageSearchModal.setAttribute?.('aria-hidden', 'true');
+        if (typeof setMessageSearchBackgroundBlocked === 'function') {
+            setMessageSearchBackgroundBlocked(false);
+        }
         messageSearchInput.value = '';
         messageSearchResults.textContent = '';
         messageSearchStatus.textContent = '';
         messageSearchSubmit.disabled = false;
         messageSearchSubmit.textContent = 'Search';
+        if (wasActive && restoreFocus && returnFocus && typeof returnFocus.focus === 'function' &&
+            messageSearchButton.style.display !== 'none') {
+            returnFocus.focus();
+        }
     }
 
     function closeHistoryModal() {
@@ -2146,17 +2214,42 @@
     }
 
     function handleMessageSearchKeydown(event) {
-        if (!event || (event.key !== 'Enter' && event.key !== 'Escape')) return false;
+        if (!event || event.key !== 'Enter') return false;
         event.preventDefault();
-        if (event.key === 'Escape') {
-            closeMessageSearch();
-            return true;
-        }
         return submitMessageSearch();
     }
 
+    function handleMessageSearchModalKeydown(event) {
+        if (!event || !messageSearchModal.classList.contains('active')) return false;
+        if (event.key === 'Escape') {
+            event.preventDefault();
+            closeMessageSearch();
+            return true;
+        }
+        if (event.key !== 'Tab') return false;
+        const focusable = messageSearchFocusableElements();
+        if (focusable.length === 0) {
+            event.preventDefault();
+            return true;
+        }
+        const first = focusable[0];
+        const last = focusable[focusable.length - 1];
+        const active = typeof document === 'undefined' ? null : document.activeElement;
+        if (event.shiftKey && (active === first || !focusable.includes(active))) {
+            event.preventDefault();
+            last.focus();
+            return true;
+        }
+        if (!event.shiftKey && (active === last || !focusable.includes(active))) {
+            event.preventDefault();
+            first.focus();
+            return true;
+        }
+        return false;
+    }
+
     function invalidateMessageReads() {
-        closeMessageSearch();
+        closeMessageSearch({ restoreFocus: false });
         closeHistoryModal();
         stopOlderAnchor();
         stopOlderAnchor = () => {};
@@ -2175,6 +2268,7 @@
             submitMessageSearch();
         });
         messageSearchInput.addEventListener('keydown', handleMessageSearchKeydown);
+        messageSearchModal.addEventListener('keydown', handleMessageSearchModalKeydown);
         document.getElementById('message-search-x').addEventListener('click', closeMessageSearch);
         document.getElementById('message-search-close').addEventListener('click', closeMessageSearch);
         document.getElementById('history-modal-close').addEventListener('click', closeHistoryModal);

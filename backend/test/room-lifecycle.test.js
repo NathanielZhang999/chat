@@ -1117,6 +1117,7 @@ function messageFixture({ count, serverCode = 'ABC123', timestampFor } = {}) {
       color: '',
       avatarUrl: '',
       text: `message ${sequence}`,
+      searchText: `message ${sequence}`,
       attachment: null,
       replyTo: null,
       reactions: { '👍': ['alice'] },
@@ -1142,8 +1143,10 @@ function trackedMessageModel(messages) {
       const recorded = { filter, sort: null, limit: null };
       queries.push(recorded);
       return {
+        select(value) { query.select(value); return this; },
         sort(value) { recorded.sort = value; query.sort(value); return this; },
         limit(value) { recorded.limit = value; query.limit(value); return this; },
+        maxTimeMS(value) { query.maxTimeMS(value); return this; },
         lean() { return query.lean(); },
         then(resolve, reject) { return query.then(resolve, reject); }
       };
@@ -1172,6 +1175,46 @@ function registerMessageReader({ messages, serverCode = 'ABC123', overrides = {}
   return { ...registered, MessageModel, UserModel, ChatServerModel, RoomRestrictionModel };
 }
 
+test('switch, list, and search commit once when a success acknowledgement throws', async t => {
+  for (const event of ['switch_server', 'list_messages', 'search_messages']) {
+    await t.test(event, async () => {
+      const broadcasts = [];
+      const { socket } = registerMessageReader({
+        messages: messageFixture({ count: 2 }),
+        serverCode: event === 'switch_server' ? 'global' : 'ABC123',
+        overrides: {
+          broadcastOnlineUsersFn: code => { broadcasts.push(code); },
+          searchRateLimiter: { check() { return true; } },
+          searchGate: { run(_serverCode, operation) { return operation(); } }
+        }
+      });
+      let attempts = 0;
+      let deliveredResponse;
+      const throwingAck = response => {
+        attempts += 1;
+        deliveredResponse = response;
+        throw new Error('trusted success callback failed');
+      };
+
+      if (event === 'switch_server') {
+        await assert.doesNotReject(socket.trigger(event, 'ABC123', throwingAck));
+        assert.equal(socket.serverCode, 'ABC123');
+        assert.deepEqual(broadcasts, ['global', 'ABC123']);
+      } else if (event === 'list_messages') {
+        await assert.doesNotReject(socket.trigger(event, {
+          serverCode: 'ABC123', clientContextId: 4, limit: 20
+        }, throwingAck));
+      } else {
+        await assert.doesNotReject(socket.trigger(event, {
+          serverCode: 'ABC123', clientContextId: 4, query: 'message', requestId: 1
+        }, throwingAck));
+      }
+      assert.equal(attempts, 1);
+      assert.equal(Boolean(deliveredResponse && !deliveredResponse.error), true);
+    });
+  }
+});
+
 function readPolicyMessageModel(messages) {
   const memory = createMemoryModel(messages);
   const queries = [];
@@ -1180,7 +1223,7 @@ function readPolicyMessageModel(messages) {
     queries,
     find(filter) {
       const clauses = Array.isArray(filter?.$and) ? filter.$and : [];
-      const searchClause = clauses.find(clause => clause?.text instanceof RegExp);
+      const searchClause = clauses.find(clause => clause?.searchText instanceof RegExp);
       const matchedSearchRows = searchClause
         ? messages.filter(message => clauses.every(clause => {
             if (Array.isArray(clause?.$or)) {
@@ -1195,7 +1238,9 @@ function readPolicyMessageModel(messages) {
             }
             if (typeof clause?.serverCode === 'string') return message.serverCode === clause.serverCode;
             if (clause?.deleted?.$ne === true) return message.deleted !== true;
-            if (clause?.text instanceof RegExp) return clause.text.test(String(message.text || ''));
+            if (clause?.searchText instanceof RegExp) {
+              return clause.searchText.test(String(message.searchText || ''));
+            }
             return true;
           }))
         : null;
@@ -1228,6 +1273,7 @@ function readPolicyMessages(serverCode) {
       color: '#123456',
       avatarUrl: '',
       text: sequence === 21 ? 'matrix deleted canary' : `matrix visible ${sequence}`,
+      searchText: sequence === 21 ? 'matrix deleted canary' : `matrix visible ${sequence}`,
       attachment: 'data:image/png;base64,AAAA',
       replyTo: {
         id: '507f1f77bcf86cd799439012', displayname: 'Reply', text: 'private reply'

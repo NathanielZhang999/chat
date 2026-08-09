@@ -47,6 +47,7 @@ function queryResult(value) {
     limit() { return this; },
     skip() { return this; },
     select() { return this; },
+    maxTimeMS() { return this; },
     then(resolve, reject) { return Promise.resolve(value).then(resolve, reject); }
   };
 }
@@ -60,6 +61,7 @@ function valuesMatch(value, expected) {
   if (expected instanceof RegExp) return expected.test(String(value || ''));
   if (expected && typeof expected === 'object' && !Array.isArray(expected)) {
     if ('$in' in expected) return expected.$in.some(candidate => valuesMatch(value, candidate));
+    if ('$ne' in expected) return !valuesMatch(value, expected.$ne);
     if ('$lt' in expected) return comparableValue(value) < comparableValue(expected.$lt);
     if ('$gt' in expected) return comparableValue(value) > comparableValue(expected.$gt);
     if ('$regex' in expected) return valuesMatch(value, expected.$regex);
@@ -132,6 +134,7 @@ function createMemoryModel(initialRows = []) {
       limit(value) { maximum = value; return this; },
       skip(value) { offset = value; return this; },
       select() { return this; },
+      maxTimeMS() { return this; },
       then(resolve, reject) { return Promise.resolve(materialize()).then(resolve, reject); }
     };
   }

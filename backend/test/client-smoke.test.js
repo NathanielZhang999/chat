@@ -623,7 +623,7 @@ test('room read token access-loss handlers invalidate before navigating away', a
   ]);
 });
 
-test('Search uses NFKC, an exact DOM bound, and installed Enter and Escape controls', () => {
+test('Search uses NFKC, an exact DOM bound, and modal-wide Enter and Escape controls', () => {
   const helpers = loadHelpers();
   assert.equal(helpers.normalizeMessageSearchQuery('  ＡＢ  '), 'AB');
 
@@ -646,17 +646,22 @@ test('Search uses NFKC, an exact DOM bound, and installed Enter and Escape contr
     ['message-search-form', new EventTarget()],
     ['message-search-x', new EventTarget()],
     ['message-search-close', new EventTarget()],
+    ['message-search-modal', new EventTarget()],
     ['history-modal-close', new EventTarget()]
   ]);
   const input = new EventTarget();
   const button = new EventTarget();
+  const submitButton = new EventTarget();
+  const resultButton = new EventTarget();
+  targets.get('message-search-modal').classList = { contains: name => name === 'active' };
   let submits = 0;
   let closes = 0;
   const runtime = loadClientFunctions(
-    ['handleMessageSearchKeydown', 'bindMessageSearchControls'],
+    ['handleMessageSearchKeydown', 'handleMessageSearchModalKeydown', 'bindMessageSearchControls'],
     {
       messageSearchButton: button,
       messageSearchInput: input,
+      messageSearchModal: targets.get('message-search-modal'),
       document: { getElementById: id => targets.get(id) },
       openMessageSearch() {},
       submitMessageSearch() { submits += 1; return true; },
@@ -672,10 +677,190 @@ test('Search uses NFKC, an exact DOM bound, and installed Enter and Escape contr
   input.dispatch('keydown', { key: 'Enter', preventDefault() { prevented += 1; } });
   assert.equal(submits, 1);
   assert.equal(closes, 0);
-  input.dispatch('keydown', { key: 'Escape', preventDefault() { prevented += 1; } });
+  for (const target of [
+    input,
+    submitButton,
+    resultButton,
+    targets.get('message-search-x'),
+    targets.get('message-search-modal')
+  ]) {
+    targets.get('message-search-modal').dispatch('keydown', {
+      key: 'Escape', target, preventDefault() { prevented += 1; }
+    });
+  }
   assert.equal(submits, 1, 'Escape closes instead of submitting');
-  assert.equal(closes, 1);
-  assert.equal(prevented, 2);
+  assert.equal(closes, 5, 'every bubbled Escape reaches the installed modal listener');
+  assert.equal(prevented, 6);
+});
+
+test('search modal exposes dialog semantics, traps focus, and restores its trigger', () => {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  assert.match(source, /id="message-search-modal"[^>]*role="dialog"[^>]*aria-modal="true"[^>]*aria-labelledby="message-search-title"/);
+  assert.match(source, /id="message-search-title"[^>]*>Search Messages</);
+
+  class Element {
+    constructor(id) {
+      this.id = id;
+      this.style = {};
+      this.attributes = new Map();
+      this.classes = new Set();
+      this.classList = {
+        add: (...names) => names.forEach(name => this.classes.add(name)),
+        remove: (...names) => names.forEach(name => this.classes.delete(name)),
+        contains: name => this.classes.has(name)
+      };
+      this.disabled = false;
+      this.hidden = false;
+      this.value = '';
+      this.textContent = '';
+      this.inert = false;
+    }
+    setAttribute(name, value) { this.attributes.set(name, String(value)); }
+    removeAttribute(name) { this.attributes.delete(name); }
+    getAttribute(name) { return this.attributes.get(name) ?? null; }
+    focus() { document.activeElement = this; }
+  }
+  const searchButton = new Element('message-search-btn');
+  searchButton.style.display = 'block';
+  const modal = new Element('message-search-modal');
+  const input = new Element('message-search-input');
+  const submit = new Element('message-search-submit');
+  const result = new Element('message-search-result');
+  const close = new Element('message-search-close');
+  const sidebar = new Element('servers-sidebar');
+  const chatArea = new Element('chat-area');
+  const elements = new Map([
+    ['message-search-btn', searchButton], ['message-search-modal', modal],
+    ['message-search-input', input], ['message-search-submit', submit],
+    ['message-search-results', new Element('message-search-results')],
+    ['message-search-status', new Element('message-search-status')],
+    ['servers-sidebar', sidebar], ['chat-area', chatArea]
+  ]);
+  modal.querySelectorAll = () => [input, submit, result, close];
+  const document = {
+    activeElement: searchButton,
+    getElementById: id => elements.get(id),
+    contains: element => [...elements.values(), result, close].includes(element)
+  };
+  const coordinator = { closeSearch() {} };
+  const runtime = loadClientFunctions([
+    'messageSearchFocusableElements',
+    'setMessageSearchBackgroundBlocked',
+    'openMessageSearch',
+    'closeMessageSearch',
+    'handleMessageSearchModalKeydown'
+  ], {
+    document,
+    currentServerCode: 'ABC123',
+    messageSearchButton: searchButton,
+    messageSearchModal: modal,
+    messageSearchInput: input,
+    messageSearchResults: elements.get('message-search-results'),
+    messageSearchStatus: elements.get('message-search-status'),
+    messageSearchSubmit: submit,
+    messageReadCoordinator: coordinator,
+    searchRequestHandle: null,
+    messageSearchReturnFocus: null
+  });
+
+  assert.equal(runtime.functions.openMessageSearch(), true);
+  assert.equal(modal.getAttribute('aria-hidden'), 'false');
+  assert.equal(sidebar.inert, true);
+  assert.equal(chatArea.inert, true);
+  assert.equal(sidebar.getAttribute('aria-hidden'), 'true');
+  assert.equal(document.activeElement, input);
+
+  let prevented = 0;
+  document.activeElement = close;
+  runtime.functions.handleMessageSearchModalKeydown({
+    key: 'Tab', shiftKey: false, preventDefault() { prevented += 1; }
+  });
+  assert.equal(document.activeElement, input);
+  document.activeElement = input;
+  runtime.functions.handleMessageSearchModalKeydown({
+    key: 'Tab', shiftKey: true, preventDefault() { prevented += 1; }
+  });
+  assert.equal(document.activeElement, close);
+
+  for (const target of [input, submit, result, modal]) {
+    runtime.functions.openMessageSearch();
+    runtime.functions.handleMessageSearchModalKeydown({
+      key: 'Escape', target, preventDefault() { prevented += 1; }
+    });
+    assert.equal(modal.classList.contains('active'), false);
+    assert.equal(document.activeElement, searchButton);
+  }
+  assert.equal(modal.getAttribute('aria-hidden'), 'true');
+  assert.equal(sidebar.inert, false);
+  assert.equal(chatArea.inert, false);
+  assert.equal(sidebar.getAttribute('aria-hidden'), null);
+  assert.equal(prevented, 6);
+});
+
+test('private-room header controls remain horizontally reachable at 320–390px viewports', () => {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  const mediaStart = source.indexOf('@media (max-width: 480px)');
+  assert.notEqual(mediaStart, -1);
+  const mobileRules = source.slice(mediaStart, source.indexOf('</style>', mediaStart));
+  assert.match(mobileRules, /header\s*\{[^}]*flex-direction:\s*column/s);
+  assert.match(mobileRules, /\.header-actions\s*\{[^}]*width:\s*100%/s);
+  assert.match(mobileRules, /\.header-actions\s*\{[^}]*overflow-x:\s*auto/s);
+  assert.match(mobileRules, /\.header-actions\s*\{[^}]*flex-wrap:\s*nowrap/s);
+  assert.match(mobileRules, /\.header-btn\s*\{[^}]*flex:\s*0\s+0\s+auto/s);
+
+  const requiredIds = [
+    'invite-code-btn', 'leave-server-btn', 'delete-server-btn',
+    'moderator-center-btn', 'message-search-btn'
+  ];
+  for (const id of requiredIds) {
+    assert.match(source, new RegExp(`id="${id}"`));
+  }
+  assert.match(source, />⚙️ Settings<\/button>/);
+  assert.match(source, />Log Out<\/button>/);
+
+  const actionMarkup = source.match(/<div class="header-actions">([\s\S]*?)<\/div>/)?.[1];
+  assert.ok(actionMarkup, 'the production header action strip is present');
+  const controls = [...actionMarkup.matchAll(/<button\b([^>]*)>([^<]*)<\/button>/g)].map(match => ({
+    id: match[1].match(/\bid="([^"]+)"/)?.[1] || null,
+    label: match[2].trim(),
+    active: true
+  }));
+  assert.ok(requiredIds.every(id => controls.some(control => control.id === id && control.active)));
+  assert.ok(controls.some(control => control.label.includes('Settings') && control.active));
+  assert.ok(controls.some(control => control.label === 'Log Out' && control.active));
+
+  const sidebarWidth = Number(source.match(/#servers-sidebar\s*\{[^}]*width:\s*(\d+)px/s)?.[1]);
+  const horizontalHeaderPadding = 16;
+  const gap = 8;
+  assert.equal(sidebarWidth, 72);
+  const widths = controls.map(control => Math.max(44, Array.from(control.label).length * 7 + 20));
+  const offsets = [];
+  let scrollWidth = 0;
+  for (const width of widths) {
+    offsets.push(scrollWidth);
+    scrollWidth += width + gap;
+  }
+  scrollWidth -= gap;
+
+  for (const viewportWidth of [320, 360, 390]) {
+    const clientWidth = viewportWidth - sidebarWidth - horizontalHeaderPadding;
+    const maxScrollLeft = scrollWidth - clientWidth;
+    assert.ok(clientWidth > 0 && maxScrollLeft > 0,
+      `active private-room controls overflow at ${viewportWidth}px`);
+    let scrollLeft = 0;
+    for (let index = 0; index < controls.length; index += 1) {
+      const start = offsets[index];
+      const end = start + widths[index];
+      if (start < scrollLeft) scrollLeft = start;
+      if (end > scrollLeft + clientWidth) scrollLeft = end - clientWidth;
+      scrollLeft = Math.max(0, Math.min(scrollLeft, maxScrollLeft));
+      assert.ok(start - scrollLeft >= -0.001 && end - scrollLeft <= clientWidth + 0.001,
+        `${controls[index].id || controls[index].label} can be scrolled into view at ${viewportWidth}px`);
+    }
+    const logoutIndex = controls.findIndex(control => control.label === 'Log Out');
+    assert.ok(offsets[logoutIndex] + widths[logoutIndex] - maxScrollLeft <= clientWidth + 0.001,
+      `the final Log Out control is reachable at ${viewportWidth}px`);
+  }
 });
 
 test('search modal sends exact context, keeps hostile results inert, and recovers from a lost ack', () => {
