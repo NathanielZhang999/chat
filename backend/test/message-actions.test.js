@@ -10,6 +10,7 @@ const {
   normalizeMessageSearchQuery,
   safeMessageForViewer,
   createRateLimiter,
+  createMessageSearchRateLimiter,
   MessageSchema,
   decodeCursor
 } = require('../server');
@@ -308,15 +309,16 @@ test('search_messages excludes deleted rows before matching current text or hist
   assert.equal(JSON.stringify(observedFilter).includes('history'), false);
 });
 
-test('search_messages identifies matching legacy Global rows with the active room code', async () => {
-  const legacyGlobalRow = { ...matchingSearchRow, _id: 'legacy-global-id' };
-  delete legacyGlobalRow.serverCode;
+test('search_messages identifies missing and null legacy Global rows with the active room code', async () => {
+  const missingGlobalRow = { ...matchingSearchRow, _id: 'missing-global-id' };
+  delete missingGlobalRow.serverCode;
+  const nullGlobalRow = { ...matchingSearchRow, _id: 'null-global-id', serverCode: null };
   let observedFilter;
   const { socket } = registerMessages({
     MessageModel: {
       find(filter) {
         observedFilter = filter;
-        return boundedSearchQuery([legacyGlobalRow]);
+        return boundedSearchQuery([missingGlobalRow, nullGlobalRow]);
       }
     }
   });
@@ -328,7 +330,13 @@ test('search_messages identifies matching legacy Global rows with the active roo
   }, ack.callback);
 
   assert.deepEqual(observedFilter.$and[0], messageRoomQuery('global'));
-  assert.equal(ack.value().results[0].serverCode, 'global');
+  assert.deepEqual(
+    ack.value().results.map(row => ({ _id: row._id, serverCode: row.serverCode })),
+    [
+      { _id: 'missing-global-id', serverCode: 'global' },
+      { _id: 'null-global-id', serverCode: 'global' }
+    ]
+  );
 });
 
 test('search_messages validates plain payloads, active room, contexts, request IDs, and query bounds', async () => {
@@ -406,47 +414,141 @@ test('search_messages returns at most twenty newest projected rows', async () =>
   assert.equal(observedQuery.limit, 20);
 });
 
-test('search rate limiter exhausts thirty attempts and resets after sixty seconds', async () => {
-  let currentTime = 0;
-  let queries = 0;
-  const searchRateLimiter = createRateLimiter({
-    maxEntries: 10_000,
-    maxAttempts: 30,
-    windowMs: 60 * 1000,
-    now: () => currentTime
-  });
-  const { socket } = registerMessages({
-    searchRateLimiter,
-    MessageModel: {
-      find() {
-        queries += 1;
-        return boundedSearchQuery([]);
-      }
+test('search rate limiter production factory wires exact bounds and unrefd pruning', () => {
+  const now = () => 123;
+  let observedOptions;
+  let scheduledCallback;
+  let scheduledDelay;
+  let pruneCalls = 0;
+  let unrefCalls = 0;
+  const injectedLimiter = {
+    check() { return true; },
+    prune() { pruneCalls += 1; }
+  };
+
+  const result = createMessageSearchRateLimiter({
+    now,
+    createLimiter(options) {
+      observedOptions = options;
+      return injectedLimiter;
+    },
+    schedule(callback, delay) {
+      scheduledCallback = callback;
+      scheduledDelay = delay;
+      return { unref() { unrefCalls += 1; } };
     }
   });
+
+  assert.equal(result, injectedLimiter);
+  assert.deepEqual(
+    {
+      maxEntries: observedOptions.maxEntries,
+      maxAttempts: observedOptions.maxAttempts,
+      windowMs: observedOptions.windowMs
+    },
+    { maxEntries: 10_000, maxAttempts: 30, windowMs: 60_000 }
+  );
+  assert.equal(observedOptions.now, now);
+  assert.equal(scheduledDelay, 60_000);
+  assert.equal(unrefCalls, 1);
+  assert.equal(pruneCalls, 0);
+  scheduledCallback();
+  assert.equal(pruneCalls, 1);
+});
+
+test('search rate limiter production defaults enforce a rolling sixty-second window', () => {
+  let currentTime = 0;
+  const searchRateLimiter = createMessageSearchRateLimiter({
+    now: () => currentTime,
+    schedule() { return { unref() {} }; }
+  });
+
+  for (let attempt = 0; attempt < 15; attempt += 1) {
+    assert.equal(searchRateLimiter.check('alice'), true);
+  }
+  currentTime = 30_000;
+  for (let attempt = 0; attempt < 15; attempt += 1) {
+    assert.equal(searchRateLimiter.check('alice'), true);
+  }
+  assert.equal(searchRateLimiter.check('alice'), false);
+
+  currentTime = 60_000;
+  for (let attempt = 0; attempt < 15; attempt += 1) {
+    assert.equal(searchRateLimiter.check('alice'), true);
+  }
+  currentTime = 89_999;
+  assert.equal(searchRateLimiter.check('alice'), false);
+  currentTime = 90_000;
+  assert.equal(searchRateLimiter.check('alice'), true);
+});
+
+test('search_messages uses the production default thirty-attempt limiter', async () => {
+  const { socket } = registerMessages({
+    searchRateLimiter: undefined,
+    MessageModel: { find() { return boundedSearchQuery([]); } }
+  });
   authenticate(socket, { serverCode: 'ABC123', joinedServers: ['global', 'ABC123'] });
+  socket.username = 'limituser';
+  socket.handshake.address = '203.0.113.77';
 
   for (let requestId = 1; requestId <= 30; requestId += 1) {
     const ack = acknowledge();
     await socket.trigger('search_messages', {
-      serverCode: 'ABC123', clientContextId: 4, query: 'rate', requestId
+      serverCode: 'ABC123', clientContextId: 4, query: 'default', requestId
     }, ack.callback);
     assert.deepEqual(ack.value().results, []);
   }
   const limitedAck = acknowledge();
   await socket.trigger('search_messages', {
-    serverCode: 'ABC123', clientContextId: 4, query: 'rate', requestId: 31
+    serverCode: 'ABC123', clientContextId: 4, query: 'default', requestId: 31
   }, limitedAck.callback);
   assert.deepEqual(limitedAck.value(), { error: 'Too many requests. Try again later.' });
-  assert.equal(queries, 30);
+});
 
-  currentTime = 60 * 1000;
-  const resetAck = acknowledge();
-  await socket.trigger('search_messages', {
-    serverCode: 'ABC123', clientContextId: 4, query: 'rate', requestId: 32
-  }, resetAck.callback);
-  assert.deepEqual(resetAck.value().results, []);
-  assert.equal(queries, 31);
+test('search_messages limiter keys normalize accounts and isolate transport addresses', async () => {
+  const observedKeys = [];
+  const limiter = createRateLimiter({
+    maxEntries: 10,
+    maxAttempts: 1,
+    windowMs: 60_000,
+    now: () => 0
+  });
+  const searchRateLimiter = {
+    check(key) {
+      observedKeys.push(key);
+      return limiter.check(key);
+    }
+  };
+  const { socket } = registerMessages({
+    searchRateLimiter,
+    MessageModel: { find() { return boundedSearchQuery([]); } }
+  });
+  authenticate(socket, { serverCode: 'ABC123', joinedServers: ['global', 'ABC123'] });
+  socket.username = 'Alice';
+  socket.handshake.address = ' ::FFFF:127.0.0.1 ';
+
+  async function search(requestId) {
+    const ack = acknowledge();
+    await socket.trigger('search_messages', {
+      serverCode: 'ABC123', clientContextId: 4, query: 'keys', requestId
+    }, ack.callback);
+    return ack.value();
+  }
+
+  assert.deepEqual((await search(1)).results, []);
+  socket.username = 'ALICE';
+  assert.deepEqual(await search(2), { error: 'Too many requests. Try again later.' });
+  socket.handshake.address = '127.0.0.2';
+  assert.deepEqual((await search(3)).results, []);
+  socket.username = 'Bob';
+  assert.deepEqual((await search(4)).results, []);
+
+  assert.deepEqual(observedKeys, [
+    'message_search:alice:127.0.0.1',
+    'message_search:alice:127.0.0.1',
+    'message_search:alice:127.0.0.2',
+    'message_search:bob:127.0.0.2'
+  ]);
 });
 
 test('search_messages allows active timeouts but denies active bans to global admins', async () => {

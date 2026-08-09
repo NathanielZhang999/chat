@@ -624,18 +624,26 @@ async function withRoomMutationLock(serverCode, operation) {
   }
 }
 
+function createMessageSearchRateLimiter({
+  now = () => Date.now(),
+  createLimiter = createRateLimiter,
+  schedule = setInterval
+} = {}) {
+  const limiter = createLimiter({
+    maxEntries: MAX_RATE_LIMIT_KEYS,
+    maxAttempts: 30,
+    windowMs: 60 * 1000,
+    now
+  });
+  schedule(() => limiter.prune(), 60 * 1000).unref();
+  return limiter;
+}
+
 const authRateLimiter = createRateLimiter();
-const messageSearchRateLimiter = createRateLimiter({
-  maxEntries: MAX_RATE_LIMIT_KEYS,
-  maxAttempts: 30,
-  windowMs: 60 * 1000
-});
+const messageSearchRateLimiter = createMessageSearchRateLimiter();
 setInterval(() => {
   authRateLimiter.prune();
 }, RATE_LIMIT_WINDOW_MS).unref();
-setInterval(() => {
-  messageSearchRateLimiter.prune();
-}, 60 * 1000).unref();
 
 // --- DATABASE SCHEMAS ---
 const UserSchema = new mongoose.Schema({
@@ -3645,6 +3653,7 @@ module.exports = {
   neutralizePingTokens,
   normalizeTransportAddress,
   createRateLimiter,
+  createMessageSearchRateLimiter,
   canAccessRoom,
   appendBoundedHistory,
   createReplySnapshot
