@@ -1,5 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const mongoose = require('mongoose');
 const {
   createAutoModTracker,
   createConnectionHandler,
@@ -7,13 +8,16 @@ const {
   messageCursorQuery,
   nextMessagePage,
   normalizeMessageSearchQuery,
-  safeMessageForViewer
+  safeMessageForViewer,
+  MessageSchema,
+  decodeCursor
 } = require('../server');
 const { FakeSocket, FakeIo, acknowledge, deferred } = require('./support/fakes');
 
 test('safeMessageForViewer allowlists ordinary and deleted history fields', () => {
+  const storedId = new mongoose.Types.ObjectId('507f1f77bcf86cd799439011');
   const stored = {
-    _id: '507f1f77bcf86cd799439011', serverCode: 'ABC123', username: 'Alice',
+    _id: storedId, serverCode: 'ABC123', username: 'Alice',
     displayName: 'Alice', role: 'user', roomRole: 'user', color: '#123456', avatarUrl: '',
     text: 'current', attachment: 'data:image/png;base64,AAAA',
     replyTo: { id: '507f1f77bcf86cd799439012', displayname: 'Bob', text: 'reply', secret: 'never return' },
@@ -28,9 +32,15 @@ test('safeMessageForViewer allowlists ordinary and deleted history fields', () =
 
   const ordinary = safeMessageForViewer(stored, { username: 'Bob', role: 'user', roomRole: 'user' });
   assert.deepEqual(Object.keys(ordinary).sort(), approvedKeys.sort());
+  assert.equal(ordinary._id, storedId.toString());
+  assert.equal(ordinary.timestamp, stored.timestamp);
   assert.equal(ordinary.attachment, stored.attachment);
   assert.deepEqual(ordinary.replyTo, { id: stored.replyTo.id, displayname: 'Bob', text: 'reply' });
   assert.deepEqual(ordinary.reactions, { '👍': ['Bob'] });
+  ordinary.replyTo.text = 'mutated reply';
+  ordinary.reactions['👍'].push('Mallory');
+  assert.equal(stored.replyTo.text, 'reply');
+  assert.deepEqual(stored.reactions, { '👍': ['Bob'] });
   assert.equal('history' in ordinary, false);
   assert.equal('__v' in ordinary, false);
   assert.equal('secret' in ordinary, false);
@@ -62,6 +72,35 @@ test('safeMessageForViewer preserves deleted content only for authorized viewers
     assert.equal(serialized.attachment, stored.attachment);
     assert.deepEqual(serialized.replyTo, stored.replyTo);
     assert.deepEqual(serialized.reactions, stored.reactions);
+  }
+
+  const malformedStoredForAdmin = safeMessageForViewer(
+    { ...stored, username: null },
+    { username: 'Bob', role: 'admin', roomRole: 'user' }
+  );
+  assert.equal(malformedStoredForAdmin.text, stored.text);
+});
+
+test('safeMessageForViewer redacts deleted content for malformed message or viewer identities', () => {
+  const validDeleted = {
+    _id: '507f1f77bcf86cd799439011', serverCode: 'ABC123', username: 'Alice',
+    text: 'deleted secret', attachment: 'data:image/png;base64,AAAA',
+    replyTo: { id: '507f1f77bcf86cd799439012', displayname: 'Bob', text: 'reply' },
+    reactions: { '👍': ['Bob'] }, deleted: true
+  };
+  const cases = [
+    [validDeleted, undefined],
+    [validDeleted, { username: '', role: 'admin', roomRole: 'mod' }],
+    [{ ...validDeleted, username: null }, { username: 'Bob', role: 'user', roomRole: 'user' }],
+    [{ ...validDeleted, username: '<invalid>' }, { username: 'Bob', role: 'user', roomRole: 'user' }]
+  ];
+
+  for (const [message, viewer] of cases) {
+    const serialized = safeMessageForViewer(message, viewer, { search: true });
+    assert.equal(serialized.text, '');
+    assert.equal(serialized.replyTo, null);
+    assert.equal('attachment' in serialized, false);
+    assert.equal('reactions' in serialized, false);
   }
 });
 
@@ -96,14 +135,34 @@ test('message keyset query and next cursor handle equal timestamps without dupli
     { timestamp: { $lt: cursor.date } },
     { timestamp: cursor.date, _id: { $lt: cursor.id } }
   ] });
-  const rows = Array.from({ length: 21 }, (_, index) => ({
-    _id: `507f1f77bcf86cd799439${String(40 - index).padStart(3, '0')}`,
-    timestamp: new Date(1_800_000_000_000 - index)
+  const timestamp = new Date('2026-08-09T00:00:00.000Z');
+  const rows = Array.from({ length: 23 }, (_, index) => ({
+    _id: `507f1f77bcf86cd799439${String(42 - index).padStart(3, '0')}`,
+    timestamp
   }));
   const result = nextMessagePage(rows, 20);
   assert.equal(result.page.length, 20);
   assert.ok(result.nextCursor);
-  assert.equal(nextMessagePage(result.page, 20).nextCursor, null);
+  const decoded = decodeCursor(result.nextCursor);
+  assert.deepEqual(decoded, { date: timestamp, id: rows[19]._id });
+  const boundary = messageCursorQuery(decoded);
+  const secondRows = rows.filter(row =>
+    row.timestamp < boundary.$or[0].timestamp.$lt ||
+    (row.timestamp.getTime() === boundary.$or[1].timestamp.getTime() && row._id < boundary.$or[1]._id.$lt)
+  );
+  const second = nextMessagePage(secondRows, 20);
+  assert.deepEqual(second.page.map(row => row._id), rows.slice(20).map(row => row._id));
+  assert.equal(second.nextCursor, null);
+  const allIds = [...result.page, ...second.page].map(row => row._id);
+  assert.equal(new Set(allIds).size, rows.length);
+  assert.deepEqual(allIds, rows.map(row => row._id));
+});
+
+test('Message schema declares exact chronological indexes', () => {
+  assert.deepEqual(MessageSchema.indexes().map(([keys]) => keys), [
+    { serverCode: 1, timestamp: -1, _id: -1 },
+    { timestamp: -1, _id: -1 }
+  ]);
 });
 
 test('search normalization accepts bounded NFKC text and rejects malformed input', () => {

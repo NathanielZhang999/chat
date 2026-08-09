@@ -375,8 +375,13 @@ function safeMessageForViewer(message, viewer, options = {}) {
     deleted: Boolean(message && message.deleted),
     timestamp: message && message.timestamp
   };
-  const mayViewDeletedContent = serialized.username === (viewer && viewer.username) ||
-    (viewer && (viewer.role === 'admin' || viewer.roomRole === 'mod'));
+  const storedUsername = normalizeUsername(message && message.username);
+  const viewerUsername = normalizeUsername(viewer && viewer.username);
+  const hasValidViewer = Boolean(viewerUsername);
+  const isAuthor = Boolean(storedUsername && hasValidViewer &&
+    normalizeAccountKey(storedUsername) === normalizeAccountKey(viewerUsername));
+  const mayViewDeletedContent = isAuthor || (hasValidViewer &&
+    (viewer.role === 'admin' || viewer.roomRole === 'mod'));
 
   if (serialized.deleted && !mayViewDeletedContent) {
     serialized.text = '';
@@ -3486,6 +3491,7 @@ module.exports = {
   RoomRestriction,
   ModerationAudit,
   ModerationReport,
+  MessageSchema,
   isValidPassword,
   normalizeColor,
   normalizeAvatarUrl,
