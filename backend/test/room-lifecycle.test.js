@@ -1,6 +1,9 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { createConnectionHandler, seedSystem, withAccountTransitionLock } = require('../server');
+const mongoose = require('mongoose');
+const {
+  createConnectionHandler, seedSystem, withAccountTransitionLock, decodeCursor
+} = require('../server');
 const {
   FakeSocket, FakeIo, queryResult, acknowledge, deferred, createMemoryModel
 } = require('./support/fakes');
@@ -1128,8 +1131,28 @@ function messageFixture({ count, serverCode = 'ABC123', timestampFor } = {}) {
   });
 }
 
+function trackedMessageModel(messages) {
+  const memory = createMemoryModel(messages);
+  const queries = [];
+  return {
+    ...memory,
+    queries,
+    find(filter) {
+      const query = memory.find(filter);
+      const recorded = { filter, sort: null, limit: null };
+      queries.push(recorded);
+      return {
+        sort(value) { recorded.sort = value; query.sort(value); return this; },
+        limit(value) { recorded.limit = value; query.limit(value); return this; },
+        lean() { return query.lean(); },
+        then(resolve, reject) { return query.then(resolve, reject); }
+      };
+    }
+  };
+}
+
 function registerMessageReader({ messages, serverCode = 'ABC123', overrides = {} }) {
-  const MessageModel = createMemoryModel(messages);
+  const MessageModel = trackedMessageModel(messages);
   const UserModel = createMemoryModel([{
     username: 'alice', role: 'user', servers: ['global', 'ABC123']
   }]);
@@ -1149,13 +1172,13 @@ function registerMessageReader({ messages, serverCode = 'ABC123', overrides = {}
   return { ...registered, MessageModel, UserModel, ChatServerModel, RoomRestrictionModel };
 }
 
-test('in-memory query adapter supports list_messages pagination filters and chains', async () => {
+test('in-memory query adapter compares equal-timestamp ObjectIds for list_messages cursors', async () => {
   const timestamp = new Date(Date.UTC(2026, 7, 9, 12));
   const model = createMemoryModel([
-    { _id: '000000000000000000000001', timestamp, serverCode: 'global' },
-    { _id: '000000000000000000000003', timestamp, serverCode: null },
-    { _id: '000000000000000000000002', timestamp },
-    { _id: '000000000000000000000004', timestamp, serverCode: 'ABC123' }
+    { _id: new mongoose.Types.ObjectId('000000000000000000000001'), timestamp, serverCode: 'global' },
+    { _id: new mongoose.Types.ObjectId('000000000000000000000003'), timestamp, serverCode: null },
+    { _id: new mongoose.Types.ObjectId('000000000000000000000002'), timestamp },
+    { _id: new mongoose.Types.ObjectId('000000000000000000000004'), timestamp, serverCode: 'ABC123' }
   ]);
 
   const rows = await model.find({
@@ -1166,21 +1189,21 @@ test('in-memory query adapter supports list_messages pagination filters and chai
         { serverCode: null }
       ] },
       { $or: [
-        { timestamp: { $lt: new Date(timestamp.getTime() + 1) } },
-        { timestamp, _id: { $lt: 'ffffffffffffffffffffffff' } }
+        { timestamp: { $lt: timestamp } },
+        { timestamp, _id: { $lt: '000000000000000000000003' } }
       ] }
     ]
-  }).sort({ timestamp: -1, _id: -1 }).limit(2).lean();
+  }).sort({ timestamp: -1, _id: -1 }).limit(10).lean();
 
-  assert.deepEqual(rows.map(row => row._id), [
-    '000000000000000000000003',
-    '000000000000000000000002'
+  assert.deepEqual(rows.map(row => String(row._id)), [
+    '000000000000000000000002',
+    '000000000000000000000001'
   ]);
 });
 
 test('switch_server returns a safe initial page and cursor', async () => {
   const messages = messageFixture({ count: 25 });
-  const { socket } = registerMessageReader({ messages, serverCode: 'global' });
+  const { socket, MessageModel } = registerMessageReader({ messages, serverCode: 'global' });
   const ack = acknowledge();
 
   await socket.trigger('switch_server', 'ABC123', ack.callback);
@@ -1193,6 +1216,11 @@ test('switch_server returns a safe initial page and cursor', async () => {
     messages.slice(5).map(row => row._id)
   );
   assert.equal(response.history.some(row => 'history' in row || '__v' in row), false);
+  assert.deepEqual(MessageModel.queries, [{
+    filter: { serverCode: 'ABC123' },
+    sort: { timestamp: -1, _id: -1 },
+    limit: 21
+  }]);
   assert.deepEqual(response.history.at(-1), {
     _id: '000000000000000000000019',
     serverCode: 'ABC123',
@@ -1212,31 +1240,89 @@ test('switch_server returns a safe initial page and cursor', async () => {
   });
 });
 
-test('list_messages paginates timestamp ties without gaps or duplicates', async () => {
-  const messages = messageFixture({
-    count: 45,
-    timestampFor: sequence => new Date(Date.UTC(2026, 7, 9, 12, 0, Math.floor((sequence - 1) / 5)))
-  });
-  const { socket } = registerMessageReader({ messages });
+test('list_messages paginates across an equal-timestamp ObjectId boundary without gaps', async () => {
+  const tiedTimestamp = new Date(Date.UTC(2026, 7, 9, 12, 1));
+  const olderTimestamp = new Date(Date.UTC(2026, 7, 9, 12));
+  const messages = [
+    ...messageFixture({ count: 8, timestampFor: () => tiedTimestamp }),
+    ...messageFixture({ count: 2, timestampFor: () => olderTimestamp }).map((message, index) => ({
+      ...message,
+      _id: (index + 9).toString(16).padStart(24, '0'),
+      deleted: false,
+      edited: false,
+      username: 'alice',
+      displayName: 'Alice'
+    }))
+  ].map(message => ({ ...message, _id: new mongoose.Types.ObjectId(message._id) }));
+  const { socket, MessageModel } = registerMessageReader({ messages });
   const firstAck = acknowledge();
 
   await socket.trigger('list_messages', {
-    serverCode: 'ABC123', clientContextId: 4, limit: 20
+    serverCode: 'ABC123', clientContextId: 4, limit: 5
   }, firstAck.callback);
   const first = firstAck.value();
+  assert.deepEqual(decodeCursor(first.nextCursor), {
+    date: tiedTimestamp,
+    id: '000000000000000000000004'
+  });
   const secondAck = acknowledge();
   await socket.trigger('list_messages', {
-    serverCode: 'ABC123', clientContextId: 4, cursor: first.nextCursor, limit: 20
+    serverCode: 'ABC123', clientContextId: 4, cursor: first.nextCursor, limit: 5
   }, secondAck.callback);
   const second = secondAck.value();
 
-  assert.equal(new Set([...first.messages, ...second.messages].map(row => row._id)).size, 40);
-  assert.deepEqual(first.messages.map(row => row._id), messages.slice(25).map(row => row._id));
-  assert.deepEqual(second.messages.map(row => row._id), messages.slice(5, 25).map(row => row._id));
+  const returnedIds = [...first.messages, ...second.messages].map(row => row._id);
+  assert.equal(new Set(returnedIds).size, 10);
+  assert.deepEqual([...returnedIds].sort(), [
+    '000000000000000000000001', '000000000000000000000002',
+    '000000000000000000000003', '000000000000000000000004',
+    '000000000000000000000005', '000000000000000000000006',
+    '000000000000000000000007', '000000000000000000000008',
+    '000000000000000000000009', '00000000000000000000000a'
+  ]);
+  assert.equal(second.nextCursor, null);
+  assert.deepEqual(MessageModel.queries.map(({ sort, limit }) => ({ sort, limit })), [
+    { sort: { timestamp: -1, _id: -1 }, limit: 6 },
+    { sort: { timestamp: -1, _id: -1 }, limit: 6 }
+  ]);
   assert.deepEqual(
     { serverCode: first.serverCode, clientContextId: first.clientContextId },
     { serverCode: 'ABC123', clientContextId: 4 }
   );
+});
+
+test('list_messages safely serializes with fresh roles despite stale cached privilege', async () => {
+  const messages = messageFixture({ count: 21 });
+  const { socket, MessageModel } = registerMessageReader({ messages });
+  const ack = acknowledge();
+
+  await socket.trigger('list_messages', {
+    serverCode: 'ABC123', clientContextId: 5, limit: 20
+  }, ack.callback);
+
+  const response = ack.value();
+  assert.equal(response.messages.some(row => 'history' in row || '__v' in row), false);
+  assert.deepEqual(response.messages.at(-1), {
+    _id: '000000000000000000000015',
+    serverCode: 'ABC123',
+    username: 'bob',
+    displayName: 'Bob',
+    role: 'user',
+    roomRole: 'user',
+    color: '',
+    avatarUrl: '',
+    text: '',
+    attachment: null,
+    replyTo: null,
+    reactions: {},
+    edited: true,
+    deleted: true,
+    timestamp: new Date(Date.UTC(2026, 7, 9, 12, 0, 21))
+  });
+  assert.deepEqual(MessageModel.queries.map(({ sort, limit }) => ({ sort, limit })), [{
+    sort: { timestamp: -1, _id: -1 },
+    limit: 21
+  }]);
 });
 
 test('list_messages validates pagination input and clamps the maximum page size', async () => {
@@ -1321,15 +1407,18 @@ test('legacy Global pagination includes missing and null serverCode rows only', 
   assert.equal(ack.value().nextCursor, null);
 });
 
-function registerModerationReadRace({ action }) {
+function registerModerationReadRace({ action, targetUser = 'alice' }) {
   const persistenceStarted = deferred();
   const releasePersistence = deferred();
   const queryStarted = deferred();
   const releaseQuery = deferred();
+  const events = [];
   let messageQueries = 0;
+  let persistenceBegan = false;
   const UserModel = createMemoryModel([
     { username: 'admin', displayName: 'Admin', role: 'admin', servers: ['global', 'ABC123'] },
-    { username: 'alice', displayName: 'Alice', role: 'user', servers: ['global', 'ABC123'] }
+    { username: 'alice', displayName: 'Alice', role: 'user', servers: ['global', 'ABC123'] },
+    { username: 'bob', displayName: 'Bob', role: 'user', servers: ['global', 'ABC123'] }
   ]);
   const ChatServerModel = createMemoryModel([
     { code: 'global', owner: 'System', moderators: [] },
@@ -1339,6 +1428,8 @@ function registerModerationReadRace({ action }) {
   const persistRestriction = RoomRestrictionModel.findOneAndUpdate.bind(RoomRestrictionModel);
   RoomRestrictionModel.findOneAndUpdate = async (query, update, options) => {
     if (update.$set && (update.$set.bannedAt || update.$set.timeoutUntil)) {
+      persistenceBegan = true;
+      events.push(`${action}:persist`);
       persistenceStarted.resolve();
       await releasePersistence.promise;
     }
@@ -1348,6 +1439,7 @@ function registerModerationReadRace({ action }) {
   const MessageModel = {
     find() {
       messageQueries += 1;
+      events.push('read:query');
       queryStarted.resolve();
       return {
         sort() { return this; },
@@ -1389,7 +1481,10 @@ function registerModerationReadRace({ action }) {
     releasePersistence,
     queryStarted,
     releaseQuery,
-    messageQueries: () => messageQueries
+    events,
+    targetUser,
+    messageQueries: () => messageQueries,
+    persistenceBegan: () => persistenceBegan
   };
 }
 
@@ -1440,6 +1535,91 @@ test('list_messages queued behind a completed timeout may finish its deferred qu
     { count: readAck.value().messages.length, nextCursor: readAck.value().nextCursor },
     { count: 1, nextCursor: null }
   );
+});
+
+test('list_messages acknowledges a deferred page before a queued ban can complete', async () => {
+  const race = registerModerationReadRace({ action: 'ban', targetUser: 'bob' });
+  let readResponse;
+  let moderationResponse;
+  let acknowledgementHeldAccountLock;
+  let accountLockProbe;
+  const readPending = race.reader.trigger('list_messages', {
+    serverCode: 'ABC123', clientContextId: 15, limit: 20
+  }, response => {
+    let probeEntered = false;
+    accountLockProbe = withAccountTransitionLock('alice', async () => { probeEntered = true; });
+    acknowledgementHeldAccountLock = !probeEntered;
+    race.events.push('read:ack');
+    readResponse = response;
+  });
+  await race.queryStarted.promise;
+
+  const moderationPending = race.moderator.trigger('moderate_user', {
+    serverCode: 'ABC123', targetUser: race.targetUser, action: 'ban', reason: 'queued ban'
+  }, response => {
+    race.events.push('ban:ack');
+    moderationResponse = response;
+  });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(race.persistenceBegan(), false);
+  assert.equal(moderationResponse, undefined);
+
+  race.releaseQuery.resolve();
+  await readPending;
+  await race.persistenceStarted.promise;
+  assert.deepEqual(readResponse.messages.map(message => message._id), [
+    '000000000000000000000001'
+  ]);
+  assert.equal(acknowledgementHeldAccountLock, true);
+  assert.ok(race.events.indexOf('read:ack') < race.events.indexOf('ban:persist'));
+
+  race.releasePersistence.resolve();
+  await Promise.all([moderationPending, accountLockProbe]);
+  assert.deepEqual(moderationResponse, { success: true });
+  assert.ok(race.events.indexOf('read:ack') < race.events.indexOf('ban:ack'));
+});
+
+test('switch_server acknowledges deferred history before a queued ban can complete', async () => {
+  const race = registerModerationReadRace({ action: 'ban', targetUser: 'bob' });
+  race.reader.serverCode = 'global';
+  race.reader.joinedRooms.delete('ABC123');
+  race.reader.joinedRooms.add('global');
+  let switchResponse;
+  let moderationResponse;
+  let acknowledgementHeldAccountLock;
+  let accountLockProbe;
+  const switchPending = race.reader.trigger('switch_server', 'ABC123', response => {
+    let probeEntered = false;
+    accountLockProbe = withAccountTransitionLock('alice', async () => { probeEntered = true; });
+    acknowledgementHeldAccountLock = !probeEntered;
+    race.events.push('read:ack');
+    switchResponse = response;
+  });
+  await race.queryStarted.promise;
+
+  const moderationPending = race.moderator.trigger('moderate_user', {
+    serverCode: 'ABC123', targetUser: race.targetUser, action: 'ban', reason: 'queued ban'
+  }, response => {
+    race.events.push('ban:ack');
+    moderationResponse = response;
+  });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(race.persistenceBegan(), false);
+  assert.equal(moderationResponse, undefined);
+
+  race.releaseQuery.resolve();
+  await switchPending;
+  await race.persistenceStarted.promise;
+  assert.deepEqual(switchResponse.history.map(message => message._id), [
+    '000000000000000000000001'
+  ]);
+  assert.equal(acknowledgementHeldAccountLock, true);
+  assert.ok(race.events.indexOf('read:ack') < race.events.indexOf('ban:persist'));
+
+  race.releasePersistence.resolve();
+  await Promise.all([moderationPending, accountLockProbe]);
+  assert.deepEqual(moderationResponse, { success: true });
+  assert.ok(race.events.indexOf('read:ack') < race.events.indexOf('ban:ack'));
 });
 
 test('leaving the active room removes transport and moderator access then moves to global', async () => {
