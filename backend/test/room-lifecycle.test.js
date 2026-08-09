@@ -1172,6 +1172,89 @@ function registerMessageReader({ messages, serverCode = 'ABC123', overrides = {}
   return { ...registered, MessageModel, UserModel, ChatServerModel, RoomRestrictionModel };
 }
 
+function readPolicyMessageModel(messages) {
+  const memory = createMemoryModel(messages);
+  const queries = [];
+  return {
+    ...memory,
+    queries,
+    find(filter) {
+      const clauses = Array.isArray(filter?.$and) ? filter.$and : [];
+      const searchClause = clauses.find(clause => clause?.text instanceof RegExp);
+      const matchedSearchRows = searchClause
+        ? messages.filter(message => clauses.every(clause => {
+            if (Array.isArray(clause?.$or)) {
+              return clause.$or.some(roomClause => {
+                if (roomClause.serverCode === 'global') return message.serverCode === 'global';
+                if (roomClause.serverCode === null) return message.serverCode == null;
+                if (roomClause.serverCode?.$exists === false) {
+                  return !Object.prototype.hasOwnProperty.call(message, 'serverCode');
+                }
+                return false;
+              });
+            }
+            if (typeof clause?.serverCode === 'string') return message.serverCode === clause.serverCode;
+            if (clause?.deleted?.$ne === true) return message.deleted !== true;
+            if (clause?.text instanceof RegExp) return clause.text.test(String(message.text || ''));
+            return true;
+          }))
+        : null;
+      const query = searchClause
+        ? createMemoryModel(matchedSearchRows).find({})
+        : memory.find(filter);
+      const recorded = { filter, select: null, sort: null, limit: null };
+      queries.push(recorded);
+      return {
+        select(value) { recorded.select = value; query.select(value); return this; },
+        sort(value) { recorded.sort = value; query.sort(value); return this; },
+        limit(value) { recorded.limit = value; query.limit(value); return this; },
+        lean() { return query.lean(); },
+        then(resolve, reject) { return query.then(resolve, reject); }
+      };
+    }
+  };
+}
+
+function readPolicyMessages(serverCode) {
+  const messages = Array.from({ length: 21 }, (_, index) => {
+    const sequence = index + 1;
+    const message = {
+      _id: `1000000000000000000000${sequence.toString(16).padStart(2, '0')}`,
+      serverCode,
+      username: 'bob',
+      displayName: 'Bob',
+      role: 'user',
+      roomRole: 'user',
+      color: '#123456',
+      avatarUrl: '',
+      text: sequence === 21 ? 'matrix deleted canary' : `matrix visible ${sequence}`,
+      attachment: 'data:image/png;base64,AAAA',
+      replyTo: {
+        id: '507f1f77bcf86cd799439012', displayname: 'Reply', text: 'private reply'
+      },
+      reactions: { '👍': ['bob'] },
+      edited: true,
+      deleted: sequence === 21,
+      history: [{ text: 'private edit history' }],
+      __v: 7,
+      internal: 'private database field',
+      timestamp: new Date(Date.UTC(2026, 7, 9, 12, 0, sequence))
+    };
+    if (serverCode === 'global' && sequence % 3 === 1) delete message.serverCode;
+    if (serverCode === 'global' && sequence % 3 === 2) message.serverCode = null;
+    return message;
+  });
+  messages.push({
+    ...messages[0],
+    _id: 'f00000000000000000000001',
+    serverCode: serverCode === 'global' ? 'ABC123' : 'BBB222',
+    text: 'matrix other room canary',
+    deleted: false,
+    timestamp: new Date(Date.UTC(2026, 7, 9, 13))
+  });
+  return messages;
+}
+
 test('in-memory query adapter compares equal-timestamp ObjectIds for list_messages cursors', async () => {
   const timestamp = new Date(Date.UTC(2026, 7, 9, 12));
   const model = createMemoryModel([
@@ -1407,6 +1490,141 @@ test('legacy Global pagination includes missing and null serverCode rows only', 
   assert.equal(ack.value().nextCursor, null);
 });
 
+const readMatrix = [
+  ['member', 'private', 'active', 'initial', true],
+  ['member', 'private', 'timeout', 'page', true],
+  ['member', 'private', 'timeout', 'search', true],
+  ['member', 'private', 'ban', 'page', false],
+  ['room-mod', 'same-private', 'active', 'search', true],
+  ['room-mod', 'other-private', 'active', 'search', false],
+  ['admin', 'private-nonmember', 'active', 'page', true],
+  ['admin', 'private-nonmember', 'ban', 'search', false],
+  ['member', 'global', 'active', 'page', true],
+  ['member', 'global', 'ban', 'search', false]
+];
+
+test('complete message read policy matrix enforces fresh access and safe responses', async t => {
+  const historyFields = [
+    '_id', 'serverCode', 'username', 'displayName', 'role', 'roomRole', 'color',
+    'avatarUrl', 'text', 'attachment', 'replyTo', 'reactions', 'edited', 'deleted', 'timestamp'
+  ].sort();
+  const searchFields = historyFields
+    .filter(field => !['attachment', 'replyTo', 'reactions'].includes(field));
+
+  for (const [actor, roomKind, restrictionKind, operation, allowed] of readMatrix) {
+    await t.test(`${actor} ${roomKind} ${restrictionKind} ${operation}`, async () => {
+      const serverCode = roomKind === 'global' ? 'global' : 'ABC123';
+      const persistedRole = actor === 'admin' ? 'admin' : 'user';
+      const persistedServers = actor === 'admin'
+        ? ['global']
+        : (roomKind === 'other-private' ? ['global', 'BBB222'] : ['global', serverCode]);
+      const socketServers = roomKind === 'other-private'
+        ? ['global', 'ABC123', 'BBB222']
+        : [...persistedServers];
+      const messages = readPolicyMessages(serverCode);
+      const MessageModel = readPolicyMessageModel(messages);
+      const UserModel = createMemoryModel([{
+        username: 'alice', displayName: 'Alice', role: persistedRole, servers: persistedServers
+      }]);
+      const ChatServerModel = createMemoryModel([
+        { code: 'global', owner: 'System', moderators: [] },
+        {
+          code: 'ABC123', owner: 'owner',
+          moderators: roomKind === 'same-private' ? ['alice'] : []
+        },
+        {
+          code: 'BBB222', owner: 'other-owner',
+          moderators: roomKind === 'other-private' ? ['alice'] : []
+        }
+      ]);
+      const restriction = restrictionKind === 'active' ? [] : [{
+        serverCode,
+        username: 'alice',
+        bannedAt: restrictionKind === 'ban' ? new Date('2026-08-09T12:00:00.000Z') : null,
+        timeoutUntil: restrictionKind === 'timeout' ? new Date(Date.now() + 60_000) : null
+      }];
+      const { socket } = register({
+        MessageModel,
+        UserModel,
+        ChatServerModel,
+        RoomRestrictionModel: createMemoryModel(restriction),
+        searchRateLimiter: { check() { return true; } }
+      });
+      Object.assign(socket, {
+        username: 'alice', displayName: 'Alice', role: persistedRole,
+        joinedServers: socketServers,
+        serverCode: operation === 'initial' ? 'global' : serverCode
+      });
+      socket.joinedRooms.add(socket.serverCode);
+      const ack = acknowledge();
+
+      if (operation === 'initial') {
+        await socket.trigger('switch_server', serverCode, ack.callback);
+      } else if (operation === 'page') {
+        await socket.trigger('list_messages', {
+          serverCode, clientContextId: 41, limit: 20
+        }, ack.callback);
+      } else {
+        await socket.trigger('search_messages', {
+          serverCode, clientContextId: 41, query: 'matrix', requestId: 71
+        }, ack.callback);
+      }
+
+      const response = ack.value();
+      if (!allowed) {
+        assert.deepEqual(response, { error: 'Permission denied.' });
+        assert.equal(MessageModel.queries.length, 0, 'denial occurs before any Message query');
+        return;
+      }
+
+      const rows = operation === 'initial'
+        ? response.history
+        : (operation === 'page' ? response.messages : response.results);
+      assert.equal(rows.length, 20);
+      assert.equal(rows.some(row => row._id === 'f00000000000000000000001'), false);
+      if (serverCode === 'global') {
+        assert.equal(rows.every(row => ['global', null, undefined].includes(row.serverCode)), true);
+      } else {
+        assert.equal(rows.every(row => row.serverCode === serverCode), true);
+      }
+      const expectedFields = operation === 'search' ? searchFields : historyFields;
+      for (const row of rows) {
+        assert.deepEqual(Object.keys(row).sort(), expectedFields);
+        assert.equal('history' in row, false);
+        assert.equal('__v' in row, false);
+        assert.equal('internal' in row, false);
+      }
+
+      if (operation === 'search') {
+        assert.deepEqual(
+          {
+            serverCode: response.serverCode,
+            clientContextId: response.clientContextId,
+            requestId: response.requestId
+          },
+          { serverCode, clientContextId: 41, requestId: 71 }
+        );
+        assert.equal(rows.some(row => row.deleted), false);
+      } else {
+        assert.equal(typeof response.nextCursor, 'string');
+        assert.ok(decodeCursor(response.nextCursor));
+        const deletedRow = rows.find(row => row.deleted);
+        assert.ok(deletedRow);
+        assert.equal(
+          deletedRow.text,
+          actor === 'admin' ? 'matrix deleted canary' : ''
+        );
+        if (operation === 'page') {
+          assert.deepEqual(
+            { serverCode: response.serverCode, clientContextId: response.clientContextId },
+            { serverCode, clientContextId: 41 }
+          );
+        }
+      }
+    });
+  }
+});
+
 function registerModerationReadRace({ action, targetUser = 'alice' }) {
   const persistenceStarted = deferred();
   const releasePersistence = deferred();
@@ -1415,11 +1633,36 @@ function registerModerationReadRace({ action, targetUser = 'alice' }) {
   const events = [];
   let messageQueries = 0;
   let persistenceBegan = false;
-  const UserModel = createMemoryModel([
+  const isGlobalDemotion = action === 'demotion';
+  const UserMemoryModel = createMemoryModel([
     { username: 'admin', displayName: 'Admin', role: 'admin', servers: ['global', 'ABC123'] },
-    { username: 'alice', displayName: 'Alice', role: 'user', servers: ['global', 'ABC123'] },
+    {
+      username: 'alice', displayName: 'Alice', role: isGlobalDemotion ? 'admin' : 'user',
+      servers: isGlobalDemotion ? ['global'] : ['global', 'ABC123']
+    },
     { username: 'bob', displayName: 'Bob', role: 'user', servers: ['global', 'ABC123'] }
   ]);
+  const UserModel = isGlobalDemotion ? {
+    ...UserMemoryModel,
+    async findOne(query) {
+      const found = await UserMemoryModel.findOne(query);
+      if (!found || String(found.username).toLowerCase() !== 'alice') return found;
+      const document = { ...found };
+      document.save = async () => {
+        persistenceBegan = true;
+        events.push(`${action}:persist`);
+        persistenceStarted.resolve();
+        await releasePersistence.promise;
+        const row = UserMemoryModel.rows.find(candidate =>
+          String(candidate.username).toLowerCase() === 'alice'
+        );
+        Object.assign(row, document);
+        delete row.save;
+        return document;
+      };
+      return document;
+    }
+  } : UserMemoryModel;
   const ChatServerModel = createMemoryModel([
     { code: 'global', owner: 'System', moderators: [] },
     { code: 'ABC123', owner: 'owner', moderators: [] }
@@ -1472,10 +1715,11 @@ function registerModerationReadRace({ action, targetUser = 'alice' }) {
   moderator.joinedRooms.add('ABC123');
   const reader = registerSharedSocket(shared, `reader-${action}`);
   Object.assign(reader, {
-    username: 'alice', displayName: 'Alice', role: 'user',
-    joinedServers: ['global', 'ABC123'], serverCode: 'ABC123'
+    username: 'alice', displayName: 'Alice', role: isGlobalDemotion ? 'admin' : 'user',
+    joinedServers: isGlobalDemotion ? ['global'] : ['global', 'ABC123'], serverCode: 'ABC123'
   });
   reader.joinedRooms.add('ABC123');
+  shared.ioInstance.sockets = [moderator, reader];
   return {
     moderator,
     reader,
@@ -1490,7 +1734,7 @@ function registerModerationReadRace({ action, targetUser = 'alice' }) {
   };
 }
 
-test('list_messages queued behind a completed ban denies before querying messages', async () => {
+test('complete message read policy matrix: list_messages queued behind a completed ban denies before querying messages', async () => {
   const race = registerModerationReadRace({ action: 'ban' });
   const moderationAck = acknowledge();
   const moderationPending = race.moderator.trigger('moderate_user', {
@@ -1539,7 +1783,7 @@ test('list_messages queued behind a completed timeout may finish its deferred qu
   );
 });
 
-test('search_messages queued behind a completed ban denies before querying messages', async () => {
+test('complete message read policy matrix: search_messages queued behind a completed ban denies before querying messages', async () => {
   const race = registerModerationReadRace({ action: 'ban' });
   const moderationAck = acknowledge();
   const moderationPending = race.moderator.trigger('moderate_user', {
@@ -1560,6 +1804,36 @@ test('search_messages queued behind a completed ban denies before querying messa
   assert.deepEqual(searchAck.value(), { error: 'Permission denied.' });
   assert.equal(race.messageQueries(), 0);
 });
+
+for (const [event, payload] of [
+  ['list_messages', { serverCode: 'ABC123', clientContextId: 18, limit: 20 }],
+  ['search_messages', {
+    serverCode: 'ABC123', clientContextId: 19, query: 'message', requestId: 3
+  }]
+]) {
+  test(`complete message read policy matrix: ${event} queued behind a completed global-admin demotion denies before querying messages`, async () => {
+    const race = registerModerationReadRace({ action: 'demotion' });
+    const roleAck = acknowledge();
+    const rolePending = race.moderator.trigger('manage_role', {
+      targetUser: 'alice', action: 'demote_global_admin'
+    }, roleAck.callback);
+    await race.persistenceStarted.promise;
+
+    const readAck = acknowledge();
+    const readPending = race.reader.trigger(event, payload, readAck.callback);
+    await new Promise(resolve => setImmediate(resolve));
+    const queriesBeforeDemotion = race.messageQueries();
+
+    race.releaseQuery.resolve();
+    race.releasePersistence.resolve();
+    await Promise.all([rolePending, readPending]);
+    assert.equal(queriesBeforeDemotion, 0,
+      'the read remains behind the account transition until demotion commits');
+    assert.deepEqual(roleAck.value(), { success: true });
+    assert.deepEqual(readAck.value(), { error: 'Permission denied.' });
+    assert.equal(race.messageQueries(), 0);
+  });
+}
 
 test('search_messages queued behind a completed timeout may finish its deferred query', async () => {
   const race = registerModerationReadRace({ action: 'timeout' });

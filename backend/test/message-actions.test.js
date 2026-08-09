@@ -14,7 +14,9 @@ const {
   MessageSchema,
   decodeCursor
 } = require('../server');
-const { FakeSocket, FakeIo, acknowledge, deferred } = require('./support/fakes');
+const {
+  FakeSocket, FakeIo, acknowledge, deferred, createMemoryModel
+} = require('./support/fakes');
 
 test('safeMessageForViewer allowlists ordinary and deleted history fields', () => {
   const storedId = new mongoose.Types.ObjectId('507f1f77bcf86cd799439011');
@@ -227,6 +229,103 @@ function registerMessages(overrides = {}) {
     ...overrides
   })(socket);
   return { socket, ioInstance };
+}
+
+function registerPrivilegedReadRevocationRace({ revocation, message }) {
+  const lookupStarted = deferred();
+  const releaseLookup = deferred();
+  const ioInstance = new FakeIo();
+  const onlineUsersMap = new Map();
+  const readerIsAdmin = revocation === 'demotion';
+  const UserModel = createMemoryModel([
+    {
+      username: 'admin', displayName: 'Admin', role: 'admin',
+      servers: ['global', 'ABC123']
+    },
+    {
+      username: 'alice', displayName: 'Alice', role: readerIsAdmin ? 'admin' : 'user',
+      servers: readerIsAdmin ? ['global'] : ['global', 'ABC123']
+    }
+  ]);
+  const ChatServerModel = createMemoryModel([
+    { code: 'global', owner: 'System', moderators: [] },
+    {
+      code: 'ABC123', owner: 'owner',
+      moderators: readerIsAdmin ? [] : ['alice']
+    }
+  ]);
+  const RoomRestrictionModel = createMemoryModel([]);
+  const shared = {
+    ioInstance,
+    onlineUsersMap,
+    UserModel,
+    ChatServerModel,
+    RoomRestrictionModel,
+    MessageModel: {
+      async findById(id) {
+        assert.equal(id, message._id);
+        lookupStarted.resolve();
+        await releaseLookup.promise;
+        return message;
+      }
+    },
+    ModerationAuditModel: createMemoryModel([]),
+    broadcastOnlineUsersFn: async () => {},
+    getRoomRoleFn: async (_serverCode, username) =>
+      (!readerIsAdmin && username === 'alice' ? 'mod' : 'user'),
+    resolvePingsFn: async text => text,
+    searchRateLimiter: { check() { return true; } },
+    autoModTracker: createAutoModTracker(),
+    logger: { error() {} }
+  };
+  const registerSocket = ({ id, username, displayName, role, joinedServers, serverCode }) => {
+    const socket = new FakeSocket();
+    socket.id = id;
+    createConnectionHandler(shared)(socket);
+    Object.assign(socket, { username, displayName, role, joinedServers, serverCode });
+    socket.joinedRooms.add(serverCode);
+    onlineUsersMap.set(id, {
+      username, displayName, role, joinedServers: [...joinedServers],
+      bannedRooms: [], serverCode
+    });
+    return socket;
+  };
+  const actor = registerSocket({
+    id: `actor-${revocation}`,
+    username: 'admin',
+    displayName: 'Admin',
+    role: 'admin',
+    joinedServers: ['global', 'ABC123'],
+    serverCode: 'global'
+  });
+  const reader = registerSocket({
+    id: `reader-${revocation}`,
+    username: 'alice',
+    displayName: 'Alice',
+    role: readerIsAdmin ? 'admin' : 'user',
+    joinedServers: readerIsAdmin ? ['global'] : ['global', 'ABC123'],
+    serverCode: 'ABC123'
+  });
+  ioInstance.sockets = [actor, reader];
+  return {
+    actor,
+    reader,
+    lookupStarted,
+    releaseLookup,
+    async completeRevocation() {
+      const ack = acknowledge();
+      if (revocation === 'ban') {
+        await actor.trigger('moderate_user', {
+          serverCode: 'ABC123', targetUser: 'alice', action: 'ban', reason: 'matrix ban'
+        }, ack.callback);
+      } else {
+        await actor.trigger('manage_role', {
+          targetUser: 'alice', action: 'demote_global_admin'
+        }, ack.callback);
+      }
+      assert.deepEqual(ack.value(), { success: true });
+    }
+  };
 }
 
 test('search_messages escapes substring input and isolates the active room', async () => {
@@ -953,6 +1052,105 @@ test('deleted-message reads strip unsafe legacy attachments', async () => {
   const ack = acknowledge();
   await socket.trigger('get_deleted_message', message._id, ack.callback);
   assert.deepEqual(ack.value(), { success: true, text: 'deleted', attachment: null });
+});
+
+test('complete message read policy matrix makes completed detail revocations win', async t => {
+  const cases = [
+    {
+      event: 'get_edit_history',
+      revocation: 'ban',
+      message: {
+        _id: '507f1f77bcf86cd799439021', serverCode: 'ABC123', username: 'bob',
+        history: [{ text: 'banned edit-history canary' }], deleted: false
+      }
+    },
+    {
+      event: 'get_deleted_message',
+      revocation: 'ban',
+      message: {
+        _id: '507f1f77bcf86cd799439022', serverCode: 'ABC123', username: 'bob',
+        text: 'banned deleted-message canary', attachment: null, deleted: true
+      }
+    },
+    {
+      event: 'get_edit_history',
+      revocation: 'demotion',
+      message: {
+        _id: '507f1f77bcf86cd799439023', serverCode: 'ABC123', username: 'bob',
+        history: [{ text: 'demoted edit-history canary' }], deleted: false
+      }
+    },
+    {
+      event: 'get_deleted_message',
+      revocation: 'demotion',
+      message: {
+        _id: '507f1f77bcf86cd799439024', serverCode: 'ABC123', username: 'bob',
+        text: 'demoted deleted-message canary', attachment: null, deleted: true
+      }
+    }
+  ];
+
+  for (const scenario of cases) {
+    await t.test(`${scenario.revocation} before deferred ${scenario.event} acknowledgement`, async () => {
+      const race = registerPrivilegedReadRevocationRace(scenario);
+      const readAck = acknowledge();
+      const readPending = race.reader.trigger(
+        scenario.event,
+        scenario.message._id,
+        readAck.callback
+      );
+      await race.lookupStarted.promise;
+      assert.equal(readAck.value(), undefined);
+
+      await race.completeRevocation();
+      assert.equal(readAck.value(), undefined, 'revocation completed before the lookup resumed');
+      race.releaseLookup.resolve();
+      await readPending;
+
+      assert.deepEqual(readAck.value(), { error: 'Permission denied.' });
+      assert.equal(JSON.stringify(readAck.value()).includes('canary'), false);
+    });
+  }
+});
+
+test('complete message read policy matrix allows privileged reads during active timeouts', async t => {
+  const messages = {
+    get_edit_history: {
+      _id: '507f1f77bcf86cd799439025', serverCode: 'ABC123', username: 'bob',
+      history: [{ text: 'timeout edit-history value' }], deleted: false
+    },
+    get_deleted_message: {
+      _id: '507f1f77bcf86cd799439026', serverCode: 'ABC123', username: 'bob',
+      text: 'timeout deleted-message value', attachment: null, deleted: true
+    }
+  };
+
+  for (const [event, message] of Object.entries(messages)) {
+    await t.test(event, async () => {
+      const { socket } = registerMessages({
+        MessageModel: { async findById() { return message; } },
+        RoomRestrictionModel: {
+          async findOne() {
+            return { bannedAt: null, timeoutUntil: new Date(Date.now() + 60_000) };
+          },
+          async find() { return []; }
+        },
+        getRoomRoleFn: async () => 'mod'
+      });
+      authenticate(socket, { serverCode: 'ABC123', joinedServers: ['global', 'ABC123'] });
+      const ack = acknowledge();
+
+      await socket.trigger(event, message._id, ack.callback);
+
+      if (event === 'get_edit_history') {
+        assert.deepEqual(ack.value(), { success: true, history: message.history });
+      } else {
+        assert.deepEqual(ack.value(), {
+          success: true, text: message.text, attachment: null
+        });
+      }
+    });
+  }
 });
 
 test('a sender who left a room cannot edit, read, or delete its old messages', async () => {

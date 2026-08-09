@@ -1403,6 +1403,453 @@ test('production load older wiring handles terminal layout late images and stale
   assert.equal(calls.filter(call => call === 'prepend').length, 1);
 });
 
+test('stale message read integration preserves switched-room and lobby state', async t => {
+  const helpers = loadHelpers();
+  for (const destination of ['room', 'lobby']) {
+    await t.test(destination, () => {
+      const socketCalls = [];
+      const timers = [];
+      const loadButton = { hidden: false, disabled: false };
+      const searchButton = { style: { display: 'block' } };
+      const searchSubmit = createClientElement();
+      const document = createClientDocument();
+      document.createElement = () => createClientElement();
+      const historyControls = { hidden: false };
+      const renderedRows = [];
+      const chatWindow = {
+        scrollHeight: 900,
+        scrollTop: 120,
+        querySelectorAll() { return [...renderedRows]; }
+      };
+      Object.defineProperty(historyControls, 'nextSibling', {
+        get() { return renderedRows[0] || null; }
+      });
+      const messageSearchInput = document.getElementById('message-search-input');
+      const messageSearchStatus = document.getElementById('message-search-status');
+      const messageSearchResults = document.getElementById('message-search-results');
+      const historyList = document.getElementById('history-list');
+      const historyModal = document.getElementById('history-modal');
+      const searchModal = document.getElementById('message-search-modal');
+      const coordinator = helpers.createMessageReadCoordinator({
+        onOlderPendingChange(value) { loadButton.disabled = value; },
+        onSearchPendingChange(value) { searchSubmit.disabled = value; }
+      });
+      const compositionContextCoordinator = helpers.createCompositionContextCoordinator();
+      compositionContextCoordinator.activate('AAAAAA');
+      const sourceContextId = compositionContextCoordinator.current().clientContextId;
+      coordinator.activate('AAAAAA', sourceContextId, 'cursor-a');
+      messageSearchInput.value = 'matrix search';
+      Object.defineProperty(chatWindow, 'children', {
+        get() { return [historyControls, ...renderedRows]; }
+      });
+      const updateSearchControl = forceHidden => {
+        const read = coordinator.current();
+        const active = !forceHidden && read.roomCode &&
+          read.roomCode === runtime.context.currentServerCode;
+        searchButton.style.display = active ? 'block' : 'none';
+      };
+      let runtime;
+      runtime = loadClientFunctions(
+        [
+          'loadOlderMessages', 'submitMessageSearch', 'viewHistory',
+          'closeMessageSearch', 'closeHistoryModal', 'invalidateMessageReads',
+          'clearRenderedMessages', 'enterLobby', 'handleSwitchResult'
+        ],
+        {
+          olderRequestHandle: null,
+          searchRequestHandle: null,
+          stopOlderAnchor: () => {},
+          messageReadCoordinator: coordinator,
+          socket: {
+            emit(event, ...args) {
+              const callback = args.pop();
+              socketCalls.push({ event, args, callback });
+            }
+          },
+          scheduleOlderAckTimeout(callback, delay) {
+            const timer = { callback, delay, kind: 'older' };
+            timers.push(timer);
+            return timer;
+          },
+          scheduleSearchAckTimeout(callback, delay) {
+            const timer = { callback, delay, kind: 'search' };
+            timers.push(timer);
+            return timer;
+          },
+          cancelOlderAckTimeout() {},
+          cancelSearchAckTimeout() {},
+          olderRequestTimeoutMs: 25,
+          searchRequestTimeoutMs: 25,
+          ChatClientHelpers: helpers,
+          renderOlderControl() {
+            helpers.applyOlderControlState(loadButton, coordinator.current());
+            historyControls.hidden = loadButton.hidden;
+          },
+          renderSearchResults(results) {
+            messageSearchResults.children.push(...results);
+            messageSearchStatus.textContent = 'stale search rendered';
+          },
+          chatWindow,
+          historyControls,
+          myUsername: 'Alice',
+          appendMessage(message) {
+            const row = {
+              id: message._id,
+              getAttribute: name => name === 'data-id' ? message._id : null,
+              remove() {
+                const index = renderedRows.indexOf(row);
+                if (index >= 0) renderedRows.splice(index, 1);
+              }
+            };
+            renderedRows.unshift(row);
+            chatWindow.scrollHeight += 100;
+            return row;
+          },
+          createOlderResizeObserver: null,
+          messageSearchInput,
+          messageSearchStatus,
+          messageSearchResults,
+          messageSearchModal: searchModal,
+          messageSearchSubmit: searchSubmit,
+          document,
+          showAppAlert() { messageSearchStatus.textContent = 'stale detail alert'; },
+          formatExactDate: value => String(value),
+          formatMessageText: value => ({ html: String(value) }),
+          compositionContextCoordinator,
+          currentServerCode: 'AAAAAA',
+          myRoomRole: 'user',
+          myRole: 'user',
+          myJoinedServers: ['global', 'AAAAAA', 'BBBBBB'],
+          myBannedRooms: new Set(),
+          serversCache: { BBBBBB: { name: 'Room B', owner: 'Bob' } },
+          restrictionCoordinator: { clear() {} },
+          typingTimeout: null,
+          typingUsers: new Map(),
+          clearTimeout() {},
+          updateTypingUI() {},
+          closeModeratorCenter() {},
+          closeModerationPrompt() {},
+          closeReportPrompt() {},
+          closeResolutionPrompt() {},
+          updateModeratorCenterAccess() {},
+          renderSearchControl: updateSearchControl,
+          renderServerAccess: updateSearchControl,
+          cancelAction() {},
+          applyRestrictionState() {},
+          loadHistory(messages) {
+            renderedRows.splice(0, renderedRows.length);
+            for (const message of messages) {
+              const row = {
+                id: message._id,
+                getAttribute: name => name === 'data-id' ? message._id : null,
+                remove() {
+                  const index = renderedRows.indexOf(row);
+                  if (index >= 0) renderedRows.splice(index, 1);
+                }
+              };
+              renderedRows.push(row);
+            }
+          },
+          msgInput: createClientElement(),
+          sendBtn: createClientElement(),
+          attachmentButton: createClientElement(),
+          emojiButton: createClientElement(),
+          fileUpload: createClientElement(),
+          restrictionNotice: createClientElement(),
+          compositionDisabled: false
+        }
+      );
+
+      searchModal.classList.add('active');
+      runtime.functions.loadOlderMessages();
+      assert.equal(runtime.functions.submitMessageSearch(), true);
+      runtime.functions.viewHistory('507f1f77bcf86cd799439011');
+      historyModal.classList.add('active');
+      assert.deepEqual(socketCalls.map(call => call.event), [
+        'list_messages', 'search_messages', 'get_edit_history'
+      ]);
+      assert.equal(loadButton.disabled, true);
+      assert.equal(searchSubmit.disabled, true);
+      assert.equal(searchModal.classList.contains('active'), true);
+      assert.equal(historyModal.classList.contains('active'), true);
+
+      if (destination === 'room') {
+        runtime.functions.handleSwitchResult('BBBBBB', {
+          history: [{ _id: 'b-1', username: 'Bob' }],
+          nextCursor: 'cursor-b', roomRole: 'user', restriction: null
+        });
+      } else runtime.functions.enterLobby();
+      assert.equal(runtime.context.currentServerCode, destination === 'room' ? 'BBBBBB' : null);
+      assert.deepEqual(renderedRows.map(row => row.id), destination === 'room' ? ['b-1'] : []);
+      assert.equal(coordinator.current().nextCursor, destination === 'room' ? 'cursor-b' : null);
+      assert.equal(searchButton.style.display, destination === 'room' ? 'block' : 'none');
+      assert.equal(searchModal.classList.contains('active'), false);
+      assert.equal(historyModal.classList.contains('active'), false);
+      assert.equal(runtime.context.olderRequestHandle, null);
+      assert.equal(runtime.context.searchRequestHandle, null);
+      assert.equal(loadButton.disabled, false);
+      assert.equal(searchSubmit.disabled, false);
+      chatWindow.scrollHeight = destination === 'room' ? 1200 : 600;
+      chatWindow.scrollTop = 777;
+      helpers.applyOlderControlState(loadButton, coordinator.current());
+      searchSubmit.disabled = false;
+      messageSearchStatus.textContent = `${destination} search sentinel`;
+      messageSearchResults.children = [{ id: `${destination}-search-row` }];
+      historyList.children = [{ id: `${destination}-history-row` }];
+      historyModal.classList.remove('active');
+      searchModal.classList.remove('active');
+
+      const expectedState = { ...coordinator.current() };
+      const expectedRows = renderedRows.map(row => row.id);
+      const expectedSearchChildren = [...messageSearchResults.children];
+      const expectedHistoryChildren = [...historyList.children];
+      socketCalls[0].callback({
+        serverCode: 'AAAAAA', clientContextId: sourceContextId,
+        messages: [{ _id: 'a-old', username: 'Bob' }], nextCursor: null
+      });
+      socketCalls[1].callback({
+        serverCode: 'AAAAAA', clientContextId: sourceContextId,
+        requestId: socketCalls[1].args[0].requestId,
+        results: [{ _id: 'a-search', text: 'private stale result' }]
+      });
+      const unreadableDetail = new Proxy({}, {
+        get() { throw new Error('stale detail acknowledgement was inspected'); }
+      });
+      assert.doesNotThrow(() => socketCalls[2].callback(unreadableDetail));
+
+      assert.deepEqual({ ...coordinator.current() }, expectedState);
+      assert.deepEqual(renderedRows.map(row => row.id), expectedRows);
+      assert.equal(chatWindow.scrollTop, 777);
+      assert.equal(loadButton.hidden, destination === 'lobby');
+      assert.equal(loadButton.disabled, false);
+      assert.equal(searchButton.style.display, destination === 'room' ? 'block' : 'none');
+      assert.equal(searchSubmit.disabled, false);
+      assert.equal(messageSearchStatus.textContent, `${destination} search sentinel`);
+      assert.deepEqual(messageSearchResults.children, expectedSearchChildren);
+      assert.deepEqual(historyList.children, expectedHistoryChildren);
+      assert.equal(historyModal.classList.contains('active'), false);
+      assert.equal(searchModal.classList.contains('active'), false);
+    });
+  }
+});
+
+test('stale message read integration keeps live mutations across duplicate cursor rows', () => {
+  const helpers = loadHelpers();
+  const socketCalls = [];
+  const loadButton = { hidden: false, disabled: false };
+  const historyControls = { hidden: false };
+
+  function createDomElement(tagName = 'div') {
+    const attributes = new Map();
+    const classes = new Set();
+    let ownText = '';
+    const element = {
+      tagName: String(tagName).toUpperCase(),
+      children: [],
+      style: {},
+      offsetHeight: 20,
+      parentNode: null,
+      innerHTML: '',
+      classList: {
+        add(...names) { names.forEach(name => classes.add(name)); },
+        remove(...names) { names.forEach(name => classes.delete(name)); },
+        contains(name) { return classes.has(name); }
+      },
+      setAttribute(name, value) { attributes.set(name, String(value)); },
+      getAttribute(name) { return attributes.get(name) ?? null; },
+      appendChild(child) {
+        child.parentNode = element;
+        element.children.push(child);
+        return child;
+      },
+      remove() {
+        if (!element.parentNode) return;
+        const index = element.parentNode.children.indexOf(element);
+        if (index >= 0) element.parentNode.children.splice(index, 1);
+        element.parentNode = null;
+      },
+      querySelectorAll(selector) {
+        const requested = selector.split(',').map(value => value.trim().replace(/^\./, ''));
+        const matches = [];
+        const visit = parent => {
+          for (const child of parent.children) {
+            if (requested.some(name => child.classList.contains(name))) matches.push(child);
+            visit(child);
+          }
+        };
+        visit(element);
+        return matches;
+      },
+      querySelector(selector) { return element.querySelectorAll(selector)[0] || null; }
+    };
+    Object.defineProperties(element, {
+      className: {
+        get() { return [...classes].join(' '); },
+        set(value) {
+          classes.clear();
+          String(value || '').split(/\s+/).filter(Boolean).forEach(name => classes.add(name));
+        }
+      },
+      textContent: {
+        get() {
+          return ownText + element.children.map(child => child.textContent || '').join('');
+        },
+        set(value) {
+          ownText = String(value ?? '');
+          element.children.splice(0, element.children.length);
+        }
+      }
+    });
+    return element;
+  }
+
+  function createMessageRow(id, text) {
+    const row = createDomElement('div');
+    row.id = String(id);
+    row.className = 'msg';
+    row.setAttribute('data-id', id);
+    row.setAttribute('data-author', 'Bob');
+    row.setAttribute('data-display', 'Bob');
+    row.setAttribute('data-raw-text', text);
+    const textDiv = createDomElement('div');
+    textDiv.className = 'msg-text';
+    const textContent = createDomElement('span');
+    textContent.className = 'msg-text-content';
+    textContent.innerHTML = text;
+    textDiv.appendChild(textContent);
+    row.appendChild(textDiv);
+    return row;
+  }
+
+  const liveEdited = createMessageRow('2', 'original text');
+  const liveDeleted = createMessageRow('3', 'delete me');
+  const children = [historyControls, liveEdited, liveDeleted];
+  const document = {
+    createElement: createDomElement,
+    querySelectorAll(selector) {
+      const match = /^\.msg\[data-id="([^"]+)"\]$/.exec(selector);
+      if (!match) return [];
+      return children.filter(child => child.classList?.contains('msg') &&
+        child.getAttribute('data-id') === match[1]);
+    }
+  };
+  Object.defineProperty(historyControls, 'nextSibling', {
+    get() { return children[children.indexOf(historyControls) + 1] || null; }
+  });
+  const chatWindow = {
+    scrollHeight: 800,
+    scrollTop: 120,
+    querySelectorAll() { return children.filter(child => child.classList?.contains('msg')); }
+  };
+  const coordinator = helpers.createMessageReadCoordinator({
+    onOlderPendingChange(value) { loadButton.disabled = value; }
+  });
+  coordinator.activate('ABC123', 8, 'cursor-a');
+  const renderOlderControl = () => {
+    helpers.applyOlderControlState(loadButton, coordinator.current());
+    const wasHidden = historyControls.hidden;
+    historyControls.hidden = loadButton.hidden;
+    if (!wasHidden && historyControls.hidden) chatWindow.scrollHeight -= 40;
+  };
+  const runtime = loadClientFunction('loadOlderMessages', {
+    olderRequestHandle: null,
+    stopOlderAnchor: () => {},
+    messageReadCoordinator: coordinator,
+    socket: {
+      emit(event, payload, callback) { socketCalls.push({ event, payload, callback }); }
+    },
+    scheduleOlderAckTimeout() { return 'older-timer'; },
+    cancelOlderAckTimeout() {},
+    olderRequestTimeoutMs: 25,
+    ChatClientHelpers: helpers,
+    renderOlderControl,
+    chatWindow,
+    historyControls,
+    myUsername: 'Alice',
+    appendMessage(message, _isMe, { before }) {
+      const row = createMessageRow(message._id, message.text);
+      children.splice(children.indexOf(before), 0, row);
+      chatWindow.scrollHeight += 100;
+      return row;
+    },
+    createOlderResizeObserver: null
+  });
+
+  runtime.fn();
+  assert.equal(loadButton.disabled, true);
+  assert.deepEqual(structuredClone(socketCalls[0].payload), {
+    serverCode: 'ABC123', clientContextId: 8, cursor: 'cursor-a'
+  });
+
+  const listeners = new Map();
+  const activeSocket = {
+    on(event, listener) { listeners.set(event, listener); }
+  };
+  const socketRuntime = loadClientFunction('setupSocket', {
+    ChatClientHelpers: helpers,
+    authBtn: { disabled: false },
+    showError() {},
+    document,
+    formatMessageText(text) {
+      return { html: `rendered:${text}`, autoEmbeds: [], isPinged: false };
+    },
+    myUsername: 'Alice',
+    myRole: 'user',
+    currentServerCode: 'ABC123',
+    myRoomRole: 'user',
+    handleServerDeleted() {},
+    viewHistory() {},
+    viewDeleted() {}
+  });
+  socketRuntime.fn(activeSocket);
+  assert.equal(typeof listeners.get('message_edited'), 'function');
+  assert.equal(typeof listeners.get('message_deleted'), 'function');
+  listeners.get('message_edited')({
+    id: '2', username: 'Bob', text: 'live edited latest'
+  });
+  listeners.get('message_deleted')('3');
+
+  assert.equal(liveEdited.getAttribute('data-raw-text'), 'live edited latest');
+  assert.equal(liveEdited.querySelector('.msg-text-content').innerHTML,
+    'rendered:live edited latest');
+  assert.equal(liveEdited.querySelector('.edited-tag').textContent, '(edited)');
+  assert.equal(liveDeleted.classList.contains('deleted-compact'), true);
+  assert.equal(liveDeleted.classList.contains('is-deleted'), true);
+  assert.equal(liveDeleted.querySelector('.deleted-text').textContent,
+    'Bob deleted a message.');
+
+  socketCalls[0].callback({
+    serverCode: 'ABC123',
+    clientContextId: 8,
+    messages: [
+      { _id: '0', username: 'Bob', text: 'oldest' },
+      { _id: '0', username: 'Bob', text: 'duplicate boundary' },
+      { _id: '1', username: 'Bob', text: 'older' },
+      { _id: '2', username: 'Bob', text: 'stale before edit' },
+      { _id: '3', username: 'Bob', text: 'stale before delete' }
+    ],
+    nextCursor: null
+  });
+
+  assert.deepEqual(children.map(child => child.getAttribute?.('data-id') || 'controls'), [
+    'controls', '0', '1', '2', '3'
+  ]);
+  assert.equal(children.filter(row => row.getAttribute?.('data-id') === '0').length, 1);
+  assert.equal(children.filter(row => row.getAttribute?.('data-id') === '2').length, 1);
+  assert.equal(children.filter(row => row.getAttribute?.('data-id') === '3').length, 1);
+  assert.equal(liveEdited.getAttribute('data-raw-text'), 'live edited latest');
+  assert.equal(liveEdited.querySelector('.msg-text-content').innerHTML,
+    'rendered:live edited latest');
+  assert.equal(liveEdited.querySelector('.edited-tag').textContent, '(edited)');
+  assert.equal(liveDeleted.classList.contains('deleted-compact'), true);
+  assert.equal(liveDeleted.classList.contains('is-deleted'), true);
+  assert.equal(liveDeleted.querySelector('.deleted-text').textContent,
+    'Bob deleted a message.');
+  assert.equal(chatWindow.scrollTop, 280);
+  assert.equal(coordinator.current().nextCursor, null);
+  assert.deepEqual(loadButton, { hidden: true, disabled: false });
+});
+
 test('backend URLs allow only HTTP and HTTPS', () => {
   const helpers = loadHelpers();
   assert.equal(helpers.normalizeBackendUrl('example.com/'), 'https://example.com');
