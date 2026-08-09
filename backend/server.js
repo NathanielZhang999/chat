@@ -300,6 +300,97 @@ function createReplySnapshot(message) {
   };
 }
 
+function messageRoomQuery(serverCode) {
+  return serverCode === 'global'
+    ? { $or: [
+        { serverCode: 'global' },
+        { serverCode: { $exists: false } },
+        { serverCode: null }
+      ] }
+    : { serverCode };
+}
+
+function messageCursorQuery(cursor) {
+  if (!cursor) return {};
+  return { $or: [
+    { timestamp: { $lt: cursor.date } },
+    { timestamp: cursor.date, _id: { $lt: cursor.id } }
+  ] };
+}
+
+function nextMessagePage(rows, limit) {
+  const hasMore = rows.length > limit;
+  const page = rows.slice(0, limit);
+  const last = page[page.length - 1];
+  return {
+    page,
+    nextCursor: hasMore && last ? encodeCursor(last.timestamp, last._id) : null
+  };
+}
+
+function normalizeMessageSearchQuery(value) {
+  if (typeof value !== 'string') return null;
+  const query = value.normalize('NFKC').trim();
+  return query.length >= 2 && query.length <= 80 ? query : null;
+}
+
+function safeReplySnapshot(replyTo) {
+  if (!replyTo || typeof replyTo !== 'object' || Array.isArray(replyTo) || !isValidObjectId(replyTo.id)) {
+    return null;
+  }
+  return {
+    id: String(replyTo.id),
+    displayname: typeof replyTo.displayname === 'string' ? replyTo.displayname.slice(0, 30) : '',
+    text: typeof replyTo.text === 'string' ? replyTo.text.slice(0, 100) : ''
+  };
+}
+
+function safeReactions(reactions) {
+  if (!reactions || typeof reactions !== 'object' || Array.isArray(reactions)) return {};
+  const result = {};
+  for (const [emoji, users] of Object.entries(reactions)) {
+    if (Object.keys(result).length >= MAX_REACTION_KEYS || !isValidReaction(emoji) || !Array.isArray(users)) continue;
+    result[emoji] = users
+      .filter(username => typeof username === 'string' && username.length <= 20)
+      .slice(0, MAX_REACTION_USERS);
+  }
+  return result;
+}
+
+function safeMessageForViewer(message, viewer, options = {}) {
+  const serialized = {
+    _id: message && message._id !== undefined && message._id !== null ? String(message._id) : '',
+    serverCode: message && message.serverCode,
+    username: message && message.username,
+    displayName: message && message.displayName,
+    role: message && message.role,
+    roomRole: message && message.roomRole,
+    color: message && message.color,
+    avatarUrl: message && message.avatarUrl,
+    text: message && typeof message.text === 'string' ? message.text : '',
+    attachment: sanitizeAttachment(message && message.attachment),
+    replyTo: safeReplySnapshot(message && message.replyTo),
+    reactions: safeReactions(message && message.reactions),
+    edited: Boolean(message && message.edited),
+    deleted: Boolean(message && message.deleted),
+    timestamp: message && message.timestamp
+  };
+  const mayViewDeletedContent = serialized.username === (viewer && viewer.username) ||
+    (viewer && (viewer.role === 'admin' || viewer.roomRole === 'mod'));
+
+  if (serialized.deleted && !mayViewDeletedContent) {
+    serialized.text = '';
+    serialized.attachment = null;
+    serialized.replyTo = null;
+    serialized.reactions = {};
+  }
+  if (options && options.search) {
+    delete serialized.attachment;
+    delete serialized.reactions;
+  }
+  return serialized;
+}
+
 // --- SECURITY: REGEX ESCAPE ---
 function escapeRegExp(string) {
   return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); 
@@ -660,6 +751,8 @@ const MessageSchema = new mongoose.Schema({
   history: [{ text: String, timestamp: Date }], 
   timestamp: { type: Date, default: Date.now }
 });
+MessageSchema.index({ serverCode: 1, timestamp: -1, _id: -1 });
+MessageSchema.index({ timestamp: -1, _id: -1 });
 const Message = mongoose.model('Message', MessageSchema);
 
 // --- AUTO-SETUP SYSTEM ---
@@ -3402,6 +3495,11 @@ module.exports = {
   isValidObjectId,
   encodeCursor,
   decodeCursor,
+  messageRoomQuery,
+  messageCursorQuery,
+  nextMessagePage,
+  normalizeMessageSearchQuery,
+  safeMessageForViewer,
   neutralizePingTokens,
   normalizeTransportAddress,
   createRateLimiter,

@@ -1,7 +1,117 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { createAutoModTracker, createConnectionHandler } = require('../server');
+const {
+  createAutoModTracker,
+  createConnectionHandler,
+  messageRoomQuery,
+  messageCursorQuery,
+  nextMessagePage,
+  normalizeMessageSearchQuery,
+  safeMessageForViewer
+} = require('../server');
 const { FakeSocket, FakeIo, acknowledge, deferred } = require('./support/fakes');
+
+test('safeMessageForViewer allowlists ordinary and deleted history fields', () => {
+  const stored = {
+    _id: '507f1f77bcf86cd799439011', serverCode: 'ABC123', username: 'Alice',
+    displayName: 'Alice', role: 'user', roomRole: 'user', color: '#123456', avatarUrl: '',
+    text: 'current', attachment: 'data:image/png;base64,AAAA',
+    replyTo: { id: '507f1f77bcf86cd799439012', displayname: 'Bob', text: 'reply', secret: 'never return' },
+    reactions: { '👍': ['Bob'] }, edited: true, deleted: false,
+    timestamp: new Date('2026-08-09T00:00:00.000Z'),
+    history: [{ text: 'old secret' }], __v: 7, secret: 'never return'
+  };
+  const approvedKeys = [
+    '_id', 'serverCode', 'username', 'displayName', 'role', 'roomRole', 'color',
+    'avatarUrl', 'text', 'attachment', 'replyTo', 'reactions', 'edited', 'deleted', 'timestamp'
+  ];
+
+  const ordinary = safeMessageForViewer(stored, { username: 'Bob', role: 'user', roomRole: 'user' });
+  assert.deepEqual(Object.keys(ordinary).sort(), approvedKeys.sort());
+  assert.equal(ordinary.attachment, stored.attachment);
+  assert.deepEqual(ordinary.replyTo, { id: stored.replyTo.id, displayname: 'Bob', text: 'reply' });
+  assert.deepEqual(ordinary.reactions, { '👍': ['Bob'] });
+  assert.equal('history' in ordinary, false);
+  assert.equal('__v' in ordinary, false);
+  assert.equal('secret' in ordinary, false);
+
+  const deleted = safeMessageForViewer({ ...stored, deleted: true }, {
+    username: 'Bob', role: 'user', roomRole: 'user'
+  });
+  assert.equal(deleted.text, '');
+  assert.equal(deleted.attachment, null);
+  assert.deepEqual(deleted.reactions, {});
+  assert.equal(deleted.replyTo, null);
+});
+
+test('safeMessageForViewer preserves deleted content only for authorized viewers', () => {
+  const stored = {
+    _id: '507f1f77bcf86cd799439011', serverCode: 'ABC123', username: 'Alice',
+    text: 'deleted current content', attachment: 'data:image/png;base64,AAAA',
+    replyTo: { id: '507f1f77bcf86cd799439012', displayname: 'Bob', text: 'reply' },
+    reactions: { '👍': ['Bob'] }, deleted: true
+  };
+
+  for (const viewer of [
+    { username: 'Alice', role: 'user', roomRole: 'user' },
+    { username: 'Bob', role: 'admin', roomRole: 'user' },
+    { username: 'Bob', role: 'user', roomRole: 'mod' }
+  ]) {
+    const serialized = safeMessageForViewer(stored, viewer);
+    assert.equal(serialized.text, stored.text);
+    assert.equal(serialized.attachment, stored.attachment);
+    assert.deepEqual(serialized.replyTo, stored.replyTo);
+    assert.deepEqual(serialized.reactions, stored.reactions);
+  }
+});
+
+test('safeMessageForViewer omits attachment and reactions from search rows', () => {
+  const serialized = safeMessageForViewer({
+    _id: '507f1f77bcf86cd799439011', serverCode: 'ABC123', username: 'Alice',
+    text: 'searchable text', attachment: 'data:image/png;base64,AAAA', reactions: { '👍': ['Bob'] },
+    replyTo: { id: '507f1f77bcf86cd799439012', displayname: 'Bob', text: 'reply' },
+    history: [{ text: 'old secret' }], __v: 7
+  }, { username: 'Bob', role: 'user', roomRole: 'user' }, { search: true });
+
+  assert.equal('attachment' in serialized, false);
+  assert.equal('reactions' in serialized, false);
+  assert.equal('history' in serialized, false);
+  assert.equal('__v' in serialized, false);
+});
+
+test('message room query preserves legacy global messages', () => {
+  assert.deepEqual(messageRoomQuery('ABC123'), { serverCode: 'ABC123' });
+  assert.deepEqual(messageRoomQuery('global'), {
+    $or: [
+      { serverCode: 'global' },
+      { serverCode: { $exists: false } },
+      { serverCode: null }
+    ]
+  });
+});
+
+test('message keyset query and next cursor handle equal timestamps without duplicates', () => {
+  const cursor = { date: new Date('2026-08-09T00:00:00.000Z'), id: '507f1f77bcf86cd799439020' };
+  assert.deepEqual(messageCursorQuery(cursor), { $or: [
+    { timestamp: { $lt: cursor.date } },
+    { timestamp: cursor.date, _id: { $lt: cursor.id } }
+  ] });
+  const rows = Array.from({ length: 21 }, (_, index) => ({
+    _id: `507f1f77bcf86cd799439${String(40 - index).padStart(3, '0')}`,
+    timestamp: new Date(1_800_000_000_000 - index)
+  }));
+  const result = nextMessagePage(rows, 20);
+  assert.equal(result.page.length, 20);
+  assert.ok(result.nextCursor);
+  assert.equal(nextMessagePage(result.page, 20).nextCursor, null);
+});
+
+test('search normalization accepts bounded NFKC text and rejects malformed input', () => {
+  assert.equal(normalizeMessageSearchQuery('  cafe\u0301  '), 'café');
+  for (const value of [null, {}, 'x', 'x'.repeat(81)]) {
+    assert.equal(normalizeMessageSearchQuery(value), null);
+  }
+});
 
 function registerMessages(overrides = {}) {
   const socket = new FakeSocket();
