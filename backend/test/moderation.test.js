@@ -622,8 +622,17 @@ test('report account lock serializes duplicate detection and the rolling daily l
   assert.equal(limitedSetup.ModerationReportModel.rows.length, 10);
 });
 
-test('report account lock makes the rolling cap atomic across distinct concurrent submissions', async () => {
+test('report account lock makes the rolling cap atomic across concurrent submissions in different rooms', async () => {
   const setup = reportingScenario();
+  const otherRoomMessageId = '507f1f77bcf86cd799439012';
+  setup.MessageModel.rows.push({
+    _id: otherRoomMessageId,
+    serverCode: 'XYZ789',
+    username: 'Bob',
+    displayName: 'Bob',
+    text: 'other-room evidence',
+    timestamp: new Date('2026-08-08T12:01:00.000Z')
+  });
   const now = Date.now();
   for (let index = 0; index < 9; index += 1) {
     setup.ModerationReportModel.rows.push({
@@ -655,17 +664,19 @@ test('report account lock makes the rolling cap atomic across distinct concurren
   }, firstAck.callback);
   await firstCountStarted.promise;
   const secondPending = setup.socket.trigger('report_moderation_target', {
-    serverCode: 'ABC123', targetUser: 'OrdinaryMember',
-    reason: 'second distinct report at the cap'
+    serverCode: 'XYZ789', targetUser: 'bOb', messageId: otherRoomMessageId,
+    reason: 'second distinct room report at the cap'
   }, secondAck.callback);
   await new Promise(resolve => setImmediate(resolve));
   releaseFirstCount.resolve();
   await Promise.all([firstPending, secondPending]);
 
   const results = [firstAck.value(), secondAck.value()];
-  assert.equal(results.filter(result => result.success).length, 1);
-  assert.deepEqual(results.find(result => result.error), { error: 'Too many reports.' });
-  assert.equal(setup.ModerationReportModel.rows.length, 10);
+  assert.deepEqual({
+    successes: results.filter(result => result.success).length,
+    limitErrors: results.filter(result => result.error === 'Too many reports.').length,
+    totalRows: setup.ModerationReportModel.rows.length
+  }, { successes: 1, limitErrors: 1, totalRows: 10 });
 });
 
 test('report and moderation reads deny ordinary and wrong-room moderators without leaking counts', async () => {
