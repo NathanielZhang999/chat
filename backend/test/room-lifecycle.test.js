@@ -1442,6 +1442,7 @@ function registerModerationReadRace({ action, targetUser = 'alice' }) {
       events.push('read:query');
       queryStarted.resolve();
       return {
+        select() { return this; },
         sort() { return this; },
         limit() { return this; },
         async lean() {
@@ -1460,6 +1461,7 @@ function registerModerationReadRace({ action, targetUser = 'alice' }) {
     MessageModel,
     ModerationAuditModel: createMemoryModel([]),
     broadcastOnlineUsersFn: async () => {},
+    searchRateLimiter: { check() { return true; } },
     logger: { error() {} }
   };
   const moderator = registerSharedSocket(shared, `moderator-${action}`);
@@ -1535,6 +1537,107 @@ test('list_messages queued behind a completed timeout may finish its deferred qu
     { count: readAck.value().messages.length, nextCursor: readAck.value().nextCursor },
     { count: 1, nextCursor: null }
   );
+});
+
+test('search_messages queued behind a completed ban denies before querying messages', async () => {
+  const race = registerModerationReadRace({ action: 'ban' });
+  const moderationAck = acknowledge();
+  const moderationPending = race.moderator.trigger('moderate_user', {
+    serverCode: 'ABC123', targetUser: 'alice', action: 'ban', reason: 'test ban'
+  }, moderationAck.callback);
+  await race.persistenceStarted.promise;
+
+  const searchAck = acknowledge();
+  const searchPending = race.reader.trigger('search_messages', {
+    serverCode: 'ABC123', clientContextId: 16, query: 'message', requestId: 1
+  }, searchAck.callback);
+  await Promise.resolve();
+  assert.equal(race.messageQueries(), 0);
+
+  race.releasePersistence.resolve();
+  await Promise.all([moderationPending, searchPending]);
+  assert.deepEqual(moderationAck.value(), { success: true });
+  assert.deepEqual(searchAck.value(), { error: 'Permission denied.' });
+  assert.equal(race.messageQueries(), 0);
+});
+
+test('search_messages queued behind a completed timeout may finish its deferred query', async () => {
+  const race = registerModerationReadRace({ action: 'timeout' });
+  const moderationAck = acknowledge();
+  const moderationPending = race.moderator.trigger('moderate_user', {
+    serverCode: 'ABC123', targetUser: 'alice', action: 'timeout',
+    duration: '10m', reason: 'test timeout'
+  }, moderationAck.callback);
+  await race.persistenceStarted.promise;
+
+  const searchAck = acknowledge();
+  const searchPending = race.reader.trigger('search_messages', {
+    serverCode: 'ABC123', clientContextId: 17, query: 'message', requestId: 2
+  }, searchAck.callback);
+  race.releasePersistence.resolve();
+  await moderationPending;
+  await race.queryStarted.promise;
+  assert.equal(searchAck.value(), undefined);
+
+  race.releaseQuery.resolve();
+  await searchPending;
+  assert.deepEqual(moderationAck.value(), { success: true });
+  assert.deepEqual(
+    {
+      ids: searchAck.value().results.map(message => message._id),
+      serverCode: searchAck.value().serverCode,
+      clientContextId: searchAck.value().clientContextId,
+      requestId: searchAck.value().requestId
+    },
+    {
+      ids: ['000000000000000000000001'],
+      serverCode: 'ABC123',
+      clientContextId: 17,
+      requestId: 2
+    }
+  );
+});
+
+test('search_messages acknowledges deferred results before a queued ban can complete', async () => {
+  const race = registerModerationReadRace({ action: 'ban', targetUser: 'bob' });
+  let searchResponse;
+  let moderationResponse;
+  let acknowledgementHeldAccountLock;
+  let accountLockProbe;
+  const searchPending = race.reader.trigger('search_messages', {
+    serverCode: 'ABC123', clientContextId: 18, query: 'message', requestId: 3
+  }, response => {
+    let probeEntered = false;
+    accountLockProbe = withAccountTransitionLock('alice', async () => { probeEntered = true; });
+    acknowledgementHeldAccountLock = !probeEntered;
+    race.events.push('read:ack');
+    searchResponse = response;
+  });
+  await race.queryStarted.promise;
+
+  const moderationPending = race.moderator.trigger('moderate_user', {
+    serverCode: 'ABC123', targetUser: race.targetUser, action: 'ban', reason: 'queued ban'
+  }, response => {
+    race.events.push('ban:ack');
+    moderationResponse = response;
+  });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(race.persistenceBegan(), false);
+  assert.equal(moderationResponse, undefined);
+
+  race.releaseQuery.resolve();
+  await searchPending;
+  await race.persistenceStarted.promise;
+  assert.deepEqual(searchResponse.results.map(message => message._id), [
+    '000000000000000000000001'
+  ]);
+  assert.equal(acknowledgementHeldAccountLock, true);
+  assert.ok(race.events.indexOf('read:ack') < race.events.indexOf('ban:persist'));
+
+  race.releasePersistence.resolve();
+  await Promise.all([moderationPending, accountLockProbe]);
+  assert.deepEqual(moderationResponse, { success: true });
+  assert.ok(race.events.indexOf('read:ack') < race.events.indexOf('ban:ack'));
 });
 
 test('list_messages acknowledges a deferred page before a queued ban can complete', async () => {

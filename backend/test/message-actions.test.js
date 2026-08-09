@@ -9,6 +9,7 @@ const {
   nextMessagePage,
   normalizeMessageSearchQuery,
   safeMessageForViewer,
+  createRateLimiter,
   MessageSchema,
   decodeCursor
 } = require('../server');
@@ -98,13 +99,13 @@ test('safeMessageForViewer redacts deleted content for malformed message or view
   for (const [message, viewer] of cases) {
     const serialized = safeMessageForViewer(message, viewer, { search: true });
     assert.equal(serialized.text, '');
-    assert.equal(serialized.replyTo, null);
+    assert.equal('replyTo' in serialized, false);
     assert.equal('attachment' in serialized, false);
     assert.equal('reactions' in serialized, false);
   }
 });
 
-test('safeMessageForViewer omits attachment and reactions from search rows', () => {
+test('safeMessageForViewer omits attachment, reply, and reactions from search rows', () => {
   const serialized = safeMessageForViewer({
     _id: '507f1f77bcf86cd799439011', serverCode: 'ABC123', username: 'Alice',
     text: 'searchable text', attachment: 'data:image/png;base64,AAAA', reactions: { '👍': ['Bob'] },
@@ -113,6 +114,7 @@ test('safeMessageForViewer omits attachment and reactions from search rows', () 
   }, { username: 'Bob', role: 'user', roomRole: 'user' }, { search: true });
 
   assert.equal('attachment' in serialized, false);
+  assert.equal('replyTo' in serialized, false);
   assert.equal('reactions' in serialized, false);
   assert.equal('history' in serialized, false);
   assert.equal('__v' in serialized, false);
@@ -172,6 +174,37 @@ test('search normalization accepts bounded NFKC text and rejects malformed input
   }
 });
 
+const matchingSearchRow = {
+  _id: 'matching-current-room-id',
+  serverCode: 'ABC123',
+  username: 'alice',
+  displayName: 'Alice',
+  role: 'user',
+  roomRole: 'user',
+  color: '#123456',
+  avatarUrl: '',
+  text: 'literal a+b match',
+  attachment: 'data:image/png;base64,AAAA',
+  replyTo: { id: '507f1f77bcf86cd799439012', displayname: 'Bob', text: 'private reply' },
+  reactions: { '👍': ['bob'] },
+  edited: true,
+  deleted: false,
+  history: [{ text: 'private history' }],
+  __v: 7,
+  internal: 'private internal field',
+  timestamp: new Date('2026-08-09T12:00:00.000Z')
+};
+
+function boundedSearchQuery(rows, observed = {}) {
+  let maximum = rows.length;
+  return {
+    select(value) { observed.select = value; return this; },
+    sort(value) { observed.sort = value; return this; },
+    limit(value) { observed.limit = value; maximum = value; return this; },
+    async lean() { return rows.slice(0, maximum); }
+  };
+}
+
 function registerMessages(overrides = {}) {
   const socket = new FakeSocket();
   const ioInstance = new FakeIo();
@@ -188,11 +221,299 @@ function registerMessages(overrides = {}) {
     broadcastOnlineUsersFn: async () => {},
     getRoomRoleFn: async () => 'user',
     resolvePingsFn: async text => text,
+    searchRateLimiter: { check() { return true; } },
     autoModTracker: createAutoModTracker(),
     ...overrides
   })(socket);
   return { socket, ioInstance };
 }
+
+test('search_messages escapes substring input and isolates the active room', async () => {
+  let observedFilter;
+  const observedQuery = {};
+  const MessageModel = {
+    find(filter) {
+      observedFilter = filter;
+      return boundedSearchQuery([matchingSearchRow], observedQuery);
+    }
+  };
+  const { socket } = registerMessages({ MessageModel });
+  authenticate(socket, { serverCode: 'ABC123', joinedServers: ['global', 'ABC123'] });
+  const ack = acknowledge();
+
+  await socket.trigger('search_messages', {
+    serverCode: 'ABC123', clientContextId: 4, query: 'a+b', requestId: 9
+  }, ack.callback);
+
+  const response = ack.value();
+  assert.deepEqual(response.results.map(row => row._id), ['matching-current-room-id']);
+  assert.deepEqual(
+    { serverCode: response.serverCode, clientContextId: response.clientContextId, requestId: response.requestId },
+    { serverCode: 'ABC123', clientContextId: 4, requestId: 9 }
+  );
+  assert.deepEqual(observedFilter.$and.slice(0, 2), [
+    { serverCode: 'ABC123' },
+    { deleted: { $ne: true } }
+  ]);
+  assert.equal(observedFilter.$and[2].text.source, 'a\\+b');
+  assert.equal(observedFilter.$and[2].text.flags, 'i');
+  assert.deepEqual(observedQuery.sort, { timestamp: -1, _id: -1 });
+  assert.equal(observedQuery.limit, 20);
+  assert.deepEqual(observedQuery.select, {
+    _id: 1,
+    serverCode: 1,
+    username: 1,
+    displayName: 1,
+    role: 1,
+    roomRole: 1,
+    color: 1,
+    avatarUrl: 1,
+    text: 1,
+    edited: 1,
+    timestamp: 1
+  });
+  for (const privateField of ['attachment', 'replyTo', 'reactions', 'history', '__v', 'internal']) {
+    assert.equal(privateField in response.results[0], false, privateField);
+  }
+});
+
+test('search_messages excludes deleted rows before matching current text or history', async () => {
+  const deletedSearchRow = {
+    ...matchingSearchRow,
+    _id: 'deleted-search-row',
+    text: 'current secret',
+    deleted: true,
+    history: [{ text: 'older secret' }]
+  };
+  let observedFilter;
+  const MessageModel = {
+    find(filter) {
+      observedFilter = filter;
+      const excludesDeleted = filter.$and.some(clause =>
+        clause.deleted && clause.deleted.$ne === true
+      );
+      return boundedSearchQuery(excludesDeleted ? [] : [deletedSearchRow]);
+    }
+  };
+  const { socket } = registerMessages({ MessageModel });
+  authenticate(socket, { serverCode: 'ABC123', joinedServers: ['global', 'ABC123'] });
+  const ack = acknowledge();
+
+  await socket.trigger('search_messages', {
+    serverCode: 'ABC123', clientContextId: 5, query: 'secret', requestId: 10
+  }, ack.callback);
+
+  assert.deepEqual(observedFilter.$and[1], { deleted: { $ne: true } });
+  assert.deepEqual(ack.value().results, []);
+  assert.equal(JSON.stringify(observedFilter).includes('history'), false);
+});
+
+test('search_messages identifies matching legacy Global rows with the active room code', async () => {
+  const legacyGlobalRow = { ...matchingSearchRow, _id: 'legacy-global-id' };
+  delete legacyGlobalRow.serverCode;
+  let observedFilter;
+  const { socket } = registerMessages({
+    MessageModel: {
+      find(filter) {
+        observedFilter = filter;
+        return boundedSearchQuery([legacyGlobalRow]);
+      }
+    }
+  });
+  authenticate(socket, { serverCode: 'global', joinedServers: ['global'] });
+  const ack = acknowledge();
+
+  await socket.trigger('search_messages', {
+    serverCode: 'global', clientContextId: 6, query: 'literal', requestId: 15
+  }, ack.callback);
+
+  assert.deepEqual(observedFilter.$and[0], messageRoomQuery('global'));
+  assert.equal(ack.value().results[0].serverCode, 'global');
+});
+
+test('search_messages validates plain payloads, active room, contexts, request IDs, and query bounds', async () => {
+  const observedPatterns = [];
+  let queries = 0;
+  const { socket } = registerMessages({
+    MessageModel: {
+      find(filter) {
+        queries += 1;
+        observedPatterns.push(filter.$and[2].text.source);
+        return boundedSearchQuery([]);
+      }
+    }
+  });
+  authenticate(socket, { serverCode: 'ABC123', joinedServers: ['global', 'ABC123'] });
+  const invalidPayloads = [
+    null,
+    [],
+    new Date(),
+    'not-an-object',
+    { serverCode: 'ABC123', clientContextId: 4, query: 'x', requestId: 1 },
+    { serverCode: 'ABC123', clientContextId: 4, query: 'x'.repeat(81), requestId: 1 },
+    { serverCode: 'ABC123', clientContextId: 4, query: 12, requestId: 1 },
+    { serverCode: 'ABC123', clientContextId: 0, query: 'ok', requestId: 1 },
+    { serverCode: 'ABC123', clientContextId: 1.5, query: 'ok', requestId: 1 },
+    { serverCode: 'ABC123', clientContextId: 4, query: 'ok', requestId: 0 },
+    { serverCode: 'ABC123', clientContextId: 4, query: 'ok', requestId: -1 },
+    { serverCode: 'ABC123', clientContextId: 4, query: 'ok', requestId: 1.5 },
+    { serverCode: 'ABC123', clientContextId: 4, query: 'ok', requestId: Number.MAX_SAFE_INTEGER + 1 },
+    { serverCode: 'global', clientContextId: 4, query: 'ok', requestId: 1 }
+  ];
+  for (const payload of invalidPayloads) {
+    const ack = acknowledge();
+    await socket.trigger('search_messages', payload, ack.callback);
+    assert.deepEqual(ack.value(), { error: 'Invalid input format.' }, JSON.stringify(payload));
+  }
+  assert.equal(queries, 0);
+
+  for (const [query, source] of [
+    ['ab', 'ab'],
+    ['x'.repeat(80), 'x'.repeat(80)],
+    ['  cafe\u0301  ', 'café']
+  ]) {
+    const ack = acknowledge();
+    await socket.trigger('search_messages', {
+      serverCode: 'abc123', clientContextId: 4, query, requestId: queries + 1
+    }, ack.callback);
+    assert.equal(ack.value().requestId, queries);
+    assert.equal(observedPatterns.at(-1), source);
+  }
+  assert.equal(queries, 3);
+});
+
+test('search_messages returns at most twenty newest projected rows', async () => {
+  const rows = Array.from({ length: 25 }, (_, index) => ({
+    ...matchingSearchRow,
+    _id: String(index + 1),
+    text: `matching row ${index + 1}`,
+    timestamp: new Date(1_800_000_000_000 - index)
+  }));
+  const observedQuery = {};
+  const { socket } = registerMessages({
+    MessageModel: { find() { return boundedSearchQuery(rows, observedQuery); } }
+  });
+  authenticate(socket, { serverCode: 'ABC123', joinedServers: ['global', 'ABC123'] });
+  const ack = acknowledge();
+
+  await socket.trigger('search_messages', {
+    serverCode: 'ABC123', clientContextId: 4, query: 'matching', requestId: 11
+  }, ack.callback);
+
+  assert.equal(ack.value().results.length, 20);
+  assert.deepEqual(ack.value().results.map(row => row._id), rows.slice(0, 20).map(row => row._id));
+  assert.deepEqual(observedQuery.sort, { timestamp: -1, _id: -1 });
+  assert.equal(observedQuery.limit, 20);
+});
+
+test('search rate limiter exhausts thirty attempts and resets after sixty seconds', async () => {
+  let currentTime = 0;
+  let queries = 0;
+  const searchRateLimiter = createRateLimiter({
+    maxEntries: 10_000,
+    maxAttempts: 30,
+    windowMs: 60 * 1000,
+    now: () => currentTime
+  });
+  const { socket } = registerMessages({
+    searchRateLimiter,
+    MessageModel: {
+      find() {
+        queries += 1;
+        return boundedSearchQuery([]);
+      }
+    }
+  });
+  authenticate(socket, { serverCode: 'ABC123', joinedServers: ['global', 'ABC123'] });
+
+  for (let requestId = 1; requestId <= 30; requestId += 1) {
+    const ack = acknowledge();
+    await socket.trigger('search_messages', {
+      serverCode: 'ABC123', clientContextId: 4, query: 'rate', requestId
+    }, ack.callback);
+    assert.deepEqual(ack.value().results, []);
+  }
+  const limitedAck = acknowledge();
+  await socket.trigger('search_messages', {
+    serverCode: 'ABC123', clientContextId: 4, query: 'rate', requestId: 31
+  }, limitedAck.callback);
+  assert.deepEqual(limitedAck.value(), { error: 'Too many requests. Try again later.' });
+  assert.equal(queries, 30);
+
+  currentTime = 60 * 1000;
+  const resetAck = acknowledge();
+  await socket.trigger('search_messages', {
+    serverCode: 'ABC123', clientContextId: 4, query: 'rate', requestId: 32
+  }, resetAck.callback);
+  assert.deepEqual(resetAck.value().results, []);
+  assert.equal(queries, 31);
+});
+
+test('search_messages allows active timeouts but denies active bans to global admins', async () => {
+  let queries = 0;
+  const timedOut = registerMessages({
+    RoomRestrictionModel: {
+      async findOne() { return { bannedAt: null, timeoutUntil: new Date(Date.now() + 60_000) }; },
+      async find() { return []; }
+    },
+    MessageModel: {
+      find() { queries += 1; return boundedSearchQuery([matchingSearchRow]); }
+    }
+  });
+  authenticate(timedOut.socket, { serverCode: 'ABC123', joinedServers: ['global', 'ABC123'] });
+  const timeoutAck = acknowledge();
+  await timedOut.socket.trigger('search_messages', {
+    serverCode: 'ABC123', clientContextId: 4, query: 'literal', requestId: 12
+  }, timeoutAck.callback);
+  assert.deepEqual(timeoutAck.value().results.map(row => row._id), ['matching-current-room-id']);
+
+  const bannedAdmin = registerMessages({
+    UserModel: {
+      async findOne() { return { username: 'alice', role: 'admin', servers: ['global'] }; }
+    },
+    RoomRestrictionModel: {
+      async findOne() { return { bannedAt: new Date(), timeoutUntil: null }; },
+      async find() { return []; }
+    },
+    MessageModel: {
+      find() { queries += 1; return boundedSearchQuery([matchingSearchRow]); }
+    }
+  });
+  authenticate(bannedAdmin.socket, { serverCode: 'ABC123', joinedServers: ['global'] });
+  bannedAdmin.socket.role = 'admin';
+  const banAck = acknowledge();
+  await bannedAdmin.socket.trigger('search_messages', {
+    serverCode: 'ABC123', clientContextId: 4, query: 'literal', requestId: 13
+  }, banAck.callback);
+  assert.deepEqual(banAck.value(), { error: 'Permission denied.' });
+  assert.equal(queries, 1);
+});
+
+test('search_messages logs only generic error metadata without query or message content', async () => {
+  const logged = [];
+  const secretQuery = 'needle-private-query';
+  const secretText = 'matching private message text';
+  const { socket } = registerMessages({
+    MessageModel: {
+      find() { throw new Error(`${secretQuery}: ${secretText}`); }
+    },
+    logger: { error(...args) { logged.push(args); } }
+  });
+  authenticate(socket, { serverCode: 'ABC123', joinedServers: ['global', 'ABC123'] });
+  const ack = acknowledge();
+
+  await socket.trigger('search_messages', {
+    serverCode: 'ABC123', clientContextId: 4, query: secretQuery, requestId: 14
+  }, ack.callback);
+
+  assert.deepEqual(ack.value(), { error: 'Search failed.' });
+  assert.deepEqual(logged, [[
+    'Chat operation failed.',
+    { event: 'search_messages', errorType: 'Error' }
+  ]]);
+  assert.equal(JSON.stringify(logged).includes(secretQuery), false);
+  assert.equal(JSON.stringify(logged).includes(secretText), false);
+});
 
 function authenticate(socket, { serverCode = 'global', joinedServers = ['global'] } = {}) {
   socket.username = 'alice';

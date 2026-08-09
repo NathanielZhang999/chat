@@ -391,6 +391,7 @@ function safeMessageForViewer(message, viewer, options = {}) {
   }
   if (options && options.search) {
     delete serialized.attachment;
+    delete serialized.replyTo;
     delete serialized.reactions;
   }
   return serialized;
@@ -624,9 +625,17 @@ async function withRoomMutationLock(serverCode, operation) {
 }
 
 const authRateLimiter = createRateLimiter();
+const messageSearchRateLimiter = createRateLimiter({
+  maxEntries: MAX_RATE_LIMIT_KEYS,
+  maxAttempts: 30,
+  windowMs: 60 * 1000
+});
 setInterval(() => {
   authRateLimiter.prune();
 }, RATE_LIMIT_WINDOW_MS).unref();
+setInterval(() => {
+  messageSearchRateLimiter.prune();
+}, 60 * 1000).unref();
 
 // --- DATABASE SCHEMAS ---
 const UserSchema = new mongoose.Schema({
@@ -916,6 +925,7 @@ function createConnectionHandler({
   getRoomRoleFn = getRoomRole,
   resolvePingsFn = resolvePings,
   rateLimiter = authRateLimiter,
+  searchRateLimiter = messageSearchRateLimiter,
   autoModTracker = serverAutoModTracker,
   logger = console
 } = {}) {
@@ -3131,6 +3141,85 @@ function createConnectionHandler({
     } catch (err) {
       logUnexpectedError(logger, 'list_messages', err);
       callback({ error: 'Failed to load messages.' });
+    }
+  });
+
+  socket.on('search_messages', async (data, callback) => {
+    callback = safeAck(callback);
+    if (!socket.username) return callback({ error: 'Not authenticated.' });
+    const isPlainObject = data && typeof data === 'object' && !Array.isArray(data) &&
+      (Object.getPrototypeOf(data) === Object.prototype || Object.getPrototypeOf(data) === null);
+    if (!isPlainObject) return callback({ error: 'Invalid input format.' });
+
+    const serverCode = normalizeServerCode(data.serverCode);
+    const clientContextId = normalizeClientContextId(data.clientContextId);
+    const query = normalizeMessageSearchQuery(data.query);
+    const requestId = normalizeClientContextId(data.requestId);
+    if (!serverCode || clientContextId === null || !query || requestId === null ||
+        serverCode !== socket.serverCode) {
+      return callback({ error: 'Invalid input format.' });
+    }
+
+    const key = authRateLimitKey(
+      socket,
+      'message_search',
+      normalizeAccountKey(socket.username)
+    );
+    if (!searchRateLimiter.check(key)) {
+      return callback({ error: 'Too many requests. Try again later.' });
+    }
+
+    try {
+      await deliverMessageRead({
+        serverCode,
+        clientContextId,
+        callback,
+        operation: async ({ access, roomRole }) => {
+          const textPattern = new RegExp(escapeRegExp(query), 'i');
+          const filter = {
+            $and: [
+              messageRoomQuery(serverCode),
+              { deleted: { $ne: true } },
+              { text: textPattern }
+            ]
+          };
+          const rows = await MessageModel.find(filter)
+            .select({
+              _id: 1,
+              serverCode: 1,
+              username: 1,
+              displayName: 1,
+              role: 1,
+              roomRole: 1,
+              color: 1,
+              avatarUrl: 1,
+              text: 1,
+              edited: 1,
+              timestamp: 1
+            })
+            .sort({ timestamp: -1, _id: -1 })
+            .limit(20)
+            .lean();
+          return {
+            results: rows.map(storedMessage => {
+              const roomScopedMessage = storedMessage && storedMessage.serverCode == null
+                ? { ...storedMessage, serverCode }
+                : storedMessage;
+              return safeMessageForViewer(roomScopedMessage, {
+                username: access.user.username,
+                role: access.user.role,
+                roomRole
+              }, { search: true });
+            }),
+            serverCode,
+            clientContextId,
+            requestId
+          };
+        }
+      });
+    } catch (err) {
+      logUnexpectedError(logger, 'search_messages', err);
+      callback({ error: 'Search failed.' });
     }
   });
 
