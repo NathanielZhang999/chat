@@ -637,6 +637,117 @@
             };
         },
 
+        createDialogRequestCoordinator({ onPendingChange = () => {} } = {}) {
+            let epoch = 0;
+            let identity = null;
+            let pendingToken = null;
+            let nextRequestId = 0;
+
+            const resetPending = () => {
+                if (pendingToken) onPendingChange(false);
+                pendingToken = null;
+            };
+
+            return {
+                open(nextIdentity) {
+                    epoch += 1;
+                    resetPending();
+                    identity = nextIdentity || null;
+                    return epoch;
+                },
+                close() {
+                    epoch += 1;
+                    resetPending();
+                    identity = null;
+                    return epoch;
+                },
+                invalidate() {
+                    return this.close();
+                },
+                begin(expectedIdentity) {
+                    if (!identity || expectedIdentity !== identity || pendingToken) return null;
+                    const token = Object.freeze({
+                        epoch,
+                        identity,
+                        requestId: ++nextRequestId
+                    });
+                    pendingToken = token;
+                    onPendingChange(true);
+                    return token;
+                },
+                finish(token) {
+                    const current = Boolean(token && pendingToken &&
+                        token.epoch === epoch && token.identity === identity &&
+                        token.requestId === pendingToken.requestId);
+                    if (!current) return false;
+                    pendingToken = null;
+                    onPendingChange(false);
+                    return true;
+                },
+                current() { return { epoch, identity, pending: Boolean(pendingToken) }; }
+            };
+        },
+
+        createCompositionContextCoordinator() {
+            let epoch = 0;
+            let roomCode = null;
+            const normalizeRoom = value => {
+                if (typeof value !== 'string') return null;
+                const trimmed = value.trim();
+                if (trimmed.toLowerCase() === 'global') return 'global';
+                const upper = trimmed.toUpperCase();
+                return /^[A-Z0-9]{6}$/.test(upper) ? upper : null;
+            };
+            return {
+                activate(nextRoom) {
+                    epoch += 1;
+                    roomCode = normalizeRoom(nextRoom);
+                    return roomCode;
+                },
+                invalidate() {
+                    epoch += 1;
+                    roomCode = null;
+                },
+                payload(value = {}) {
+                    if (!roomCode) return null;
+                    return { ...value, serverCode: roomCode, clientContextId: epoch };
+                },
+                matches(data) {
+                    return Boolean(data && roomCode && data.serverCode === roomCode &&
+                        data.clientContextId === epoch);
+                },
+                current() { return { roomCode, clientContextId: epoch }; }
+            };
+        },
+
+        isRoomRailAccessible({ serverCode, role, joinedServers, bannedRooms } = {}) {
+            if (!serverCode || (Array.isArray(bannedRooms) && bannedRooms.includes(serverCode))) return false;
+            if (serverCode === 'global' || role === 'admin') return true;
+            return Array.isArray(joinedServers) && joinedServers.includes(serverCode);
+        },
+
+        applyPrivilegeRevocation({
+            closeCenter,
+            closeModeration,
+            closeResolution,
+            clearRows,
+            updateAccess
+        } = {}) {
+            for (const action of [closeModeration, closeResolution, closeCenter, clearRows, updateAccess]) {
+                if (typeof action === 'function') action();
+            }
+        },
+
+        roomScopedConfirmation({ verb, targetUsername, roomName, roomCode } = {}) {
+            if (!verb || !roomCode) return '';
+            return `${verb} the report for @${targetUsername || 'Unknown'} in ${roomName || roomCode} (${roomCode})`;
+        },
+
+        shouldDisplayMessageBlocked({ data, currentServerCode, clientContextId } = {}) {
+            return Boolean(data && data.serverCode === currentServerCode &&
+                data.clientContextId === clientContextId);
+        },
+
         appendTextElement(doc, parent, tagName, className, value) {
             const element = doc.createElement(tagName);
             element.className = className || '';
@@ -1196,12 +1307,15 @@
 
     // --- ATTACHMENT & PICKER STATE ---
     let pendingAttachmentBase64 = null; 
+    let attachmentLoadEpoch = 0;
     let activeReactMessageId = null; 
     
     function clearAttachment() {
+        const clearEpoch = ++attachmentLoadEpoch;
         pendingAttachmentBase64 = null;
         document.getElementById('attachment-preview').classList.remove('show');
-        setTimeout(() => { 
+        setTimeout(() => {
+            if (clearEpoch !== attachmentLoadEpoch) return;
             document.getElementById('preview-img').src = '';
             document.getElementById('file-upload').value = ''; 
         }, 300); 
@@ -1282,6 +1396,7 @@
     let moderatorCenterRoom = null;
     let moderatorCenterTab = 'reports';
     const moderatorCenterCursors = { reports: null, restrictions: null, audit: null };
+    const compositionContextCoordinator = ChatClientHelpers.createCompositionContextCoordinator();
 
     let isLoginMode = true;
     let typingTimeout;
@@ -1347,6 +1462,21 @@
         onPendingChange: (key, pending) =>
             ChatClientHelpers.applyModeratorPendingState(moderatorPendingControls, key, pending)
     });
+    const moderationDialogCoordinator = ChatClientHelpers.createDialogRequestCoordinator({
+        onPendingChange: pending => {
+            document.getElementById('moderation-action-confirm').disabled = pending;
+        }
+    });
+    const reportDialogCoordinator = ChatClientHelpers.createDialogRequestCoordinator({
+        onPendingChange: pending => {
+            document.getElementById('report-confirm').disabled = pending;
+        }
+    });
+    const resolutionDialogCoordinator = ChatClientHelpers.createDialogRequestCoordinator({
+        onPendingChange: pending => {
+            document.getElementById('resolution-confirm').disabled = pending;
+        }
+    });
 
     function setCompositionDisabled(disabled, notice = '') {
         compositionDisabled = Boolean(disabled);
@@ -1364,9 +1494,11 @@
     }
 
     function enterLobby() {
+        compositionContextCoordinator.invalidate();
         currentServerCode = null;
         myRoomRole = 'user';
         restrictionCoordinator.clear();
+        clearTimeout(typingTimeout);
         typingUsers.clear();
         updateTypingUI();
         chatWindow.textContent = '';
@@ -1378,6 +1510,9 @@
             document.getElementById(id).style.display = 'none';
         }
         closeModeratorCenter();
+        closeModerationPrompt();
+        closeReportPrompt();
+        closeResolutionPrompt();
         updateModeratorCenterAccess();
         cancelAction();
         ChatClientHelpers.applyLobbyState({
@@ -1396,6 +1531,31 @@
         compositionDisabled = true;
     }
 
+    function invalidatePrivilegedAccess() {
+        ChatClientHelpers.applyPrivilegeRevocation({
+            closeModeration: closeModerationPrompt,
+            closeResolution: closeResolutionPrompt,
+            closeCenter: closeModeratorCenter,
+            clearRows: clearModeratorRows,
+            updateAccess() {
+                document.getElementById('moderator-center-btn').style.display = 'none';
+            }
+        });
+    }
+
+    function invalidateRevokedRoomState(data) {
+        if (!currentServerCode || !data) return false;
+        const stillAccessible = ChatClientHelpers.isRoomRailAccessible({
+            serverCode: currentServerCode,
+            role: myRole,
+            joinedServers: myJoinedServers,
+            bannedRooms: Array.isArray(data.bannedRooms) ? data.bannedRooms : [...myBannedRooms]
+        });
+        if (data.serverCode === currentServerCode && stillAccessible) return false;
+        enterLobby();
+        return true;
+    }
+
     function applyRestrictionState(restriction, roomCode = currentServerCode) {
         restrictionCoordinator.apply(restriction, roomCode);
     }
@@ -1405,12 +1565,25 @@
             if (icon.classList.contains('add-btn')) return;
             const code = icon.id === 'srv-global' ? 'global' : icon.id.replace(/^srv-/, '');
             const banned = myBannedRooms.has(code);
-            icon.setAttribute('aria-disabled', banned ? 'true' : 'false');
-            if (banned) {
-                icon.title = 'You are banned from this room';
+            const accessible = ChatClientHelpers.isRoomRailAccessible({
+                serverCode: code,
+                role: myRole,
+                joinedServers: myJoinedServers,
+                bannedRooms: [...myBannedRooms]
+            });
+            icon.setAttribute('aria-disabled', accessible ? 'false' : 'true');
+            if (!accessible) {
+                icon.title = banned ? 'You are banned from this room' : 'Join this room to open it';
                 icon.classList.remove('active');
             } else {
                 icon.removeAttribute('title');
+            }
+            if (code !== 'global' && myRole === 'admin' && !myJoinedServers.includes(code) && !banned) {
+                icon.style.opacity = '0.4';
+                icon.style.border = '1px dashed #8e9297';
+            } else {
+                icon.style.opacity = '';
+                icon.style.border = '';
             }
         });
     }
@@ -1422,7 +1595,11 @@
 
     function updateModeratorCenterAccess() {
         const button = document.getElementById('moderator-center-btn');
-        button.style.display = canModerateCurrentRoom() ? 'block' : 'none';
+        const allowed = canModerateCurrentRoom();
+        button.style.display = allowed ? 'block' : 'none';
+        if (!allowed && document.getElementById('moderator-center-modal').classList.contains('active')) {
+            invalidatePrivilegedAccess();
+        }
     }
 
     const moderationActionLabels = {
@@ -1434,7 +1611,9 @@
     };
 
     function closeModerationPrompt() {
+        moderationDialogCoordinator.close();
         selectedModerationRequest = null;
+        document.getElementById('moderation-action-confirm').disabled = false;
         document.getElementById('moderation-action-modal').classList.remove('active');
         document.getElementById('moderation-reason').value = '';
         document.getElementById('moderation-action-error').textContent = '';
@@ -1442,7 +1621,10 @@
 
     function openModerationPrompt({ targetUsername, action, roomCode = currentServerCode, onSuccess = null }) {
         if (!targetUsername || !roomCode || !moderationActionLabels[action]) return;
-        selectedModerationRequest = { targetUsername, action, roomCode, onSuccess };
+        const identity = JSON.stringify({ roomCode, targetUsername, action });
+        moderationDialogCoordinator.open(identity);
+        selectedModerationRequest = { targetUsername, action, roomCode, onSuccess, identity };
+        document.getElementById('moderation-action-confirm').disabled = false;
         const roomName = serversCache[roomCode]?.name || roomCode;
         document.getElementById('moderation-action-title').textContent = moderationActionLabels[action];
         document.getElementById('moderation-action-context').textContent =
@@ -1472,8 +1654,8 @@
                 'Enter a reason of 1–200 characters and choose a valid duration.';
             return;
         }
-        const confirmButton = document.getElementById('moderation-action-confirm');
-        confirmButton.disabled = true;
+        const token = moderationDialogCoordinator.begin(request.identity);
+        if (!token) return;
         socket.emit('moderate_user', {
             serverCode: request.roomCode,
             targetUser: request.targetUsername,
@@ -1481,7 +1663,7 @@
             duration: normalized.duration,
             reason: normalized.reason
         }, response => {
-            confirmButton.disabled = false;
+            if (!moderationDialogCoordinator.finish(token)) return;
             const result = response || { error: 'No response from server.' };
             if (result.error) {
                 showAppAlert('Moderation failed', result.error);
@@ -1494,7 +1676,9 @@
     }
 
     function closeReportPrompt() {
+        reportDialogCoordinator.close();
         selectedReportRequest = null;
+        document.getElementById('report-confirm').disabled = false;
         document.getElementById('report-modal').classList.remove('active');
         document.getElementById('report-reason').value = '';
         document.getElementById('report-error').textContent = '';
@@ -1502,7 +1686,11 @@
 
     function openReportPrompt(targetUsername, messageId = null) {
         if (!targetUsername || targetUsername === myUsername || !currentServerCode) return;
-        selectedReportRequest = { targetUsername, messageId, roomCode: currentServerCode };
+        const roomCode = currentServerCode;
+        const identity = JSON.stringify({ roomCode, targetUsername, messageId });
+        reportDialogCoordinator.open(identity);
+        selectedReportRequest = { targetUsername, messageId, roomCode, identity };
+        document.getElementById('report-confirm').disabled = false;
         document.getElementById('report-title').textContent = messageId ? 'Report Message' : 'Report User';
         document.getElementById('report-context').textContent = messageId
             ? `Report a message from @${targetUsername} in ${currentServerCode}`
@@ -1530,10 +1718,10 @@
             closeReportPrompt();
             return;
         }
-        const confirmButton = document.getElementById('report-confirm');
-        confirmButton.disabled = true;
+        const token = reportDialogCoordinator.begin(request.identity);
+        if (!token) return;
         ChatClientHelpers.dispatchModerationReport(socket, payload, response => {
-            confirmButton.disabled = false;
+            if (!reportDialogCoordinator.finish(token)) return;
             const result = response || { error: 'No response from server.' };
             if (result.error) return showAppAlert('Report failed', result.error);
             closeReportPrompt();
@@ -1567,6 +1755,7 @@
 
     function closeModeratorCenter() {
         moderatorCenterCoordinator.close();
+        closeResolutionPrompt();
         document.getElementById('moderator-center-modal').classList.remove('active');
         moderatorCenterRoom = null;
         clearModeratorRows();
@@ -1591,6 +1780,7 @@
 
     function selectModeratorTab(tab) {
         if (!['reports', 'restrictions', 'audit', 'automod'].includes(tab)) return;
+        if (tab !== 'reports') closeResolutionPrompt();
         moderatorCenterTab = tab;
         moderatorCenterCoordinator.selectView(tab);
         document.querySelectorAll('.moderator-tab').forEach(button => {
@@ -1801,7 +1991,9 @@
     }
 
     function closeResolutionPrompt() {
+        resolutionDialogCoordinator.close();
         selectedResolutionRequest = null;
+        document.getElementById('resolution-confirm').disabled = false;
         document.getElementById('resolution-modal').classList.remove('active');
         document.getElementById('resolution-reason').value = '';
         document.getElementById('resolution-error').textContent = '';
@@ -1809,10 +2001,18 @@
 
     function openResolutionPrompt(report, status) {
         if (!report || !['resolved', 'dismissed'].includes(status) || !moderatorCenterRoom) return;
-        selectedResolutionRequest = { reportId: report._id, status, roomCode: moderatorCenterRoom };
+        const roomCode = moderatorCenterRoom;
+        const identity = JSON.stringify({ roomCode, reportId: report._id, status });
+        resolutionDialogCoordinator.open(identity);
+        selectedResolutionRequest = { reportId: report._id, status, roomCode, identity };
+        document.getElementById('resolution-confirm').disabled = false;
         document.getElementById('resolution-title').textContent = status === 'resolved' ? 'Resolve Report' : 'Dismiss Report';
-        document.getElementById('resolution-context').textContent =
-            `${status === 'resolved' ? 'Resolve' : 'Dismiss'} the report for @${report.targetUsername || 'Unknown'}`;
+        document.getElementById('resolution-context').textContent = ChatClientHelpers.roomScopedConfirmation({
+            verb: status === 'resolved' ? 'Resolve' : 'Dismiss',
+            targetUsername: report.targetUsername,
+            roomName: serversCache[roomCode]?.name || roomCode,
+            roomCode
+        });
         document.getElementById('resolution-reason').value = '';
         document.getElementById('resolution-error').textContent = '';
         document.getElementById('resolution-modal').classList.add('active');
@@ -1836,18 +2036,17 @@
             closeResolutionPrompt();
             return;
         }
-        ChatClientHelpers.dispatchModeratorCenterRequest({
-            coordinator: moderatorCenterCoordinator,
-            socket,
-            request: ChatClientHelpers.moderatorCenterMutationRequestFor('resolve', payload),
-            apply(result) {
-                if (result.error) {
-                    document.getElementById('resolution-error').textContent = result.error;
-                    return;
-                }
-                closeResolutionPrompt();
-                loadModeratorCenterTab('reports');
+        const token = resolutionDialogCoordinator.begin(request.identity);
+        if (!token) return;
+        socket.emit('resolve_moderation_report', payload, response => {
+            if (!resolutionDialogCoordinator.finish(token)) return;
+            const result = response || { error: 'No response from server.' };
+            if (result.error) {
+                document.getElementById('resolution-error').textContent = result.error;
+                return;
             }
+            closeResolutionPrompt();
+            loadModeratorCenterTab('reports');
         });
     }
 
@@ -1913,7 +2112,11 @@
         const span2 = document.createElement('span'); span2.className = 'emoji-item'; span2.textContent = emo;
         span2.onclick = () => { 
             if(activeReactMessageId && socket && currentServerCode) {
-                socket.emit('toggle_reaction', { id: activeReactMessageId, emoji: emo });
+                const payload = compositionContextCoordinator.payload({
+                    id: activeReactMessageId,
+                    emoji: emo
+                });
+                if (payload) socket.emit('toggle_reaction', payload);
             }
             document.getElementById('reaction-picker').classList.remove('show'); 
             activeReactMessageId = null;
@@ -1944,11 +2147,18 @@
         if (!file.type.startsWith('image/')) return showAppAlert("Error", "Only image files are allowed.");
         
         if(file.size > 10 * 1024 * 1024) return showAppAlert("Error", "File too large. Max 10MB before compression.");
+        const uploadContext = compositionContextCoordinator.payload();
+        if (!uploadContext) return;
+        const uploadEpoch = ++attachmentLoadEpoch;
+        const isCurrentUpload = () => uploadEpoch === attachmentLoadEpoch &&
+            !compositionDisabled && compositionContextCoordinator.matches(uploadContext);
         
         const reader = new FileReader();
         reader.onload = (event) => {
+            if (!isCurrentUpload()) return;
             const img = new Image();
             img.onload = () => {
+                if (!isCurrentUpload()) return;
                 const canvas = document.createElement('canvas');
                 let w = img.width; let h = img.height;
                 const max = 800; 
@@ -2095,7 +2305,13 @@
         const replacement = ChatClientHelpers.replaceSocket(socket, socketUrl, url, io);
         socket = replacement.socket;
         socketUrl = replacement.socketUrl;
-        if (socket !== previousSocket) setupSocket(socket);
+        if (socket !== previousSocket) {
+            compositionContextCoordinator.invalidate();
+            closeModerationPrompt();
+            closeReportPrompt();
+            invalidatePrivilegedAccess();
+            setupSocket(socket);
+        }
         const authSocket = socket;
 
         const action = isLoginMode ? 'login' : 'register';
@@ -2187,25 +2403,34 @@
         activeSocket.on('global_role_updated', (data) => {
             if (data.username === myUsername) {
                 myRole = data.role;
+                if (data.role !== 'admin') invalidatePrivilegedAccess();
+                renderServerAccess();
                 showAppAlert(data.role === 'admin' ? "Promoted!" : "Demoted", `You have been ${data.role === 'admin' ? 'promoted to' : 'demoted from'} Global Admin!`);
-                if (currentServerCode) switchServer(currentServerCode);
+                if (currentServerCode) roomSwitchCoordinator.request(currentServerCode);
                 else updateModeratorCenterAccess();
             }
         });
         
         activeSocket.on('room_role_updated', (data) => {
             if (data.username === myUsername && data.targetServer === currentServerCode) {
-                switchServer(currentServerCode);
+                myRoomRole = 'user';
+                invalidatePrivilegedAccess();
+                roomSwitchCoordinator.request(currentServerCode);
             }
         });
 
         activeSocket.on('room_access_updated', (data) => {
             if (!data || data.username !== myUsername) return;
+            closeModerationPrompt();
+            closeReportPrompt();
+            closeResolutionPrompt();
             myJoinedServers = Array.isArray(data.joinedServers) ? data.joinedServers : ['global'];
+            invalidateRevokedRoomState(data);
             roomAccessCoordinator.handleAccessUpdate(data);
         });
 
         activeSocket.on('room_restriction_updated', (data) => {
+            if (data && data.serverCode === currentServerCode && data.banned) enterLobby();
             roomAccessCoordinator.handleRestrictionUpdate(data);
         });
 
@@ -2216,7 +2441,13 @@
             loadModeratorCenterTab(moderatorCenterTab);
         });
 
-        activeSocket.on('message_blocked', () => {
+        activeSocket.on('message_blocked', (data) => {
+            const context = compositionContextCoordinator.current();
+            if (!ChatClientHelpers.shouldDisplayMessageBlocked({
+                data,
+                currentServerCode,
+                clientContextId: context.clientContextId
+            })) return;
             showAppAlert('Message blocked', "Your message was blocked by this room's content policy.");
         });
         
@@ -2350,6 +2581,9 @@
             if (me) {
                 myRoomRole = me.roomRole || 'user';
                 updateModeratorCenterAccess();
+            } else if (myRole !== 'admin') {
+                myRoomRole = 'user';
+                invalidatePrivilegedAccess();
             }
 
             const isGlobal = currentServerCode === 'global';
@@ -2602,7 +2836,8 @@
 
             bubble.onclick = () => {
                 if (!currentServerCode) return;
-                socket.emit('toggle_reaction', { id: msgId, emoji: emoji });
+                const payload = compositionContextCoordinator.payload({ id: msgId, emoji });
+                if (payload) socket.emit('toggle_reaction', payload);
             };
             container.appendChild(bubble);
         }
@@ -2646,6 +2881,12 @@
     }
 
     function switchServer(code) {
+        if (!ChatClientHelpers.isRoomRailAccessible({
+            serverCode: code,
+            role: myRole,
+            joinedServers: myJoinedServers,
+            bannedRooms: [...myBannedRooms]
+        })) return false;
         return roomAccessCoordinator.requestRoom(code);
     }
 
@@ -2660,7 +2901,10 @@
                 const isStealth = myRole === 'admin' && !myJoinedServers.includes(targetServerCode) && targetServerCode !== 'global';
 
                 closeModeratorCenter();
+                closeModerationPrompt();
+                closeReportPrompt();
                 currentServerCode = targetServerCode;
+                compositionContextCoordinator.activate(targetServerCode);
                 myRoomRole = response.roomRole || 'user';
                 applyRestrictionState(response.restriction, targetServerCode);
                 renderServerAccess();
@@ -2834,23 +3078,40 @@
         if (!socket?.connected) return;
 
         if (editingMsgId) {
-            socket.emit('edit_message', { id: editingMsgId, text });
+            const payload = compositionContextCoordinator.payload({ id: editingMsgId, text });
+            if (!payload) return;
+            socket.emit('edit_message', payload);
             cancelAction();
         } else {
-            const payload = { text: text, attachment: pendingAttachmentBase64 };
+            const payload = compositionContextCoordinator.payload({
+                text,
+                attachment: pendingAttachmentBase64
+            });
+            if (!payload) return;
             if (replyingToData) payload.replyTo = replyingToData;
             socket.emit('chat_message', payload);
             cancelAction();
         }
         
-        socket.emit('typing', false); msgInput.focus();
+        const stoppedTyping = compositionContextCoordinator.payload({ isTyping: false });
+        if (stoppedTyping) socket.emit('typing', stoppedTyping);
+        msgInput.focus();
     });
 
     msgInput.addEventListener('input', () => {
         if (compositionDisabled || !currentServerCode) return;
-        socket.emit('typing', true);
+        const typingStarted = compositionContextCoordinator.payload({ isTyping: true });
+        if (!typingStarted) return;
+        socket.emit('typing', typingStarted);
         clearTimeout(typingTimeout);
-        typingTimeout = setTimeout(() => socket.emit('typing', false), 1500); 
+        typingTimeout = setTimeout(() => {
+            if (!compositionContextCoordinator.matches(typingStarted)) return;
+            socket.emit('typing', {
+                serverCode: typingStarted.serverCode,
+                clientContextId: typingStarted.clientContextId,
+                isTyping: false
+            });
+        }, 1500);
     });
 
     function initiateEdit(id, currentTextElement) {
@@ -3073,7 +3334,11 @@
             const delBtn = document.createElement('button'); delBtn.className = 'action-btn del'; delBtn.textContent = '🗑️ Delete';
             delBtn.onclick = async () => {
                 if (!currentServerCode) return;
-                if (await showAppConfirm("Delete Message", "Delete this message?", "Delete", true)) socket.emit('delete_message', data._id);
+                const payload = compositionContextCoordinator.payload({ id: data._id });
+                if (payload && await showAppConfirm("Delete Message", "Delete this message?", "Delete", true) &&
+                    compositionContextCoordinator.matches(payload)) {
+                    socket.emit('delete_message', payload);
+                }
             };
             actions.appendChild(delBtn);
         }

@@ -6,18 +6,18 @@ const { FakeSocket, FakeIo, queryResult, acknowledge, deferred } = require('./su
 function register(overrides = {}) {
   const socket = new FakeSocket();
   const ioInstance = new FakeIo();
+  const defaultUserModel = {
+    async findOne() {
+      return {
+        username: socket.username || 'alice',
+        role: socket.role || 'user',
+        servers: Array.isArray(socket.joinedServers) && socket.joinedServers.length > 0
+          ? [...socket.joinedServers] : ['global']
+      };
+    }
+  };
   createConnectionHandler({
     ioInstance,
-    UserModel: {
-      async findOne() {
-        return {
-          username: socket.username || 'alice',
-          role: socket.role || 'user',
-          servers: Array.isArray(socket.joinedServers) && socket.joinedServers.length > 0
-            ? [...socket.joinedServers] : ['global']
-        };
-      }
-    },
     ChatServerModel: {
       async find(query = {}) {
         const codes = query.code && Array.isArray(query.code.$in) ? query.code.$in : ['global'];
@@ -30,7 +30,8 @@ function register(overrides = {}) {
     broadcastOnlineUsersFn: async () => {},
     getRoomRoleFn: async () => 'user',
     resolvePingsFn: async text => text,
-    ...overrides
+    ...overrides,
+    UserModel: { ...defaultUserModel, ...(overrides.UserModel || {}) }
   })(socket);
   return { socket, ioInstance };
 }
@@ -38,17 +39,17 @@ function register(overrides = {}) {
 function registerSharedSocket(overrides, id) {
   const socket = new FakeSocket();
   socket.id = id;
+  const defaultUserModel = {
+    async findOne() {
+      return {
+        username: socket.username || 'alice',
+        role: socket.role || 'user',
+        servers: Array.isArray(socket.joinedServers) && socket.joinedServers.length > 0
+          ? [...socket.joinedServers] : ['global']
+      };
+    }
+  };
   createConnectionHandler({
-    UserModel: {
-      async findOne() {
-        return {
-          username: socket.username || 'alice',
-          role: socket.role || 'user',
-          servers: Array.isArray(socket.joinedServers) && socket.joinedServers.length > 0
-            ? [...socket.joinedServers] : ['global']
-        };
-      }
-    },
     ChatServerModel: {
       async find(query = {}) {
         const codes = query.code && Array.isArray(query.code.$in) ? query.code.$in : ['global'];
@@ -60,7 +61,8 @@ function registerSharedSocket(overrides, id) {
     broadcastOnlineUsersFn: async () => {},
     getRoomRoleFn: async () => 'user',
     resolvePingsFn: async text => text,
-    ...overrides
+    ...overrides,
+    UserModel: { ...defaultUserModel, ...(overrides.UserModel || {}) }
   })(socket);
   return socket;
 }
@@ -942,7 +944,11 @@ test('failed target join cannot restore a concurrently deleted source room', asy
       async deleteOne({ code }) { rooms.delete(code); }
     },
     UserModel: {
-      async findOne() {
+      async findOne(query) {
+        const matcher = query.username && query.username.$regex;
+        if (matcher && matcher.test('alice')) {
+          return { username: 'alice', role: 'admin', servers: ['global'] };
+        }
         return { username: 'bob', role: 'user', servers: ['global', 'OLD123', 'NEW123'] };
       },
       async updateMany() {}
@@ -1662,7 +1668,7 @@ test('room deletion serializes against an in-flight membership join', async () =
   const releaseSave = deferred();
   const state = { roomExists: true, persistedServers: ['global'], savedAfterDeletion: false };
   const joinerUser = {
-    servers: ['global'],
+    username: 'bob', role: 'user', servers: ['global'],
     async save() {
       const proposedServers = [...this.servers];
       saveStarted.resolve();
@@ -1671,8 +1677,12 @@ test('room deletion serializes against an in-flight membership join', async () =
       state.persistedServers = proposedServers;
     }
   };
+  const deleterUser = { username: 'alice', role: 'admin', servers: ['global'] };
   const UserModel = {
-    async findOne() { return joinerUser; },
+    async findOne(query) {
+      const matcher = query.username && query.username.$regex;
+      return matcher && matcher.test('alice') ? deleterUser : joinerUser;
+    },
     async updateMany() {
       state.persistedServers = state.persistedServers.filter(code => code !== 'ABC123');
     }
@@ -1894,7 +1904,11 @@ test('a switch waiting behind deletion cannot join the deleted room', async () =
     ChatServerModel,
     MessageModel,
     UserModel: {
-      async findOne() {
+      async findOne(query) {
+        const matcher = query.username && query.username.$regex;
+        if (matcher && matcher.test('alice')) {
+          return { username: 'alice', role: 'admin', servers: ['global'] };
+        }
         return { username: 'bob', role: 'user', servers: ['global', 'OLD123', 'ABC123'] };
       },
       async updateMany() {}

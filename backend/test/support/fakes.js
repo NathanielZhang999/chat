@@ -6,9 +6,24 @@ class FakeSocket {
     this.outbound = [];
     this.handshake = { headers: {}, address: '127.0.0.1' };
     this.id = 'socket-1';
+    this.clientContextId = 1;
   }
   on(event, handler) { this.handlers.set(event, handler); }
-  async trigger(event, ...args) { return this.handlers.get(event)(...args); }
+  async trigger(event, ...args) {
+    if (['chat_message', 'edit_message', 'toggle_reaction'].includes(event) &&
+        args[0] && typeof args[0] === 'object' && !Array.isArray(args[0])) {
+      args[0] = { ...args[0] };
+      if (!Object.prototype.hasOwnProperty.call(args[0], 'serverCode')) args[0].serverCode = this.serverCode;
+      if (!Object.prototype.hasOwnProperty.call(args[0], 'clientContextId')) {
+        args[0].clientContextId = this.clientContextId;
+      }
+    } else if (event === 'delete_message' && (typeof args[0] === 'string' || args[0] === null)) {
+      args[0] = { id: args[0], serverCode: this.serverCode, clientContextId: this.clientContextId };
+    } else if (event === 'typing' && (typeof args[0] !== 'object' || args[0] === null)) {
+      args[0] = { isTyping: args[0], serverCode: this.serverCode, clientContextId: this.clientContextId };
+    }
+    return this.handlers.get(event)(...args);
+  }
   join(room) { this.joinedRooms.add(room); }
   leave(room) { this.joinedRooms.delete(room); this.leftRooms.push(room); }
   emit(event, payload) { this.outbound.push({ target: 'self', event, payload }); }
@@ -102,7 +117,12 @@ function createMemoryModel(initialRows = []) {
     async updateOne(query, update) {
       const row = rows.find(candidate => matchesQuery(candidate, query));
       if (!row) return { matchedCount: 0, modifiedCount: 0 };
-      Object.assign(row, update.$set || update);
+      if (update.$set) Object.assign(row, update.$set);
+      else if (!Object.keys(update).some(key => key.startsWith('$'))) Object.assign(row, update);
+      for (const [key, value] of Object.entries(update.$pull || {})) {
+        row[key] = (Array.isArray(row[key]) ? row[key] : [])
+          .filter(candidate => candidate !== value);
+      }
       return { matchedCount: 1, modifiedCount: 1 };
     },
     async countDocuments(query = {}) { return rows.filter(row => matchesQuery(row, query)).length; }

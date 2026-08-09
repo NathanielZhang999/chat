@@ -47,7 +47,7 @@ test('reaction in an inaccessible message room does not save or emit', async () 
   assert.deepEqual(ioInstance.outbound, []);
 });
 
-test('editing emits to the stored message room rather than current socket room', async () => {
+test('editing emits only to the active stored message room', async () => {
   const message = {
     _id: '507f1f77bcf86cd799439011', serverCode: 'ABC123', username: 'alice',
     role: 'user', roomRole: 'user', text: 'before', history: [], deleted: false,
@@ -55,7 +55,7 @@ test('editing emits to the stored message room rather than current socket room',
   };
   const MessageModel = { findById: async () => message };
   const { socket, ioInstance } = registerMessages({ MessageModel });
-  authenticate(socket, { joinedServers: ['global', 'ABC123'] });
+  authenticate(socket, { serverCode: 'ABC123', joinedServers: ['global', 'ABC123'] });
   await socket.trigger('edit_message', { id: message._id, text: 'after' });
   assert.equal(ioInstance.outbound.at(-1).room, 'ABC123');
   assert.equal(ioInstance.outbound.at(-1).event, 'message_edited');
@@ -87,7 +87,7 @@ test('message reply snapshot comes from the stored same-room message', async () 
   });
 });
 
-test('chat message snapshots its room while mention resolution is pending', async () => {
+test('chat message is rejected when its active room changes while mention resolution is pending', async () => {
   const resolverStarted = deferred();
   const resolver = deferred();
   let created;
@@ -111,8 +111,8 @@ test('chat message snapshots its room while mention resolution is pending', asyn
   resolver.resolve('hello');
   await pending;
 
-  assert.equal(created.serverCode, 'ABC123');
-  assert.equal(ioInstance.outbound.at(-1).room, 'ABC123');
+  assert.equal(created, undefined);
+  assert.deepEqual(ioInstance.outbound, []);
 });
 
 test('chat message emits to its stored room when persistence is pending', async () => {
@@ -390,6 +390,58 @@ test('a sender who left a room cannot edit, read, or delete its old messages', a
   assert.equal(roomRoleLookups, 0);
 });
 
+test('stale cached admin and moderator roles cannot delete another user message', async () => {
+  for (const staleRole of ['admin', 'mod']) {
+    let saved = false;
+    const message = {
+      _id: '507f1f77bcf86cd799439011', serverCode: 'ABC123', username: 'bob',
+      role: 'user', roomRole: 'user', text: 'protected', history: [], deleted: false,
+      markModified() {}, async save() { saved = true; }
+    };
+    const { socket, ioInstance } = registerMessages({
+      MessageModel: { findById: async () => message },
+      getRoomRoleFn: async () => staleRole === 'mod' ? 'mod' : 'user'
+    });
+    authenticate(socket, { serverCode: 'ABC123', joinedServers: ['global', 'ABC123'] });
+    socket.role = staleRole === 'admin' ? 'admin' : 'user';
+
+    await socket.trigger('delete_message', message._id);
+
+    assert.equal(saved, false, staleRole);
+    assert.equal(message.deleted, false, staleRole);
+    assert.deepEqual(ioInstance.outbound, [], staleRole);
+  }
+});
+
+test('a persisted room ban blocks an administrator from deleting another user message', async () => {
+  let saved = false;
+  const message = {
+    _id: '507f1f77bcf86cd799439011', serverCode: 'ABC123', username: 'bob',
+    role: 'user', roomRole: 'user', text: 'protected', history: [], deleted: false,
+    markModified() {}, async save() { saved = true; }
+  };
+  const { socket, ioInstance } = registerMessages({
+    MessageModel: { findById: async () => message },
+    UserModel: {
+      async findOne() {
+        return { username: 'alice', role: 'admin', servers: ['global', 'ABC123'] };
+      }
+    },
+    RoomRestrictionModel: {
+      async findOne() { return { bannedAt: new Date(), timeoutUntil: null }; },
+      async find() { return []; }
+    }
+  });
+  authenticate(socket, { serverCode: 'ABC123', joinedServers: ['global', 'ABC123'] });
+  socket.role = 'admin';
+
+  await socket.trigger('delete_message', message._id);
+
+  assert.equal(saved, false);
+  assert.equal(message.deleted, false);
+  assert.deepEqual(ioInstance.outbound, []);
+});
+
 test('typing emits a complete payload only for accessible active rooms and boolean states', async () => {
   const { socket } = registerMessages();
   authenticate(socket, { serverCode: 'ABC123', joinedServers: ['global'] });
@@ -529,7 +581,8 @@ test('Blocked edit leaves the saved message and history unchanged without leakin
   assert.deepEqual(message.history, []);
   assert.deepEqual(ioInstance.outbound, []);
   assert.deepEqual(socket.outbound, [{
-    target: 'self', event: 'message_blocked', payload: { rule: 'content_policy' }
+    target: 'self', event: 'message_blocked',
+    payload: { rule: 'content_policy', serverCode: 'global', clientContextId: 1 }
   }]);
   assert.deepEqual(logged, []);
   assert.equal(audits.length, 1);

@@ -1352,7 +1352,8 @@ test('identical normalized messages share repeat state across same-account socke
   assert.equal(setup.MessageModel.rows.length, 4);
   assert.equal(setup.ioInstance.outbound.length, 4);
   assert.deepEqual(setup.socket.outbound, [{
-    target: 'self', event: 'message_blocked', payload: { rule: 'content_policy' }
+    target: 'self', event: 'message_blocked',
+    payload: { rule: 'content_policy', serverCode: 'ABC123', clientContextId: 1 }
   }]);
 });
 
@@ -1378,7 +1379,8 @@ test('Blocked send never persists, broadcasts, logs, or audits raw text', async 
   assert.deepEqual(setup.MessageModel.rows, []);
   assert.deepEqual(setup.ioInstance.outbound, []);
   assert.deepEqual(setup.socket.outbound, [{
-    target: 'self', event: 'message_blocked', payload: { rule: 'content_policy' }
+    target: 'self', event: 'message_blocked',
+    payload: { rule: 'content_policy', serverCode: 'ABC123', clientContextId: 1 }
   }]);
   assert.deepEqual(logged, []);
   assert.equal(setup.ModerationAuditModel.rows.length, 1);
@@ -1424,9 +1426,12 @@ test('audit mutation hook rejects updates and deletes', () => {
   assert.throws(() => rejectAuditMutation(), /append-only/);
 });
 
-test('audit schema registers every prohibited mutation operation', () => {
+test('audit schema registers every supported prohibited mutation operation', () => {
   const source = require('node:fs').readFileSync(require.resolve('../server'), 'utf8');
-  for (const operation of ['updateOne', 'updateMany', 'findOneAndUpdate', 'replaceOne', 'deleteOne', 'deleteMany', 'findOneAndDelete']) {
+  for (const operation of [
+    'updateOne', 'updateMany', 'findOneAndUpdate', 'findOneAndReplace', 'replaceOne',
+    'deleteOne', 'deleteMany', 'findOneAndDelete', 'bulkWrite'
+  ]) {
     assert.match(source, new RegExp(`pre\\(['\"]${operation}['\"]`));
   }
 });
@@ -1909,6 +1914,457 @@ test('moderationScenario exposes the documented aggregate and individual model h
     ModerationAuditModel: setup.ModerationAuditModel,
     ModerationReportModel: setup.ModerationReportModel
   });
+});
+
+test('forced migration rejects a private-room draft instead of publishing it in fallback Global', async () => {
+  const setup = moderationScenario({ room: 'ABC123', actor: 'admin', action: 'kick' });
+  const leaveStarted = deferred();
+  const releaseLeave = deferred();
+  const targetSocket = connectAdditionalSocket(setup, {
+    id: 'target-private-draft', username: 'TargetUser', serverCode: 'ABC123',
+    joinedServers: ['global', 'ABC123', 'XYZ789']
+  });
+  targetSocket.leave = async code => {
+    leaveStarted.resolve();
+    await releaseLeave.promise;
+    FakeSocket.prototype.leave.call(targetSocket, code);
+  };
+
+  const moderationAck = acknowledge();
+  const moderationPending = setup.socket.trigger('moderate_user', {
+    serverCode: 'ABC123', targetUser: 'TargetUser', action: 'kick',
+    reason: 'remove access before the draft can publish'
+  }, moderationAck.callback);
+  await leaveStarted.promise;
+
+  assert.equal(targetSocket.serverCode, 'global', 'server stages the fallback before transport settles');
+  await targetSocket.trigger('chat_message', {
+    serverCode: 'ABC123', clientContextId: 17, text: 'private draft must stay private'
+  });
+  const savedCount = setup.MessageModel.created.length;
+  const publishedInGlobal = setup.ioInstance.outbound.some(item =>
+    item.room === 'global' && item.event === 'chat_message'
+  );
+  releaseLeave.resolve();
+  await moderationPending;
+  assert.equal(savedCount, 0);
+  assert.equal(publishedInGlobal, false);
+  assert.deepEqual(moderationAck.value(), { success: true });
+});
+
+test('partial private ban persistence repairs removal invariants and quarantines target sessions', async () => {
+  const setup = moderationScenario({ room: 'ABC123', actor: 'admin', action: 'ban' });
+  setup.ChatServerModel.rows.find(room => room.code === 'ABC123').moderators.push('TargetUser');
+  const targetSocket = connectAdditionalSocket(setup, {
+    id: 'target-partial-ban', username: 'TargetUser', serverCode: 'ABC123',
+    joinedServers: ['global', 'ABC123', 'XYZ789']
+  });
+  const baseFindOne = setup.UserModel.findOne.bind(setup.UserModel);
+  let targetReads = 0;
+  setup.UserModel.findOne = async query => {
+    const document = await baseFindOne(query);
+    if (document?.username !== 'TargetUser' || ++targetReads !== 2) return document;
+    return {
+      ...document,
+      markModified() {},
+      async save() { throw new Error('simulated membership save failure'); }
+    };
+  };
+
+  const ack = acknowledge();
+  await setup.socket.trigger('moderate_user', {
+    serverCode: 'ABC123', targetUser: 'TargetUser', action: 'ban',
+    reason: 'durable partial failure regression'
+  }, ack.callback);
+
+  assert.deepEqual(ack.value(), { error: 'Moderation failed.' });
+  assert.equal(Boolean(setup.RoomRestrictionModel.rows[0]?.bannedAt), true);
+  assert.equal(setup.UserModel.rows.find(user => user.username === 'TargetUser').servers.includes('ABC123'), false);
+  assert.equal(setup.ChatServerModel.rows.find(room => room.code === 'ABC123').moderators.includes('TargetUser'), false);
+  assert.equal(targetSocket.username, null);
+  assert.equal(targetSocket.joinedRooms.has('ABC123'), false);
+  assert.equal(targetSocket.disconnected, true);
+  assert.equal(setup.onlineUsersMap.has(targetSocket.id), false);
+});
+
+test('private unban removes stale membership and moderator authority before clearing the ban', async () => {
+  const setup = moderationScenario({ room: 'ABC123', actor: 'admin', action: 'unban' });
+  setup.UserModel.rows.find(user => user.username === 'TargetUser').servers = ['global', 'ABC123', 'XYZ789'];
+  setup.ChatServerModel.rows.find(room => room.code === 'ABC123').moderators.push('tArGeTuSeR');
+  const targetSocket = connectAdditionalSocket(setup, {
+    id: 'target-stale-unban', username: 'TargetUser', serverCode: 'XYZ789',
+    joinedServers: ['global', 'ABC123', 'XYZ789'], bannedRooms: ['ABC123']
+  });
+
+  const ack = acknowledge();
+  await setup.socket.trigger('moderate_user', {
+    serverCode: 'ABC123', targetUser: 'TargetUser', action: 'unban',
+    reason: 'unban without restoring old authority'
+  }, ack.callback);
+
+  assert.deepEqual(ack.value(), { success: true });
+  assert.equal(setup.UserModel.rows.find(user => user.username === 'TargetUser').servers.includes('ABC123'), false);
+  assert.equal(setup.ChatServerModel.rows.find(room => room.code === 'ABC123').moderators.some(
+    username => normalizeAccountKey(username) === 'targetuser'
+  ), false);
+  assert.equal(targetSocket.joinedServers.includes('ABC123'), false);
+  assert.equal(setup.onlineUsersMap.get(targetSocket.id).joinedServers.includes('ABC123'), false);
+  assert.equal(setup.RoomRestrictionModel.rows[0].bannedAt, null);
+});
+
+test('moderation persistence uses one shared database transaction when the models support it', async () => {
+  const setup = moderationScenario({ room: 'ABC123', actor: 'admin', action: 'ban' });
+  let transactionCalls = 0;
+  const sharedConnection = {
+    async transaction(operation) {
+      transactionCalls += 1;
+      return operation({ id: 'test-transaction-session' });
+    }
+  };
+  setup.UserModel.db = sharedConnection;
+  setup.ChatServerModel.db = sharedConnection;
+  setup.RoomRestrictionModel.db = sharedConnection;
+
+  const ack = acknowledge();
+  await setup.socket.trigger('moderate_user', {
+    serverCode: 'ABC123', targetUser: 'TargetUser', action: 'ban',
+    reason: 'atomic persistence regression'
+  }, ack.callback);
+
+  assert.deepEqual(ack.value(), { success: true });
+  assert.equal(transactionCalls, 1);
+  assert.equal(Boolean(setup.RoomRestrictionModel.rows[0]?.bannedAt), true);
+  assert.equal(setup.UserModel.rows.find(user => user.username === 'TargetUser').servers.includes('ABC123'), false);
+});
+
+test('failed transaction does not decompose an atomic kick into partial compensating writes', async () => {
+  const setup = moderationScenario({ room: 'ABC123', actor: 'admin', action: 'kick' });
+  setup.ChatServerModel.rows.find(room => room.code === 'ABC123').moderators.push('TargetUser');
+  const targetSocket = connectAdditionalSocket(setup, {
+    id: 'failed-transaction-target', username: 'TargetUser', serverCode: 'ABC123',
+    joinedServers: ['global', 'ABC123', 'XYZ789']
+  });
+  const baseRoomFind = setup.ChatServerModel.findOne.bind(setup.ChatServerModel);
+  setup.ChatServerModel.findOne = async query => {
+    const room = await baseRoomFind(query);
+    if (!room || room.code !== 'ABC123') return room;
+    return {
+      ...room,
+      markModified() {},
+      async save() { throw new Error('simulated permanent room save failure'); }
+    };
+  };
+  const sharedConnection = {
+    async transaction() { throw new Error('simulated transaction start failure'); }
+  };
+  setup.UserModel.db = sharedConnection;
+  setup.ChatServerModel.db = sharedConnection;
+  setup.RoomRestrictionModel.db = sharedConnection;
+
+  const ack = acknowledge();
+  await setup.socket.trigger('moderate_user', {
+    serverCode: 'ABC123', targetUser: 'TargetUser', action: 'kick',
+    reason: 'transaction failure must stay atomic'
+  }, ack.callback);
+
+  assert.deepEqual(ack.value(), { error: 'Moderation failed.' });
+  assert.equal(setup.UserModel.rows.find(user => user.username === 'TargetUser').servers.includes('ABC123'), true);
+  assert.equal(setup.ChatServerModel.rows.find(room => room.code === 'ABC123').moderators.includes('TargetUser'), true);
+  assert.equal(targetSocket.username, null, 'uncertain sessions are still quarantined');
+});
+
+test('failed fallback kick restores its prior membership when removal repair cannot complete', async () => {
+  const setup = moderationScenario({ room: 'ABC123', actor: 'admin', action: 'kick' });
+  setup.ChatServerModel.rows.find(room => room.code === 'ABC123').moderators.push('TargetUser');
+  const targetSocket = connectAdditionalSocket(setup, {
+    id: 'failed-fallback-target', username: 'TargetUser', serverCode: 'ABC123',
+    joinedServers: ['global', 'ABC123', 'XYZ789']
+  });
+  const baseRoomFind = setup.ChatServerModel.findOne.bind(setup.ChatServerModel);
+  setup.ChatServerModel.findOne = async query => {
+    const room = await baseRoomFind(query);
+    if (!room || room.code !== 'ABC123') return room;
+    return {
+      ...room,
+      markModified() {},
+      async save() { throw new Error('simulated permanent room save failure'); }
+    };
+  };
+
+  const ack = acknowledge();
+  await setup.socket.trigger('moderate_user', {
+    serverCode: 'ABC123', targetUser: 'TargetUser', action: 'kick',
+    reason: 'failed fallback removal must restore a consistent prior state'
+  }, ack.callback);
+
+  assert.deepEqual(ack.value(), { error: 'Moderation failed.' });
+  assert.equal(setup.UserModel.rows.find(user => user.username === 'TargetUser').servers.includes('ABC123'), true);
+  assert.equal(setup.ChatServerModel.rows.find(room => room.code === 'ABC123').moderators.includes('TargetUser'), true);
+  assert.equal(targetSocket.username, null, 'uncertain sessions are still quarantined');
+});
+
+test('failed fallback ban restores prior access when neither its ban nor removal can be made durable', async () => {
+  const setup = moderationScenario({ room: 'ABC123', actor: 'admin', action: 'ban' });
+  setup.ChatServerModel.rows.find(room => room.code === 'ABC123').moderators.push('TargetUser');
+  setup.RoomRestrictionModel.findOneAndUpdate = async () => {
+    throw new Error('simulated permanent restriction failure');
+  };
+  const targetSocket = connectAdditionalSocket(setup, {
+    id: 'failed-fallback-ban-target', username: 'TargetUser', serverCode: 'ABC123',
+    joinedServers: ['global', 'ABC123', 'XYZ789']
+  });
+  const baseRoomFind = setup.ChatServerModel.findOne.bind(setup.ChatServerModel);
+  setup.ChatServerModel.findOne = async query => {
+    const room = await baseRoomFind(query);
+    if (!room || room.code !== 'ABC123') return room;
+    return {
+      ...room,
+      markModified() {},
+      async save() { throw new Error('simulated permanent room save failure'); }
+    };
+  };
+
+  const ack = acknowledge();
+  await setup.socket.trigger('moderate_user', {
+    serverCode: 'ABC123', targetUser: 'TargetUser', action: 'ban',
+    reason: 'failed ban must not create revivable stale moderation authority'
+  }, ack.callback);
+
+  assert.deepEqual(ack.value(), { error: 'Moderation failed.' });
+  assert.equal(setup.RoomRestrictionModel.rows.some(row => Boolean(row.bannedAt)), false);
+  assert.equal(setup.UserModel.rows.find(user => user.username === 'TargetUser').servers.includes('ABC123'), true);
+  assert.equal(setup.ChatServerModel.rows.find(room => room.code === 'ABC123').moderators.includes('TargetUser'), true);
+  assert.equal(targetSocket.username, null, 'uncertain sessions are still quarantined');
+});
+
+test('failed fallback snapshot restore establishes a durable ban before releasing quarantine', async () => {
+  const setup = moderationScenario({ room: 'ABC123', actor: 'admin', action: 'kick' });
+  setup.ChatServerModel.rows.find(room => room.code === 'ABC123').moderators.push('TargetUser');
+  const targetSocket = connectAdditionalSocket(setup, {
+    id: 'failed-snapshot-restore-target', username: 'TargetUser', serverCode: 'ABC123',
+    joinedServers: ['global', 'ABC123', 'XYZ789']
+  });
+  const baseUserFind = setup.UserModel.findOne.bind(setup.UserModel);
+  setup.UserModel.findOne = async query => {
+    const user = await baseUserFind(query);
+    if (!user || user.username !== 'TargetUser') return user;
+    return {
+      ...user,
+      markModified() {},
+      async save() {
+        if (this.servers.includes('ABC123')) {
+          throw new Error('simulated permanent membership restore failure');
+        }
+        user.servers = [...this.servers];
+        return user.save();
+      }
+    };
+  };
+  const baseRoomFind = setup.ChatServerModel.findOne.bind(setup.ChatServerModel);
+  setup.ChatServerModel.findOne = async query => {
+    const room = await baseRoomFind(query);
+    if (!room || room.code !== 'ABC123') return room;
+    return {
+      ...room,
+      markModified() {},
+      async save() { throw new Error('simulated permanent room save failure'); }
+    };
+  };
+
+  const ack = acknowledge();
+  await setup.socket.trigger('moderate_user', {
+    serverCode: 'ABC123', targetUser: 'TargetUser', action: 'kick',
+    reason: 'failed rollback requires a durable access gate'
+  }, ack.callback);
+
+  assert.deepEqual(ack.value(), { error: 'Moderation failed.' });
+  assert.equal(Boolean(setup.RoomRestrictionModel.rows[0]?.bannedAt), true);
+  assert.equal(setup.UserModel.rows.find(user => user.username === 'TargetUser').servers.includes('ABC123'), false);
+  assert.equal(setup.ChatServerModel.rows.find(room => room.code === 'ABC123').moderators.includes('TargetUser'), true);
+  assert.equal(targetSocket.username, null, 'uncertain sessions are still quarantined');
+});
+
+test('committed Global ban response loss quarantines every preflighted target session', async () => {
+  const restrictions = createMemoryModel([]);
+  const baseUpsert = restrictions.findOneAndUpdate.bind(restrictions);
+  let writes = 0;
+  restrictions.findOneAndUpdate = async (...args) => {
+    const result = await baseUpsert(...args);
+    if (++writes === 1) throw new Error('simulated committed response loss');
+    return result;
+  };
+  const setup = moderationScenario({
+    room: 'global', actor: 'admin', action: 'ban', RoomRestrictionModel: restrictions
+  });
+  const firstLeaveStarted = deferred();
+  const releaseFirstLeave = deferred();
+  const first = connectAdditionalSocket(setup, {
+    id: 'uncertain-global-ban-1', username: 'TargetUser', serverCode: 'global',
+    joinedServers: ['global', 'ABC123', 'XYZ789']
+  });
+  first.leave = async code => {
+    firstLeaveStarted.resolve();
+    await releaseFirstLeave.promise;
+    FakeSocket.prototype.leave.call(first, code);
+  };
+  const second = connectAdditionalSocket(setup, {
+    id: 'uncertain-global-ban-2', username: 'targetuser', serverCode: 'global',
+    joinedServers: ['global', 'ABC123', 'XYZ789']
+  });
+  first.joinedRooms.add('ABC123');
+  second.joinedRooms.add('ABC123');
+  second.joinedRooms.add('XYZ789');
+  second.disconnect = async () => { throw new Error('simulated disconnect failure'); };
+  setup.onlineUsersMap.set('uncertain-global-ban-map-only', {
+    username: 'TARGETUSER', serverCode: 'global',
+    joinedServers: ['global', 'ABC123', 'XYZ789'], bannedRooms: []
+  });
+
+  const ack = acknowledge();
+  const pending = setup.socket.trigger('moderate_user', {
+    serverCode: 'global', targetUser: 'TargetUser', action: 'ban',
+    reason: 'uncertain Global ban persistence'
+  }, ack.callback);
+  await Promise.race([firstLeaveStarted.promise, pending]);
+
+  assert.equal(second.username, null, 'later live sessions are staged before the first transport await');
+  assert.equal(setup.onlineUsersMap.has(second.id), false);
+  assert.equal(setup.onlineUsersMap.has('uncertain-global-ban-map-only'), false);
+  releaseFirstLeave.resolve();
+  await pending;
+
+  assert.deepEqual(ack.value(), { error: 'Moderation failed.' });
+  assert.equal(Boolean(restrictions.rows[0]?.bannedAt), true);
+  assert.equal(first.disconnected, true);
+  assert.equal(second.username, null);
+  assert.equal(second.joinedRooms.has('global'), false);
+  assert.equal(second.joinedRooms.has('ABC123'), false);
+  assert.equal(second.joinedRooms.has('XYZ789'), false);
+});
+
+test('active private-room bans deny admins moderation and room-role mutations', async () => {
+  const moderationSetup = moderationScenario({ room: 'ABC123', actor: 'admin', action: 'timeout' });
+  moderationSetup.RoomRestrictionModel.rows.push(restrictionDocument('ABC123', 'Admin', {
+    bannedAt: new Date(), bannedBy: 'SecondAdmin', banReason: 'active actor ban'
+  }));
+  const moderationAck = acknowledge();
+  await moderationSetup.socket.trigger('moderate_user', {
+    serverCode: 'ABC123', targetUser: 'TargetUser', action: 'timeout', duration: '10m',
+    reason: 'must be denied while banned'
+  }, moderationAck.callback);
+  assert.deepEqual(moderationAck.value(), { error: 'Permission denied.' });
+
+  const roleSetup = moderationScenario({ room: 'ABC123', actor: 'admin', action: 'kick' });
+  roleSetup.RoomRestrictionModel.rows.push(restrictionDocument('ABC123', 'Admin', {
+    bannedAt: new Date(), bannedBy: 'SecondAdmin', banReason: 'active actor ban'
+  }));
+  const roleAck = acknowledge();
+  await roleSetup.socket.trigger('manage_role', {
+    serverCode: 'ABC123', targetUser: 'TargetUser', action: 'promote_mod'
+  }, roleAck.callback);
+  assert.deepEqual(roleAck.value(), { error: 'Permission denied.' });
+  assert.equal(roleSetup.ChatServerModel.rows.find(room => room.code === 'ABC123').moderators.includes('TargetUser'), false);
+});
+
+test('banned non-admin owner cannot delete a private room from a fallback session', async () => {
+  const setup = registerWithModels({
+    users: [userDocument({ username: 'Owner', displayName: 'Owner', servers: ['global'] })],
+    rooms: [
+      roomDocument('global', { owner: 'System' }),
+      roomDocument('ABC123', { owner: 'Owner', moderators: [] })
+    ],
+    restrictions: [restrictionDocument('ABC123', 'Owner', { bannedAt: new Date() })]
+  });
+  Object.assign(setup.socket, {
+    username: 'Owner', displayName: 'Owner', role: 'user', serverCode: 'global',
+    joinedServers: ['global'], bannedRooms: ['ABC123']
+  });
+  setup.onlineUsersMap.set(setup.socket.id, {
+    username: 'Owner', displayName: 'Owner', role: 'user', serverCode: 'global',
+    joinedServers: ['global'], bannedRooms: ['ABC123']
+  });
+  setup.ioInstance.sockets.push(setup.socket);
+
+  const ack = acknowledge();
+  await setup.socket.trigger('delete_server', 'ABC123', ack.callback);
+  assert.deepEqual(ack.value(), { error: 'Permission denied.' });
+  assert.equal(setup.ChatServerModel.rows.some(room => room.code === 'ABC123'), true);
+});
+
+test('sensitive report reads do not disclose after a completed moderator demotion', async () => {
+  const setup = reportingScenario();
+  setup.ModerationReportModel.rows.push({
+    _id: '507f1f77bcf86cd799439099', serverCode: 'ABC123', reporterUsername: 'Alice',
+    targetUsername: 'Bob', messageId: null, reason: 'private interleaving reason', status: 'open',
+    createdAt: new Date('2026-08-08T12:00:00.000Z')
+  });
+  setup.UserModel.rows.push(userDocument({
+    username: 'SecondAdmin', displayName: 'SecondAdmin', role: 'admin',
+    servers: ['global', 'ABC123']
+  }));
+  const administrator = connectAdditionalSocket(setup, {
+    id: 'sensitive-read-demoter', username: 'SecondAdmin', serverCode: 'ABC123',
+    joinedServers: ['global', 'ABC123'], role: 'admin'
+  });
+
+  const queryStarted = deferred();
+  const releaseQuery = deferred();
+  const baseFind = setup.ModerationReportModel.find.bind(setup.ModerationReportModel);
+  setup.ModerationReportModel.find = query => {
+    const result = baseFind(query);
+    const baseThen = result.then.bind(result);
+    result.then = (resolve, reject) => {
+      queryStarted.resolve();
+      return releaseQuery.promise.then(() => baseThen(resolve, reject), reject);
+    };
+    return result;
+  };
+
+  let revocationCompleted = false;
+  let disclosedAfterRevocation = false;
+  const readPending = setup.modSocket.trigger('list_moderation_reports', {
+    serverCode: 'ABC123', status: 'open'
+  }, result => {
+    if (revocationCompleted && Array.isArray(result?.items) && result.items.length > 0) {
+      disclosedAfterRevocation = true;
+    }
+  });
+  await queryStarted.promise;
+  const demotionPending = administrator.trigger('manage_role', {
+    serverCode: 'ABC123', targetUser: 'ExactMod', action: 'demote_mod'
+  }, result => { revocationCompleted = Boolean(result?.success); });
+  await new Promise(resolve => setImmediate(resolve));
+  releaseQuery.resolve();
+  await Promise.all([readPending, demotionPending]);
+
+  assert.equal(revocationCompleted, true);
+  assert.equal(disclosedAfterRevocation, false);
+});
+
+test('supplied malformed report status is rejected instead of defaulting to open', async () => {
+  const setup = reportingScenario();
+  for (const status of [{}, undefined, null, 12]) {
+    const ack = acknowledge();
+    await setup.modSocket.trigger('list_moderation_reports', {
+      serverCode: 'ABC123', status
+    }, ack.callback);
+    assert.deepEqual(ack.value(), { error: 'Invalid input format.' });
+  }
+});
+
+test('blocked message response is scoped to its room and client send context', async () => {
+  const setup = moderationScenario({ room: 'ABC123', actor: 'mod', action: 'kick' });
+  const room = setup.ChatServerModel.rows.find(candidate => candidate.code === 'ABC123');
+  room.autoMod = {
+    blockedKeywords: ['blocked'], mentionLimit: 8, repeatLimit: 3, repeatWindowSeconds: 30
+  };
+  await setup.socket.trigger('chat_message', {
+    serverCode: 'ABC123', clientContextId: 41, text: 'blocked content'
+  });
+  assert.deepEqual(
+    setup.socket.outbound.find(item => item.event === 'message_blocked')?.payload,
+    { rule: 'content_policy', serverCode: 'ABC123', clientContextId: 41 }
+  );
 });
 
 for (const action of ['timeout', 'ban']) {

@@ -250,6 +250,10 @@ function isValidObjectId(value) {
   return typeof value === 'string' && OBJECT_ID_RE.test(value);
 }
 
+function normalizeClientContextId(value) {
+  return Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+
 function encodeCursor(date, id) {
   return Buffer.from(JSON.stringify([new Date(date).toISOString(), String(id)]), 'utf8').toString('base64url');
 }
@@ -301,11 +305,19 @@ function escapeRegExp(string) {
   return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); 
 }
 
-async function findUserByUsername(UserModel, value) {
+function applyQuerySession(query, session) {
+  if (session && query && typeof query.session === 'function') return query.session(session);
+  return query;
+}
+
+async function findUserByUsername(UserModel, value, { session = null } = {}) {
   const username = normalizeUsername(value);
   if (!username) return null;
   const escaped = escapeRegExp(username);
-  return UserModel.findOne({ username: { $regex: new RegExp(`^${escaped}$`, 'i') } });
+  return applyQuerySession(
+    UserModel.findOne({ username: { $regex: new RegExp(`^${escaped}$`, 'i') } }),
+    session
+  );
 }
 
 // --- SECURITY: RATE LIMITING ---
@@ -599,10 +611,12 @@ ModerationAuditSchema.index({ serverCode: 1, createdAt: -1, _id: -1 });
 ModerationAuditSchema.pre('updateOne', rejectAuditMutation);
 ModerationAuditSchema.pre('updateMany', rejectAuditMutation);
 ModerationAuditSchema.pre('findOneAndUpdate', rejectAuditMutation);
+ModerationAuditSchema.pre('findOneAndReplace', rejectAuditMutation);
 ModerationAuditSchema.pre('replaceOne', rejectAuditMutation);
 ModerationAuditSchema.pre('deleteOne', rejectAuditMutation);
 ModerationAuditSchema.pre('deleteMany', rejectAuditMutation);
 ModerationAuditSchema.pre('findOneAndDelete', rejectAuditMutation);
+ModerationAuditSchema.pre('bulkWrite', rejectAuditMutation);
 ModerationAuditSchema.pre('save', function rejectAuditSave(next) {
   if (!this.isNew) return rejectAuditMutation(next);
   next();
@@ -856,6 +870,181 @@ function createConnectionHandler({
     }
   }
 
+  async function quarantineAccountSessions(sockets, username, roomCodes) {
+    const accountKey = normalizeAccountKey(username);
+    const quarantinedIds = new Set();
+    const transportQuarantines = [];
+    for (const live of sockets || []) {
+      const session = onlineUsersMap.get(live.id);
+      if (normalizeAccountKey(live.username || session?.username) !== accountKey) continue;
+      quarantinedIds.add(live.id);
+      const transportRooms = new Set((roomCodes || []).filter(Boolean));
+      const joinedRoomSnapshot = live.rooms && typeof live.rooms[Symbol.iterator] === 'function'
+        ? live.rooms
+        : live.joinedRooms;
+      if (joinedRoomSnapshot && typeof joinedRoomSnapshot[Symbol.iterator] === 'function') {
+        for (const roomCode of joinedRoomSnapshot) {
+          if (roomCode && roomCode !== live.id) transportRooms.add(roomCode);
+        }
+      }
+      if (live.serverCode) transportRooms.add(live.serverCode);
+      if (session?.serverCode) transportRooms.add(session.serverCode);
+      transportQuarantines.push(quarantineLiveSocket(live, session, [...transportRooms]));
+    }
+    for (const [id, session] of onlineUsersMap.entries()) {
+      if (quarantinedIds.has(id) || normalizeAccountKey(session?.username) !== accountKey) continue;
+      session.username = null;
+      session.displayName = null;
+      session.role = null;
+      session.serverCode = null;
+      session.joinedServers = [];
+      session.bannedRooms = [];
+      onlineUsersMap.delete(id);
+    }
+    await Promise.all(transportQuarantines);
+  }
+
+  async function repairPrivateRemovalInvariant({ targetUser, room, serverCode }) {
+    let lastError;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        const freshUser = await findUserByUsername(UserModel, targetUser.username);
+        if (freshUser) {
+          freshUser.servers = (Array.isArray(freshUser.servers) ? freshUser.servers : [])
+            .filter(code => code !== serverCode);
+          await freshUser.save();
+        }
+        const freshRoom = await ChatServerModel.findOne({ code: serverCode });
+        if (freshRoom) {
+          freshRoom.moderators = (Array.isArray(freshRoom.moderators) ? freshRoom.moderators : [])
+            .filter(username => normalizeAccountKey(username) !== normalizeAccountKey(targetUser.username));
+          await freshRoom.save();
+        }
+        const verifiedUser = await findUserByUsername(UserModel, targetUser.username);
+        const verifiedRoom = await ChatServerModel.findOne({ code: serverCode });
+        const membershipRemoved = !verifiedUser ||
+          !(Array.isArray(verifiedUser.servers) && verifiedUser.servers.includes(serverCode));
+        const moderatorRemoved = !verifiedRoom || !isCurrentRoomModerator(verifiedRoom, targetUser.username);
+        if (!membershipRemoved || !moderatorRemoved) throw new Error('Private removal invariant incomplete.');
+        targetUser.servers = verifiedUser && Array.isArray(verifiedUser.servers) ? [...verifiedUser.servers] : [];
+        room.moderators = verifiedRoom && Array.isArray(verifiedRoom.moderators) ? [...verifiedRoom.moderators] : [];
+        return true;
+      } catch (err) {
+        lastError = err;
+      }
+    }
+    logUnexpectedError(logger, 'moderation_invariant_repair', lastError);
+    return false;
+  }
+
+  async function restorePrivateAccessSnapshot({
+    targetUser,
+    room,
+    serverCode,
+    wasMember,
+    wasModerator
+  }) {
+    let lastError;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        const freshUser = await findUserByUsername(UserModel, targetUser.username);
+        if (freshUser) {
+          const servers = Array.isArray(freshUser.servers) ? [...freshUser.servers] : [];
+          const hasMembership = servers.includes(serverCode);
+          if (wasMember !== hasMembership) {
+            freshUser.servers = wasMember
+              ? [...new Set([...servers, serverCode])]
+              : servers.filter(code => code !== serverCode);
+            await freshUser.save();
+          }
+        }
+        const freshRoom = await ChatServerModel.findOne({ code: serverCode });
+        if (freshRoom) {
+          const moderators = Array.isArray(freshRoom.moderators) ? [...freshRoom.moderators] : [];
+          const hasModerator = moderators.some(username =>
+            normalizeAccountKey(username) === normalizeAccountKey(targetUser.username)
+          );
+          if (wasModerator !== hasModerator) {
+            freshRoom.moderators = wasModerator
+              ? [...moderators, targetUser.username]
+              : moderators.filter(username =>
+                normalizeAccountKey(username) !== normalizeAccountKey(targetUser.username)
+              );
+            await freshRoom.save();
+          }
+        }
+        const verifiedUser = await findUserByUsername(UserModel, targetUser.username);
+        const verifiedRoom = await ChatServerModel.findOne({ code: serverCode });
+        const hasMembership = Boolean(verifiedUser &&
+          Array.isArray(verifiedUser.servers) && verifiedUser.servers.includes(serverCode));
+        const hasModerator = Boolean(verifiedRoom &&
+          isCurrentRoomModerator(verifiedRoom, targetUser.username));
+        if (hasMembership !== wasMember || hasModerator !== wasModerator) {
+          throw new Error('Private access snapshot restore incomplete.');
+        }
+        targetUser.servers = verifiedUser && Array.isArray(verifiedUser.servers)
+          ? [...verifiedUser.servers]
+          : [];
+        room.moderators = verifiedRoom && Array.isArray(verifiedRoom.moderators)
+          ? [...verifiedRoom.moderators]
+          : [];
+        return true;
+      } catch (err) {
+        lastError = err;
+      }
+    }
+    logUnexpectedError(logger, 'moderation_snapshot_restore', lastError);
+    return false;
+  }
+
+  async function establishFailClosedPrivateBan({ targetUser, serverCode, actorUsername }) {
+    let lastError;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        await RoomRestrictionModel.findOneAndUpdate(
+          { serverCode, username: normalizeAccountKey(targetUser.username) },
+          { $set: {
+            bannedAt: new Date(),
+            bannedBy: actorUsername,
+            banReason: 'Restriction retained after failed moderation',
+            timeoutUntil: null,
+            timeoutBy: null,
+            timeoutReason: null
+          } },
+          { upsert: true, new: true, setDefaultsOnInsert: true }
+        );
+      } catch (err) {
+        lastError = err;
+      }
+      try {
+        const verifiedRestriction = await RoomRestrictionModel.findOne({
+          serverCode,
+          username: normalizeAccountKey(targetUser.username)
+        });
+        if (activeRestrictionState(verifiedRestriction).banned) return true;
+      } catch (err) {
+        lastError = err;
+      }
+    }
+    logUnexpectedError(logger, 'moderation_fail_closed_restriction', lastError);
+    return false;
+  }
+
+  function moderationTransactionConnection() {
+    const connection = UserModel && UserModel.db;
+    const modelsShareConnection = connection &&
+      ChatServerModel && ChatServerModel.db === connection &&
+      RoomRestrictionModel && RoomRestrictionModel.db === connection;
+    return modelsShareConnection && typeof connection.transaction === 'function'
+      ? connection
+      : null;
+  }
+
+  async function runModerationPersistence(operation, connection) {
+    if (!connection) return operation(null);
+    return connection.transaction(session => operation(session));
+  }
+
   async function reconcileAccountSessions({
     sockets,
     username,
@@ -1024,8 +1213,15 @@ function createConnectionHandler({
     return false;
   }
 
-  async function rejectAutoModContent({ serverCode, access, roomRole, rawText, result }) {
-    socket.emit('message_blocked', { rule: 'content_policy' });
+  async function rejectAutoModContent({
+    serverCode,
+    clientContextId,
+    access,
+    roomRole,
+    rawText,
+    result
+  }) {
+    socket.emit('message_blocked', { rule: 'content_policy', serverCode, clientContextId });
     await appendAuditReliably({
       correlationId: new mongoose.Types.ObjectId().toString(),
       action: 'automod_block',
@@ -1056,6 +1252,20 @@ function createConnectionHandler({
     const eligible = access.user.role === 'admin' ||
       (serverCode !== 'global' && isCurrentRoomModerator(access.room, access.user.username));
     return eligible ? access : null;
+  }
+
+  async function deliverModeratorRead(serverCode, callback, operation) {
+    return withAccountTransitionLock(socket.username, () =>
+      withRoomMutationLock(serverCode, async () => {
+        const access = await loadModeratorAccess(serverCode, socket.username);
+        if (!access) {
+          callback({ error: 'Permission denied.' });
+          return;
+        }
+        const response = await operation(access);
+        callback(response);
+      })
+    );
   }
 
   async function emitModerationQueueUpdated(serverCode) {
@@ -1575,6 +1785,10 @@ function createConnectionHandler({
             const actorRestrictionState = activeRestrictionState(actorRestriction);
             const targetDisp = targetUserDoc.displayName || targetUserDoc.username;
 
+            if (!actorUser || actorRestrictionState.banned) {
+              return { error: 'Permission denied.' };
+            }
+
             if (action === 'promote_mod') {
               if (!isGlobalAdmin && (!isRoomMod || !isCurrentMember ||
                   actorRestrictionState.banned || actorRestrictionState.timedOut)) {
@@ -1658,7 +1872,8 @@ function createConnectionHandler({
           const actorState = activeRestrictionState(actorRestriction);
           const actorIsAdmin = actorUser.role === 'admin';
           const actorIsCurrentMember = Array.isArray(actorUser.servers) && actorUser.servers.includes(serverCode);
-          if (!actorIsAdmin && (!actorIsCurrentMember || actorState.banned || actorState.timedOut)) {
+          if (actorState.banned ||
+              (!actorIsAdmin && (!actorIsCurrentMember || actorState.timedOut))) {
             return { error: 'Permission denied.' };
           }
           const actorRoomRole = isCurrentRoomModerator(room, actorUser.username) ? 'mod' : 'user';
@@ -1666,6 +1881,7 @@ function createConnectionHandler({
           const currentState = activeRestrictionState(restriction);
           const memberships = Array.isArray(targetUser.servers) ? targetUser.servers : [];
           const isCurrentMember = memberships.includes(serverCode);
+          const wasCurrentModerator = targetRoomRole === 'mod';
           if (serverCode !== 'global' &&
               (action === 'kick' || action === 'timeout' || action === 'ban') &&
               !isCurrentMember) {
@@ -1680,52 +1896,181 @@ function createConnectionHandler({
           const now = new Date();
           let expiresAt = null;
           let updatedRestriction = restriction;
-          if (action === 'timeout') {
-            expiresAt = new Date(now.getTime() + MODERATION_DURATIONS[duration]);
-            updatedRestriction = await RoomRestrictionModel.findOneAndUpdate(
-              { serverCode, username: normalizeAccountKey(targetUser.username) },
-              { $set: {
-                timeoutUntil: expiresAt,
-                timeoutBy: actorUser.username,
-                timeoutReason: reason
-              } },
-              { upsert: true, new: true, setDefaultsOnInsert: true }
-            );
-          } else if (action === 'ban') {
-            updatedRestriction = await RoomRestrictionModel.findOneAndUpdate(
-              { serverCode, username: normalizeAccountKey(targetUser.username) },
-              { $set: {
-                bannedAt: now,
-                bannedBy: actorUser.username,
-                banReason: reason,
-                timeoutUntil: null,
-                timeoutBy: null,
-                timeoutReason: null
-              } },
-              { upsert: true, new: true, setDefaultsOnInsert: true }
-            );
-          } else if (action === 'clear_timeout') {
-            updatedRestriction = await RoomRestrictionModel.findOneAndUpdate(
-              { serverCode, username: normalizeAccountKey(targetUser.username) },
-              { $set: { timeoutUntil: null, timeoutBy: null, timeoutReason: null } },
-              { new: true }
-            );
-          } else if (action === 'unban') {
-            updatedRestriction = await RoomRestrictionModel.findOneAndUpdate(
-              { serverCode, username: normalizeAccountKey(targetUser.username) },
-              { $set: { bannedAt: null, bannedBy: null, banReason: null } },
-              { new: true }
-            );
-          }
-
           const removesPrivateMembership = serverCode !== 'global' &&
             (action === 'kick' || action === 'ban');
-          if (removesPrivateMembership) {
-            targetUser.servers = memberships.filter(code => code !== serverCode);
-            await targetUser.save();
-            room.moderators = (Array.isArray(room.moderators) ? room.moderators : [])
-              .filter(username => normalizeAccountKey(username) !== normalizeAccountKey(targetUser.username));
-            await room.save();
+          const enforcesPrivateAbsence = removesPrivateMembership ||
+            (serverCode !== 'global' && action === 'unban');
+          const transactionConnection = moderationTransactionConnection();
+          try {
+            const persisted = await runModerationPersistence(async session => {
+              const restrictionOptions = extra => ({
+                ...extra,
+                ...(session ? { session } : {})
+              });
+              let persistentTarget = targetUser;
+              let persistentRoom = room;
+              if (enforcesPrivateAbsence && session) {
+                persistentTarget = await findUserByUsername(
+                  UserModel,
+                  targetUser.username,
+                  { session }
+                );
+                persistentRoom = await applyQuerySession(
+                  ChatServerModel.findOne({ code: serverCode }),
+                  session
+                );
+                if (!persistentTarget || !persistentRoom) {
+                  throw new Error('Moderation persistence target disappeared.');
+                }
+              }
+
+              let persistedRestriction = restriction;
+              if (action === 'timeout') {
+                expiresAt = new Date(now.getTime() + MODERATION_DURATIONS[duration]);
+                persistedRestriction = await RoomRestrictionModel.findOneAndUpdate(
+                  { serverCode, username: normalizeAccountKey(targetUser.username) },
+                  { $set: {
+                    timeoutUntil: expiresAt,
+                    timeoutBy: actorUser.username,
+                    timeoutReason: reason
+                  } },
+                  restrictionOptions({ upsert: true, new: true, setDefaultsOnInsert: true })
+                );
+              } else if (action === 'ban') {
+                persistedRestriction = await RoomRestrictionModel.findOneAndUpdate(
+                  { serverCode, username: normalizeAccountKey(targetUser.username) },
+                  { $set: {
+                    bannedAt: now,
+                    bannedBy: actorUser.username,
+                    banReason: reason,
+                    timeoutUntil: null,
+                    timeoutBy: null,
+                    timeoutReason: null
+                  } },
+                  restrictionOptions({ upsert: true, new: true, setDefaultsOnInsert: true })
+                );
+              } else if (action === 'clear_timeout') {
+                persistedRestriction = await RoomRestrictionModel.findOneAndUpdate(
+                  { serverCode, username: normalizeAccountKey(targetUser.username) },
+                  { $set: { timeoutUntil: null, timeoutBy: null, timeoutReason: null } },
+                  restrictionOptions({ new: true })
+                );
+              }
+
+              if (enforcesPrivateAbsence) {
+                persistentTarget.servers = (Array.isArray(persistentTarget.servers)
+                  ? persistentTarget.servers : [])
+                  .filter(code => code !== serverCode);
+                persistentRoom.moderators = (Array.isArray(persistentRoom.moderators)
+                  ? persistentRoom.moderators : [])
+                  .filter(username => normalizeAccountKey(username) !== normalizeAccountKey(targetUser.username));
+                if (session) await persistentTarget.save({ session });
+                else await persistentTarget.save();
+                if (session) await persistentRoom.save({ session });
+                else await persistentRoom.save();
+              }
+
+              if (action === 'unban') {
+                persistedRestriction = await RoomRestrictionModel.findOneAndUpdate(
+                  { serverCode, username: normalizeAccountKey(targetUser.username) },
+                  { $set: { bannedAt: null, bannedBy: null, banReason: null } },
+                  restrictionOptions({ new: true })
+                );
+              }
+
+              return {
+                restriction: persistedRestriction,
+                servers: Array.isArray(persistentTarget.servers) ? [...persistentTarget.servers] : [],
+                moderators: Array.isArray(persistentRoom.moderators) ? [...persistentRoom.moderators] : []
+              };
+            }, transactionConnection);
+            updatedRestriction = persisted.restriction;
+            if (enforcesPrivateAbsence) {
+              targetUser.servers = persisted.servers;
+              room.moderators = persisted.moderators;
+            }
+          } catch (persistenceError) {
+            const quarantinePending = action === 'ban' || enforcesPrivateAbsence
+              ? quarantineAccountSessions(liveSockets, targetUser.username, [serverCode])
+              : Promise.resolve();
+            if (!transactionConnection) {
+              if (action === 'ban') {
+                try {
+                  updatedRestriction = await RoomRestrictionModel.findOneAndUpdate(
+                    { serverCode, username: normalizeAccountKey(targetUser.username) },
+                    { $set: {
+                      bannedAt: now,
+                      bannedBy: actorUser.username,
+                      banReason: reason,
+                      timeoutUntil: null,
+                      timeoutBy: null,
+                      timeoutReason: null
+                    } },
+                    { upsert: true, new: true, setDefaultsOnInsert: true }
+                  );
+                } catch (repairRestrictionError) {
+                  logUnexpectedError(logger, 'moderation_restriction_repair', repairRestrictionError);
+                }
+              } else if (serverCode !== 'global' && action === 'unban') {
+                try {
+                  updatedRestriction = await RoomRestrictionModel.findOneAndUpdate(
+                    { serverCode, username: normalizeAccountKey(targetUser.username) },
+                    { $set: {
+                      bannedAt: restriction.bannedAt || now,
+                      bannedBy: restriction.bannedBy || actorUser.username,
+                      banReason: restriction.banReason || 'Restriction retained after failed unban'
+                    } },
+                    { upsert: true, new: true, setDefaultsOnInsert: true }
+                  );
+                } catch (repairRestrictionError) {
+                  logUnexpectedError(logger, 'moderation_restriction_repair', repairRestrictionError);
+                }
+              }
+              if (enforcesPrivateAbsence) {
+                const invariantRepaired = await repairPrivateRemovalInvariant({
+                  targetUser,
+                  room,
+                  serverCode
+                });
+                if (!invariantRepaired) {
+                  let shouldRestoreSnapshot = action === 'kick';
+                  if (action === 'ban') {
+                    try {
+                      const verifiedRestriction = await RoomRestrictionModel.findOne({
+                        serverCode,
+                        username: normalizeAccountKey(targetUser.username)
+                      });
+                      shouldRestoreSnapshot = !activeRestrictionState(verifiedRestriction).banned;
+                    } catch (verifyRestrictionError) {
+                      shouldRestoreSnapshot = true;
+                      logUnexpectedError(
+                        logger,
+                        'moderation_restriction_verification',
+                        verifyRestrictionError
+                      );
+                    }
+                  }
+                  if (shouldRestoreSnapshot) {
+                    const snapshotRestored = await restorePrivateAccessSnapshot({
+                      targetUser,
+                      room,
+                      serverCode,
+                      wasMember: isCurrentMember,
+                      wasModerator: wasCurrentModerator
+                    });
+                    if (!snapshotRestored) {
+                      await establishFailClosedPrivateBan({
+                        targetUser,
+                        serverCode,
+                        actorUsername: actorUser.username
+                      });
+                    }
+                  }
+                }
+              }
+            }
+            await quarantinePending;
+            throw persistenceError;
           }
 
           const access = await loadAccountSessionAccess(targetUser);
@@ -1884,7 +2229,9 @@ function createConnectionHandler({
       return callback({ error: 'Invalid input format.' });
     }
     const serverCode = normalizeServerCode(data.serverCode);
-    const status = typeof data.status === 'string' ? data.status.trim().toLowerCase() : 'open';
+    const status = !Object.prototype.hasOwnProperty.call(data, 'status')
+      ? 'open'
+      : (typeof data.status === 'string' ? data.status.trim().toLowerCase() : null);
     const limit = normalizePageLimit(data.limit);
     const cursorResult = paginationCursor(data);
     if (!serverCode || !['open', 'resolved', 'dismissed'].includes(status) || !limit || cursorResult.error) {
@@ -1892,21 +2239,21 @@ function createConnectionHandler({
     }
 
     try {
-      const access = await loadModeratorAccess(serverCode, socket.username);
-      if (!access) return callback({ error: 'Permission denied.' });
-      const query = { serverCode, status };
-      if (cursorResult.cursor) {
-        query.$or = [
-          { createdAt: { $lt: cursorResult.cursor.date } },
-          { createdAt: cursorResult.cursor.date, _id: { $lt: cursorResult.cursor.id } }
-        ];
-      }
-      const rows = await ModerationReportModel.find(query)
-        .sort({ createdAt: -1, _id: -1 })
-        .limit(limit + 1)
-        .select('_id serverCode reporterUsername targetUsername messageId reason status resolvedBy resolution resolvedAt createdAt');
-      const { page, nextCursor } = nextPage(rows, limit);
-      callback({ items: page.map(safeReportRow), nextCursor });
+      await deliverModeratorRead(serverCode, callback, async () => {
+        const query = { serverCode, status };
+        if (cursorResult.cursor) {
+          query.$or = [
+            { createdAt: { $lt: cursorResult.cursor.date } },
+            { createdAt: cursorResult.cursor.date, _id: { $lt: cursorResult.cursor.id } }
+          ];
+        }
+        const rows = await ModerationReportModel.find(query)
+          .sort({ createdAt: -1, _id: -1 })
+          .limit(limit + 1)
+          .select('_id serverCode reporterUsername targetUsername messageId reason status resolvedBy resolution resolvedAt createdAt');
+        const { page, nextCursor } = nextPage(rows, limit);
+        return { items: page.map(safeReportRow), nextCursor };
+      });
     } catch (err) {
       logUnexpectedError(logger, 'list_moderation_reports', err);
       callback({ error: 'Failed to list reports.' });
@@ -1993,36 +2340,36 @@ function createConnectionHandler({
     }
 
     try {
-      const access = await loadModeratorAccess(serverCode, socket.username);
-      if (!access) return callback({ error: 'Permission denied.' });
-      const now = new Date();
-      const query = { serverCode };
-      if (targetInput) query.username = normalizeAccountKey(targetInput);
-      const clauses = [{
-        $or: [
-          { bannedAt: { $ne: null } },
-          { timeoutUntil: { $gt: now } }
-        ]
-      }];
-      if (cursorResult.cursor) {
-        clauses.push({
+      await deliverModeratorRead(serverCode, callback, async () => {
+        const now = new Date();
+        const query = { serverCode };
+        if (targetInput) query.username = normalizeAccountKey(targetInput);
+        const clauses = [{
           $or: [
-            { createdAt: { $lt: cursorResult.cursor.date } },
-            { createdAt: cursorResult.cursor.date, _id: { $lt: cursorResult.cursor.id } }
+            { bannedAt: { $ne: null } },
+            { timeoutUntil: { $gt: now } }
           ]
+        }];
+        if (cursorResult.cursor) {
+          clauses.push({
+            $or: [
+              { createdAt: { $lt: cursorResult.cursor.date } },
+              { createdAt: cursorResult.cursor.date, _id: { $lt: cursorResult.cursor.id } }
+            ]
+          });
+        }
+        query.$and = clauses;
+        const rows = await RoomRestrictionModel.find(query)
+          .sort({ createdAt: -1, _id: -1 })
+          .limit(limit + 1)
+          .select('_id username bannedAt bannedBy banReason timeoutUntil timeoutBy timeoutReason createdAt');
+        const activeRows = rows.filter(row => {
+          const state = activeRestrictionState(row, now);
+          return state.banned || state.timedOut;
         });
-      }
-      query.$and = clauses;
-      const rows = await RoomRestrictionModel.find(query)
-        .sort({ createdAt: -1, _id: -1 })
-        .limit(limit + 1)
-        .select('_id username bannedAt bannedBy banReason timeoutUntil timeoutBy timeoutReason createdAt');
-      const activeRows = rows.filter(row => {
-        const state = activeRestrictionState(row, now);
-        return state.banned || state.timedOut;
+        const { page, nextCursor } = nextPage(activeRows, limit);
+        return { items: page.map(row => safeRestrictionRow(row, now)), nextCursor };
       });
-      const { page, nextCursor } = nextPage(activeRows, limit);
-      callback({ items: page.map(row => safeRestrictionRow(row, now)), nextCursor });
     } catch (err) {
       logUnexpectedError(logger, 'list_room_restrictions', err);
       callback({ error: 'Failed to list restrictions.' });
@@ -2043,21 +2390,21 @@ function createConnectionHandler({
     }
 
     try {
-      const access = await loadModeratorAccess(serverCode, socket.username);
-      if (!access) return callback({ error: 'Permission denied.' });
-      const query = { serverCode };
-      if (cursorResult.cursor) {
-        query.$or = [
-          { createdAt: { $lt: cursorResult.cursor.date } },
-          { createdAt: cursorResult.cursor.date, _id: { $lt: cursorResult.cursor.id } }
-        ];
-      }
-      const rows = await ModerationAuditModel.find(query)
-        .sort({ createdAt: -1, _id: -1 })
-        .limit(limit + 1)
-        .select('_id correlationId action serverCode actorUsername actorRole actorRoomRole targetUsername targetRole targetRoomRole reason duration expiresAt messageId reportId metadata createdAt');
-      const { page, nextCursor } = nextPage(rows, limit);
-      callback({ items: page.map(safeAuditRow), nextCursor });
+      await deliverModeratorRead(serverCode, callback, async () => {
+        const query = { serverCode };
+        if (cursorResult.cursor) {
+          query.$or = [
+            { createdAt: { $lt: cursorResult.cursor.date } },
+            { createdAt: cursorResult.cursor.date, _id: { $lt: cursorResult.cursor.id } }
+          ];
+        }
+        const rows = await ModerationAuditModel.find(query)
+          .sort({ createdAt: -1, _id: -1 })
+          .limit(limit + 1)
+          .select('_id correlationId action serverCode actorUsername actorRole actorRoomRole targetUsername targetRole targetRoomRole reason duration expiresAt messageId reportId metadata createdAt');
+        const { page, nextCursor } = nextPage(rows, limit);
+        return { items: page.map(safeAuditRow), nextCursor };
+      });
     } catch (err) {
       logUnexpectedError(logger, 'get_moderation_audit', err);
       callback({ error: 'Failed to load audit.' });
@@ -2073,11 +2420,11 @@ function createConnectionHandler({
     const serverCode = normalizeServerCode(data.serverCode);
     if (!serverCode) return callback({ error: 'Invalid input format.' });
     try {
-      const access = await loadModeratorAccess(serverCode, socket.username);
-      if (!access) return callback({ error: 'Permission denied.' });
-      const autoMod = normalizeAutoModSettings(access.room.autoMod);
-      if (!autoMod) throw new Error('Invalid stored AutoMod state.');
-      callback({ autoMod });
+      await deliverModeratorRead(serverCode, callback, async access => {
+        const autoMod = normalizeAutoModSettings(access.room.autoMod);
+        if (!autoMod) throw new Error('Invalid stored AutoMod state.');
+        return { autoMod };
+      });
     } catch (err) {
       logUnexpectedError(logger, 'get_automod', err);
       callback({ error: 'Failed to load AutoMod.' });
@@ -2328,11 +2675,28 @@ function createConnectionHandler({
           const key = normalizeAccountKey(session?.username);
           if (key && !sessionUsernames.has(key)) sessionUsernames.set(key, session.username);
         }
+        const actorKey = normalizeAccountKey(socket.username);
+        if (actorKey) sessionUsernames.set(actorKey, socket.username);
         return withAccountTransitionLocks([...sessionUsernames.values()], () =>
           withRoomMutationLock(serverCode, async () => {
         const currentRoom = await ChatServerModel.findOne({ code: serverCode });
         if (!currentRoom) return { error: 'Server not found.' };
-        if (socket.role !== 'admin' && currentRoom.owner !== socket.username) return { error: 'Permission denied.' };
+        const actorAccess = await loadRoomAccessState({
+          UserModel,
+          ChatServerModel,
+          RoomRestrictionModel,
+          username: socket.username,
+          serverCode
+        });
+        const actorIsAdmin = actorAccess.user?.role === 'admin';
+        const actorIsOwner = normalizeAccountKey(currentRoom.owner) ===
+          normalizeAccountKey(actorAccess.user?.username);
+        const actorIsMember = Array.isArray(actorAccess.user?.servers) &&
+          actorAccess.user.servers.includes(serverCode);
+        if (!actorAccess.user || actorAccess.restriction.banned ||
+            (!actorIsAdmin && (!actorIsOwner || !actorIsMember || !actorAccess.allowed))) {
+          return { error: 'Permission denied.' };
+        }
 
         const freshAccessByAccount = new Map();
         if (typeof UserModel.findOne === 'function') {
@@ -2631,6 +2995,9 @@ function createConnectionHandler({
       const identity = { role: socket.role, joinedServers: socket.joinedServers || [] };
       if (!socket.username || !serverCode || !canAccessRoom(identity, serverCode)) return;
       if (!payload || typeof payload !== 'object' || Array.isArray(payload) || typeof payload.text !== 'string') return;
+      const intendedServerCode = normalizeServerCode(payload.serverCode);
+      const clientContextId = normalizeClientContextId(payload.clientContextId);
+      if (intendedServerCode !== serverCode || clientContextId === null) return;
       if (!isValidAttachment(payload.attachment)) return;
 
       const now = Date.now();
@@ -2663,6 +3030,7 @@ function createConnectionHandler({
           username: socket.username, serverCode
         });
         if (!access.allowed || access.restriction.timedOut || !canAccessRoom(socket, serverCode)) return;
+        if (socket.serverCode !== intendedServerCode) return;
         const settings = roomAutoModSettings(access.room);
         if (!settings) return;
         const freshRoomRole = currentRoomRole(access.room, access.user.username);
@@ -2679,6 +3047,7 @@ function createConnectionHandler({
         if (!autoModResult.allowed) {
           await rejectAutoModContent({
             serverCode,
+            clientContextId,
             access,
             roomRole: freshRoomRole,
             rawText,
@@ -2707,10 +3076,13 @@ function createConnectionHandler({
       try {
           if (!socket.username || !data || typeof data !== 'object' || Array.isArray(data)) return;
           const { id, emoji } = data;
-          if (!isValidObjectId(id) || !isValidReaction(emoji)) return;
+          const intendedServerCode = normalizeServerCode(data.serverCode);
+          const clientContextId = normalizeClientContextId(data.clientContextId);
+          if (!isValidObjectId(id) || !isValidReaction(emoji) ||
+              intendedServerCode !== socket.serverCode || clientContextId === null) return;
 
           const msg = await MessageModel.findById(id);
-          if (!msg || msg.deleted) return;
+          if (!msg || msg.deleted || msg.serverCode !== intendedServerCode) return;
           const identity = { role: socket.role, joinedServers: socket.joinedServers || [] };
           if (!canAccessRoom(identity, msg.serverCode)) return;
           await withRoomMutationLock(msg.serverCode, async () => {
@@ -2718,7 +3090,8 @@ function createConnectionHandler({
               UserModel, ChatServerModel, RoomRestrictionModel,
               username: socket.username, serverCode: msg.serverCode
             });
-            if (msg.deleted || !access.allowed || access.restriction.timedOut || !canAccessRoom(socket, msg.serverCode)) return;
+            if (msg.deleted || socket.serverCode !== intendedServerCode || !access.allowed ||
+                access.restriction.timedOut || !canAccessRoom(socket, msg.serverCode)) return;
 
             let rx = msg.reactions || {};
             let users = Array.isArray(rx[emoji]) ? rx[emoji] : [];
@@ -2754,11 +3127,14 @@ function createConnectionHandler({
     try {
       if (!socket.username || !data || typeof data !== 'object' || Array.isArray(data) ||
           !isValidObjectId(data.id) || typeof data.text !== 'string') return;
+      const intendedServerCode = normalizeServerCode(data.serverCode);
+      const clientContextId = normalizeClientContextId(data.clientContextId);
+      if (intendedServerCode !== socket.serverCode || clientContextId === null) return;
       let cleanText = data.text.trim().substring(0, 2000);
       if (!cleanText) return;
 
       const msg = await MessageModel.findById(data.id);
-      if (msg && !msg.deleted) {
+      if (msg && !msg.deleted && msg.serverCode === intendedServerCode) {
         const identity = { role: socket.role, joinedServers: socket.joinedServers || [] };
         if (!canAccessRoom(identity, msg.serverCode)) return;
         const roomRole = await getRoomRoleFn(msg.serverCode, socket.username);
@@ -2775,7 +3151,8 @@ function createConnectionHandler({
               UserModel, ChatServerModel, RoomRestrictionModel,
               username: socket.username, serverCode: msg.serverCode
             });
-            if (msg.deleted || !access.allowed || access.restriction.timedOut || !canAccessRoom(socket, msg.serverCode)) return;
+            if (msg.deleted || socket.serverCode !== intendedServerCode || !access.allowed ||
+                access.restriction.timedOut || !canAccessRoom(socket, msg.serverCode)) return;
             const freshRoomRole = currentRoomRole(access.room, access.user.username);
             if (msg.username !== socket.username && access.user.role !== 'admin' && freshRoomRole !== 'mod') return;
             const settings = roomAutoModSettings(access.room);
@@ -2793,6 +3170,7 @@ function createConnectionHandler({
             if (!autoModResult.allowed) {
               await rejectAutoModContent({
                 serverCode: msg.serverCode,
+                clientContextId,
                 access,
                 roomRole: freshRoomRole,
                 rawText,
@@ -2815,11 +3193,16 @@ function createConnectionHandler({
     }
   });
 
-  socket.on('delete_message', async (msgId) => {
+  socket.on('delete_message', async (data) => {
     try {
-      if (!socket.username || !isValidObjectId(msgId)) return;
+      if (!socket.username || !data || typeof data !== 'object' || Array.isArray(data)) return;
+      const msgId = data.id;
+      const intendedServerCode = normalizeServerCode(data.serverCode);
+      const clientContextId = normalizeClientContextId(data.clientContextId);
+      if (!isValidObjectId(msgId) || intendedServerCode !== socket.serverCode ||
+          clientContextId === null) return;
       const msg = await MessageModel.findById(msgId);
-      if (msg && !msg.deleted) {
+      if (msg && !msg.deleted && msg.serverCode === intendedServerCode) {
         const identity = { role: socket.role, joinedServers: socket.joinedServers || [] };
         if (!canAccessRoom(identity, msg.serverCode)) return;
         await withRoomMutationLock(msg.serverCode, async () => {
@@ -2827,12 +3210,13 @@ function createConnectionHandler({
             UserModel, ChatServerModel, RoomRestrictionModel,
             username: socket.username, serverCode: msg.serverCode
           });
-          if (msg.deleted || !access.allowed || !canAccessRoom(socket, msg.serverCode)) return;
+          if (msg.deleted || socket.serverCode !== intendedServerCode || !access.allowed ||
+              !canAccessRoom(socket, msg.serverCode)) return;
           if (access.restriction.timedOut && msg.username !== socket.username) return;
-          const roomRole = await getRoomRoleFn(msg.serverCode, socket.username);
+          const freshRoomRole = currentRoomRole(access.room, access.user.username);
 
           // Sender, SysAdmin, or RoomMod can delete it
-          if (msg.username === socket.username || socket.role === 'admin' || roomRole === 'mod') {
+          if (msg.username === socket.username || access.user.role === 'admin' || freshRoomRole === 'mod') {
             msg.deleted = true; await msg.save();
             ioInstance.to(msg.serverCode).emit('message_deleted', msgId);
           }
@@ -2891,17 +3275,23 @@ function createConnectionHandler({
     }
   });
 
-  socket.on('typing', async (isTyping) => {
+  socket.on('typing', async (data) => {
     try {
       const serverCode = socket.serverCode;
       const identity = { role: socket.role, joinedServers: socket.joinedServers || [] };
-      if (!socket.username || !serverCode || typeof isTyping !== 'boolean' || !canAccessRoom(identity, serverCode)) return;
+      if (!socket.username || !serverCode || !data || typeof data !== 'object' || Array.isArray(data)) return;
+      const intendedServerCode = normalizeServerCode(data.serverCode);
+      const clientContextId = normalizeClientContextId(data.clientContextId);
+      const isTyping = data.isTyping;
+      if (intendedServerCode !== serverCode || clientContextId === null ||
+          typeof isTyping !== 'boolean' || !canAccessRoom(identity, serverCode)) return;
       await withRoomMutationLock(serverCode, async () => {
         const access = await loadRoomAccessState({
           UserModel, ChatServerModel, RoomRestrictionModel,
           username: socket.username, serverCode
         });
-        if (!access.allowed || access.restriction.timedOut || !canAccessRoom(socket, serverCode)) return;
+        if (socket.serverCode !== intendedServerCode || !access.allowed ||
+            access.restriction.timedOut || !canAccessRoom(socket, serverCode)) return;
         socket.to(serverCode).emit('typing', {
           username: socket.username,
           displayName: socket.displayName || socket.username,

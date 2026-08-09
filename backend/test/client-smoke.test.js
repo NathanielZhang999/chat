@@ -453,6 +453,48 @@ test('production client wires moderation coordinators and direct room events', (
   assert.doesNotMatch(source, /internalSecret|storageSecret/);
 });
 
+test('production dialog acknowledgements are bound to the exact open prompt request', () => {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  const functionSource = name => {
+    const start = source.indexOf(`function ${name}()`);
+    assert.notEqual(start, -1, `${name} exists`);
+    const next = source.indexOf('\n    function ', start + 1);
+    return source.slice(start, next === -1 ? source.length : next);
+  };
+
+  for (const [name, coordinator, dispatchMarker] of [
+    ['submitModerationAction', 'moderationDialogCoordinator', 'moderate_user'],
+    ['submitReport', 'reportDialogCoordinator', 'dispatchModerationReport'],
+    ['submitResolution', 'resolutionDialogCoordinator', 'resolve_moderation_report']
+  ]) {
+    const block = functionSource(name);
+    assert.match(block, new RegExp(`const token = ${coordinator}\\.begin\\(request\\.identity\\)`));
+    assert.match(block, new RegExp(dispatchMarker));
+    assert.match(block, new RegExp(`if \\(!${coordinator}\\.finish\\(token\\)\\) return`));
+    assert.match(
+      block,
+      new RegExp(`response => \\{\\s*if \\(!${coordinator}\\.finish\\(token\\)\\) return`),
+      `${name} makes acknowledgement validation the callback's first statement`
+    );
+    const callbackStart = block.indexOf('response =>');
+    const acknowledgementGuard = block.indexOf(`${coordinator}.finish(token)`);
+    const resultHandling = block.indexOf('const result =');
+    assert.ok(
+      callbackStart > block.indexOf(dispatchMarker) &&
+        acknowledgementGuard > callbackStart &&
+        resultHandling > acknowledgementGuard,
+      `${name} validates inside its acknowledgement before any result handling`
+    );
+    assert.doesNotMatch(
+      block.slice(callbackStart, acknowledgementGuard),
+      /close(?:Moderation|Report|Resolution)Prompt|showAppAlert|\.textContent|\.disabled/,
+      `${name} performs no UI mutation before validating the acknowledgement`
+    );
+  }
+
+  assert.match(source, /if \(socket !== previousSocket\)[\s\S]{0,400}closeModerationPrompt\(\)[\s\S]{0,200}closeReportPrompt\(\)[\s\S]{0,200}invalidatePrivilegedAccess\(\)/);
+});
+
 function createDeferredSocket() {
   const calls = [];
   return {
@@ -922,4 +964,117 @@ test('resolve and dismiss controls reset across same-room reopen and view invali
   assert.equal(controls.resolutionConfirm.disabled, false, 'tab change cleans up immediately');
   socket.calls[1].callback({ ok: true });
   assert.deepEqual(applied, [], 'dismiss acknowledgement cannot mutate the audit view');
+});
+
+test('dialog request epochs reset lost controls and reject late close-reopen acknowledgements', () => {
+  const client = loadHelpers();
+  const pending = [];
+  const dialog = client.createDialogRequestCoordinator({
+    onPendingChange(value) { pending.push(value); }
+  });
+
+  dialog.open('moderate:ABC123:Alice');
+  const oldToken = dialog.begin('moderate:ABC123:Alice');
+  assert.ok(oldToken);
+  assert.equal(pending.at(-1), true);
+
+  dialog.close();
+  assert.equal(pending.at(-1), false, 'closing resets a request whose ack never arrived');
+  dialog.open('moderate:ABC123:Bob');
+  const newToken = dialog.begin('moderate:ABC123:Bob');
+  assert.ok(newToken);
+  assert.equal(dialog.finish(oldToken), false, 'late acknowledgement cannot target the reopened prompt');
+  assert.equal(pending.at(-1), true, 'late acknowledgement cannot enable the new prompt');
+  assert.equal(dialog.finish(newToken), true);
+  assert.equal(pending.at(-1), false);
+
+  dialog.open('report:ABC123:Bob');
+  dialog.begin('report:ABC123:Bob');
+  dialog.invalidate();
+  assert.equal(pending.at(-1), false, 'room/access/socket invalidation resets pending state');
+});
+
+test('composition context binds sends to the visible room and invalidates revoked drafts', () => {
+  const client = loadHelpers();
+  const context = client.createCompositionContextCoordinator();
+
+  context.activate('ABC123');
+  const privatePayload = context.payload({ text: 'private draft' });
+  assert.deepEqual({ ...privatePayload }, {
+    text: 'private draft', serverCode: 'ABC123', clientContextId: 1
+  });
+  assert.equal(context.matches({ serverCode: 'ABC123', clientContextId: 1 }), true);
+
+  context.invalidate();
+  context.activate('global');
+  assert.equal(context.matches({ serverCode: 'ABC123', clientContextId: 1 }), false);
+  assert.equal(context.payload({ text: 'new draft' }).serverCode, 'global');
+  assert.equal(context.payload({ text: 'new draft' }).clientContextId, 3);
+});
+
+test('room rail disables kicked and unbanned nonmembers but preserves admin ghost rooms', () => {
+  const client = loadHelpers();
+  const ordinary = {
+    serverCode: 'ABC123', role: 'user', joinedServers: ['global'], bannedRooms: []
+  };
+  assert.equal(client.isRoomRailAccessible(ordinary), false);
+  assert.equal(client.isRoomRailAccessible({ ...ordinary, bannedRooms: ['ABC123'] }), false);
+  assert.equal(client.isRoomRailAccessible({ ...ordinary, role: 'admin' }), true);
+  assert.equal(client.isRoomRailAccessible({
+    serverCode: 'global', role: 'user', joinedServers: ['global'], bannedRooms: []
+  }), true);
+});
+
+test('privilege revocation immediately closes and clears every privileged surface', () => {
+  const client = loadHelpers();
+  const calls = [];
+  client.applyPrivilegeRevocation({
+    closeCenter: () => calls.push('center'),
+    closeModeration: () => calls.push('moderation'),
+    closeResolution: () => calls.push('resolution'),
+    clearRows: () => calls.push('rows'),
+    updateAccess: () => calls.push('access')
+  });
+  assert.deepEqual(calls, ['moderation', 'resolution', 'center', 'rows', 'access']);
+});
+
+test('room-scoped confirmation and blocked-message helpers retain exact context', () => {
+  const client = loadHelpers();
+  assert.equal(client.roomScopedConfirmation({
+    verb: 'Resolve', targetUsername: 'Bob', roomName: 'Private Room', roomCode: 'ABC123'
+  }), 'Resolve the report for @Bob in Private Room (ABC123)');
+  assert.equal(client.shouldDisplayMessageBlocked({
+    data: { serverCode: 'ABC123', clientContextId: 5 },
+    currentServerCode: 'ABC123', clientContextId: 5
+  }), true);
+  assert.equal(client.shouldDisplayMessageBlocked({
+    data: { serverCode: 'ABC123', clientContextId: 5 },
+    currentServerCode: 'global', clientContextId: 6
+  }), false);
+});
+
+test('production client invalidates revoked access and sends every room mutation with context', () => {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  assert.match(source, /activeSocket\.on\(['"]room_access_updated['"][\s\S]*invalidateRevokedRoomState/);
+  assert.match(source, /activeSocket\.on\(['"]room_access_updated['"][\s\S]{0,500}closeModerationPrompt\(\)[\s\S]{0,200}closeReportPrompt\(\)[\s\S]{0,200}closeResolutionPrompt\(\)/);
+  assert.match(source, /activeSocket\.on\(['"]global_role_updated['"][\s\S]*invalidatePrivilegedAccess/);
+  assert.match(source, /activeSocket\.on\(['"]room_role_updated['"][\s\S]*invalidatePrivilegedAccess/);
+  for (const event of ['chat_message', 'edit_message', 'toggle_reaction', 'delete_message', 'typing']) {
+    assert.match(source, new RegExp(`compositionContextCoordinator\\.payload\\([\\s\\S]{0,240}socket\\.emit\\(['"]${event}['"]`), event);
+  }
+});
+
+test('production image uploads cannot complete into a replaced room composition context', () => {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  const start = source.indexOf("document.getElementById('file-upload').addEventListener('change'");
+  const end = source.indexOf('// --- SETTINGS LOGIC ---', start);
+  assert.notEqual(start, -1);
+  assert.ok(end > start);
+  const uploadBlock = source.slice(start, end);
+
+  assert.match(uploadBlock, /const uploadContext = compositionContextCoordinator\.payload\(\)/);
+  assert.match(uploadBlock, /const uploadEpoch = \+\+attachmentLoadEpoch/);
+  assert.match(uploadBlock, /const isCurrentUpload[\s\S]*compositionContextCoordinator\.matches\(uploadContext\)/);
+  assert.equal((uploadBlock.match(/if \(!isCurrentUpload\(\)\) return/g) || []).length, 2);
+  assert.match(uploadBlock, /uploadEpoch === attachmentLoadEpoch/);
 });
