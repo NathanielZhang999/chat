@@ -622,6 +622,52 @@ test('report account lock serializes duplicate detection and the rolling daily l
   assert.equal(limitedSetup.ModerationReportModel.rows.length, 10);
 });
 
+test('report account lock makes the rolling cap atomic across distinct concurrent submissions', async () => {
+  const setup = reportingScenario();
+  const now = Date.now();
+  for (let index = 0; index < 9; index += 1) {
+    setup.ModerationReportModel.rows.push({
+      _id: (index + 20).toString(16).padStart(24, '0'),
+      serverCode: 'XYZ789', reporterUsername: 'Alice', targetUsername: `Prior${index}`,
+      messageId: null, reason: 'prior report', status: 'open', createdAt: new Date(now - index * 1000)
+    });
+  }
+
+  const firstCountStarted = deferred();
+  const releaseFirstCount = deferred();
+  const baseCountDocuments = setup.ModerationReportModel.countDocuments.bind(setup.ModerationReportModel);
+  let gateFirstRollingCount = true;
+  setup.ModerationReportModel.countDocuments = async query => {
+    const snapshot = await baseCountDocuments(query);
+    if (gateFirstRollingCount && query.reporterUsername === 'Alice') {
+      gateFirstRollingCount = false;
+      firstCountStarted.resolve();
+      await releaseFirstCount.promise;
+    }
+    return snapshot;
+  };
+
+  const firstAck = acknowledge();
+  const secondAck = acknowledge();
+  const firstPending = setup.socket.trigger('report_moderation_target', {
+    serverCode: 'ABC123', targetUser: 'Bob', messageId: VALID_MESSAGE_ID,
+    reason: 'first distinct report at the cap'
+  }, firstAck.callback);
+  await firstCountStarted.promise;
+  const secondPending = setup.socket.trigger('report_moderation_target', {
+    serverCode: 'ABC123', targetUser: 'OrdinaryMember',
+    reason: 'second distinct report at the cap'
+  }, secondAck.callback);
+  await new Promise(resolve => setImmediate(resolve));
+  releaseFirstCount.resolve();
+  await Promise.all([firstPending, secondPending]);
+
+  const results = [firstAck.value(), secondAck.value()];
+  assert.equal(results.filter(result => result.success).length, 1);
+  assert.deepEqual(results.find(result => result.error), { error: 'Too many reports.' });
+  assert.equal(setup.ModerationReportModel.rows.length, 10);
+});
+
 test('report and moderation reads deny ordinary and wrong-room moderators without leaking counts', async () => {
   const setup = reportingScenario();
   const reportId = '507f1f77bcf86cd799439021';
