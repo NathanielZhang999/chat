@@ -658,6 +658,16 @@
             let pendingOlderToken = null;
             let nextOlderRequestId = 0;
 
+            const isCurrentOlder = token => Boolean(token && pendingOlderToken &&
+                token === pendingOlderToken && token.epoch === epoch &&
+                token.roomCode === roomCode && token.clientContextId === clientContextId);
+            const clearOlder = token => {
+                if (!isCurrentOlder(token)) return false;
+                pendingOlderToken = null;
+                onOlderPendingChange(false);
+                return true;
+            };
+
             const resetPending = () => {
                 pendingOlderToken = null;
                 onOlderPendingChange(false);
@@ -706,13 +716,7 @@
                     return token;
                 },
                 finishOlder(token, response) {
-                    const isCurrentRequest = Boolean(token && pendingOlderToken &&
-                        token === pendingOlderToken && token.epoch === epoch &&
-                        token.roomCode === roomCode && token.clientContextId === clientContextId);
-                    if (!isCurrentRequest) return null;
-
-                    pendingOlderToken = null;
-                    onOlderPendingChange(false);
+                    if (!clearOlder(token)) return null;
                     const accepted = Boolean(response && Array.isArray(response.messages) &&
                         response.serverCode === roomCode &&
                         response.clientContextId === clientContextId &&
@@ -721,6 +725,13 @@
                     if (!accepted) return null;
                     nextCursor = response.nextCursor;
                     return response;
+                },
+                cancelOlder(token) {
+                    return clearOlder(token);
+                },
+                matches(token) {
+                    return Boolean(token && token.epoch === epoch &&
+                        token.roomCode === roomCode && token.clientContextId === clientContextId);
                 },
                 current() {
                     return {
@@ -734,20 +745,47 @@
             };
         },
 
-        requestOlderMessages({ coordinator, socket, onAccepted = () => {} } = {}) {
+        requestOlderMessages({
+            coordinator,
+            socket,
+            onAccepted = () => {},
+            onTimeout = () => {},
+            scheduleTimeout = null,
+            cancelTimeout = null,
+            timeoutMs = 10000
+        } = {}) {
             if (!coordinator || !socket || typeof socket.emit !== 'function') return false;
             const token = coordinator.beginOlder();
             if (!token) return false;
+            let timerId = null;
+            const clearTimer = () => {
+                if (timerId !== null && typeof cancelTimeout === 'function') cancelTimeout(timerId);
+                timerId = null;
+            };
+            if (typeof scheduleTimeout === 'function') {
+                timerId = scheduleTimeout(() => {
+                    timerId = null;
+                    if (!coordinator.cancelOlder(token)) return;
+                    onTimeout(token);
+                }, timeoutMs);
+            }
             socket.emit('list_messages', {
                 serverCode: token.roomCode,
                 clientContextId: token.clientContextId,
                 cursor: token.cursor
             }, response => {
+                clearTimer();
                 const accepted = coordinator.finishOlder(token, response);
                 if (!accepted) return;
-                onAccepted(accepted);
+                onAccepted(accepted, token);
             });
-            return true;
+            return Object.freeze({
+                token,
+                cancel() {
+                    clearTimer();
+                    return coordinator.cancelOlder(token);
+                }
+            });
         },
 
         prependScrollTop({ oldScrollHeight, oldScrollTop, newScrollHeight } = {}) {
@@ -776,25 +814,79 @@
             historyControls,
             messages,
             renderMessage,
-            afterRender = () => {}
+            afterRender = () => {},
+            createResizeObserver = null,
+            isCurrent = () => true,
+            onAnchorCleanup = () => {}
         } = {}) {
             if (!chatWindow || !historyControls || typeof renderMessage !== 'function') return [];
             const oldScrollHeight = chatWindow.scrollHeight;
             const oldScrollTop = chatWindow.scrollTop;
+            const existingRows = [...chatWindow.querySelectorAll('.msg[data-id]')];
             const existingIds = new Set(
-                [...chatWindow.querySelectorAll('.msg[data-id]')]
+                existingRows
                     .map(row => row.getAttribute('data-id'))
                     .filter(Boolean)
             );
             const unique = this.uniqueMessages(existingIds, messages);
             const anchor = historyControls.nextSibling;
-            unique.forEach(message => renderMessage(message, anchor));
+            const anchorElement = existingRows[0] || null;
+            const canMeasureAnchor = Boolean(anchorElement &&
+                typeof anchorElement.getBoundingClientRect === 'function' &&
+                typeof chatWindow.getBoundingClientRect === 'function');
+            const originalAnchorTop = canMeasureAnchor
+                ? anchorElement.getBoundingClientRect().top - chatWindow.getBoundingClientRect().top
+                : null;
+            const renderedRows = unique.map(message => renderMessage(message, anchor)).filter(Boolean);
             afterRender();
-            chatWindow.scrollTop = this.prependScrollTop({
-                oldScrollHeight,
-                oldScrollTop,
-                newScrollHeight: chatWindow.scrollHeight
-            });
+            const correctAnchor = () => {
+                if (!canMeasureAnchor) return false;
+                const currentTop = anchorElement.getBoundingClientRect().top -
+                    chatWindow.getBoundingClientRect().top;
+                const delta = currentTop - originalAnchorTop;
+                if (!delta) return true;
+                chatWindow.scrollTop += delta;
+                return true;
+            };
+            if (!correctAnchor()) {
+                chatWindow.scrollTop = this.prependScrollTop({
+                    oldScrollHeight,
+                    oldScrollTop,
+                    newScrollHeight: chatWindow.scrollHeight
+                });
+            }
+
+            let stopped = false;
+            let observer = null;
+            const onScroll = () => {
+                const currentTop = canMeasureAnchor
+                    ? anchorElement.getBoundingClientRect().top - chatWindow.getBoundingClientRect().top
+                    : null;
+                if (currentTop !== null && Math.abs(currentTop - originalAnchorTop) < 1) return;
+                cleanup();
+            };
+            const cleanup = () => {
+                if (stopped) return;
+                stopped = true;
+                if (observer) observer.disconnect();
+                if (typeof chatWindow.removeEventListener === 'function') {
+                    chatWindow.removeEventListener('scroll', onScroll);
+                }
+            };
+            if (canMeasureAnchor && renderedRows.length && typeof createResizeObserver === 'function') {
+                observer = createResizeObserver(() => {
+                    if (stopped) return;
+                    if (!isCurrent()) return cleanup();
+                    correctAnchor();
+                });
+                if (observer && typeof observer.observe === 'function') {
+                    renderedRows.forEach(row => observer.observe(row));
+                    if (typeof chatWindow.addEventListener === 'function') {
+                        chatWindow.addEventListener('scroll', onScroll, { passive: true });
+                    }
+                }
+            }
+            onAnchorCleanup(cleanup);
             return unique;
         },
 
@@ -1608,6 +1700,14 @@
     const messageReadCoordinator = ChatClientHelpers.createMessageReadCoordinator({
         onOlderPendingChange: pending => { loadOlderButton.disabled = pending; }
     });
+    let olderRequestHandle = null;
+    let stopOlderAnchor = () => {};
+    const olderRequestTimeoutMs = 10000;
+    const scheduleOlderAckTimeout = (callback, delay) => setTimeout(callback, delay);
+    const cancelOlderAckTimeout = timerId => clearTimeout(timerId);
+    const createOlderResizeObserver = typeof window.ResizeObserver === 'function'
+        ? callback => new window.ResizeObserver(callback)
+        : null;
     const scheduleAnimationFrame = window.requestAnimationFrame
         ? callback => window.requestAnimationFrame(callback)
         : callback => setTimeout(callback, 0);
@@ -1701,11 +1801,17 @@
     }
 
     function invalidateMessageReads() {
+        stopOlderAnchor();
+        stopOlderAnchor = () => {};
+        if (olderRequestHandle) olderRequestHandle.cancel();
+        olderRequestHandle = null;
         messageReadCoordinator.invalidate();
         renderOlderControl();
     }
 
     function clearRenderedMessages() {
+        stopOlderAnchor();
+        stopOlderAnchor = () => {};
         [...chatWindow.children].forEach(child => {
             if (child !== historyControls) child.remove();
         });
@@ -3464,24 +3570,38 @@
     }
 
     function loadOlderMessages() {
-        ChatClientHelpers.requestOlderMessages({
+        const requestHandle = ChatClientHelpers.requestOlderMessages({
             coordinator: messageReadCoordinator,
             socket,
-            onAccepted(response) {
+            scheduleTimeout: scheduleOlderAckTimeout,
+            cancelTimeout: cancelOlderAckTimeout,
+            timeoutMs: olderRequestTimeoutMs,
+            onTimeout() {
+                olderRequestHandle = null;
+                renderOlderControl();
+            },
+            onAccepted(response, token) {
+                olderRequestHandle = null;
+                stopOlderAnchor();
                 ChatClientHelpers.prependMessagePage({
                     chatWindow,
                     historyControls,
                     messages: response.messages,
                     renderMessage(message, before) {
-                        appendMessage(message, message.username === myUsername, {
+                        return appendMessage(message, message.username === myUsername, {
                             history: true,
                             before
                         });
                     },
-                    afterRender: renderOlderControl
+                    afterRender: renderOlderControl,
+                    createResizeObserver: createOlderResizeObserver,
+                    isCurrent: () => messageReadCoordinator.matches(token),
+                    onAnchorCleanup(cleanup) { stopOlderAnchor = cleanup; }
                 });
             }
         });
+        olderRequestHandle = requestHandle || null;
+        if (!messageReadCoordinator.current().olderPending) olderRequestHandle = null;
     }
 
     loadOlderButton.addEventListener('click', loadOlderMessages);
@@ -3518,7 +3638,7 @@
             }
             chatWindow.insertBefore(wrapper, before);
             if (renderPolicy.shouldScroll) chatScrollCoordinator.request(renderPolicy.behavior);
-            return;
+            return wrapper;
         }
 
         wrapper.className = `msg`; 
@@ -3670,6 +3790,7 @@
         wrapper.appendChild(avatarDiv); wrapper.appendChild(bodyDiv);
         chatWindow.insertBefore(wrapper, before);
         if (renderPolicy.shouldScroll) chatScrollCoordinator.request(renderPolicy.behavior);
+        return wrapper;
     }
 
     function appendSystemMessage(txt) {

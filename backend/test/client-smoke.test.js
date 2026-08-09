@@ -313,9 +313,9 @@ test('older message request sends its frozen room context and ignores stale ackn
   const coordinator = helpers.createMessageReadCoordinator();
   coordinator.activate('ABC123', 11, 'cursor-a');
 
-  assert.equal(helpers.requestOlderMessages({
+  assert.ok(helpers.requestOlderMessages({
     coordinator, socket, onAccepted: response => applied.push(structuredClone(response))
-  }), true);
+  }));
   assert.deepEqual(structuredClone(calls[0].payload), {
     serverCode: 'ABC123', clientContextId: 11, cursor: 'cursor-a'
   });
@@ -328,6 +328,67 @@ test('older message request sends its frozen room context and ignores stale ackn
   });
   assert.deepEqual(applied, []);
   assert.equal(coordinator.current().nextCursor, 'cursor-b');
+});
+
+test('older message timeout clears only its exact token and rejects a late acknowledgement', () => {
+  const helpers = loadHelpers();
+  const callbacks = [];
+  const timers = [];
+  const canceledTimers = [];
+  const pending = [];
+  const accepted = [];
+  const coordinator = helpers.createMessageReadCoordinator({
+    onOlderPendingChange: value => pending.push(value)
+  });
+  const socket = {
+    emit(event, payload, callback) { callbacks.push({ event, payload, callback }); }
+  };
+  const options = {
+    coordinator,
+    socket,
+    scheduleTimeout(callback, delay) {
+      const timer = { callback, delay };
+      timers.push(timer);
+      return timer;
+    },
+    cancelTimeout(timer) { canceledTimers.push(timer); },
+    timeoutMs: 25,
+    onAccepted(response) { accepted.push(structuredClone(response)); }
+  };
+
+  coordinator.activate('ABC123', 4, 'cursor-a');
+  const firstHandle = helpers.requestOlderMessages(options);
+  assert.ok(firstHandle);
+  assert.equal(timers[0].delay, 25);
+  assert.equal(coordinator.current().olderPending, true);
+
+  timers[0].callback();
+  assert.equal(coordinator.current().olderPending, false);
+  assert.equal(firstHandle.cancel(), false, 'settled timeout cannot cancel again');
+
+  const secondHandle = helpers.requestOlderMessages(options);
+  assert.ok(secondHandle);
+  timers[0].callback();
+  assert.equal(coordinator.current().olderPending, true, 'late timeout cannot clear a newer token');
+  callbacks[0].callback({
+    serverCode: 'ABC123', clientContextId: 4,
+    messages: [{ _id: 'late' }], nextCursor: 'wrong'
+  });
+  assert.deepEqual(accepted, [], 'late acknowledgement after timeout cannot render');
+  assert.equal(coordinator.current().nextCursor, 'cursor-a');
+  assert.equal(coordinator.current().olderPending, true);
+
+  callbacks[1].callback({
+    serverCode: 'ABC123', clientContextId: 4,
+    messages: [{ _id: 'current' }], nextCursor: null
+  });
+  assert.deepEqual(accepted, [{
+    serverCode: 'ABC123', clientContextId: 4,
+    messages: [{ _id: 'current' }], nextCursor: null
+  }]);
+  assert.equal(coordinator.current().olderPending, false);
+  assert.equal(canceledTimers.includes(timers[1]), true);
+  assert.deepEqual(pending, [false, true, false, true, false]);
 });
 
 test('older message control is hidden without a cursor and disabled only while pending', () => {
@@ -384,6 +445,72 @@ test('older message page prepends chronological unique rows and preserves its DO
   assert.equal(chatWindow.scrollTop, 380, 'terminal control removal is included in the anchor correction');
 });
 
+test('older message anchor follows late image sizing until user scroll or room invalidation', () => {
+  const helpers = loadHelpers();
+  const listeners = new Map();
+  const controls = { nextSibling: null };
+  let anchorLayoutTop = 300;
+  let current = true;
+  let observerCallback;
+  let disconnected = false;
+  const anchor = {
+    getAttribute: name => name === 'data-id' ? 'existing' : null,
+    getBoundingClientRect: () => ({ top: anchorLayoutTop - chatWindow.scrollTop })
+  };
+  const children = [controls, anchor];
+  controls.nextSibling = anchor;
+  const chatWindow = {
+    scrollHeight: 900,
+    scrollTop: 120,
+    getBoundingClientRect: () => ({ top: 0 }),
+    querySelectorAll: () => children.filter(child => child !== controls),
+    addEventListener(type, callback) { listeners.set(type, callback); },
+    removeEventListener(type) { listeners.delete(type); }
+  };
+  const renderedRows = [];
+  let cleanup;
+
+  helpers.prependMessagePage({
+    chatWindow,
+    historyControls: controls,
+    messages: [{ _id: 'remote-embed' }, { _id: 'attachment' }],
+    renderMessage(message) {
+      const row = {
+        id: message._id,
+        getAttribute: name => name === 'data-id' ? message._id : null
+      };
+      renderedRows.push(row);
+      children.splice(children.indexOf(anchor), 0, row);
+      anchorLayoutTop += 80;
+      chatWindow.scrollHeight += 80;
+      return row;
+    },
+    createResizeObserver(callback) {
+      observerCallback = callback;
+      return { observe() {}, disconnect() { disconnected = true; } };
+    },
+    isCurrent: () => current,
+    onAnchorCleanup(value) { cleanup = value; }
+  });
+  assert.equal(anchor.getBoundingClientRect().top, 180, 'existing row retains its initial viewport offset');
+
+  anchorLayoutTop += 140;
+  chatWindow.scrollHeight += 140;
+  observerCallback([{ target: renderedRows[0] }]);
+  assert.equal(anchor.getBoundingClientRect().top, 180, 'late remote image sizing preserves the row offset');
+
+  chatWindow.scrollTop += 25;
+  listeners.get('scroll')();
+  const intentionalTop = chatWindow.scrollTop;
+  anchorLayoutTop += 90;
+  observerCallback([{ target: renderedRows[1] }]);
+  assert.equal(chatWindow.scrollTop, intentionalTop, 'late attachment sizing does not fight intentional scroll');
+  assert.equal(disconnected, true);
+
+  cleanup();
+  current = false;
+});
+
 test('initial message history renders without motion and requests one bottom scroll', () => {
   const helpers = loadHelpers();
   const rendered = [];
@@ -435,6 +562,17 @@ test('current-user room access fallback invalidates reads on membership loss', (
 });
 
 test('production message read lifecycle invalidates real lobby logout switch and socket paths', async () => {
+  const invalidationCalls = [];
+  const invalidation = loadClientFunction('invalidateMessageReads', {
+    stopOlderAnchor: () => invalidationCalls.push('anchor'),
+    olderRequestHandle: { cancel: () => invalidationCalls.push('timer') },
+    messageReadCoordinator: { invalidate: () => invalidationCalls.push('coordinator') },
+    renderOlderControl: () => invalidationCalls.push('control')
+  });
+  invalidation.fn();
+  assert.deepEqual(invalidationCalls, ['anchor', 'timer', 'coordinator', 'control']);
+  assert.equal(invalidation.context.olderRequestHandle, null);
+
   const lobbyCalls = [];
   const lobbyDocument = createClientDocument();
   const lobby = loadClientFunction('enterLobby', {
@@ -553,6 +691,129 @@ test('production message read lifecycle invalidates real lobby logout switch and
     'history', [{ _id: '1', username: 'Alice' }], { replace: true }
   ]);
   assert.equal(switchCalls[4], 'control');
+});
+
+test('production load older wiring handles terminal layout late images and stale callbacks', () => {
+  const helpers = loadHelpers();
+  const calls = [];
+  const socketCalls = [];
+  const timers = [];
+  const listeners = new Map();
+  const loadButton = { hidden: false, disabled: false };
+  const historyControls = { hidden: false };
+  let anchorLayoutTop = 240;
+  let observerCallback;
+  const existing = {
+    id: '2',
+    getAttribute: name => name === 'data-id' ? '2' : null,
+    getBoundingClientRect: () => ({ top: anchorLayoutTop - chatWindow.scrollTop })
+  };
+  const children = [historyControls, existing];
+  Object.defineProperty(historyControls, 'nextSibling', {
+    get() { return children[children.indexOf(historyControls) + 1] || null; }
+  });
+  const chatWindow = {
+    scrollHeight: 900,
+    scrollTop: 120,
+    children,
+    getBoundingClientRect: () => ({ top: 0 }),
+    querySelectorAll: () => children.filter(child => child.id),
+    addEventListener(type, callback) { listeners.set(type, callback); },
+    removeEventListener(type) { listeners.delete(type); }
+  };
+  const coordinator = helpers.createMessageReadCoordinator({
+    onOlderPendingChange(value) { loadButton.disabled = value; }
+  });
+  coordinator.activate('ABC123', 8, 'cursor-a');
+  const renderControl = () => {
+    calls.push('control');
+    helpers.applyOlderControlState(loadButton, coordinator.current());
+    const wasHidden = historyControls.hidden;
+    historyControls.hidden = loadButton.hidden;
+    if (!wasHidden && historyControls.hidden) {
+      anchorLayoutTop -= 40;
+      chatWindow.scrollHeight -= 40;
+    }
+  };
+  const instrumentedHelpers = {
+    requestOlderMessages(options) {
+      calls.push('request');
+      return helpers.requestOlderMessages(options);
+    },
+    prependMessagePage(options) {
+      calls.push('prepend');
+      return helpers.prependMessagePage(options);
+    }
+  };
+  const runtime = loadClientFunction('loadOlderMessages', {
+    olderRequestHandle: null,
+    stopOlderAnchor: () => {},
+    messageReadCoordinator: coordinator,
+    socket: {
+      emit(event, payload, callback) { socketCalls.push({ event, payload, callback }); }
+    },
+    scheduleOlderAckTimeout(callback, delay) {
+      const timer = { callback, delay };
+      timers.push(timer);
+      return timer;
+    },
+    cancelOlderAckTimeout() {},
+    olderRequestTimeoutMs: 25,
+    ChatClientHelpers: instrumentedHelpers,
+    renderOlderControl: renderControl,
+    chatWindow,
+    historyControls,
+    myUsername: 'Alice',
+    appendMessage(message, isMe, { before }) {
+      const row = {
+        id: message._id,
+        getAttribute: name => name === 'data-id' ? message._id : null
+      };
+      children.splice(children.indexOf(before), 0, row);
+      anchorLayoutTop += 50;
+      chatWindow.scrollHeight += 50;
+      return row;
+    },
+    createOlderResizeObserver(callback) {
+      observerCallback = callback;
+      return { observe() {}, disconnect() {} };
+    }
+  });
+
+  runtime.fn();
+  assert.deepEqual(calls, ['request']);
+  assert.equal(loadButton.disabled, true);
+  assert.equal(socketCalls[0].event, 'list_messages');
+  assert.deepEqual(structuredClone(socketCalls[0].payload), {
+    serverCode: 'ABC123', clientContextId: 8, cursor: 'cursor-a'
+  });
+
+  socketCalls[0].callback({
+    serverCode: 'ABC123', clientContextId: 8,
+    messages: [{ _id: '0', username: 'Bob' }, { _id: '1', username: 'Bob' }, { _id: '2', username: 'Bob' }],
+    nextCursor: null
+  });
+  assert.deepEqual(calls, ['request', 'prepend', 'control']);
+  assert.deepEqual(children.map(child => child.id || 'controls'), ['controls', '0', '1', '2']);
+  assert.equal(historyControls.hidden, true);
+  assert.equal(loadButton.hidden, true);
+  assert.equal(existing.getBoundingClientRect().top, 120, 'terminal flex removal is anchored');
+
+  anchorLayoutTop += 110;
+  chatWindow.scrollHeight += 110;
+  observerCallback([{ target: children[1] }]);
+  assert.equal(existing.getBoundingClientRect().top, 120, 'late remote image growth remains anchored');
+
+  coordinator.activate('ABC123', 9, 'cursor-b');
+  runtime.fn();
+  coordinator.activate('XYZ789', 10, 'cursor-c');
+  const childIds = children.map(child => child.id || 'controls');
+  socketCalls[1].callback({
+    serverCode: 'ABC123', clientContextId: 9,
+    messages: [{ _id: 'stale', username: 'Bob' }], nextCursor: null
+  });
+  assert.deepEqual(children.map(child => child.id || 'controls'), childIds);
+  assert.equal(calls.filter(call => call === 'prepend').length, 1);
 });
 
 test('backend URLs allow only HTTP and HTTPS', () => {
