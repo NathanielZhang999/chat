@@ -8,11 +8,13 @@ const {
   normalizeAccountKey,
   findUserByUsername,
   withAccountTransitionLocks,
+  withAccountTransitionLock,
   canModerateTarget,
   activeRestrictionState,
-  rejectAuditMutation
+  rejectAuditMutation,
+  createConnectionHandler
 } = require('../server');
-const { FakeSocket, FakeIo, createMemoryModel, deferred } = require('./support/fakes');
+const { FakeSocket, FakeIo, createMemoryModel, acknowledge, deferred } = require('./support/fakes');
 
 const VALID_MESSAGE_ID = '507f1f77bcf86cd799439011';
 
@@ -49,17 +51,100 @@ function restrictionDocument(serverCode, username, overrides = {}) {
 function registerWithModels(seed = {}) {
   const socket = new FakeSocket();
   const ioInstance = new FakeIo();
-  return {
+  const MessageModel = createMemoryModel(seed.messages || []);
+  MessageModel.created = [];
+  const createMessage = MessageModel.create.bind(MessageModel);
+  MessageModel.create = async value => {
+    const created = await createMessage(value);
+    MessageModel.created.push(created);
+    return created;
+  };
+  const setup = {
     socket,
     ioInstance,
-    onlineUsersMap: new Map(),
-    UserModel: createMemoryModel(seed.users || []),
+    onlineUsersMap: seed.onlineUsersMap || new Map(),
+    UserModel: createMemoryModel(seed.users || (seed.user ? [seed.user] : [])),
     ChatServerModel: createMemoryModel(seed.rooms || []),
-    MessageModel: createMemoryModel(seed.messages || []),
+    MessageModel,
     RoomRestrictionModel: createMemoryModel(seed.restrictions || []),
     ModerationAuditModel: createMemoryModel(seed.audits || []),
     ModerationReportModel: createMemoryModel(seed.reports || [])
   };
+  createConnectionHandler({
+    ...setup,
+    bcryptImpl: { async compare() { return true; }, async hash(value) { return value; } },
+    broadcastOnlineUsersFn: seed.broadcastOnlineUsersFn || (async () => {}),
+    getRoomRoleFn: seed.getRoomRoleFn || (async () => 'user'),
+    resolvePingsFn: seed.resolvePingsFn || (async text => text),
+    logger: { error() {} }
+  })(socket);
+  return setup;
+}
+
+function authenticatedRoomSocket({ joinedServers = ['global', 'ABC123'], serverCode = 'global', username = 'Alice' } = {}) {
+  const setup = registerWithModels({
+    user: userDocument({ username, servers: joinedServers }),
+    rooms: joinedServers.map(code => roomDocument(code))
+  });
+  setup.socket.username = username;
+  setup.socket.displayName = username;
+  setup.socket.role = 'user';
+  setup.socket.serverCode = serverCode;
+  setup.socket.joinedServers = [...joinedServers];
+  setup.socket.joinedRooms.add(serverCode);
+  setup.onlineUsersMap.set(setup.socket.id, {
+    username,
+    displayName: username,
+    role: 'user',
+    serverCode,
+    joinedServers: [...joinedServers],
+    bannedRooms: []
+  });
+  return setup;
+}
+
+function authenticatedLobbySocket({ username = 'Alice', bannedRooms = [] } = {}) {
+  const setup = registerWithModels({
+    user: userDocument({ username, servers: ['global'] }),
+    rooms: [roomDocument('global'), roomDocument('ABC123')],
+    restrictions: bannedRooms.map(code => restrictionDocument(code, username, { bannedAt: new Date() }))
+  });
+  setup.socket.username = username;
+  setup.socket.displayName = username;
+  setup.socket.role = 'user';
+  setup.socket.serverCode = null;
+  setup.socket.joinedServers = [];
+  setup.socket.bannedRooms = [...bannedRooms];
+  setup.onlineUsersMap.set(setup.socket.id, {
+    username,
+    displayName: username,
+    role: 'user',
+    serverCode: null,
+    joinedServers: [],
+    bannedRooms: [...bannedRooms]
+  });
+  return setup;
+}
+
+function timedOutAuthenticatedSocket(serverCode, username) {
+  const message = saveableDocument({
+    _id: VALID_MESSAGE_ID,
+    serverCode,
+    username,
+    displayName: username,
+    role: 'user',
+    roomRole: 'user',
+    text: 'original',
+    history: [],
+    reactions: {},
+    deleted: false
+  });
+  const setup = authenticatedRoomSocket({ joinedServers: ['global', serverCode], serverCode, username });
+  setup.RoomRestrictionModel.rows.push(restrictionDocument(serverCode, username, {
+    timeoutUntil: new Date(Date.now() + 60_000)
+  }));
+  setup.MessageModel.findById = async () => message;
+  return { ...setup, message };
 }
 
 test('moderation inputs accept only the supported actions, durations, reasons, and AutoMod bounds', () => {
@@ -181,4 +266,187 @@ test('audit schema registers every prohibited mutation operation', () => {
   }
 });
 
-module.exports = { VALID_MESSAGE_ID, userDocument, roomDocument, restrictionDocument, registerWithModels };
+test('global-banned login chooses the first accessible joined private room', async () => {
+  const { socket } = registerWithModels({
+    user: userDocument({ username: 'Alice', servers: ['global', 'ABC123', 'XYZ789'] }),
+    rooms: [roomDocument('global'), roomDocument('ABC123'), roomDocument('XYZ789')],
+    restrictions: [restrictionDocument('global', 'alice', { bannedAt: new Date() })]
+  });
+  const ack = acknowledge();
+  await socket.trigger('login', { username: 'Alice', password: '123456' }, ack.callback);
+  assert.equal(ack.value().defaultServerCode, 'ABC123');
+  assert.equal(socket.serverCode, 'ABC123');
+  assert.equal(socket.joinedRooms.has('global'), false);
+  assert.equal(socket.joinedRooms.has('ABC123'), true);
+});
+
+test('global-banned login with no accessible private room enters authenticated lobby', async () => {
+  const setup = registerWithModels({
+    user: userDocument({ username: 'Alice', servers: ['global'] }),
+    rooms: [roomDocument('global')],
+    restrictions: [restrictionDocument('global', 'alice', { bannedAt: new Date() })]
+  });
+  const ack = acknowledge();
+  await setup.socket.trigger('login', { username: 'Alice', password: '123456' }, ack.callback);
+  assert.equal(ack.value().defaultServerCode, null);
+  assert.equal(setup.socket.serverCode, null);
+  assert.equal(setup.onlineUsersMap.get(setup.socket.id).serverCode, null);
+  assert.deepEqual([...setup.socket.joinedRooms], []);
+});
+
+test('global-banned login never publishes Global presence or a Global join notice', async () => {
+  const broadcasts = [];
+  const setup = registerWithModels({
+    user: userDocument({ username: 'Alice', servers: ['global'] }),
+    rooms: [roomDocument('global')],
+    restrictions: [restrictionDocument('global', 'alice', { bannedAt: new Date() })],
+    broadcastOnlineUsersFn: code => broadcasts.push(code)
+  });
+  const ack = acknowledge();
+  await setup.socket.trigger('login', { username: 'alice', password: '123456' }, ack.callback);
+  assert.deepEqual(broadcasts, []);
+  assert.equal(setup.socket.outbound.some(item => item.target === 'global' && item.event === 'system_message'), false);
+  assert.deepEqual(ack.value().bannedRooms, ['global']);
+});
+
+test('room ban blocks join and switch even when socket membership is stale', async () => {
+  const setup = authenticatedRoomSocket({ joinedServers: ['global', 'ABC123'] });
+  setup.RoomRestrictionModel.rows.push(restrictionDocument('ABC123', 'alice', { bannedAt: new Date() }));
+  const joinAck = acknowledge();
+  const switchAck = acknowledge();
+  await setup.socket.trigger('join_server', 'ABC123', joinAck.callback);
+  await setup.socket.trigger('switch_server', 'ABC123', switchAck.callback);
+  assert.deepEqual(joinAck.value(), { error: 'Permission denied.' });
+  assert.deepEqual(switchAck.value(), { error: 'Permission denied.' });
+});
+
+test('mixed-case ban lookup denies the canonical user', async () => {
+  const setup = authenticatedRoomSocket({ joinedServers: ['global', 'ABC123'], username: 'Alice' });
+  setup.RoomRestrictionModel.rows.push(restrictionDocument('ABC123', 'alice', { bannedAt: new Date() }));
+  const ack = acknowledge();
+  await setup.socket.trigger('switch_server', 'ABC123', ack.callback);
+  assert.deepEqual(ack.value(), { error: 'Permission denied.' });
+});
+
+test('global-banned lobby user can join an unbanned private room without joining Global', async () => {
+  const setup = authenticatedLobbySocket({ username: 'Alice', bannedRooms: ['global'] });
+  const ack = acknowledge();
+  await setup.socket.trigger('join_server', 'ABC123', ack.callback);
+  assert.equal(ack.value().success, true);
+  assert.equal(setup.socket.joinedRooms.has('global'), false);
+  assert.deepEqual(setup.onlineUsersMap.get(setup.socket.id).bannedRooms, ['global']);
+});
+
+test('timeout blocks send edit reaction and typing but allows own delete', async () => {
+  const setup = timedOutAuthenticatedSocket('ABC123', 'Alice');
+  await setup.socket.trigger('chat_message', { text: 'blocked message' });
+  await setup.socket.trigger('edit_message', { id: VALID_MESSAGE_ID, text: 'blocked edit' });
+  await setup.socket.trigger('toggle_reaction', { id: VALID_MESSAGE_ID, emoji: '👍' });
+  await setup.socket.trigger('typing', true);
+  await setup.socket.trigger('delete_message', VALID_MESSAGE_ID);
+  assert.equal(setup.MessageModel.created.length, 0);
+  assert.equal(setup.message.text, 'original');
+  assert.deepEqual(setup.message.reactions, {});
+  assert.equal(setup.socket.outbound.some(item => item.event === 'typing'), false);
+  assert.equal(setup.message.deleted, true);
+});
+
+test('join_server rejects a ban committed before its account and room critical section', async () => {
+  const setup = authenticatedRoomSocket({ joinedServers: ['global'] });
+  setup.ChatServerModel.rows.push(roomDocument('ABC123'));
+  const releaseAccount = deferred();
+  const accountHeld = deferred();
+  const holder = withAccountTransitionLock('alice', async () => {
+    accountHeld.resolve();
+    await releaseAccount.promise;
+  });
+  await accountHeld.promise;
+
+  const ack = acknowledge();
+  const pending = setup.socket.trigger('join_server', 'ABC123', ack.callback);
+  setup.RoomRestrictionModel.rows.push(restrictionDocument('ABC123', 'alice', { bannedAt: new Date() }));
+  releaseAccount.resolve();
+  await Promise.all([holder, pending]);
+
+  assert.deepEqual(ack.value(), { error: 'Permission denied.' });
+  assert.deepEqual(setup.UserModel.rows[0].servers, ['global']);
+  assert.equal(setup.socket.outbound.some(item => item.event === 'room_access_updated'), false);
+});
+
+test('chat_message rejects a timeout committed before its room critical section', async () => {
+  const setup = authenticatedRoomSocket({ joinedServers: ['global', 'ABC123'], serverCode: 'ABC123' });
+  const saveStarted = deferred();
+  const releaseSave = deferred();
+  const holderMessage = {
+    _id: VALID_MESSAGE_ID,
+    serverCode: 'ABC123',
+    username: 'Bob',
+    deleted: false,
+    reactions: {},
+    markModified() {},
+    async save() {
+      saveStarted.resolve();
+      await releaseSave.promise;
+    }
+  };
+  setup.MessageModel.findById = async () => holderMessage;
+
+  const holdingMutation = setup.socket.trigger('toggle_reaction', { id: VALID_MESSAGE_ID, emoji: '👍' });
+  await saveStarted.promise;
+  const pendingMessage = setup.socket.trigger('chat_message', { text: 'blocked after commit' });
+  await new Promise(resolve => setImmediate(resolve));
+  setup.RoomRestrictionModel.rows.push(restrictionDocument('ABC123', 'alice', {
+    timeoutUntil: new Date(Date.now() + 60_000)
+  }));
+  releaseSave.resolve();
+  await Promise.all([holdingMutation, pendingMessage]);
+
+  assert.equal(setup.MessageModel.created.length, 0);
+  assert.equal(setup.ioInstance.outbound.some(item => item.event === 'chat_message'), false);
+});
+
+test('successful login and switch expose only active timeout state', async () => {
+  const loginTimeoutUntil = new Date(Date.now() + 120_000);
+  const loginSetup = registerWithModels({
+    user: userDocument({ username: 'Alice', servers: ['global'] }),
+    rooms: [roomDocument('global')],
+    restrictions: [restrictionDocument('global', 'alice', {
+      timeoutUntil: loginTimeoutUntil,
+      timeoutBy: 'Admin',
+      timeoutReason: 'sensitive'
+    })]
+  });
+  const loginAck = acknowledge();
+  await loginSetup.socket.trigger('login', { username: 'Alice', password: '123456' }, loginAck.callback);
+  assert.deepEqual(loginAck.value().restriction, {
+    banned: false,
+    timedOut: true,
+    timeoutUntil: loginTimeoutUntil
+  });
+
+  const switchTimeoutUntil = new Date(Date.now() + 180_000);
+  const switchSetup = authenticatedRoomSocket({ joinedServers: ['global', 'ABC123'] });
+  switchSetup.RoomRestrictionModel.rows.push(restrictionDocument('ABC123', 'alice', {
+    timeoutUntil: switchTimeoutUntil,
+    timeoutBy: 'Admin',
+    timeoutReason: 'sensitive'
+  }));
+  const switchAck = acknowledge();
+  await switchSetup.socket.trigger('switch_server', 'ABC123', switchAck.callback);
+  assert.deepEqual(switchAck.value().restriction, {
+    banned: false,
+    timedOut: true,
+    timeoutUntil: switchTimeoutUntil
+  });
+});
+
+module.exports = {
+  VALID_MESSAGE_ID,
+  userDocument,
+  roomDocument,
+  restrictionDocument,
+  registerWithModels,
+  authenticatedRoomSocket,
+  authenticatedLobbySocket,
+  timedOutAuthenticatedSocket
+};

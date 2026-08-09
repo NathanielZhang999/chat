@@ -14,6 +14,7 @@ function registerMessages(overrides = {}) {
       }
     },
     ChatServerModel: { async findOne(query) { return { code: query.code }; } },
+    RoomRestrictionModel: { async findOne() { return null; }, async find() { return []; } },
     onlineUsersMap: new Map(),
     broadcastOnlineUsersFn: async () => {},
     getRoomRoleFn: async () => 'user',

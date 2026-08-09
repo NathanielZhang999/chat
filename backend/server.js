@@ -318,6 +318,38 @@ function activeRestrictionState(restriction, now = new Date()) {
   return { banned: Boolean(restriction && restriction.bannedAt), timedOut: Boolean(timeoutUntil), timeoutUntil };
 }
 
+async function getActiveRoomRestriction(RoomRestrictionModel, serverCode, username, now = new Date()) {
+  const row = await RoomRestrictionModel.findOne({ serverCode, username: normalizeAccountKey(username) });
+  const state = activeRestrictionState(row, now);
+  return { row, ...state };
+}
+
+function chooseAccessibleRoom({ user, rooms, restrictions }) {
+  const blocked = new Set((restrictions || []).filter(item => item.banned).map(item => item.serverCode));
+  if (!blocked.has('global')) return 'global';
+  const roomCodes = new Set((rooms || []).map(room => room.code));
+  for (const code of user && Array.isArray(user.servers) ? user.servers : []) {
+    if (code !== 'global' && roomCodes.has(code) && !blocked.has(code)) return code;
+  }
+  return null;
+}
+
+async function loadRoomAccessState({ UserModel, ChatServerModel, RoomRestrictionModel, username, serverCode, now = new Date() }) {
+  const [user, room, restriction] = await Promise.all([
+    findUserByUsername(UserModel, username),
+    ChatServerModel.findOne({ code: serverCode }),
+    getActiveRoomRestriction(RoomRestrictionModel, serverCode, username, now)
+  ]);
+  const memberships = user && Array.isArray(user.servers) ? user.servers : [];
+  return {
+    allowed: Boolean(user && room) && !restriction.banned &&
+      (serverCode === 'global' || user.role === 'admin' || memberships.includes(serverCode)),
+    user,
+    room,
+    restriction
+  };
+}
+
 const roomMutationTails = new Map();
 async function withRoomMutationLock(serverCode, operation) {
   const previous = roomMutationTails.get(serverCode) || Promise.resolve();
@@ -548,8 +580,15 @@ async function broadcastOnlineUsers(serverCode) {
   if (!serverCode) return;
   
   const globalOnlineMap = new Map();
+  const bannedAccounts = new Set();
   for (const info of onlineUsers.values()) {
-      if (!globalOnlineMap.has(info.username)) globalOnlineMap.set(info.username, info);
+      const accountKey = normalizeAccountKey(info.username);
+      if (Array.isArray(info.bannedRooms) && info.bannedRooms.includes(serverCode)) {
+          bannedAccounts.add(accountKey);
+          globalOnlineMap.delete(accountKey);
+          continue;
+      }
+      if (!bannedAccounts.has(accountKey) && !globalOnlineMap.has(accountKey)) globalOnlineMap.set(accountKey, info);
   }
 
   let usersList = [];
@@ -573,8 +612,10 @@ async function broadcastOnlineUsers(serverCode) {
           const members = await User.find({ servers: serverCode }).lean();
           
           for (const member of members) {
-              const isOnline = globalOnlineMap.has(member.username);
-              const activeData = globalOnlineMap.get(member.username);
+              const accountKey = normalizeAccountKey(member.username);
+              if (bannedAccounts.has(accountKey)) continue;
+              const isOnline = globalOnlineMap.has(accountKey);
+              const activeData = globalOnlineMap.get(accountKey);
               
               let rRole = roomMods.includes(member.username) ? 'mod' : 'user';
 
@@ -783,7 +824,7 @@ function createConnectionHandler({
         if (!(await bcryptImpl.compare(data.password, user.password))) return { error: 'Incorrect password.' };
 
         let needsSave = false;
-        if (!user.servers || user.servers.length === 0) {
+        if (!Array.isArray(user.servers) || user.servers.length === 0) {
           user.servers = ['global'];
           needsSave = true;
         }
@@ -794,35 +835,55 @@ function createConnectionHandler({
         if (needsSave) await user.save();
 
         const role = user.role || 'user';
-        const servers = role === 'admin'
-          ? await ChatServerModel.find()
-          : await ChatServerModel.find({ code: { $in: user.servers } });
+        const [rooms, restrictionRows] = await Promise.all([
+          role === 'admin'
+            ? ChatServerModel.find()
+            : ChatServerModel.find({ code: { $in: user.servers } }),
+          RoomRestrictionModel.find({ username: normalizeAccountKey(user.username) })
+        ]);
+        const restrictions = (restrictionRows || []).map(row => ({
+          serverCode: row.serverCode,
+          ...activeRestrictionState(row)
+        }));
+        const bannedRooms = restrictions.filter(item => item.banned).map(item => item.serverCode);
+        const blockedRooms = new Set(bannedRooms);
+        const existingRoomCodes = new Set((rooms || []).map(room => room.code));
+        const joinedServers = user.servers.filter(code =>
+          (code === 'global' || existingRoomCodes.has(code)) && !blockedRooms.has(code)
+        );
+        const visibleRooms = (rooms || []).filter(room => !blockedRooms.has(room.code));
+        const defaultServerCode = chooseAccessibleRoom({ user, rooms, restrictions });
+        const restriction = defaultServerCode
+          ? (restrictions.find(item => item.serverCode === defaultServerCode) || activeRestrictionState(null))
+          : activeRestrictionState(null);
 
         socket.username = user.username;
         socket.displayName = user.displayName;
         socket.role = role;
         socket.color = user.color || '';
         socket.avatarUrl = user.avatarUrl || '';
-        socket.serverCode = 'global';
-        socket.joinedServers = [...user.servers];
+        socket.serverCode = defaultServerCode;
+        socket.joinedServers = [...joinedServers];
+        socket.bannedRooms = [...bannedRooms];
 
-        await Promise.resolve(socket.join('global'));
+        if (defaultServerCode) await Promise.resolve(socket.join(defaultServerCode));
         onlineUsersMap.set(socket.id, {
           username: user.username,
           displayName: socket.displayName,
           role: socket.role,
           color: socket.color,
           avatarUrl: socket.avatarUrl,
-          serverCode: 'global',
-          joinedServers: [...user.servers]
+          serverCode: defaultServerCode,
+          joinedServers: [...joinedServers],
+          bannedRooms: [...bannedRooms]
         });
 
-        const serversToUpdate = new Set(user.servers);
-        serversToUpdate.add('global');
+        const serversToUpdate = new Set(joinedServers);
         serversToUpdate.forEach(c => broadcastOnlineUsersFn(c));
 
-        const isVisible = socket.role !== 'admin' || socket.joinedServers.includes('global');
-        if (isVisible) socket.to('global').emit('system_message', `${socket.displayName} joined the app.`);
+        const isVisible = defaultServerCode &&
+          (socket.role !== 'admin' || socket.joinedServers.includes(defaultServerCode) || defaultServerCode === 'global');
+        if (isVisible) socket.to(defaultServerCode).emit('system_message', `${socket.displayName} joined the app.`);
 
         return {
           success: true,
@@ -831,8 +892,15 @@ function createConnectionHandler({
           role: socket.role,
           color: socket.color,
           avatarUrl: socket.avatarUrl,
-          servers: servers || [],
-          joinedServers: [...user.servers]
+          servers: visibleRooms,
+          joinedServers: [...joinedServers],
+          defaultServerCode,
+          restriction: {
+            banned: restriction.banned,
+            timedOut: restriction.timedOut,
+            timeoutUntil: restriction.timeoutUntil
+          },
+          bannedRooms: [...bannedRooms]
         };
       });
 
@@ -1110,6 +1178,7 @@ function createConnectionHandler({
       await withAccountTransitionLock(socket.username, async () => {
         const user = await UserModel.findOne({ username: socket.username });
         if (!user) throw new Error('User not found.');
+        if (!Array.isArray(user.servers) || user.servers.length === 0) user.servers = ['global'];
 
         if (!user.servers.includes(srv.code)) {
           if (typeof user.servers.addToSet === 'function') user.servers.addToSet(srv.code);
@@ -1122,7 +1191,8 @@ function createConnectionHandler({
           } catch (err) {
             logUnexpectedError(logger, 'create_server_membership_sync', err);
           }
-          await synchronizeMembership(sockets, socket.username, user.servers);
+          const bannedRooms = new Set(Array.isArray(socket.bannedRooms) ? socket.bannedRooms : []);
+          await synchronizeMembership(sockets, socket.username, user.servers.filter(code => !bannedRooms.has(code)));
           broadcastOnlineUsersFn(srv.code);
         }
       });
@@ -1151,8 +1221,13 @@ function createConnectionHandler({
           const srv = await ChatServerModel.findOne({ code: serverCode });
           if (!srv) return { error: 'Invalid invite code.' };
 
-          const user = await UserModel.findOne({ username: socket.username });
+          const [user, restriction] = await Promise.all([
+            findUserByUsername(UserModel, socket.username),
+            getActiveRoomRestriction(RoomRestrictionModel, serverCode, socket.username)
+          ]);
           if (!user) return { error: 'User not found.' };
+          if (restriction.banned) return { error: 'Permission denied.' };
+          if (!Array.isArray(user.servers) || user.servers.length === 0) user.servers = ['global'];
           if (!user.servers.includes(srv.code)) {
             if (typeof user.servers.addToSet === 'function') user.servers.addToSet(srv.code);
             else user.servers.push(srv.code);
@@ -1164,7 +1239,8 @@ function createConnectionHandler({
             } catch (err) {
               logUnexpectedError(logger, 'join_server_membership_sync', err);
             }
-            await synchronizeMembership(sockets, socket.username, user.servers);
+            const bannedRooms = new Set(Array.isArray(socket.bannedRooms) ? socket.bannedRooms : []);
+            await synchronizeMembership(sockets, socket.username, user.servers.filter(code => !bannedRooms.has(code)));
 
             broadcastOnlineUsersFn(srv.code);
 
@@ -1314,9 +1390,12 @@ function createConnectionHandler({
     let safeHistory;
     let roomRole;
     try {
-      const room = await ChatServerModel.findOne({ code: serverCode });
-      if (!room) return callback({ error: 'Server not found.' });
-      if (!canAccessRoom(socket, serverCode)) return callback({ error: 'Permission denied.' });
+      const access = await loadRoomAccessState({
+        UserModel, ChatServerModel, RoomRestrictionModel,
+        username: socket.username, serverCode
+      });
+      if (!access.room) return callback({ error: 'Server not found.' });
+      if (!access.allowed || !canAccessRoom(socket, serverCode)) return callback({ error: 'Permission denied.' });
 
       let query = { serverCode };
       if (serverCode === 'global') query = { $or: [{ serverCode: 'global' }, { serverCode: { $exists: false } }, { serverCode: null }] };
@@ -1339,10 +1418,13 @@ function createConnectionHandler({
 
     let result;
     try {
-      result = await withRoomMutationLock(serverCode, async () => {
-        const currentRoom = await ChatServerModel.findOne({ code: serverCode });
-        if (!currentRoom) return { error: 'Server not found.' };
-        if (!canAccessRoom(socket, serverCode)) return { error: 'Permission denied.' };
+      result = await withAccountTransitionLock(socket.username, () => withRoomMutationLock(serverCode, async () => {
+        const access = await loadRoomAccessState({
+          UserModel, ChatServerModel, RoomRestrictionModel,
+          username: socket.username, serverCode
+        });
+        if (!access.room) return { error: 'Server not found.' };
+        if (!access.allowed || !canAccessRoom(socket, serverCode)) return { error: 'Permission denied.' };
 
         const oldCode = socket.serverCode;
         const session = onlineUsersMap.get(socket.id);
@@ -1381,15 +1463,23 @@ function createConnectionHandler({
         }
         socket.serverCode = serverCode;
         if (session) session.serverCode = serverCode;
-        return { success: true, oldCode };
-      });
+        return { success: true, oldCode, restriction: access.restriction };
+      }));
     } catch (err) {
       logUnexpectedError(logger, 'switch_server_recheck', err);
       return callback({ error: 'Failed to switch server.' });
     }
     if (result.error) return callback(result);
 
-    callback({ history: safeHistory, roomRole });
+    callback({
+      history: safeHistory,
+      roomRole,
+      restriction: {
+        banned: result.restriction.banned,
+        timedOut: result.restriction.timedOut,
+        timeoutUntil: result.restriction.timeoutUntil
+      }
+    });
 
     const broadcastCodes = [];
     if (result.oldCode && result.oldCode !== serverCode) broadcastCodes.push(result.oldCode);
@@ -1437,16 +1527,11 @@ function createConnectionHandler({
       if (typeof cleanText !== 'string' || cleanText.length > 2000) return;
 
       await withRoomMutationLock(serverCode, async () => {
-        const [currentRoom, currentUser] = await Promise.all([
-          ChatServerModel.findOne({ code: serverCode }),
-          UserModel.findOne({ username: socket.username })
-        ]);
-        const authoritativeIdentity = {
-          role: currentUser?.role || 'user',
-          joinedServers: Array.isArray(currentUser?.servers) ? currentUser.servers : []
-        };
-        if (!currentRoom || !currentUser || !canAccessRoom(authoritativeIdentity, serverCode) ||
-            !canAccessRoom(socket, serverCode)) return;
+        const access = await loadRoomAccessState({
+          UserModel, ChatServerModel, RoomRestrictionModel,
+          username: socket.username, serverCode
+        });
+        if (!access.allowed || access.restriction.timedOut || !canAccessRoom(socket, serverCode)) return;
 
         const msg = await MessageModel.create({
             serverCode, username: socket.username, displayName: socket.displayName,
@@ -1475,7 +1560,11 @@ function createConnectionHandler({
           const identity = { role: socket.role, joinedServers: socket.joinedServers || [] };
           if (!canAccessRoom(identity, msg.serverCode)) return;
           await withRoomMutationLock(msg.serverCode, async () => {
-            if (msg.deleted || !(await roomExists(msg.serverCode)) || !canAccessRoom(socket, msg.serverCode)) return;
+            const access = await loadRoomAccessState({
+              UserModel, ChatServerModel, RoomRestrictionModel,
+              username: socket.username, serverCode: msg.serverCode
+            });
+            if (msg.deleted || !access.allowed || access.restriction.timedOut || !canAccessRoom(socket, msg.serverCode)) return;
 
             let rx = msg.reactions || {};
             let users = Array.isArray(rx[emoji]) ? rx[emoji] : [];
@@ -1527,7 +1616,11 @@ function createConnectionHandler({
           cleanText = await resolvePingsFn(cleanText, msg.serverCode, socket.role, roomRole, socket.username);
           if (typeof cleanText !== 'string' || cleanText.length > 2000) return;
           await withRoomMutationLock(msg.serverCode, async () => {
-            if (msg.deleted || !(await roomExists(msg.serverCode)) || !canAccessRoom(socket, msg.serverCode)) return;
+            const access = await loadRoomAccessState({
+              UserModel, ChatServerModel, RoomRestrictionModel,
+              username: socket.username, serverCode: msg.serverCode
+            });
+            if (msg.deleted || !access.allowed || access.restriction.timedOut || !canAccessRoom(socket, msg.serverCode)) return;
             const currentRoomRole = await getRoomRoleFn(msg.serverCode, socket.username);
             if (msg.username !== socket.username && socket.role !== 'admin' && currentRoomRole !== 'mod') return;
 
@@ -1553,7 +1646,11 @@ function createConnectionHandler({
         const identity = { role: socket.role, joinedServers: socket.joinedServers || [] };
         if (!canAccessRoom(identity, msg.serverCode)) return;
         await withRoomMutationLock(msg.serverCode, async () => {
-          if (msg.deleted || !(await roomExists(msg.serverCode)) || !canAccessRoom(socket, msg.serverCode)) return;
+          const access = await loadRoomAccessState({
+            UserModel, ChatServerModel, RoomRestrictionModel,
+            username: socket.username, serverCode: msg.serverCode
+          });
+          if (msg.deleted || !access.allowed || !canAccessRoom(socket, msg.serverCode)) return;
           const roomRole = await getRoomRoleFn(msg.serverCode, socket.username);
 
           // Sender, SysAdmin, or RoomMod can delete it
@@ -1577,6 +1674,8 @@ function createConnectionHandler({
       if (msg) {
         const identity = { role: socket.role, joinedServers: socket.joinedServers || [] };
         if (!canAccessRoom(identity, msg.serverCode)) return callback({ error: 'Permission denied.' });
+        const restriction = await getActiveRoomRestriction(RoomRestrictionModel, msg.serverCode, socket.username);
+        if (restriction.banned) return callback({ error: 'Permission denied.' });
         if (!(await roomExists(msg.serverCode))) return callback({ error: 'Permission denied.' });
         const roomRole = await getRoomRoleFn(msg.serverCode, socket.username);
         if (msg.username === socket.username || socket.role === 'admin' || roomRole === 'mod') {
@@ -1599,6 +1698,8 @@ function createConnectionHandler({
       if (msg && msg.deleted) {
         const identity = { role: socket.role, joinedServers: socket.joinedServers || [] };
         if (!canAccessRoom(identity, msg.serverCode)) return callback({ error: 'Permission denied.' });
+        const restriction = await getActiveRoomRestriction(RoomRestrictionModel, msg.serverCode, socket.username);
+        if (restriction.banned) return callback({ error: 'Permission denied.' });
         if (!(await roomExists(msg.serverCode))) return callback({ error: 'Permission denied.' });
         const roomRole = await getRoomRoleFn(msg.serverCode, socket.username);
         if (msg.username === socket.username || socket.role === 'admin' || roomRole === 'mod') {
@@ -1612,14 +1713,26 @@ function createConnectionHandler({
     }
   });
 
-  socket.on('typing', (isTyping) => {
-    const identity = { role: socket.role, joinedServers: socket.joinedServers || [] };
-    if (!socket.username || !socket.serverCode || typeof isTyping !== 'boolean' || !canAccessRoom(identity, socket.serverCode)) return;
-    socket.to(socket.serverCode).emit('typing', {
-      username: socket.username,
-      displayName: socket.displayName || socket.username,
-      isTyping
-    });
+  socket.on('typing', async (isTyping) => {
+    try {
+      const serverCode = socket.serverCode;
+      const identity = { role: socket.role, joinedServers: socket.joinedServers || [] };
+      if (!socket.username || !serverCode || typeof isTyping !== 'boolean' || !canAccessRoom(identity, serverCode)) return;
+      await withRoomMutationLock(serverCode, async () => {
+        const access = await loadRoomAccessState({
+          UserModel, ChatServerModel, RoomRestrictionModel,
+          username: socket.username, serverCode
+        });
+        if (!access.allowed || access.restriction.timedOut || !canAccessRoom(socket, serverCode)) return;
+        socket.to(serverCode).emit('typing', {
+          username: socket.username,
+          displayName: socket.displayName || socket.username,
+          isTyping
+        });
+      });
+    } catch (err) {
+      logUnexpectedError(logger, 'typing', err);
+    }
   });
 
   socket.on('disconnect', () => {
@@ -1701,6 +1814,9 @@ module.exports = {
   findUserByUsername,
   canModerateTarget,
   activeRestrictionState,
+  getActiveRoomRestriction,
+  chooseAccessibleRoom,
+  loadRoomAccessState,
   rejectAuditMutation,
   MODERATION_DURATIONS,
   RoomRestriction,

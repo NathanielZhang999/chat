@@ -8,6 +8,17 @@ function register(overrides = {}) {
   const ioInstance = new FakeIo();
   createConnectionHandler({
     ioInstance,
+    UserModel: {
+      async findOne() {
+        return {
+          username: socket.username || 'alice',
+          role: socket.role || 'user',
+          servers: Array.isArray(socket.joinedServers) && socket.joinedServers.length > 0
+            ? [...socket.joinedServers] : ['global']
+        };
+      }
+    },
+    RoomRestrictionModel: { async findOne() { return null; }, async find() { return []; } },
     onlineUsersMap: new Map(),
     broadcastOnlineUsersFn: async () => {},
     getRoomRoleFn: async () => 'user',
@@ -21,6 +32,17 @@ function registerSharedSocket(overrides, id) {
   const socket = new FakeSocket();
   socket.id = id;
   createConnectionHandler({
+    UserModel: {
+      async findOne() {
+        return {
+          username: socket.username || 'alice',
+          role: socket.role || 'user',
+          servers: Array.isArray(socket.joinedServers) && socket.joinedServers.length > 0
+            ? [...socket.joinedServers] : ['global']
+        };
+      }
+    },
+    RoomRestrictionModel: { async findOne() { return null; }, async find() { return []; } },
     broadcastOnlineUsersFn: async () => {},
     getRoomRoleFn: async () => 'user',
     resolvePingsFn: async text => text,
@@ -506,7 +528,10 @@ test('authorized room switch leaves old room only after access succeeds', async 
   assert.equal(socket.serverCode, 'ABC123');
   assert.deepEqual(socket.leftRooms, ['global']);
   assert.equal(socket.joinedRooms.has('ABC123'), true);
-  assert.deepEqual(ack.value(), { history: [], roomRole: 'user' });
+  assert.deepEqual(ack.value(), {
+    history: [], roomRole: 'user',
+    restriction: { banned: false, timedOut: false, timeoutUntil: null }
+  });
 });
 
 test('room switch history failure preserves transport, socket, and presence state', async () => {
@@ -634,7 +659,7 @@ for (const failure of ['synchronous throw', 'rejected promise']) {
     }]]);
     const room = { code: 'ABC123', owner: 'owner', moderators: [] };
     const readUser = () => ({
-      username: 'alice', displayName: 'Alice', password: 'hash', role: 'user',
+      username: 'alice', displayName: 'Alice', password: 'hash', role: 'admin',
       color: '', avatarUrl: '', servers: ['global'], async save() {}
     });
     const { socket } = register({
@@ -694,6 +719,7 @@ for (const failure of ['synchronous throw', 'rejected promise']) {
     assert.equal(socket.serverCode, null);
     assert.equal(onlineUsersMap.has(socket.id), false);
     assert.deepEqual([...socket.joinedRooms], []);
+    const userLookupsAfterSwitch = userLookups;
 
     const authenticatedAck = acknowledge();
     await socket.trigger('join_server', 'ABC123', authenticatedAck.callback);
@@ -709,7 +735,7 @@ for (const failure of ['synchronous throw', 'rejected promise']) {
     }, registerAck.callback);
     assert.deepEqual(loginAck.value(), { error: 'Connection unavailable.' });
     assert.deepEqual(registerAck.value(), { error: 'Connection unavailable.' });
-    assert.equal(userLookups, 0);
+    assert.equal(userLookups, userLookupsAfterSwitch);
     assert.equal(userCreates, 0);
     assert.equal(passwordComparisons, 0);
     assert.equal(passwordHashes, 0);
@@ -793,12 +819,12 @@ test('failed target join cannot restore source access revoked by a concurrent le
   await targetJoinStarted.promise;
 
   const leaveAck = acknowledge();
-  await revoker.trigger('leave_server', 'OLD123', leaveAck.callback);
+  const leavePending = revoker.trigger('leave_server', 'OLD123', leaveAck.callback);
+  await Promise.resolve();
+  releaseTargetJoin.resolve();
+  await Promise.all([switchPending, leavePending]);
   assert.deepEqual(leaveAck.value(), { success: true });
   assert.deepEqual(persisted.servers, ['global', 'NEW123']);
-
-  releaseTargetJoin.resolve();
-  await switchPending;
 
   assert.deepEqual(switchAck.value(), { error: 'Failed to switch server.' });
   assert.equal(switcher.disconnected, true);
@@ -869,14 +895,14 @@ test('failed target join cannot restore source access revoked by a concurrent de
   await targetJoinStarted.promise;
 
   const roleAck = acknowledge();
-  await administrator.trigger('manage_role', {
+  const rolePending = administrator.trigger('manage_role', {
     targetUser: 'bob', action: 'demote_global_admin'
   }, roleAck.callback);
+  await Promise.resolve();
+  releaseTargetJoin.resolve();
+  await Promise.all([switchPending, rolePending]);
   assert.deepEqual(roleAck.value(), { success: true });
   assert.equal(targetUser.role, 'user');
-
-  releaseTargetJoin.resolve();
-  await switchPending;
 
   assert.deepEqual(switchAck.value(), { error: 'Failed to switch server.' });
   assert.equal(switcher.disconnected, true);
@@ -901,7 +927,12 @@ test('failed target join cannot restore a concurrently deleted source room', asy
       async findOne({ code }) { return rooms.get(code) || null; },
       async deleteOne({ code }) { rooms.delete(code); }
     },
-    UserModel: { async updateMany() {} },
+    UserModel: {
+      async findOne() {
+        return { username: 'bob', role: 'user', servers: ['global', 'OLD123', 'NEW123'] };
+      },
+      async updateMany() {}
+    },
     MessageModel: {
       find: () => queryResult([]),
       async deleteMany() {}
@@ -986,7 +1017,10 @@ test('room switch acknowledges success before broadcasting target presence', asy
 
   await socket.trigger('switch_server', 'ABC123', result => {
     events.push('ack');
-    assert.deepEqual(result, { history: [], roomRole: 'user' });
+    assert.deepEqual(result, {
+      history: [], roomRole: 'user',
+      restriction: { banned: false, timedOut: false, timeoutUntil: null }
+    });
   });
 
   assert.equal(socket.serverCode, 'ABC123');
@@ -1033,7 +1067,10 @@ test('room switch finishes role lookup before history lookup begins', async () =
   const ack = acknowledge();
   await socket.trigger('switch_server', 'ABC123', ack.callback);
 
-  assert.deepEqual(ack.value(), { history: [], roomRole: 'user' });
+  assert.deepEqual(ack.value(), {
+    history: [], roomRole: 'user',
+    restriction: { banned: false, timedOut: false, timeoutUntil: null }
+  });
   assert.deepEqual(events, [
     'role:start', 'role:end', 'history:find', 'history:lean'
   ]);
@@ -1708,7 +1745,10 @@ test('deletion snapshots after a queued switch commits', async () => {
   assert.notEqual(joinIndex, -1);
   assert.notEqual(fetchIndex, -1);
   assert.ok(joinIndex < fetchIndex);
-  assert.deepEqual(switchAck.value(), { history: [], roomRole: 'user' });
+  assert.deepEqual(switchAck.value(), {
+    history: [], roomRole: 'user',
+    restriction: { banned: false, timedOut: false, timeoutUntil: null }
+  });
   assert.deepEqual(deleteAck.value(), { success: true });
   assert.equal(late.serverCode, 'global');
   assert.equal(onlineUsersMap.get(late.id).serverCode, 'global');
@@ -1753,7 +1793,12 @@ test('a switch waiting behind deletion cannot join the deleted room', async () =
     onlineUsersMap,
     ChatServerModel,
     MessageModel,
-    UserModel: { async updateMany() {} },
+    UserModel: {
+      async findOne() {
+        return { username: 'bob', role: 'user', servers: ['global', 'OLD123', 'ABC123'] };
+      },
+      async updateMany() {}
+    },
     broadcastOnlineUsersFn: async () => {},
     getRoomRoleFn: async () => 'user',
     logger: { error() {} }
@@ -2021,6 +2066,24 @@ test('a failed best-effort admin notification acknowledges server creation only 
   }]);
   assert.equal(logged.some(args => JSON.stringify(args).includes('create_server_admin_notification')), true);
   assert.equal(JSON.stringify(logged).includes('notification unavailable'), false);
+});
+
+test('server creation normalizes malformed legacy memberships before checking the new room', async () => {
+  const user = { username: 'alice', servers: null, async save() {} };
+  const { socket } = register({
+    UserModel: { async findOne() { return user; } },
+    ChatServerModel: {
+      async create(value) { return { ...value, code: 'ABC123' }; }
+    }
+  });
+  socket.username = 'alice';
+  socket.displayName = 'Alice';
+
+  const ack = acknowledge();
+  await socket.trigger('create_server', 'Private Room', ack.callback);
+
+  assert.equal(ack.value().success, true);
+  assert.deepEqual(user.servers, ['global', 'ABC123']);
 });
 
 test('invalid profile values do not write the user record', async () => {
