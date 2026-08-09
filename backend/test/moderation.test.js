@@ -6,6 +6,8 @@ const {
   normalizeModerationReason,
   normalizeAutoModSettings,
   normalizeAccountKey,
+  createAutoModTracker,
+  evaluateAutoMod,
   findUserByUsername,
   withAccountTransitionLocks,
   withAccountTransitionLock,
@@ -198,7 +200,8 @@ function registerWithModels(seed = {}) {
     MessageModel,
     RoomRestrictionModel: seed.RoomRestrictionModel || createMemoryModel(seed.restrictions || []),
     ModerationAuditModel: seed.ModerationAuditModel || createMemoryModel(seed.audits || []),
-    ModerationReportModel: seed.ModerationReportModel || createMemoryModel(seed.reports || [])
+    ModerationReportModel: seed.ModerationReportModel || createMemoryModel(seed.reports || []),
+    autoModTracker: seed.autoModTracker || createAutoModTracker()
   };
   for (const model of [setup.RoomRestrictionModel, setup.ModerationReportModel]) {
     if (typeof model.deleteMany === 'function' || !Array.isArray(model.rows)) continue;
@@ -759,6 +762,129 @@ test('exact-room moderator and global admin can read private report and AutoMod 
   assert.equal(adminAck.value().items[0].targetUsername, 'Bob');
 });
 
+test('exact-room moderator and global admin can update room AutoMod settings without auditing keywords', async () => {
+  const setup = reportingScenario();
+  const moderatorSettings = {
+    blockedKeywords: ['  ＳＰＡＭ  ', 'spam', 'Spoilers'],
+    mentionLimit: 4,
+    repeatLimit: 5,
+    repeatWindowSeconds: 60
+  };
+  const moderatorAck = acknowledge();
+  await setup.modSocket.trigger('update_automod', {
+    serverCode: 'ABC123',
+    ...moderatorSettings
+  }, moderatorAck.callback);
+
+  const normalizedModeratorSettings = {
+    blockedKeywords: ['spam', 'spoilers'],
+    mentionLimit: 4,
+    repeatLimit: 5,
+    repeatWindowSeconds: 60
+  };
+  assert.deepEqual(moderatorAck.value(), { success: true, autoMod: normalizedModeratorSettings });
+  assert.deepEqual(
+    setup.ChatServerModel.rows.find(room => room.code === 'ABC123').autoMod,
+    normalizedModeratorSettings
+  );
+  assert.equal(setup.ModerationAuditModel.rows.length, 1);
+  assert.equal(setup.ModerationAuditModel.rows[0].action, 'update_automod');
+  assert.deepEqual(setup.ModerationAuditModel.rows[0].metadata, {
+    keywordCount: 2,
+    mentionLimit: 4,
+    repeatLimit: 5,
+    repeatWindowSeconds: 60
+  });
+  assert.equal(JSON.stringify(setup.ModerationAuditModel.rows).includes('spam'), false);
+  assert.equal(JSON.stringify(setup.ModerationAuditModel.rows).includes('spoilers'), false);
+
+  setup.UserModel.rows.push(userDocument({
+    username: 'GlobalAdmin', displayName: 'GlobalAdmin', role: 'admin', servers: ['global']
+  }));
+  const adminSocket = connectAdditionalSocket(setup, {
+    id: 'automod-admin', username: 'GlobalAdmin', serverCode: 'global', role: 'admin', joinedServers: ['global']
+  });
+  const adminAck = acknowledge();
+  await adminSocket.trigger('update_automod', {
+    serverCode: 'ABC123',
+    blockedKeywords: ['AdminRule'],
+    mentionLimit: 3,
+    repeatLimit: 4,
+    repeatWindowSeconds: 45
+  }, adminAck.callback);
+  assert.deepEqual(adminAck.value(), {
+    success: true,
+    autoMod: {
+      blockedKeywords: ['adminrule'], mentionLimit: 3, repeatLimit: 4, repeatWindowSeconds: 45
+    }
+  });
+
+  const globalAck = acknowledge();
+  await adminSocket.trigger('update_automod', {
+    serverCode: 'global',
+    blockedKeywords: ['LobbyRule'],
+    mentionLimit: 2,
+    repeatLimit: 3,
+    repeatWindowSeconds: 30
+  }, globalAck.callback);
+  assert.deepEqual(globalAck.value(), {
+    success: true,
+    autoMod: {
+      blockedKeywords: ['lobbyrule'], mentionLimit: 2, repeatLimit: 3, repeatWindowSeconds: 30
+    }
+  });
+  assert.deepEqual(setup.ChatServerModel.rows.find(room => room.code === 'global').autoMod, {
+    blockedKeywords: ['lobbyrule'], mentionLimit: 2, repeatLimit: 3, repeatWindowSeconds: 30
+  });
+});
+
+test('update AutoMod settings denies other-room, stale, banned, and non-admin Global moderators', async () => {
+  const setup = reportingScenario();
+  const requestedSettings = {
+    blockedKeywords: ['private'], mentionLimit: 4, repeatLimit: 4, repeatWindowSeconds: 40
+  };
+  const originalPrivateSettings = structuredClone(
+    setup.ChatServerModel.rows.find(room => room.code === 'ABC123').autoMod
+  );
+  const originalGlobalSettings = structuredClone(
+    setup.ChatServerModel.rows.find(room => room.code === 'global').autoMod
+  );
+
+  const otherRoomAck = acknowledge();
+  await setup.otherModSocket.trigger('update_automod', {
+    serverCode: 'ABC123', ...requestedSettings
+  }, otherRoomAck.callback);
+  assert.deepEqual(otherRoomAck.value(), { error: 'Permission denied.' });
+
+  const privateRoom = setup.ChatServerModel.rows.find(room => room.code === 'ABC123');
+  privateRoom.moderators = [];
+  const staleAck = acknowledge();
+  await setup.modSocket.trigger('update_automod', {
+    serverCode: 'ABC123', ...requestedSettings
+  }, staleAck.callback);
+  assert.deepEqual(staleAck.value(), { error: 'Permission denied.' });
+
+  privateRoom.moderators = ['ExactMod'];
+  setup.RoomRestrictionModel.rows.push(restrictionDocument('ABC123', 'ExactMod', {
+    bannedAt: new Date('2026-08-08T12:00:00.000Z')
+  }));
+  const bannedAck = acknowledge();
+  await setup.modSocket.trigger('update_automod', {
+    serverCode: 'ABC123', ...requestedSettings
+  }, bannedAck.callback);
+  assert.deepEqual(bannedAck.value(), { error: 'Permission denied.' });
+
+  const globalAck = acknowledge();
+  await setup.modSocket.trigger('update_automod', {
+    serverCode: 'global', ...requestedSettings
+  }, globalAck.callback);
+  assert.deepEqual(globalAck.value(), { error: 'Permission denied.' });
+
+  assert.deepEqual(privateRoom.autoMod, originalPrivateSettings);
+  assert.deepEqual(setup.ChatServerModel.rows.find(room => room.code === 'global').autoMod, originalGlobalSettings);
+  assert.deepEqual(setup.ModerationAuditModel.rows, []);
+});
+
 test('report pagination uses descending createdAt and id keysets with an opaque cursor', async () => {
   const setup = reportingScenario();
   const reportRows = [
@@ -1086,6 +1212,181 @@ test('memory model save persists data without storing helper methods', async () 
   await user.save();
 
   assert.deepEqual(UserModel.rows, [{ username: 'Alice', displayName: 'Updated' }]);
+});
+
+test('AutoMod normalizes Unicode keywords and never returns blocked content', () => {
+  const tracker = createAutoModTracker({ maxKeys: 100, now: () => 1_000 });
+  assert.deepEqual(evaluateAutoMod({
+    text: 'That is ＢＡＤ',
+    resolvedText: 'That is ＢＡＤ',
+    username: 'Alice',
+    serverCode: 'ABC123',
+    role: 'user',
+    settings: {
+      blockedKeywords: ['bad'], mentionLimit: 5, repeatLimit: 3, repeatWindowSeconds: 30
+    },
+    tracker,
+    now: new Date(1_000)
+  }), { allowed: false, rule: 'blocked_keyword' });
+});
+
+test('AutoMod mention limit applies to admins while keyword and repeat rules exempt admins', () => {
+  const tracker = createAutoModTracker({ maxKeys: 100, now: () => 1_000 });
+  const settings = {
+    blockedKeywords: ['bad'], mentionLimit: 1, repeatLimit: 2, repeatWindowSeconds: 30
+  };
+  assert.equal(evaluateAutoMod({
+    text: 'bad', resolvedText: 'bad', username: 'Admin', serverCode: 'global', role: 'admin',
+    settings, tracker, now: new Date(1_000)
+  }).allowed, true);
+  assert.equal(evaluateAutoMod({
+    text: 'bad', resolvedText: 'bad', username: 'Admin', serverCode: 'global', role: 'admin',
+    settings, tracker, now: new Date(1_000)
+  }).allowed, true);
+  assert.deepEqual(evaluateAutoMod({
+    text: '@a @b',
+    resolvedText: '{{PING:a|A}} {{PING:b|B}}',
+    username: 'Admin',
+    serverCode: 'global',
+    role: 'admin',
+    settings,
+    tracker,
+    now: new Date(1_000)
+  }), { allowed: false, rule: 'mention_limit' });
+});
+
+test('AutoMod keeps raw keyword checks separate from resolved display names and mention syntax', () => {
+  const settings = {
+    blockedKeywords: ['bad'], mentionLimit: 5, repeatLimit: 3, repeatWindowSeconds: 30
+  };
+  const displayNameTracker = createAutoModTracker({ maxKeys: 100, now: () => 1_000 });
+  assert.deepEqual(evaluateAutoMod({
+    text: '@alice',
+    resolvedText: '{{PING:alice|Bad Actor}}',
+    username: 'Bob',
+    serverCode: 'ABC123',
+    role: 'user',
+    settings,
+    tracker: displayNameTracker,
+    now: new Date(1_000)
+  }), { allowed: true });
+
+  const adjacentKeywordTracker = createAutoModTracker({ maxKeys: 100, now: () => 1_000 });
+  assert.deepEqual(evaluateAutoMod({
+    text: 'ＢＡＤ@alice',
+    resolvedText: '{{PING:alice|Alice}}',
+    username: 'Bob',
+    serverCode: 'ABC123',
+    role: 'user',
+    settings,
+    tracker: adjacentKeywordTracker,
+    now: new Date(1_000)
+  }), { allowed: false, rule: 'blocked_keyword' });
+});
+
+test('AutoMod repeat tracker expires entries and remains bounded to ten thousand account-room keys', () => {
+  let currentTime = 1_000;
+  const tracker = createAutoModTracker({ maxKeys: 10_000, now: () => currentTime });
+  assert.equal(tracker.recordAndCheck('ABC123\0alice', 'same', 2, 5_000), false);
+  currentTime = 2_000;
+  assert.equal(tracker.recordAndCheck('ABC123\0alice', 'same', 2, 5_000), true);
+  currentTime = 7_001;
+  assert.equal(tracker.recordAndCheck('ABC123\0alice', 'same', 2, 5_000), false);
+
+  for (let index = 0; index <= 10_000; index += 1) {
+    tracker.recordAndCheck(`ROOM${index}\0user${index}`, `message-${index}`, 3, 5_000);
+  }
+  assert.equal(tracker.size(), 10_000);
+
+  currentTime = 20_000;
+  tracker.prune(5_000);
+  assert.equal(tracker.size(), 0);
+});
+
+test('identical normalized messages share repeat state across same-account sockets but not rooms or accounts', async () => {
+  const repeatText = '  Same\tＲＥＰＥＡＴ  ';
+  const setup = registerWithModels({
+    users: [
+      userDocument({ username: 'Alice', servers: ['global', 'ABC123', 'XYZ789'] }),
+      userDocument({ username: 'Bob', servers: ['global', 'ABC123'] })
+    ],
+    rooms: [
+      roomDocument('global'),
+      roomDocument('ABC123', {
+        autoMod: { blockedKeywords: [], mentionLimit: 8, repeatLimit: 3, repeatWindowSeconds: 30 }
+      }),
+      roomDocument('XYZ789', {
+        autoMod: { blockedKeywords: [], mentionLimit: 8, repeatLimit: 3, repeatWindowSeconds: 30 }
+      })
+    ]
+  });
+  Object.assign(setup.socket, {
+    username: 'Alice', displayName: 'Alice', role: 'user', serverCode: 'ABC123',
+    joinedServers: ['global', 'ABC123', 'XYZ789'], bannedRooms: []
+  });
+  const secondAlice = connectAdditionalSocket(setup, {
+    id: 'alice-second', username: 'aLiCe', serverCode: 'ABC123',
+    joinedServers: ['global', 'ABC123', 'XYZ789']
+  });
+  const otherRoomAlice = connectAdditionalSocket(setup, {
+    id: 'alice-other-room', username: 'Alice', serverCode: 'XYZ789',
+    joinedServers: ['global', 'ABC123', 'XYZ789']
+  });
+  const bob = connectAdditionalSocket(setup, {
+    id: 'bob-repeat', username: 'Bob', serverCode: 'ABC123', joinedServers: ['global', 'ABC123']
+  });
+
+  await setup.socket.trigger('chat_message', { text: repeatText });
+  await bob.trigger('chat_message', { text: 'same repeat' });
+  await otherRoomAlice.trigger('chat_message', { text: 'same repeat' });
+  await secondAlice.trigger('chat_message', { text: 'same  repeat' });
+
+  assert.equal(setup.MessageModel.rows.length, 4);
+  assert.deepEqual(setup.ioInstance.outbound.map(item => item.payload.text), [
+    repeatText.trim(), 'same repeat', 'same repeat', 'same  repeat'
+  ]);
+
+  await new Promise(resolve => setTimeout(resolve, 510));
+  await setup.socket.trigger('chat_message', { text: 'same repeat' });
+
+  assert.equal(setup.MessageModel.rows.length, 4);
+  assert.equal(setup.ioInstance.outbound.length, 4);
+  assert.deepEqual(setup.socket.outbound, [{
+    target: 'self', event: 'message_blocked', payload: { rule: 'content_policy' }
+  }]);
+});
+
+test('Blocked send never persists, broadcasts, logs, or audits raw text', async () => {
+  const blockedText = 'Never Leak ＳＥＣＲＥＴ Payload';
+  const logged = [];
+  const setup = registerWithModels({
+    user: userDocument({ username: 'Alice', servers: ['global', 'ABC123'] }),
+    rooms: [roomDocument('global'), roomDocument('ABC123', {
+      autoMod: {
+        blockedKeywords: ['secret'], mentionLimit: 8, repeatLimit: 3, repeatWindowSeconds: 30
+      }
+    })],
+    logger: { error(...args) { logged.push(args); } }
+  });
+  Object.assign(setup.socket, {
+    username: 'Alice', displayName: 'Alice', role: 'user', serverCode: 'ABC123',
+    joinedServers: ['global', 'ABC123'], bannedRooms: []
+  });
+
+  await setup.socket.trigger('chat_message', { text: blockedText });
+
+  assert.deepEqual(setup.MessageModel.rows, []);
+  assert.deepEqual(setup.ioInstance.outbound, []);
+  assert.deepEqual(setup.socket.outbound, [{
+    target: 'self', event: 'message_blocked', payload: { rule: 'content_policy' }
+  }]);
+  assert.deepEqual(logged, []);
+  assert.equal(setup.ModerationAuditModel.rows.length, 1);
+  assert.equal(setup.ModerationAuditModel.rows[0].action, 'automod_block');
+  assert.equal(setup.ModerationAuditModel.rows[0].metadata.rule, 'blocked_keyword');
+  assert.match(setup.ModerationAuditModel.rows[0].metadata.contentDigest, /^[0-9a-f]{64}$/);
+  assert.equal(JSON.stringify(setup.ModerationAuditModel.rows).includes(blockedText), false);
+  assert.equal(JSON.stringify(setup.ModerationAuditModel.rows).includes('Never Leak'), false);
 });
 
 test('multiple account locks normalize, de-duplicate, sort, serialize overlap, and release after rejection', async () => {

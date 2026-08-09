@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { createConnectionHandler } = require('../server');
+const { createAutoModTracker, createConnectionHandler } = require('../server');
 const { FakeSocket, FakeIo, acknowledge, deferred } = require('./support/fakes');
 
 function registerMessages(overrides = {}) {
@@ -19,6 +19,7 @@ function registerMessages(overrides = {}) {
     broadcastOnlineUsersFn: async () => {},
     getRoomRoleFn: async () => 'user',
     resolvePingsFn: async text => text,
+    autoModTracker: createAutoModTracker(),
     ...overrides
   })(socket);
   return { socket, ioInstance };
@@ -492,6 +493,50 @@ test('edits do not persist or emit text expanded beyond two thousand characters'
   assert.equal(message.text, 'before');
   assert.deepEqual(message.history, []);
   assert.deepEqual(ioInstance.outbound, []);
+});
+
+test('Blocked edit leaves the saved message and history unchanged without leaking raw text', async () => {
+  const blockedText = 'Never Persist ＦＯＲＢＩＤＤＥＮ Edit';
+  let saved = 0;
+  const audits = [];
+  const logged = [];
+  const message = {
+    _id: '507f1f77bcf86cd799439011', serverCode: 'global', username: 'alice',
+    role: 'user', roomRole: 'user', text: 'before', history: [], deleted: false,
+    markModified() {}, async save() { saved += 1; }
+  };
+  const { socket, ioInstance } = registerMessages({
+    ChatServerModel: {
+      async findOne() {
+        return {
+          code: 'global', moderators: [],
+          autoMod: {
+            blockedKeywords: ['forbidden'], mentionLimit: 8, repeatLimit: 3, repeatWindowSeconds: 30
+          }
+        };
+      }
+    },
+    MessageModel: { async findById() { return message; } },
+    ModerationAuditModel: { async create(value) { audits.push(value); return value; } },
+    logger: { error(...args) { logged.push(args); } }
+  });
+  authenticate(socket);
+
+  await socket.trigger('edit_message', { id: message._id, text: blockedText });
+
+  assert.equal(saved, 0);
+  assert.equal(message.text, 'before');
+  assert.deepEqual(message.history, []);
+  assert.deepEqual(ioInstance.outbound, []);
+  assert.deepEqual(socket.outbound, [{
+    target: 'self', event: 'message_blocked', payload: { rule: 'content_policy' }
+  }]);
+  assert.deepEqual(logged, []);
+  assert.equal(audits.length, 1);
+  assert.equal(audits[0].metadata.rule, 'blocked_keyword');
+  assert.match(audits[0].metadata.contentDigest, /^[0-9a-f]{64}$/);
+  assert.equal(JSON.stringify(audits).includes(blockedText), false);
+  assert.equal(JSON.stringify(audits).includes('Never Persist'), false);
 });
 
 test('reaction handlers reject non-pictographic permitted sequence characters before lookup', async () => {

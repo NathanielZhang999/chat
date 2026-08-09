@@ -4,6 +4,7 @@ const { Server } = require('socket.io');
 const cors = require('cors');
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
+const { createHash } = require('node:crypto');
 
 const app = express();
 app.use(cors());
@@ -29,6 +30,7 @@ const MAX_RATE_LIMIT_KEYS = 10_000;
 const MAX_REACTION_KEYS = 20;
 const MAX_REACTION_USERS = 200;
 const MAX_REACTIONS_PER_USER = 20;
+const MAX_AUTOMOD_KEYS = 10_000;
 const MODERATION_ACTIONS = new Set(['kick', 'timeout', 'clear_timeout', 'ban', 'unban']);
 const MODERATION_DURATIONS = Object.freeze({
   '10m': 10 * 60 * 1000,
@@ -103,6 +105,107 @@ function normalizeAutoModSettings(value) {
     repeatLimit: value.repeatLimit,
     repeatWindowSeconds: value.repeatWindowSeconds
   };
+}
+
+function normalizeAutoModText(value) {
+  return String(value || '').normalize('NFKC').toLocaleLowerCase('en-US').replace(/\s+/g, ' ').trim();
+}
+
+function createAutoModTracker({ maxKeys = MAX_AUTOMOD_KEYS, now = () => Date.now() } = {}) {
+  const boundedMaxKeys = Number.isInteger(maxKeys) && maxKeys > 0 ? maxKeys : MAX_AUTOMOD_KEYS;
+  const messagesByAccountRoom = new Map();
+
+  function pruneMessages(messages, currentTime, windowMs) {
+    for (const [normalizedText, timestamps] of messages.entries()) {
+      const recent = timestamps.filter(timestamp => currentTime - timestamp < windowMs);
+      if (recent.length === 0) messages.delete(normalizedText);
+      else messages.set(normalizedText, recent);
+    }
+  }
+
+  function prune(windowMs) {
+    const currentTime = now();
+    for (const [key, messages] of messagesByAccountRoom.entries()) {
+      pruneMessages(messages, currentTime, windowMs);
+      if (messages.size === 0) messagesByAccountRoom.delete(key);
+    }
+  }
+
+  function recordAndCheck(key, normalizedText, limit, windowMs) {
+    const currentTime = now();
+    let messages = messagesByAccountRoom.get(key);
+    if (messages) {
+      pruneMessages(messages, currentTime, windowMs);
+      if (messages.size === 0) {
+        messagesByAccountRoom.delete(key);
+        messages = null;
+      }
+    }
+    if (!messages) {
+      if (messagesByAccountRoom.size >= boundedMaxKeys) prune(windowMs);
+      messages = new Map();
+      messagesByAccountRoom.set(key, messages);
+      while (messagesByAccountRoom.size > boundedMaxKeys) {
+        messagesByAccountRoom.delete(messagesByAccountRoom.keys().next().value);
+      }
+    }
+    const timestamps = messages.get(normalizedText) || [];
+    timestamps.push(currentTime);
+    messages.set(normalizedText, timestamps);
+    return timestamps.length >= limit;
+  }
+
+  return {
+    recordAndCheck,
+    prune,
+    size() { return messagesByAccountRoom.size; }
+  };
+}
+
+function evaluateAutoMod({ text, resolvedText, username, serverCode, role, settings, tracker }) {
+  const normalizedRawText = normalizeAutoModText(text);
+  if (role !== 'admin' && settings.blockedKeywords.some(keyword =>
+    normalizedRawText.includes(normalizeAutoModText(keyword)))) {
+    return { allowed: false, rule: 'blocked_keyword' };
+  }
+
+  const canonicalMentions = typeof resolvedText === 'string'
+    ? resolvedText.match(/\{\{PING:[^}|]{1,20}\|[^}]{1,30}\}\}/g) || []
+    : [];
+  if (canonicalMentions.length > settings.mentionLimit) {
+    return { allowed: false, rule: 'mention_limit' };
+  }
+
+  if (role !== 'admin') {
+    const key = `${serverCode}\0${normalizeAccountKey(username)}`;
+    const repeated = tracker.recordAndCheck(
+      key,
+      normalizedRawText,
+      settings.repeatLimit,
+      settings.repeatWindowSeconds * 1000
+    );
+    if (repeated) return { allowed: false, rule: 'repeat_message' };
+  }
+
+  return { allowed: true };
+}
+
+const serverAutoModTracker = createAutoModTracker();
+const DEFAULT_AUTOMOD_SETTINGS = Object.freeze({
+  blockedKeywords: Object.freeze([]),
+  mentionLimit: 8,
+  repeatLimit: 3,
+  repeatWindowSeconds: 30
+});
+
+function roomAutoModSettings(room) {
+  const normalized = normalizeAutoModSettings(room && room.autoMod);
+  if (normalized) return normalized;
+  return room && room.autoMod === undefined ? DEFAULT_AUTOMOD_SETTINGS : null;
+}
+
+function currentRoomRole(room, username) {
+  return isCurrentRoomModerator(room, username) ? 'mod' : 'user';
 }
 
 function isValidPassword(value) {
@@ -701,6 +804,7 @@ function createConnectionHandler({
   getRoomRoleFn = getRoomRole,
   resolvePingsFn = resolvePings,
   rateLimiter = authRateLimiter,
+  autoModTracker = serverAutoModTracker,
   logger = console
 } = {}) {
   return socket => {
@@ -918,6 +1022,26 @@ function createConnectionHandler({
     }
     logUnexpectedError(logger, 'moderation_audit_write', lastError);
     return false;
+  }
+
+  async function rejectAutoModContent({ serverCode, access, roomRole, rawText, result }) {
+    socket.emit('message_blocked', { rule: 'content_policy' });
+    await appendAuditReliably({
+      correlationId: new mongoose.Types.ObjectId().toString(),
+      action: 'automod_block',
+      serverCode,
+      actorUsername: socket.username,
+      actorRole: access.user.role || 'user',
+      actorRoomRole: roomRole,
+      targetUsername: socket.username,
+      targetRole: access.user.role || 'user',
+      targetRoomRole: roomRole,
+      reason: 'Automated content policy',
+      metadata: {
+        rule: result.rule,
+        contentDigest: createHash('sha256').update(rawText).digest('hex')
+      }
+    });
   }
 
   async function loadModeratorAccess(serverCode, username) {
@@ -1960,6 +2084,65 @@ function createConnectionHandler({
     }
   });
 
+  socket.on('update_automod', async (data, callback) => {
+    callback = safeAck(callback);
+    if (!socket.username) return callback({ error: 'Not authenticated.' });
+    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+      return callback({ error: 'Invalid input format.' });
+    }
+    const serverCode = normalizeServerCode(data.serverCode);
+    const autoMod = normalizeAutoModSettings({
+      blockedKeywords: data.blockedKeywords,
+      mentionLimit: data.mentionLimit,
+      repeatLimit: data.repeatLimit,
+      repeatWindowSeconds: data.repeatWindowSeconds
+    });
+    if (!serverCode || !autoMod) return callback({ error: 'Invalid input format.' });
+
+    try {
+      const result = await withAccountTransitionLock(socket.username, () =>
+        withRoomMutationLock(serverCode, async () => {
+          const access = await loadRoomAccessState({
+            UserModel,
+            ChatServerModel,
+            RoomRestrictionModel,
+            username: socket.username,
+            serverCode
+          });
+          if (!access.allowed || access.restriction.banned) return { error: 'Permission denied.' };
+          const actorRoomRole = currentRoomRole(access.room, access.user.username);
+          const authorized = access.user.role === 'admin' ||
+            (serverCode !== 'global' && actorRoomRole === 'mod');
+          if (!authorized) return { error: 'Permission denied.' };
+
+          access.room.autoMod = autoMod;
+          if (typeof access.room.markModified === 'function') access.room.markModified('autoMod');
+          await access.room.save();
+          await appendAuditReliably({
+            correlationId: new mongoose.Types.ObjectId().toString(),
+            action: 'update_automod',
+            serverCode,
+            actorUsername: access.user.username,
+            actorRole: access.user.role || 'user',
+            actorRoomRole,
+            reason: 'Updated AutoMod settings',
+            metadata: {
+              keywordCount: autoMod.blockedKeywords.length,
+              mentionLimit: autoMod.mentionLimit,
+              repeatLimit: autoMod.repeatLimit,
+              repeatWindowSeconds: autoMod.repeatWindowSeconds
+            }
+          });
+          return { success: true, autoMod };
+        })
+      );
+      callback(result);
+    } catch (err) {
+      logUnexpectedError(logger, 'update_automod', err);
+      callback({ error: 'Failed to update AutoMod.' });
+    }
+  });
+
   socket.on('create_server', async (name, callback) => {
     callback = safeAck(callback);
     if (!socket.username) return callback({ error: 'Not authenticated.' });
@@ -2470,6 +2653,7 @@ function createConnectionHandler({
 
       const roomRole = await getRoomRoleFn(serverCode, socket.username);
       cleanText = neutralizePingTokens(cleanText);
+      const rawText = cleanText;
       cleanText = await resolvePingsFn(cleanText, serverCode, socket.role, roomRole, socket.username);
       if (typeof cleanText !== 'string' || cleanText.length > 2000) return;
 
@@ -2479,6 +2663,29 @@ function createConnectionHandler({
           username: socket.username, serverCode
         });
         if (!access.allowed || access.restriction.timedOut || !canAccessRoom(socket, serverCode)) return;
+        const settings = roomAutoModSettings(access.room);
+        if (!settings) return;
+        const freshRoomRole = currentRoomRole(access.room, access.user.username);
+        const autoModResult = evaluateAutoMod({
+          text: rawText,
+          resolvedText: cleanText,
+          username: access.user.username,
+          serverCode,
+          role: access.user.role,
+          settings,
+          tracker: autoModTracker,
+          now: new Date()
+        });
+        if (!autoModResult.allowed) {
+          await rejectAutoModContent({
+            serverCode,
+            access,
+            roomRole: freshRoomRole,
+            rawText,
+            result: autoModResult
+          });
+          return;
+        }
 
         const msg = await MessageModel.create({
             serverCode, username: socket.username, displayName: socket.displayName,
@@ -2560,6 +2767,7 @@ function createConnectionHandler({
         if (msg.username === socket.username || socket.role === 'admin' || roomRole === 'mod') {
           
           cleanText = neutralizePingTokens(cleanText);
+          const rawText = cleanText;
           cleanText = await resolvePingsFn(cleanText, msg.serverCode, socket.role, roomRole, socket.username);
           if (typeof cleanText !== 'string' || cleanText.length > 2000) return;
           await withRoomMutationLock(msg.serverCode, async () => {
@@ -2568,8 +2776,30 @@ function createConnectionHandler({
               username: socket.username, serverCode: msg.serverCode
             });
             if (msg.deleted || !access.allowed || access.restriction.timedOut || !canAccessRoom(socket, msg.serverCode)) return;
-            const currentRoomRole = await getRoomRoleFn(msg.serverCode, socket.username);
-            if (msg.username !== socket.username && socket.role !== 'admin' && currentRoomRole !== 'mod') return;
+            const freshRoomRole = currentRoomRole(access.room, access.user.username);
+            if (msg.username !== socket.username && access.user.role !== 'admin' && freshRoomRole !== 'mod') return;
+            const settings = roomAutoModSettings(access.room);
+            if (!settings) return;
+            const autoModResult = evaluateAutoMod({
+              text: rawText,
+              resolvedText: cleanText,
+              username: access.user.username,
+              serverCode: msg.serverCode,
+              role: access.user.role,
+              settings,
+              tracker: autoModTracker,
+              now: new Date()
+            });
+            if (!autoModResult.allowed) {
+              await rejectAutoModContent({
+                serverCode: msg.serverCode,
+                access,
+                roomRole: freshRoomRole,
+                rawText,
+                result: autoModResult
+              });
+              return;
+            }
 
             if (msg.text !== cleanText) {
                 msg.history = appendBoundedHistory(msg.history, { text: msg.text, timestamp: new Date() });
@@ -2759,6 +2989,8 @@ module.exports = {
   normalizeModerationReason,
   normalizeAutoModSettings,
   normalizeAccountKey,
+  createAutoModTracker,
+  evaluateAutoMod,
   findUserByUsername,
   canModerateTarget,
   activeRestrictionState,
