@@ -13,6 +13,7 @@ const {
   activeRestrictionState,
   applySessionAccessSnapshot,
   rejectAuditMutation,
+  ModerationReport,
   createConnectionHandler
 } = require('../server');
 const { FakeSocket, FakeIo, createMemoryModel, acknowledge, deferred } = require('./support/fakes');
@@ -49,10 +50,138 @@ function restrictionDocument(serverCode, username, overrides = {}) {
   });
 }
 
+let nextModerationFixtureId = 100;
+
+function createModerationApiModel(initialRows = [], { defaults = {} } = {}) {
+  const rows = initialRows.map(row => ({ ...defaults, ...row }));
+
+  function valueTime(value) {
+    return value instanceof Date ? value.getTime() : value;
+  }
+
+  function valuesMatch(value, expected) {
+    if (expected === null) return value === null || value === undefined;
+    if (expected instanceof RegExp) return expected.test(String(value || ''));
+    if (expected instanceof Date) return value instanceof Date && value.getTime() === expected.getTime();
+    if (expected && typeof expected === 'object' && !Array.isArray(expected)) {
+      if ('$in' in expected) return expected.$in.some(candidate => valuesMatch(value, candidate));
+      if ('$lt' in expected && !(valueTime(value) < valueTime(expected.$lt))) return false;
+      if ('$gt' in expected && !(valueTime(value) > valueTime(expected.$gt))) return false;
+      if ('$ne' in expected && valuesMatch(value, expected.$ne)) return false;
+      if ('$regex' in expected && !valuesMatch(value, expected.$regex)) return false;
+      return true;
+    }
+    return value === expected;
+  }
+
+  function matches(row, query = {}) {
+    return Object.entries(query).every(([key, expected]) => {
+      if (key === '$or') return Array.isArray(expected) && expected.some(clause => matches(row, clause));
+      if (key === '$and') return Array.isArray(expected) && expected.every(clause => matches(row, clause));
+      return valuesMatch(row[key], expected);
+    });
+  }
+
+  function documentFor(row) {
+    if (!row) return null;
+    const document = { ...row };
+    Object.defineProperties(document, {
+      markModified: { value: () => {}, enumerable: false },
+      save: {
+        value: async () => {
+          Object.assign(row, document, { updatedAt: new Date() });
+          return documentFor(row);
+        },
+        enumerable: false
+      }
+    });
+    return document;
+  }
+
+  function queryResult(values) {
+    let current = values;
+    const query = {
+      sort(spec = {}) {
+        const entries = Object.entries(spec);
+        current = [...current].sort((left, right) => {
+          for (const [key, direction] of entries) {
+            const leftValue = valueTime(left[key]);
+            const rightValue = valueTime(right[key]);
+            if (leftValue < rightValue) return -1 * direction;
+            if (leftValue > rightValue) return 1 * direction;
+          }
+          return 0;
+        });
+        return query;
+      },
+      limit(value) { current = current.slice(0, value); return query; },
+      select() { return query; },
+      lean: async () => current.map(row => ({ ...row })),
+      then(resolve, reject) {
+        return Promise.resolve(current.map(documentFor)).then(resolve, reject);
+      }
+    };
+    return query;
+  }
+
+  return {
+    rows,
+    find(query = {}) { return queryResult(rows.filter(row => matches(row, query))); },
+    findOne(query = {}) { return Promise.resolve(documentFor(rows.find(row => matches(row, query)))); },
+    findById(id) { return Promise.resolve(documentFor(rows.find(row => String(row._id) === String(id)))); },
+    async create(value) {
+      const now = new Date();
+      const row = {
+        ...defaults,
+        _id: (++nextModerationFixtureId).toString(16).padStart(24, '0'),
+        createdAt: now,
+        updatedAt: now,
+        ...value
+      };
+      rows.push(row);
+      return documentFor(row);
+    },
+    async countDocuments(query = {}) { return rows.filter(row => matches(row, query)).length; },
+    async findOneAndUpdate(query, update, options = {}) {
+      let row = rows.find(candidate => matches(candidate, query));
+      if (!row && options.upsert) {
+        row = { ...defaults, ...query };
+        rows.push(row);
+      }
+      if (!row) return null;
+      Object.assign(row, update.$set || update, { updatedAt: new Date() });
+      return documentFor(row);
+    },
+    async updateOne(query, update) {
+      const row = rows.find(candidate => matches(candidate, query));
+      if (!row) return { matchedCount: 0, modifiedCount: 0 };
+      Object.assign(row, update.$set || update, { updatedAt: new Date() });
+      return { matchedCount: 1, modifiedCount: 1 };
+    },
+    async updateMany(_query, update) {
+      for (const row of rows) {
+        if (update.$pull?.servers) {
+          row.servers = (Array.isArray(row.servers) ? row.servers : [])
+            .filter(code => code !== update.$pull.servers);
+        }
+      }
+    },
+    async deleteOne(query) {
+      const index = rows.findIndex(row => matches(row, query));
+      if (index >= 0) rows.splice(index, 1);
+    },
+    async deleteMany(query) {
+      for (let index = rows.length - 1; index >= 0; index -= 1) {
+        if (matches(rows[index], query)) rows.splice(index, 1);
+      }
+    }
+  };
+}
+
 function registerWithModels(seed = {}) {
   const socket = new FakeSocket();
   const ioInstance = new FakeIo();
-  const MessageModel = createMemoryModel(seed.messages || []);
+  const MessageModel = seed.MessageModel || createMemoryModel(seed.messages || []);
   MessageModel.created = [];
   const createMessage = MessageModel.create.bind(MessageModel);
   MessageModel.create = async value => {
@@ -64,13 +193,23 @@ function registerWithModels(seed = {}) {
     socket,
     ioInstance,
     onlineUsersMap: seed.onlineUsersMap || new Map(),
-    UserModel: createMemoryModel(seed.users || (seed.user ? [seed.user] : [])),
-    ChatServerModel: createMemoryModel(seed.rooms || []),
+    UserModel: seed.UserModel || createMemoryModel(seed.users || (seed.user ? [seed.user] : [])),
+    ChatServerModel: seed.ChatServerModel || createMemoryModel(seed.rooms || []),
     MessageModel,
     RoomRestrictionModel: seed.RoomRestrictionModel || createMemoryModel(seed.restrictions || []),
     ModerationAuditModel: seed.ModerationAuditModel || createMemoryModel(seed.audits || []),
-    ModerationReportModel: createMemoryModel(seed.reports || [])
+    ModerationReportModel: seed.ModerationReportModel || createMemoryModel(seed.reports || [])
   };
+  for (const model of [setup.RoomRestrictionModel, setup.ModerationReportModel]) {
+    if (typeof model.deleteMany === 'function' || !Array.isArray(model.rows)) continue;
+    model.deleteMany = async query => {
+      for (let index = model.rows.length - 1; index >= 0; index -= 1) {
+        if (Object.entries(query).every(([key, value]) => model.rows[index][key] === value)) {
+          model.rows.splice(index, 1);
+        }
+      }
+    };
+  }
   createConnectionHandler({
     ...setup,
     bcryptImpl: { async compare() { return true; }, async hash(value) { return value; } },
@@ -128,6 +267,83 @@ function connectAdditionalSocket(setup, {
   if (serverCode) live.joinedRooms.add(serverCode);
   setup.ioInstance.sockets.push(live);
   return live;
+}
+
+function reportingScenario({ reporter = 'Alice', room = 'ABC123', target = 'Bob' } = {}) {
+  const users = [
+    userDocument({ username: reporter, displayName: reporter, servers: ['global', 'ABC123', 'XYZ789'] }),
+    userDocument({ username: target, displayName: target, servers: ['global', 'ABC123', 'XYZ789'] }),
+    userDocument({ username: 'ExactMod', displayName: 'ExactMod', servers: ['global', 'ABC123', 'XYZ789'] }),
+    userDocument({ username: 'OtherMod', displayName: 'OtherMod', servers: ['global', 'ABC123', 'XYZ789'] }),
+    userDocument({ username: 'OrdinaryMember', displayName: 'OrdinaryMember', servers: ['global', 'ABC123', 'XYZ789'] })
+  ];
+  const rooms = [
+    roomDocument('global', { owner: 'System' }),
+    roomDocument('ABC123', { moderators: ['ExactMod'] }),
+    roomDocument('XYZ789', { moderators: ['OtherMod'] })
+  ];
+  const UserModel = createModerationApiModel(users);
+  const ChatServerModel = createModerationApiModel(rooms);
+  const MessageModel = createModerationApiModel([{
+    _id: VALID_MESSAGE_ID,
+    serverCode: room,
+    username: target,
+    displayName: target,
+    text: 'room-scoped evidence',
+    timestamp: new Date('2026-08-08T12:00:00.000Z')
+  }]);
+  const RoomRestrictionModel = createModerationApiModel([]);
+  const ModerationAuditModel = createModerationApiModel([]);
+  const ModerationReportModel = createModerationApiModel([], { defaults: { status: 'open' } });
+  const setup = registerWithModels({
+    UserModel,
+    ChatServerModel,
+    MessageModel,
+    RoomRestrictionModel,
+    ModerationAuditModel,
+    ModerationReportModel
+  });
+  Object.assign(setup.socket, {
+    username: reporter,
+    displayName: reporter,
+    role: 'user',
+    roomRole: 'user',
+    serverCode: room,
+    joinedServers: ['global', 'ABC123', 'XYZ789'],
+    bannedRooms: []
+  });
+  setup.socket.joinedRooms.add(room);
+  setup.onlineUsersMap.set(setup.socket.id, {
+    username: reporter,
+    displayName: reporter,
+    role: 'user',
+    serverCode: room,
+    joinedServers: ['global', 'ABC123', 'XYZ789'],
+    bannedRooms: []
+  });
+  const modSocket = connectAdditionalSocket(setup, {
+    id: 'exact-mod', username: 'ExactMod', serverCode: 'ABC123',
+    joinedServers: ['global', 'ABC123', 'XYZ789']
+  });
+  modSocket.roomRole = 'mod';
+  const otherModSocket = connectAdditionalSocket(setup, {
+    id: 'other-mod', username: 'OtherMod', serverCode: 'XYZ789',
+    joinedServers: ['global', 'ABC123', 'XYZ789']
+  });
+  otherModSocket.roomRole = 'mod';
+  const memberSocket = connectAdditionalSocket(setup, {
+    id: 'ordinary-member', username: 'OrdinaryMember', serverCode: room,
+    joinedServers: ['global', 'ABC123', 'XYZ789']
+  });
+  const models = {
+    UserModel,
+    ChatServerModel,
+    MessageModel,
+    RoomRestrictionModel,
+    ModerationAuditModel,
+    ModerationReportModel
+  };
+  return { ...setup, modSocket, otherModSocket, memberSocket, models };
 }
 
 function moderationScenario({
@@ -266,6 +482,477 @@ function timedOutAuthenticatedSocket(serverCode, username) {
   setup.MessageModel.findById = async () => message;
   return { ...setup, message };
 }
+
+test('ordinary member can report only a target or message in an accessible room', async () => {
+  const setup = reportingScenario({ reporter: 'Alice', room: 'ABC123', target: 'Bob' });
+  const ack = acknowledge();
+  await setup.socket.trigger('report_moderation_target', {
+    serverCode: 'ABC123', targetUser: 'Bob', messageId: VALID_MESSAGE_ID,
+    reason: 'repeated personal attacks'
+  }, ack.callback);
+
+  assert.equal(ack.value().success, true);
+  assert.equal(setup.ModerationReportModel.rows.length, 1);
+  assert.deepEqual({
+    serverCode: setup.ModerationReportModel.rows[0].serverCode,
+    reporterUsername: setup.ModerationReportModel.rows[0].reporterUsername,
+    targetUsername: setup.ModerationReportModel.rows[0].targetUsername,
+    messageId: setup.ModerationReportModel.rows[0].messageId,
+    reason: setup.ModerationReportModel.rows[0].reason,
+    status: setup.ModerationReportModel.rows[0].status
+  }, {
+    serverCode: 'ABC123', reporterUsername: 'Alice', targetUsername: 'Bob',
+    messageId: VALID_MESSAGE_ID, reason: 'repeated personal attacks', status: 'open'
+  });
+  assert.equal(setup.ioInstance.outbound.some(item => item.room === 'ABC123' && item.event === 'moderation_queue_updated'), false);
+  assert.equal(setup.memberSocket.outbound.some(item => item.event === 'moderation_queue_updated'), false);
+  assert.equal(setup.otherModSocket.outbound.some(item => item.event === 'moderation_queue_updated'), false);
+  assert.equal(setup.modSocket.outbound.some(item => item.event === 'moderation_queue_updated'), true);
+  assert.deepEqual(
+    setup.modSocket.outbound.find(item => item.event === 'moderation_queue_updated').payload,
+    { serverCode: 'ABC123' }
+  );
+});
+
+test('report validation resolves canonical users and rejects missing or mismatched message evidence', async () => {
+  const canonical = reportingScenario();
+  const canonicalAck = acknowledge();
+  await canonical.socket.trigger('report_moderation_target', {
+    serverCode: 'abc123', targetUser: 'bOb', reason: '  Ｆｕｌｌ width abuse  '
+  }, canonicalAck.callback);
+  assert.equal(canonicalAck.value().success, true);
+  assert.equal(canonical.ModerationReportModel.rows[0].targetUsername, 'Bob');
+  assert.equal(canonical.ModerationReportModel.rows[0].reason, 'Full width abuse');
+  assert.equal(canonical.ModerationReportModel.rows[0].messageId, null);
+
+  for (const scenario of [
+    { name: 'missing target', mutate() {}, request: { targetUser: 'MissingUser' } },
+    {
+      name: 'missing message',
+      mutate() {},
+      request: { targetUser: 'Bob', messageId: '507f1f77bcf86cd799439012' }
+    },
+    {
+      name: 'other-room message',
+      mutate(setup) {
+        setup.MessageModel.rows.push({
+          _id: '507f1f77bcf86cd799439013', serverCode: 'XYZ789', username: 'Bob'
+        });
+      },
+      request: { targetUser: 'Bob', messageId: '507f1f77bcf86cd799439013' }
+    },
+    {
+      name: 'other-author message',
+      mutate(setup) {
+        setup.MessageModel.rows.push({
+          _id: '507f1f77bcf86cd799439014', serverCode: 'ABC123', username: 'OrdinaryMember'
+        });
+      },
+      request: { targetUser: 'Bob', messageId: '507f1f77bcf86cd799439014' }
+    }
+  ]) {
+    const setup = reportingScenario();
+    scenario.mutate(setup);
+    const ack = acknowledge();
+    await setup.socket.trigger('report_moderation_target', {
+      serverCode: 'ABC123', reason: scenario.name, ...scenario.request
+    }, ack.callback);
+    assert.equal(Boolean(ack.value().error), true, scenario.name);
+    assert.equal(setup.ModerationReportModel.rows.length, 0, scenario.name);
+  }
+});
+
+test('report reason is 1-300 characters after NFKC normalization', async () => {
+  for (const [reason, accepted] of [
+    [' ', false],
+    ['x'.repeat(300), true],
+    ['x'.repeat(301), false],
+    ['  valid normalized reason  ', true]
+  ]) {
+    const setup = reportingScenario();
+    const ack = acknowledge();
+    await setup.socket.trigger('report_moderation_target', {
+      serverCode: 'ABC123', targetUser: 'Bob', reason
+    }, ack.callback);
+    assert.equal(Boolean(ack.value().success), accepted, `reason length ${reason.trim().length}`);
+    assert.equal(setup.ModerationReportModel.rows.length, accepted ? 1 : 0);
+  }
+});
+
+test('report schema enforces one canonical open report across MongoDB processes', () => {
+  const duplicateIndex = ModerationReport.schema.indexes().find(([, options]) =>
+    options.unique === true && options.partialFilterExpression?.status === 'open'
+  );
+  assert.deepEqual(duplicateIndex, [
+    { reporterUsername: 1, serverCode: 1, targetUsername: 1, messageId: 1, status: 1 },
+    { unique: true, partialFilterExpression: { status: 'open' }, background: true }
+  ]);
+});
+
+test('report account lock serializes duplicate detection and the rolling daily limit', async () => {
+  const duplicateSetup = reportingScenario();
+  const firstAck = acknowledge();
+  const secondAck = acknowledge();
+  const request = {
+    serverCode: 'ABC123', targetUser: 'Bob', messageId: VALID_MESSAGE_ID,
+    reason: 'same open report'
+  };
+  await Promise.all([
+    duplicateSetup.socket.trigger('report_moderation_target', request, firstAck.callback),
+    duplicateSetup.socket.trigger('report_moderation_target', request, secondAck.callback)
+  ]);
+  assert.equal([firstAck.value(), secondAck.value()].filter(result => result.success).length, 1);
+  assert.equal([firstAck.value(), secondAck.value()].filter(result => result.error).length, 1);
+  assert.equal(duplicateSetup.ModerationReportModel.rows.length, 1);
+
+  const limitedSetup = reportingScenario();
+  const now = Date.now();
+  for (let index = 0; index < 10; index += 1) {
+    limitedSetup.ModerationReportModel.rows.push({
+      _id: (index + 1).toString(16).padStart(24, '0'),
+      serverCode: 'XYZ789', reporterUsername: 'Alice', targetUsername: `Prior${index}`,
+      messageId: null, reason: 'prior report', status: 'open', createdAt: new Date(now - index * 1000)
+    });
+  }
+  const limitedAck = acknowledge();
+  await limitedSetup.socket.trigger('report_moderation_target', {
+    serverCode: 'ABC123', targetUser: 'Bob', reason: 'eleventh rolling report'
+  }, limitedAck.callback);
+  assert.equal(Boolean(limitedAck.value().error), true);
+  assert.equal(limitedSetup.ModerationReportModel.rows.length, 10);
+});
+
+test('report and moderation reads deny ordinary and wrong-room moderators without leaking counts', async () => {
+  const setup = reportingScenario();
+  const reportId = '507f1f77bcf86cd799439021';
+  setup.ModerationReportModel.rows.push({
+    _id: reportId, serverCode: 'ABC123', reporterUsername: 'Alice', targetUsername: 'Bob',
+    messageId: null, reason: 'private report reason', status: 'open',
+    createdAt: new Date('2026-08-08T12:00:00.000Z')
+  });
+  setup.RoomRestrictionModel.rows.push(restrictionDocument('ABC123', 'bob', {
+    bannedAt: new Date('2026-08-08T12:00:00.000Z'), banReason: 'private ban reason',
+    createdAt: new Date('2026-08-08T12:00:00.000Z')
+  }));
+  setup.ModerationAuditModel.rows.push({
+    _id: '507f1f77bcf86cd799439022', correlationId: 'audit-private', action: 'ban',
+    serverCode: 'ABC123', actorUsername: 'ExactMod', reason: 'private audit reason',
+    createdAt: new Date('2026-08-08T12:00:00.000Z')
+  });
+  const requests = [
+    ['list_moderation_reports', { serverCode: 'ABC123', status: 'open' }],
+    ['resolve_moderation_report', { serverCode: 'ABC123', reportId, status: 'resolved', resolution: 'handled privately' }],
+    ['list_room_restrictions', { serverCode: 'ABC123' }],
+    ['get_moderation_audit', { serverCode: 'ABC123' }],
+    ['get_automod', { serverCode: 'ABC123' }]
+  ];
+  for (const [event, payload] of requests) {
+    const ack = acknowledge();
+    await setup.memberSocket.trigger(event, payload, ack.callback);
+    assert.deepEqual(ack.value(), { error: 'Permission denied.' }, event);
+    assert.equal(JSON.stringify(ack.value()).includes('count'), false, event);
+    assert.equal(JSON.stringify(ack.value()).includes('private'), false, event);
+  }
+
+  const wrongRoomAck = acknowledge();
+  await setup.modSocket.trigger('list_moderation_reports', {
+    serverCode: 'XYZ789', status: 'open'
+  }, wrongRoomAck.callback);
+  assert.deepEqual(wrongRoomAck.value(), { error: 'Permission denied.' });
+  assert.equal(JSON.stringify(wrongRoomAck.value()).includes('items'), false);
+});
+
+test('exact-room moderator and global admin can read private report and AutoMod state', async () => {
+  const setup = reportingScenario();
+  const room = setup.ChatServerModel.rows.find(candidate => candidate.code === 'ABC123');
+  room.autoMod = {
+    blockedKeywords: ['  SPAM  ', 'ＳＰＡＭ'], mentionLimit: 5, repeatLimit: 4, repeatWindowSeconds: 45
+  };
+  setup.ModerationReportModel.rows.push({
+    _id: '507f1f77bcf86cd799439023', serverCode: 'ABC123', reporterUsername: 'Alice',
+    targetUsername: 'Bob', messageId: VALID_MESSAGE_ID, reason: 'private report', status: 'open',
+    createdAt: new Date('2026-08-08T12:00:00.000Z'), internalSecret: 'never expose'
+  });
+
+  const modListAck = acknowledge();
+  await setup.modSocket.trigger('list_moderation_reports', {
+    serverCode: 'ABC123', status: 'open', limit: 10
+  }, modListAck.callback);
+  assert.equal(modListAck.value().items.length, 1);
+  assert.equal(modListAck.value().items[0].reason, 'private report');
+  assert.equal(Object.prototype.hasOwnProperty.call(modListAck.value().items[0], 'internalSecret'), false);
+
+  const autoModAck = acknowledge();
+  await setup.modSocket.trigger('get_automod', { serverCode: 'ABC123' }, autoModAck.callback);
+  assert.deepEqual(autoModAck.value(), {
+    autoMod: { blockedKeywords: ['spam'], mentionLimit: 5, repeatLimit: 4, repeatWindowSeconds: 45 }
+  });
+
+  setup.UserModel.rows.push(userDocument({
+    username: 'GlobalAdmin', displayName: 'GlobalAdmin', role: 'admin', servers: ['global']
+  }));
+  const adminSocket = connectAdditionalSocket(setup, {
+    id: 'global-admin', username: 'GlobalAdmin', serverCode: 'global', role: 'admin', joinedServers: ['global']
+  });
+  const adminAck = acknowledge();
+  await adminSocket.trigger('list_moderation_reports', {
+    serverCode: 'ABC123', status: 'open', limit: 10
+  }, adminAck.callback);
+  assert.equal(adminAck.value().items.length, 1);
+  assert.equal(adminAck.value().items[0].targetUsername, 'Bob');
+});
+
+test('report pagination uses descending createdAt and id keysets with an opaque cursor', async () => {
+  const setup = reportingScenario();
+  const reportRows = [
+    ['507f1f77bcf86cd799439031', '2026-08-08T12:03:00.000Z'],
+    ['507f1f77bcf86cd799439033', '2026-08-08T12:02:00.000Z'],
+    ['507f1f77bcf86cd799439032', '2026-08-08T12:02:00.000Z'],
+    ['507f1f77bcf86cd799439034', '2026-08-08T12:01:00.000Z']
+  ].map(([_id, createdAt]) => ({
+    _id, createdAt: new Date(createdAt), serverCode: 'ABC123', reporterUsername: 'Alice',
+    targetUsername: 'Bob', messageId: null, reason: _id, status: 'open'
+  }));
+  setup.ModerationReportModel.rows.push(...reportRows);
+
+  const firstAck = acknowledge();
+  await setup.modSocket.trigger('list_moderation_reports', {
+    serverCode: 'ABC123', status: 'open', limit: 2
+  }, firstAck.callback);
+  assert.deepEqual(firstAck.value().items.map(item => item._id), [
+    '507f1f77bcf86cd799439031', '507f1f77bcf86cd799439033'
+  ]);
+  assert.equal(typeof firstAck.value().nextCursor, 'string');
+  assert.equal(firstAck.value().nextCursor.includes('2026-08-08'), false);
+
+  const secondAck = acknowledge();
+  await setup.modSocket.trigger('list_moderation_reports', {
+    serverCode: 'ABC123', status: 'open', limit: 2, before: firstAck.value().nextCursor
+  }, secondAck.callback);
+  assert.deepEqual(secondAck.value().items.map(item => item._id), [
+    '507f1f77bcf86cd799439032', '507f1f77bcf86cd799439034'
+  ]);
+  assert.equal(secondAck.value().nextCursor, null);
+
+  const invalidAck = acknowledge();
+  await setup.modSocket.trigger('list_moderation_reports', {
+    serverCode: 'ABC123', status: 'open', before: 'not-a-valid-cursor'
+  }, invalidAck.callback);
+  assert.equal(Boolean(invalidAck.value().error), true);
+});
+
+test('audit pagination clamps the limit to fifty and projects explicit safe fields', async () => {
+  const setup = reportingScenario();
+  for (let index = 0; index < 52; index += 1) {
+    setup.ModerationAuditModel.rows.push({
+      _id: (500 + index).toString(16).padStart(24, '0'),
+      correlationId: `audit-${index}`, action: 'timeout', serverCode: 'ABC123',
+      actorUsername: 'ExactMod', actorRole: 'user', actorRoomRole: 'mod',
+      targetUsername: 'Bob', targetRole: 'user', targetRoomRole: 'user',
+      reason: `reason-${index}`, duration: '10m', expiresAt: null,
+      messageId: null, reportId: null, metadata: { sequence: index },
+      createdAt: new Date(Date.UTC(2026, 7, 8, 12, 0, index)), privateStorageField: 'never expose'
+    });
+  }
+  const ack = acknowledge();
+  await setup.modSocket.trigger('get_moderation_audit', {
+    serverCode: 'ABC123', limit: 999
+  }, ack.callback);
+  assert.equal(ack.value().items.length, 50);
+  assert.equal(typeof ack.value().nextCursor, 'string');
+  assert.equal(ack.value().items[0].correlationId, 'audit-51');
+  assert.equal(Object.prototype.hasOwnProperty.call(ack.value().items[0], 'privateStorageField'), false);
+});
+
+test('report resolution validates status and resolution then appends immutable audit history', async () => {
+  const setup = reportingScenario();
+  const reportId = '507f1f77bcf86cd799439041';
+  setup.ModerationReportModel.rows.push({
+    _id: reportId, serverCode: 'ABC123', reporterUsername: 'Alice', targetUsername: 'Bob',
+    messageId: VALID_MESSAGE_ID, reason: 'private report', status: 'open',
+    resolvedBy: null, resolution: null, resolvedAt: null,
+    createdAt: new Date('2026-08-08T12:00:00.000Z')
+  });
+  setup.ModerationAuditModel.rows.push({
+    _id: '507f1f77bcf86cd799439042', correlationId: 'existing-audit', action: 'ban',
+    serverCode: 'ABC123', actorUsername: 'ExactMod', reason: 'existing immutable audit',
+    createdAt: new Date('2026-08-08T11:00:00.000Z')
+  });
+  const originalAudit = structuredClone(setup.ModerationAuditModel.rows[0]);
+
+  for (const payload of [
+    { status: 'open', resolution: 'not a terminal status' },
+    { status: 'resolved', resolution: ' ' },
+    { status: 'dismissed', resolution: 'x'.repeat(301) }
+  ]) {
+    const ack = acknowledge();
+    await setup.modSocket.trigger('resolve_moderation_report', {
+      serverCode: 'ABC123', reportId, ...payload
+    }, ack.callback);
+    assert.equal(Boolean(ack.value().error), true);
+    assert.equal(setup.ModerationReportModel.rows[0].status, 'open');
+    assert.equal(setup.ModerationAuditModel.rows.length, 1);
+  }
+
+  const resolvedAck = acknowledge();
+  await setup.modSocket.trigger('resolve_moderation_report', {
+    serverCode: 'ABC123', reportId, status: 'resolved', resolution: '  Ｒｅｖｉｅｗｅｄ and handled  '
+  }, resolvedAck.callback);
+  assert.deepEqual(resolvedAck.value(), { success: true });
+  assert.equal(setup.ModerationReportModel.rows[0].status, 'resolved');
+  assert.equal(setup.ModerationReportModel.rows[0].resolvedBy, 'ExactMod');
+  assert.equal(setup.ModerationReportModel.rows[0].resolution, 'Reviewed and handled');
+  assert.equal(setup.ModerationReportModel.rows[0].resolvedAt instanceof Date, true);
+  assert.deepEqual(setup.ModerationAuditModel.rows[0], originalAudit);
+  assert.equal(setup.ModerationAuditModel.rows.length, 2);
+  assert.equal(setup.ModerationAuditModel.rows[1].action, 'resolve_report');
+  assert.equal(setup.ModerationAuditModel.rows[1].reportId, reportId);
+  assert.equal(setup.ModerationAuditModel.rows[1].reason, 'Reviewed and handled');
+  assert.equal(setup.ioInstance.outbound.some(item => item.event === 'moderation_queue_updated'), false);
+  assert.equal(setup.memberSocket.outbound.some(item => item.event === 'moderation_queue_updated'), false);
+  assert.equal(setup.otherModSocket.outbound.some(item => item.event === 'moderation_queue_updated'), false);
+  assert.equal(setup.modSocket.outbound.some(item => item.event === 'moderation_queue_updated'), true);
+
+  const secondAck = acknowledge();
+  await setup.modSocket.trigger('resolve_moderation_report', {
+    serverCode: 'ABC123', reportId, status: 'dismissed', resolution: 'second resolution'
+  }, secondAck.callback);
+  assert.equal(Boolean(secondAck.value().error), true);
+  assert.equal(setup.ModerationAuditModel.rows.length, 2);
+});
+
+test('restriction list returns active room rows and honors normalized target pagination', async () => {
+  const setup = reportingScenario();
+  setup.RoomRestrictionModel.rows.push(
+    restrictionDocument('ABC123', 'bob', {
+      _id: '507f1f77bcf86cd799439051', bannedAt: new Date('2026-08-08T12:03:00.000Z'),
+      bannedBy: 'ExactMod', banReason: 'private ban reason',
+      createdAt: new Date('2026-08-08T12:03:00.000Z'), storageSecret: 'never expose'
+    }),
+    restrictionDocument('ABC123', 'ordinarymember', {
+      _id: '507f1f77bcf86cd799439052', timeoutUntil: new Date(Date.now() + 60_000),
+      timeoutBy: 'ExactMod', timeoutReason: 'private timeout reason',
+      createdAt: new Date('2026-08-08T12:02:00.000Z')
+    }),
+    restrictionDocument('ABC123', 'othermod', {
+      _id: '507f1f77bcf86cd799439053', timeoutUntil: new Date(Date.now() - 60_000),
+      timeoutReason: 'expired', createdAt: new Date('2026-08-08T12:01:00.000Z')
+    }),
+    restrictionDocument('XYZ789', 'bob', {
+      _id: '507f1f77bcf86cd799439054', bannedAt: new Date(), banReason: 'other room',
+      createdAt: new Date('2026-08-08T12:04:00.000Z')
+    })
+  );
+
+  const targetAck = acknowledge();
+  await setup.modSocket.trigger('list_room_restrictions', {
+    serverCode: 'ABC123', targetUser: 'BoB', limit: 1
+  }, targetAck.callback);
+  assert.equal(targetAck.value().items.length, 1);
+  assert.deepEqual(targetAck.value().items[0], {
+    _id: '507f1f77bcf86cd799439051', targetUsername: 'bob', banned: true,
+    bannedAt: new Date('2026-08-08T12:03:00.000Z'), bannedBy: 'ExactMod',
+    banReason: 'private ban reason', timedOut: false, timeoutUntil: null,
+    timeoutBy: null, timeoutReason: null, createdAt: new Date('2026-08-08T12:03:00.000Z')
+  });
+
+  const firstAck = acknowledge();
+  await setup.modSocket.trigger('list_room_restrictions', {
+    serverCode: 'ABC123', limit: 1
+  }, firstAck.callback);
+  assert.equal(firstAck.value().items[0].targetUsername, 'bob');
+  assert.equal(typeof firstAck.value().nextCursor, 'string');
+  const secondAck = acknowledge();
+  await setup.modSocket.trigger('list_room_restrictions', {
+    serverCode: 'ABC123', limit: 1, before: firstAck.value().nextCursor
+  }, secondAck.callback);
+  assert.equal(secondAck.value().items[0].targetUsername, 'ordinarymember');
+  assert.equal(secondAck.value().nextCursor, null);
+});
+
+test('stale banned sockets cannot report or read private moderation data', async () => {
+  const reporterSetup = reportingScenario();
+  reporterSetup.RoomRestrictionModel.rows.push(restrictionDocument('ABC123', 'alice', {
+    bannedAt: new Date(), banReason: 'fresh persisted ban'
+  }));
+  reporterSetup.socket.roomRole = 'mod';
+  const reportAck = acknowledge();
+  await reporterSetup.socket.trigger('report_moderation_target', {
+    serverCode: 'ABC123', targetUser: 'Bob', reason: 'stale socket report'
+  }, reportAck.callback);
+  assert.deepEqual(reportAck.value(), { error: 'Permission denied.' });
+  assert.equal(reporterSetup.ModerationReportModel.rows.length, 0);
+
+  const modSetup = reportingScenario();
+  modSetup.RoomRestrictionModel.rows.push(restrictionDocument('ABC123', 'exactmod', {
+    bannedAt: new Date(), banReason: 'fresh persisted moderator ban'
+  }));
+  modSetup.ModerationReportModel.rows.push({
+    _id: '507f1f77bcf86cd799439061', serverCode: 'ABC123', reporterUsername: 'Alice',
+    targetUsername: 'Bob', reason: 'must remain private', status: 'open', createdAt: new Date()
+  });
+  modSetup.ModerationAuditModel.rows.push({
+    _id: '507f1f77bcf86cd799439062', correlationId: 'private', action: 'ban',
+    serverCode: 'ABC123', reason: 'must remain private', createdAt: new Date()
+  });
+  for (const [event, payload] of [
+    ['list_moderation_reports', { serverCode: 'ABC123', status: 'open' }],
+    ['resolve_moderation_report', {
+      serverCode: 'ABC123', reportId: '507f1f77bcf86cd799439061',
+      status: 'resolved', resolution: 'stale moderator cannot resolve'
+    }],
+    ['list_room_restrictions', { serverCode: 'ABC123' }],
+    ['get_moderation_audit', { serverCode: 'ABC123' }],
+    ['get_automod', { serverCode: 'ABC123' }]
+  ]) {
+    const ack = acknowledge();
+    await modSetup.modSocket.trigger(event, payload, ack.callback);
+    assert.deepEqual(ack.value(), { error: 'Permission denied.' }, event);
+    assert.deepEqual(Object.keys(ack.value()), ['error'], event);
+  }
+  assert.equal(modSetup.ModerationReportModel.rows[0].status, 'open');
+  assert.equal(modSetup.ModerationAuditModel.rows.length, 1);
+});
+
+test('room deletion removes private report and restriction rows but retains append-only audit rows', async () => {
+  const setup = reportingScenario();
+  setup.UserModel.rows.find(user => user.username === 'Alice').role = 'admin';
+  setup.socket.role = 'admin';
+  setup.RoomRestrictionModel.rows.push(
+    restrictionDocument('ABC123', 'bob', { bannedAt: new Date() }),
+    restrictionDocument('XYZ789', 'bob', { bannedAt: new Date() })
+  );
+  setup.ModerationReportModel.rows.push(
+    { _id: '507f1f77bcf86cd799439071', serverCode: 'ABC123', status: 'open', createdAt: new Date() },
+    { _id: '507f1f77bcf86cd799439072', serverCode: 'XYZ789', status: 'open', createdAt: new Date() }
+  );
+  setup.ModerationAuditModel.rows.push(
+    { _id: '507f1f77bcf86cd799439073', serverCode: 'ABC123', action: 'ban', createdAt: new Date() },
+    { _id: '507f1f77bcf86cd799439074', serverCode: 'XYZ789', action: 'ban', createdAt: new Date() }
+  );
+  const ack = acknowledge();
+  await setup.socket.trigger('delete_server', 'ABC123', ack.callback);
+  assert.deepEqual(ack.value(), { success: true });
+  assert.deepEqual(setup.RoomRestrictionModel.rows.map(row => row.serverCode), ['XYZ789']);
+  assert.deepEqual(setup.ModerationReportModel.rows.map(row => row.serverCode), ['XYZ789']);
+  assert.deepEqual(setup.ModerationAuditModel.rows.map(row => row.serverCode), ['ABC123', 'XYZ789']);
+});
+
+test('restriction cleanup failure follows the generic room deletion failure path', async () => {
+  const setup = reportingScenario();
+  setup.UserModel.rows.find(user => user.username === 'Alice').role = 'admin';
+  setup.socket.role = 'admin';
+  setup.RoomRestrictionModel.rows.push(restrictionDocument('ABC123', 'bob', { bannedAt: new Date() }));
+  setup.ModerationReportModel.rows.push({
+    _id: '507f1f77bcf86cd799439075', serverCode: 'ABC123', status: 'open', createdAt: new Date()
+  });
+  setup.RoomRestrictionModel.deleteMany = async () => { throw new Error('secret restriction outage'); };
+  const ack = acknowledge();
+  await setup.socket.trigger('delete_server', 'ABC123', ack.callback);
+  assert.deepEqual(ack.value(), { error: 'Deletion failed.' });
+  assert.equal(setup.ChatServerModel.rows.some(room => room.code === 'ABC123'), false);
+  assert.equal(setup.ModerationReportModel.rows.some(report => report.serverCode === 'ABC123'), false);
+});
 
 test('moderation inputs accept only the supported actions, durations, reasons, and AutoMod bounds', () => {
   assert.equal(normalizeModerationAction(' Ban '), 'ban');
@@ -1647,5 +2334,6 @@ module.exports = {
   authenticatedRoomSocket,
   authenticatedLobbySocket,
   timedOutAuthenticatedSocket,
-  moderationScenario
+  moderationScenario,
+  reportingScenario
 };

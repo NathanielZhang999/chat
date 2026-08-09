@@ -147,6 +147,28 @@ function isValidObjectId(value) {
   return typeof value === 'string' && OBJECT_ID_RE.test(value);
 }
 
+function encodeCursor(date, id) {
+  return Buffer.from(JSON.stringify([new Date(date).toISOString(), String(id)]), 'utf8').toString('base64url');
+}
+
+function decodeCursor(value) {
+  if (typeof value !== 'string' || value.length > 256) return null;
+  try {
+    const parsed = JSON.parse(Buffer.from(value, 'base64url').toString('utf8'));
+    if (!Array.isArray(parsed) || parsed.length !== 2 || !isValidObjectId(parsed[1])) return null;
+    const date = new Date(parsed[0]);
+    return Number.isNaN(date.getTime()) ? null : { date, id: parsed[1] };
+  } catch {
+    return null;
+  }
+}
+
+function normalizePageLimit(value) {
+  if (value === undefined) return 20;
+  if (!Number.isInteger(value)) return null;
+  return Math.min(50, Math.max(1, value));
+}
+
 function neutralizePingTokens(text) {
   if (typeof text !== 'string') return '';
   return text.replace(/\{\{PING:/gi, '{{ PING:');
@@ -898,6 +920,112 @@ function createConnectionHandler({
     return false;
   }
 
+  async function loadModeratorAccess(serverCode, username) {
+    const access = await loadRoomAccessState({
+      UserModel,
+      ChatServerModel,
+      RoomRestrictionModel,
+      username,
+      serverCode
+    });
+    if (!access.allowed || access.restriction.banned) return null;
+    const eligible = access.user.role === 'admin' ||
+      (serverCode !== 'global' && isCurrentRoomModerator(access.room, access.user.username));
+    return eligible ? access : null;
+  }
+
+  async function emitModerationQueueUpdated(serverCode) {
+    let sockets;
+    try {
+      sockets = await fetchLiveSockets();
+    } catch (err) {
+      logUnexpectedError(logger, 'moderation_queue_socket_discovery', err);
+      return;
+    }
+    for (const live of sockets) {
+      const session = onlineUsersMap.get(live.id);
+      const username = live.username || session?.username;
+      if (!username) continue;
+      try {
+        const access = await loadModeratorAccess(serverCode, username);
+        if (access) live.emit('moderation_queue_updated', { serverCode });
+      } catch (err) {
+        logUnexpectedError(logger, 'moderation_queue_notification', err);
+      }
+    }
+  }
+
+  function paginationCursor(data) {
+    if (data.before === undefined || data.before === null) return { cursor: null };
+    const cursor = decodeCursor(data.before);
+    return cursor ? { cursor } : { error: 'Invalid input format.' };
+  }
+
+  function nextPage(items, limit) {
+    const hasMore = items.length > limit;
+    const page = items.slice(0, limit);
+    const last = page[page.length - 1];
+    return {
+      page,
+      nextCursor: hasMore && last ? encodeCursor(last.createdAt, last._id) : null
+    };
+  }
+
+  function safeReportRow(row) {
+    return {
+      _id: String(row._id),
+      serverCode: row.serverCode,
+      reporterUsername: row.reporterUsername,
+      targetUsername: row.targetUsername,
+      messageId: row.messageId ? String(row.messageId) : null,
+      reason: row.reason,
+      status: row.status,
+      resolvedBy: row.resolvedBy || null,
+      resolution: row.resolution || null,
+      resolvedAt: row.resolvedAt || null,
+      createdAt: row.createdAt
+    };
+  }
+
+  function safeAuditRow(row) {
+    return {
+      _id: String(row._id),
+      correlationId: row.correlationId,
+      action: row.action,
+      serverCode: row.serverCode,
+      actorUsername: row.actorUsername,
+      actorRole: row.actorRole,
+      actorRoomRole: row.actorRoomRole,
+      targetUsername: row.targetUsername || null,
+      targetRole: row.targetRole || null,
+      targetRoomRole: row.targetRoomRole || null,
+      reason: row.reason,
+      duration: row.duration || null,
+      expiresAt: row.expiresAt || null,
+      messageId: row.messageId ? String(row.messageId) : null,
+      reportId: row.reportId ? String(row.reportId) : null,
+      metadata: row.metadata && typeof row.metadata === 'object' ? row.metadata : {},
+      createdAt: row.createdAt
+    };
+  }
+
+  function safeRestrictionRow(row, now) {
+    const state = activeRestrictionState(row, now);
+    return {
+      _id: String(row._id),
+      targetUsername: row.username,
+      banned: state.banned,
+      bannedAt: state.banned ? row.bannedAt : null,
+      bannedBy: state.banned ? (row.bannedBy || null) : null,
+      banReason: state.banned ? (row.banReason || null) : null,
+      timedOut: state.timedOut,
+      timeoutUntil: state.timeoutUntil,
+      timeoutBy: state.timedOut ? (row.timeoutBy || null) : null,
+      timeoutReason: state.timedOut ? (row.timeoutReason || null) : null,
+      createdAt: row.createdAt
+    };
+  }
+
   async function reconcileRestrictedAccount({
     username,
     removedRoom,
@@ -1536,6 +1664,302 @@ function createConnectionHandler({
     }
   });
 
+  socket.on('report_moderation_target', async (data, callback) => {
+    callback = safeAck(callback);
+    if (!socket.username) return callback({ error: 'Not authenticated.' });
+    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+      return callback({ error: 'Invalid input format.' });
+    }
+    const serverCode = normalizeServerCode(data.serverCode);
+    const targetInput = normalizeUsername(data.targetUser);
+    const reason = normalizeModerationReason(data.reason, 300);
+    const messageId = data.messageId === undefined || data.messageId === null
+      ? null
+      : data.messageId;
+    if (!serverCode || !targetInput || !reason || (messageId !== null && !isValidObjectId(messageId))) {
+      return callback({ error: 'Invalid input format.' });
+    }
+
+    try {
+      const initialReporter = await findUserByUsername(UserModel, socket.username);
+      if (!initialReporter) return callback({ error: 'Permission denied.' });
+      const result = await withAccountTransitionLock(initialReporter.username, () =>
+        withRoomMutationLock(serverCode, async () => {
+          const [access, targetUser] = await Promise.all([
+            loadRoomAccessState({
+              UserModel,
+              ChatServerModel,
+              RoomRestrictionModel,
+              username: initialReporter.username,
+              serverCode
+            }),
+            findUserByUsername(UserModel, targetInput)
+          ]);
+          if (!access.allowed || access.restriction.banned || !targetUser) {
+            return { error: 'Permission denied.' };
+          }
+          if (serverCode !== 'global' &&
+              targetUser.role !== 'admin' &&
+              (!Array.isArray(targetUser.servers) || !targetUser.servers.includes(serverCode))) {
+            return { error: 'Permission denied.' };
+          }
+
+          if (messageId) {
+            const message = await MessageModel.findById(messageId);
+            if (!message || message.serverCode !== serverCode ||
+                normalizeAccountKey(message.username) !== normalizeAccountKey(targetUser.username)) {
+              return { error: 'Permission denied.' };
+            }
+          }
+
+          const duplicateQuery = {
+            reporterUsername: access.user.username,
+            serverCode,
+            targetUsername: targetUser.username,
+            messageId,
+            status: 'open'
+          };
+          if (await ModerationReportModel.findOne(duplicateQuery)) {
+            return { error: 'Duplicate report.' };
+          }
+          const rollingStart = new Date(Date.now() - 24 * 60 * 60 * 1000);
+          const recentCount = await ModerationReportModel.countDocuments({
+            reporterUsername: access.user.username,
+            createdAt: { $gt: rollingStart }
+          });
+          if (recentCount >= 10) return { error: 'Too many reports.' };
+
+          try {
+            await ModerationReportModel.create({
+              serverCode,
+              reporterUsername: access.user.username,
+              targetUsername: targetUser.username,
+              messageId,
+              reason,
+              status: 'open'
+            });
+          } catch (err) {
+            if (err && err.code === 11000) return { error: 'Duplicate report.' };
+            throw err;
+          }
+          await emitModerationQueueUpdated(serverCode);
+          return { success: true };
+        })
+      );
+      callback(result);
+    } catch (err) {
+      logUnexpectedError(logger, 'report_moderation_target', err);
+      callback({ error: 'Report failed.' });
+    }
+  });
+
+  socket.on('list_moderation_reports', async (data, callback) => {
+    callback = safeAck(callback);
+    if (!socket.username) return callback({ error: 'Not authenticated.' });
+    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+      return callback({ error: 'Invalid input format.' });
+    }
+    const serverCode = normalizeServerCode(data.serverCode);
+    const status = typeof data.status === 'string' ? data.status.trim().toLowerCase() : 'open';
+    const limit = normalizePageLimit(data.limit);
+    const cursorResult = paginationCursor(data);
+    if (!serverCode || !['open', 'resolved', 'dismissed'].includes(status) || !limit || cursorResult.error) {
+      return callback({ error: 'Invalid input format.' });
+    }
+
+    try {
+      const access = await loadModeratorAccess(serverCode, socket.username);
+      if (!access) return callback({ error: 'Permission denied.' });
+      const query = { serverCode, status };
+      if (cursorResult.cursor) {
+        query.$or = [
+          { createdAt: { $lt: cursorResult.cursor.date } },
+          { createdAt: cursorResult.cursor.date, _id: { $lt: cursorResult.cursor.id } }
+        ];
+      }
+      const rows = await ModerationReportModel.find(query)
+        .sort({ createdAt: -1, _id: -1 })
+        .limit(limit + 1)
+        .select('_id serverCode reporterUsername targetUsername messageId reason status resolvedBy resolution resolvedAt createdAt');
+      const { page, nextCursor } = nextPage(rows, limit);
+      callback({ items: page.map(safeReportRow), nextCursor });
+    } catch (err) {
+      logUnexpectedError(logger, 'list_moderation_reports', err);
+      callback({ error: 'Failed to list reports.' });
+    }
+  });
+
+  socket.on('resolve_moderation_report', async (data, callback) => {
+    callback = safeAck(callback);
+    if (!socket.username) return callback({ error: 'Not authenticated.' });
+    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+      return callback({ error: 'Invalid input format.' });
+    }
+    const serverCode = normalizeServerCode(data.serverCode);
+    const reportId = typeof data.reportId === 'string' ? data.reportId : null;
+    const status = typeof data.status === 'string' ? data.status.trim().toLowerCase() : null;
+    const resolution = normalizeModerationReason(data.resolution, 300);
+    if (!serverCode || !isValidObjectId(reportId) ||
+        !['resolved', 'dismissed'].includes(status) || !resolution) {
+      return callback({ error: 'Invalid input format.' });
+    }
+
+    try {
+      const initialActor = await findUserByUsername(UserModel, socket.username);
+      if (!initialActor) return callback({ error: 'Permission denied.' });
+      const result = await withAccountTransitionLock(initialActor.username, () =>
+        withRoomMutationLock(serverCode, async () => {
+          const access = await loadModeratorAccess(serverCode, initialActor.username);
+          if (!access) return { error: 'Permission denied.' };
+          const report = await ModerationReportModel.findOne({
+            _id: reportId,
+            serverCode,
+            status: 'open'
+          });
+          if (!report) return { error: 'Report unavailable.' };
+
+          const targetUser = await findUserByUsername(UserModel, report.targetUsername);
+          const now = new Date();
+          report.status = status;
+          report.resolvedBy = access.user.username;
+          report.resolution = resolution;
+          report.resolvedAt = now;
+          await report.save();
+
+          await appendAuditReliably({
+            correlationId: new mongoose.Types.ObjectId().toString(),
+            action: 'resolve_report',
+            serverCode,
+            actorUsername: access.user.username,
+            actorRole: access.user.role || 'user',
+            actorRoomRole: isCurrentRoomModerator(access.room, access.user.username) ? 'mod' : 'user',
+            targetUsername: report.targetUsername,
+            targetRole: targetUser?.role || 'user',
+            targetRoomRole: isCurrentRoomModerator(access.room, report.targetUsername) ? 'mod' : 'user',
+            reason: resolution,
+            reportId,
+            metadata: { status }
+          });
+          await emitModerationQueueUpdated(serverCode);
+          return { success: true };
+        })
+      );
+      callback(result);
+    } catch (err) {
+      logUnexpectedError(logger, 'resolve_moderation_report', err);
+      callback({ error: 'Resolution failed.' });
+    }
+  });
+
+  socket.on('list_room_restrictions', async (data, callback) => {
+    callback = safeAck(callback);
+    if (!socket.username) return callback({ error: 'Not authenticated.' });
+    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+      return callback({ error: 'Invalid input format.' });
+    }
+    const serverCode = normalizeServerCode(data.serverCode);
+    const targetInput = data.targetUser === undefined || data.targetUser === null
+      ? null
+      : normalizeUsername(data.targetUser);
+    const limit = normalizePageLimit(data.limit);
+    const cursorResult = paginationCursor(data);
+    if (!serverCode || (data.targetUser !== undefined && data.targetUser !== null && !targetInput) ||
+        !limit || cursorResult.error) {
+      return callback({ error: 'Invalid input format.' });
+    }
+
+    try {
+      const access = await loadModeratorAccess(serverCode, socket.username);
+      if (!access) return callback({ error: 'Permission denied.' });
+      const now = new Date();
+      const query = { serverCode };
+      if (targetInput) query.username = normalizeAccountKey(targetInput);
+      const clauses = [{
+        $or: [
+          { bannedAt: { $ne: null } },
+          { timeoutUntil: { $gt: now } }
+        ]
+      }];
+      if (cursorResult.cursor) {
+        clauses.push({
+          $or: [
+            { createdAt: { $lt: cursorResult.cursor.date } },
+            { createdAt: cursorResult.cursor.date, _id: { $lt: cursorResult.cursor.id } }
+          ]
+        });
+      }
+      query.$and = clauses;
+      const rows = await RoomRestrictionModel.find(query)
+        .sort({ createdAt: -1, _id: -1 })
+        .limit(limit + 1)
+        .select('_id username bannedAt bannedBy banReason timeoutUntil timeoutBy timeoutReason createdAt');
+      const activeRows = rows.filter(row => {
+        const state = activeRestrictionState(row, now);
+        return state.banned || state.timedOut;
+      });
+      const { page, nextCursor } = nextPage(activeRows, limit);
+      callback({ items: page.map(row => safeRestrictionRow(row, now)), nextCursor });
+    } catch (err) {
+      logUnexpectedError(logger, 'list_room_restrictions', err);
+      callback({ error: 'Failed to list restrictions.' });
+    }
+  });
+
+  socket.on('get_moderation_audit', async (data, callback) => {
+    callback = safeAck(callback);
+    if (!socket.username) return callback({ error: 'Not authenticated.' });
+    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+      return callback({ error: 'Invalid input format.' });
+    }
+    const serverCode = normalizeServerCode(data.serverCode);
+    const limit = normalizePageLimit(data.limit);
+    const cursorResult = paginationCursor(data);
+    if (!serverCode || !limit || cursorResult.error) {
+      return callback({ error: 'Invalid input format.' });
+    }
+
+    try {
+      const access = await loadModeratorAccess(serverCode, socket.username);
+      if (!access) return callback({ error: 'Permission denied.' });
+      const query = { serverCode };
+      if (cursorResult.cursor) {
+        query.$or = [
+          { createdAt: { $lt: cursorResult.cursor.date } },
+          { createdAt: cursorResult.cursor.date, _id: { $lt: cursorResult.cursor.id } }
+        ];
+      }
+      const rows = await ModerationAuditModel.find(query)
+        .sort({ createdAt: -1, _id: -1 })
+        .limit(limit + 1)
+        .select('_id correlationId action serverCode actorUsername actorRole actorRoomRole targetUsername targetRole targetRoomRole reason duration expiresAt messageId reportId metadata createdAt');
+      const { page, nextCursor } = nextPage(rows, limit);
+      callback({ items: page.map(safeAuditRow), nextCursor });
+    } catch (err) {
+      logUnexpectedError(logger, 'get_moderation_audit', err);
+      callback({ error: 'Failed to load audit.' });
+    }
+  });
+
+  socket.on('get_automod', async (data, callback) => {
+    callback = safeAck(callback);
+    if (!socket.username) return callback({ error: 'Not authenticated.' });
+    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+      return callback({ error: 'Invalid input format.' });
+    }
+    const serverCode = normalizeServerCode(data.serverCode);
+    if (!serverCode) return callback({ error: 'Invalid input format.' });
+    try {
+      const access = await loadModeratorAccess(serverCode, socket.username);
+      if (!access) return callback({ error: 'Permission denied.' });
+      const autoMod = normalizeAutoModSettings(access.room.autoMod);
+      if (!autoMod) throw new Error('Invalid stored AutoMod state.');
+      callback({ autoMod });
+    } catch (err) {
+      logUnexpectedError(logger, 'get_automod', err);
+      callback({ error: 'Failed to load AutoMod.' });
+    }
+  });
+
   socket.on('create_server', async (name, callback) => {
     callback = safeAck(callback);
     if (!socket.username) return callback({ error: 'Not authenticated.' });
@@ -1865,6 +2289,26 @@ function createConnectionHandler({
         } catch (err) {
           cleanupFailed = true;
           logUnexpectedError(logger, 'delete_server_message_cleanup', err);
+        }
+        try {
+          const hasInjectedRestrictionCleanup = RoomRestrictionModel !== RoomRestriction;
+          if (typeof RoomRestrictionModel.deleteMany === 'function' &&
+              (hasInjectedRestrictionCleanup || ChatServerModel === ChatServer)) {
+            await RoomRestrictionModel.deleteMany({ serverCode });
+          }
+        } catch (err) {
+          cleanupFailed = true;
+          logUnexpectedError(logger, 'delete_server_restriction_cleanup', err);
+        }
+        try {
+          const hasInjectedReportCleanup = ModerationReportModel !== ModerationReport;
+          if (typeof ModerationReportModel.deleteMany === 'function' &&
+              (hasInjectedReportCleanup || ChatServerModel === ChatServer)) {
+            await ModerationReportModel.deleteMany({ serverCode });
+          }
+        } catch (err) {
+          cleanupFailed = true;
+          logUnexpectedError(logger, 'delete_server_report_cleanup', err);
         }
         try {
           await UserModel.updateMany({}, { $pull: { servers: serverCode } });
@@ -2334,6 +2778,8 @@ module.exports = {
   sanitizeAttachment,
   isValidReaction,
   isValidObjectId,
+  encodeCursor,
+  decodeCursor,
   neutralizePingTokens,
   normalizeTransportAddress,
   createRateLimiter,
