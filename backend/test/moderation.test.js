@@ -768,6 +768,104 @@ test('Global ban preserves private memberships and moves all Global sessions to 
   assert.deepEqual(setup.onlineUsersMap.get('target-global-map').bannedRooms, ['global']);
 });
 
+test('Global ban socket-discovery failure makes no durable or published change', async () => {
+  const setup = moderationScenario({ room: 'global', actor: 'admin', action: 'ban' });
+  const targetSocket = connectAdditionalSocket(setup, {
+    id: 'target-discovery-failure', username: 'TargetUser', serverCode: 'global',
+    joinedServers: ['global', 'ABC123', 'XYZ789']
+  });
+  targetSocket.joinedRooms.add('global');
+  const beforeUser = structuredClone(setup.UserModel.rows.find(user => user.username === 'TargetUser'));
+  const beforeSession = structuredClone(setup.onlineUsersMap.get(targetSocket.id));
+  const beforeTargetEvents = [...targetSocket.outbound];
+  const beforeIoEvents = [...setup.ioInstance.outbound];
+  setup.ioInstance.fetchSockets = async () => { throw new Error('adapter unavailable'); };
+
+  const ack = acknowledge();
+  await setup.socket.trigger('moderate_user', {
+    serverCode: 'global', targetUser: 'TargetUser', action: 'ban',
+    reason: 'discovery must preflight durable mutation'
+  }, ack.callback);
+
+  assert.deepEqual(ack.value(), { error: 'Moderation failed.' });
+  assert.deepEqual(setup.UserModel.rows.find(user => user.username === 'TargetUser'), beforeUser);
+  assert.deepEqual(setup.RoomRestrictionModel.rows, []);
+  assert.deepEqual(setup.ModerationAuditModel.rows, []);
+  assert.deepEqual(setup.onlineUsersMap.get(targetSocket.id), beforeSession);
+  assert.equal(targetSocket.serverCode, 'global');
+  assert.deepEqual(targetSocket.joinedServers, ['global', 'ABC123', 'XYZ789']);
+  assert.deepEqual(targetSocket.bannedRooms, []);
+  assert.equal(targetSocket.joinedRooms.has('global'), true);
+  assert.deepEqual(targetSocket.outbound, beforeTargetEvents);
+  assert.deepEqual(setup.ioInstance.outbound, beforeIoEvents);
+});
+
+test('room deletion serializes a concurrent Global ban and cannot restore stale Global access', async () => {
+  const setup = moderationScenario({ room: 'global', actor: 'admin', action: 'ban' });
+  const deleteStarted = deferred();
+  const releaseDelete = deferred();
+  const banWriteStarted = deferred();
+  const originalRestrictionUpdate = setup.RoomRestrictionModel.findOneAndUpdate.bind(setup.RoomRestrictionModel);
+  setup.RoomRestrictionModel.findOneAndUpdate = async (query, update, options) => {
+    if (query.serverCode === 'global' && update?.$set?.bannedAt) banWriteStarted.resolve();
+    return originalRestrictionUpdate(query, update, options);
+  };
+  setup.ChatServerModel.deleteOne = async query => {
+    deleteStarted.resolve();
+    await releaseDelete.promise;
+    const index = setup.ChatServerModel.rows.findIndex(room => room.code === query.code);
+    if (index >= 0) setup.ChatServerModel.rows.splice(index, 1);
+  };
+  setup.UserModel.updateMany = async (_query, update) => {
+    const removedRoom = update?.$pull?.servers;
+    for (const user of setup.UserModel.rows) {
+      user.servers = (Array.isArray(user.servers) ? user.servers : []).filter(code => code !== removedRoom);
+    }
+  };
+  setup.MessageModel.deleteMany = async () => {};
+
+  const targetSocket = connectAdditionalSocket(setup, {
+    id: 'target-delete-global-ban', username: 'TargetUser', serverCode: 'ABC123',
+    joinedServers: ['global', 'ABC123', 'XYZ789']
+  });
+  targetSocket.joinedRooms.add('global');
+  setup.onlineUsersMap.set('target-delete-global-ban-map', {
+    username: 'targetuser', role: 'user', serverCode: 'ABC123',
+    joinedServers: ['global', 'ABC123', 'XYZ789'], bannedRooms: []
+  });
+
+  const deleteAck = acknowledge();
+  const deletePending = setup.socket.trigger('delete_server', 'ABC123', deleteAck.callback);
+  await deleteStarted.promise;
+
+  const banAck = acknowledge();
+  const banPending = setup.socket.trigger('moderate_user', {
+    serverCode: 'global', targetUser: 'TargetUser', action: 'ban',
+    reason: 'concurrent deletion cannot restore access'
+  }, banAck.callback);
+  const banWroteBeforeDeleteReleased = await Promise.race([
+    banWriteStarted.promise.then(() => true),
+    new Promise(resolve => setImmediate(() => resolve(false)))
+  ]);
+  releaseDelete.resolve();
+  await Promise.all([deletePending, banPending]);
+
+  assert.equal(banWroteBeforeDeleteReleased, false);
+  assert.deepEqual(deleteAck.value(), { success: true });
+  assert.deepEqual(banAck.value(), { success: true });
+  assert.deepEqual(setup.UserModel.rows.find(user => user.username === 'TargetUser').servers, ['global', 'XYZ789']);
+  assert.equal(setup.RoomRestrictionModel.rows.some(row => row.serverCode === 'global' && row.bannedAt), true);
+  assert.equal(targetSocket.serverCode, 'XYZ789');
+  assert.deepEqual(targetSocket.joinedServers, ['XYZ789']);
+  assert.deepEqual(targetSocket.bannedRooms, ['global']);
+  assert.equal(targetSocket.joinedRooms.has('ABC123'), false);
+  assert.equal(targetSocket.joinedRooms.has('global'), false);
+  assert.equal(targetSocket.joinedRooms.has('XYZ789'), true);
+  assert.equal(setup.onlineUsersMap.get('target-delete-global-ban-map').serverCode, 'XYZ789');
+  assert.deepEqual(setup.onlineUsersMap.get('target-delete-global-ban-map').joinedServers, ['XYZ789']);
+  assert.deepEqual(setup.onlineUsersMap.get('target-delete-global-ban-map').bannedRooms, ['global']);
+});
+
 test('Global ban reconciliation never inserts Global implicitly for private or null fallback', () => {
   const live = {
     serverCode: 'global', joinedServers: ['global', 'ABC123'], bannedRooms: [],

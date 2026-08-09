@@ -736,11 +736,13 @@ function createConnectionHandler({
     joinedServers,
     bannedRooms = [],
     removedRoom = null,
+    removedRooms = null,
     fallbackCode = null,
     notifyAccess = true
   }) {
     const authoritativeMemberships = [...new Set(Array.isArray(joinedServers) ? joinedServers : [])];
     const activeBannedRooms = [...new Set(Array.isArray(bannedRooms) ? bannedRooms : [])];
+    const removedRoomSet = new Set(Array.isArray(removedRooms) ? removedRooms.filter(Boolean) : []);
     const normalizedUsername = normalizeAccountKey(username);
     const accountSockets = [];
 
@@ -749,43 +751,47 @@ function createConnectionHandler({
       const liveUsername = normalizeAccountKey(live.username || session?.username);
       if (liveUsername !== normalizedUsername) continue;
       const activeRoom = live.serverCode ?? session?.serverCode ?? null;
+      const effectiveRemovedRoom = removedRoom || (removedRoomSet.has(activeRoom) ? activeRoom : null);
       applySessionAccessSnapshot({
         live,
         session,
         joinedServers: authoritativeMemberships,
         bannedRooms: activeBannedRooms,
-        removedRoom,
+        removedRoom: effectiveRemovedRoom,
         fallbackCode
       });
-      accountSockets.push({ live, session, activeRoom, quarantined: false });
+      accountSockets.push({
+        live, session, activeRoom, removedRoom: effectiveRemovedRoom, quarantined: false
+      });
     }
 
     const liveSessionIds = new Set(accountSockets.map(({ live }) => live.id));
     for (const [id, session] of onlineUsersMap.entries()) {
       if (liveSessionIds.has(id) || normalizeAccountKey(session?.username) !== normalizedUsername) continue;
+      const activeRoom = session?.serverCode ?? null;
       applySessionAccessSnapshot({
         session,
         joinedServers: authoritativeMemberships,
         bannedRooms: activeBannedRooms,
-        removedRoom,
+        removedRoom: removedRoom || (removedRoomSet.has(activeRoom) ? activeRoom : null),
         fallbackCode
       });
     }
 
     let transportSynchronized = true;
     for (const record of accountSockets) {
-      const { live, session, activeRoom } = record;
-      if (removedRoom) {
+      const { live, session, activeRoom, removedRoom: recordRemovedRoom } = record;
+      if (recordRemovedRoom) {
         try {
-          await Promise.resolve(live.leave(removedRoom));
-          if (activeRoom === removedRoom && fallbackCode) {
+          await Promise.resolve(live.leave(recordRemovedRoom));
+          if (activeRoom === recordRemovedRoom && fallbackCode) {
             await Promise.resolve(live.join(fallbackCode));
           }
         } catch (err) {
           transportSynchronized = false;
           record.quarantined = true;
           logUnexpectedError(logger, 'room_transport_eviction', err);
-          await quarantineLiveSocket(live, session, [removedRoom, fallbackCode]);
+          await quarantineLiveSocket(live, session, [recordRemovedRoom, fallbackCode]);
         }
       }
 
@@ -1258,36 +1264,16 @@ function createConnectionHandler({
                   }
                 }
 
-                let roleSyncFailed = false;
-                if (invalidActiveRooms.size === 0) {
-                  const reconciliation = await reconcileAccountSessions({
-                    sockets,
-                    username: targetUserDoc.username,
-                    joinedServers: access.authoritativeMemberships,
-                    bannedRooms: access.activeBannedRooms,
-                    fallbackCode: null,
-                    notifyAccess: false
-                  });
-                  roleSyncFailed = !reconciliation.transportSynchronized;
-                } else {
-                  for (const removedRoom of invalidActiveRooms) {
-                    const affectedRoomSockets = sockets.filter(live => {
-                      const session = onlineUsersMap.get(live.id);
-                      return normalizeAccountKey(live.username || session?.username) === normalizedTarget &&
-                        (live.serverCode ?? session?.serverCode ?? null) === removedRoom;
-                    });
-                    const reconciliation = await reconcileAccountSessions({
-                      sockets: affectedRoomSockets,
-                      username: targetUserDoc.username,
-                      joinedServers: access.authoritativeMemberships,
-                      bannedRooms: access.activeBannedRooms,
-                      removedRoom,
-                      fallbackCode: access.fallbackCode,
-                      notifyAccess: false
-                    });
-                    roleSyncFailed = !reconciliation.transportSynchronized || roleSyncFailed;
-                  }
-                }
+                const reconciliation = await reconcileAccountSessions({
+                  sockets,
+                  username: targetUserDoc.username,
+                  joinedServers: access.authoritativeMemberships,
+                  bannedRooms: access.activeBannedRooms,
+                  removedRooms: [...invalidActiveRooms],
+                  fallbackCode: invalidActiveRooms.size > 0 ? access.fallbackCode : null,
+                  notifyAccess: false
+                });
+                let roleSyncFailed = !reconciliation.transportSynchronized;
 
                 for (const { live, session } of targetSockets) {
                   if (!live.username) continue;
@@ -1320,20 +1306,28 @@ function createConnectionHandler({
         if (!serverCode || serverCode === 'global') return callback({ error: 'Invalid input format.' });
         const result = await withAccountTransitionLocks([socket.username, targetUser], () =>
           withRoomMutationLock(serverCode, async () => {
-            const [actorUser, targetUserDoc, srv] = await Promise.all([
+            const [actorUser, targetUserDoc, srv, actorRestriction] = await Promise.all([
               findUserByUsername(UserModel, socket.username),
               findUserByUsername(UserModel, targetUser),
-              ChatServerModel.findOne({ code: serverCode })
+              ChatServerModel.findOne({ code: serverCode }),
+              RoomRestrictionModel.findOne({
+                serverCode,
+                username: normalizeAccountKey(socket.username)
+              })
             ]);
             if (!targetUserDoc) return { error: 'User not found.' };
             if (!srv) return { error: 'Server not found.' };
             const isGlobalAdmin = actorUser?.role === 'admin';
             const isRoomMod = isCurrentRoomModerator(srv, actorUser?.username);
             const isCurrentMember = Array.isArray(actorUser?.servers) && actorUser.servers.includes(serverCode);
+            const actorRestrictionState = activeRestrictionState(actorRestriction);
             const targetDisp = targetUserDoc.displayName || targetUserDoc.username;
 
             if (action === 'promote_mod') {
-              if (!isGlobalAdmin && (!isRoomMod || !isCurrentMember)) return { error: 'Permission denied.' };
+              if (!isGlobalAdmin && (!isRoomMod || !isCurrentMember ||
+                  actorRestrictionState.banned || actorRestrictionState.timedOut)) {
+                return { error: 'Permission denied.' };
+              }
               if (!Array.isArray(targetUserDoc.servers) || !targetUserDoc.servers.includes(serverCode)) {
                 return { error: 'Target user is not a room member.' };
               }
@@ -1430,6 +1424,7 @@ function createConnectionHandler({
           if (action === 'clear_timeout' && !currentState.timedOut) return { error: 'Permission denied.' };
           if (action === 'unban' && !currentState.banned) return { error: 'Permission denied.' };
 
+          const liveSockets = await fetchLiveSockets();
           const now = new Date();
           let expiresAt = null;
           let updatedRestriction = restriction;
@@ -1483,7 +1478,6 @@ function createConnectionHandler({
 
           const access = await loadAccountSessionAccess(targetUser);
           const removedRoom = action === 'kick' || action === 'ban' ? serverCode : null;
-          const liveSockets = await fetchLiveSockets();
           const reconciliation = await reconcileRestrictedAccount({
             username: targetUser.username,
             removedRoom,
@@ -1714,11 +1708,7 @@ function createConnectionHandler({
     if (!serverCode) return callback({ error: 'Invalid input format.' });
     if (serverCode === 'global') return callback({ error: 'Cannot delete global.' });
     try {
-      const result = await withRoomMutationLock(serverCode, async () => {
-        const currentRoom = await ChatServerModel.findOne({ code: serverCode });
-        if (!currentRoom) return { error: 'Server not found.' };
-        if (socket.role !== 'admin' && currentRoom.owner !== socket.username) return { error: 'Permission denied.' };
-
+      const result = await withIdentityMutationLock(async () => {
         const sockets = await fetchLiveSockets();
         const sessionUsernames = new Map();
         for (const live of sockets) {
@@ -1731,6 +1721,12 @@ function createConnectionHandler({
           const key = normalizeAccountKey(session?.username);
           if (key && !sessionUsernames.has(key)) sessionUsernames.set(key, session.username);
         }
+        return withAccountTransitionLocks([...sessionUsernames.values()], () =>
+          withRoomMutationLock(serverCode, async () => {
+        const currentRoom = await ChatServerModel.findOne({ code: serverCode });
+        if (!currentRoom) return { error: 'Server not found.' };
+        if (socket.role !== 'admin' && currentRoom.owner !== socket.username) return { error: 'Permission denied.' };
+
         const freshAccessByAccount = new Map();
         if (typeof UserModel.findOne === 'function') {
           for (const [key, username] of sessionUsernames.entries()) {
@@ -1878,6 +1874,8 @@ function createConnectionHandler({
         }
         broadcastOnlineUsersFn('global');
         return cleanupFailed ? { error: 'Deletion failed.' } : { success: true };
+          })
+        );
       });
       callback(result);
     } catch (err) {

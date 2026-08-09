@@ -996,12 +996,12 @@ test('failed target join cannot restore a concurrently deleted source room', asy
   await targetJoinStarted.promise;
 
   const deleteAck = acknowledge();
-  await deleter.trigger('delete_server', 'OLD123', deleteAck.callback);
+  const deletePending = deleter.trigger('delete_server', 'OLD123', deleteAck.callback);
+  await Promise.resolve();
+  releaseTargetJoin.resolve();
+  await Promise.all([switchPending, deletePending]);
   assert.deepEqual(deleteAck.value(), { success: true });
   assert.equal(rooms.has('OLD123'), false);
-
-  releaseTargetJoin.resolve();
-  await switchPending;
 
   assert.deepEqual(switchAck.value(), { error: 'Failed to switch server.' });
   assert.equal(switcher.disconnected, true);
@@ -1729,7 +1729,7 @@ test('room deletion serializes against an in-flight membership join', async () =
   assert.deepEqual(deleteAck.value(), { success: true });
 });
 
-test('deletion snapshots after a queued switch commits', async () => {
+test('deletion preflights sockets then waits for a queued switch account commit', async () => {
   const mutationEntered = deferred();
   const historyEntered = deferred();
   const historyPrepared = deferred();
@@ -1844,7 +1844,7 @@ test('deletion snapshots after a queued switch commits', async () => {
   const fetchIndex = order.indexOf('delete:fetchSockets');
   assert.notEqual(joinIndex, -1);
   assert.notEqual(fetchIndex, -1);
-  assert.ok(joinIndex < fetchIndex);
+  assert.ok(fetchIndex < joinIndex);
   assert.deepEqual(switchAck.value(), {
     history: [], roomRole: 'user',
     restriction: { banned: false, timedOut: false, timeoutUntil: null }
@@ -2039,7 +2039,7 @@ test('global-admin demotion evicts every ghost-viewing session before acknowledg
   }
 });
 
-test('global-admin demotion updates every session role before awaiting transport eviction', async () => {
+test('global-admin demotion stages every session role and fallback before awaiting transport eviction', async () => {
   const firstLeaveStarted = deferred();
   const releaseFirstLeave = deferred();
   const target = {
@@ -2087,10 +2087,18 @@ test('global-admin demotion updates every session role before awaiting transport
     targetUser: 'bob', action: 'demote_global_admin'
   }, ack.callback);
   await firstLeaveStarted.promise;
-  assert.equal(second.role, 'user');
-  assert.equal(onlineUsersMap.get(second.id).role, 'user');
+  const stagedBeforeTransport = {
+    liveRole: second.role,
+    liveServerCode: second.serverCode,
+    sessionRole: onlineUsersMap.get(second.id).role,
+    sessionServerCode: onlineUsersMap.get(second.id).serverCode
+  };
   releaseFirstLeave.resolve();
   await pending;
+  assert.deepEqual(stagedBeforeTransport, {
+    liveRole: 'user', liveServerCode: 'global',
+    sessionRole: 'user', sessionServerCode: 'global'
+  });
   assert.deepEqual(ack.value(), { success: true });
 });
 
@@ -2268,6 +2276,50 @@ test('a stale nonmember moderator cannot promote a current room member', async (
   socket.displayName = 'Alice';
   socket.role = 'user';
   socket.joinedServers = ['global'];
+
+  const ack = acknowledge();
+  await socket.trigger('manage_role', {
+    targetUser: 'bob', action: 'promote_mod', serverCode: 'ABC123'
+  }, ack.callback);
+
+  assert.deepEqual(ack.value(), { error: 'Permission denied.' });
+  assert.deepEqual(room.moderators, ['alice']);
+  assert.equal(roomWrites, 0);
+});
+
+test('a timed-out room moderator cannot promote a current room member', async () => {
+  let roomWrites = 0;
+  const users = {
+    alice: { username: 'alice', displayName: 'Alice', role: 'user', servers: ['global', 'ABC123'] },
+    bob: { username: 'bob', displayName: 'Bob', role: 'user', servers: ['global', 'ABC123'] }
+  };
+  const room = {
+    code: 'ABC123', owner: 'owner', moderators: ['alice'],
+    async save() { roomWrites += 1; }
+  };
+  const { socket } = register({
+    UserModel: {
+      async findOne(query) {
+        const matcher = query.username && query.username.$regex;
+        if (matcher) return Object.values(users).find(user => matcher.test(user.username));
+        return users[query.username];
+      }
+    },
+    ChatServerModel: { async findOne() { return room; } },
+    RoomRestrictionModel: {
+      async findOne(query) {
+        return query.username === 'alice'
+          ? { serverCode: 'ABC123', username: 'alice', timeoutUntil: new Date(Date.now() + 60_000) }
+          : null;
+      },
+      async find() { return []; }
+    }
+  });
+  socket.username = 'alice';
+  socket.displayName = 'Alice';
+  socket.role = 'user';
+  socket.serverCode = 'ABC123';
+  socket.joinedServers = ['global', 'ABC123'];
 
   const ack = acknowledge();
   await socket.trigger('manage_role', {
