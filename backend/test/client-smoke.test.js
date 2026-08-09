@@ -42,6 +42,61 @@ function loadHelpers() {
   });
 }
 
+function loadClientFunction(name, values = {}) {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  const plainStart = source.indexOf(`function ${name}(`);
+  const asyncStart = source.indexOf(`async function ${name}(`);
+  const start = plainStart === -1 ? asyncStart :
+    (asyncStart === -1 ? plainStart : Math.min(plainStart, asyncStart));
+  assert.notEqual(start, -1, `missing production function ${name}`);
+
+  for (let end = source.indexOf('}', start); end !== -1; end = source.indexOf('}', end + 1)) {
+    const candidate = source.slice(start, end + 1);
+    const context = vm.createContext({ ...values });
+    try {
+      vm.runInContext(`globalThis.__clientFunction = (${candidate});`, context, {
+        filename: `${name}.js`
+      });
+      return { fn: context.__clientFunction, context };
+    } catch (error) {
+      if (!(error instanceof SyntaxError) && error?.name !== 'SyntaxError') throw error;
+    }
+  }
+  assert.fail(`could not compile production function ${name}`);
+}
+
+function createClientElement() {
+  const classes = new Set();
+  return {
+    children: [],
+    style: {},
+    hidden: false,
+    disabled: false,
+    textContent: '',
+    classList: {
+      add(...names) { names.forEach(name => classes.add(name)); },
+      remove(...names) { names.forEach(name => classes.delete(name)); },
+      contains(name) { return classes.has(name); }
+    },
+    appendChild(child) { this.children.push(child); return child; },
+    remove() {},
+    setAttribute() {},
+    querySelector() { return null; },
+    querySelectorAll() { return []; }
+  };
+}
+
+function createClientDocument() {
+  const elements = new Map();
+  return {
+    getElementById(id) {
+      if (!elements.has(id)) elements.set(id, createClientElement());
+      return elements.get(id);
+    },
+    querySelectorAll() { return []; }
+  };
+}
+
 test('new users receive the deployed Render backend URL by default', () => {
   const source = fs.readFileSync(chatPath, 'utf8');
   assert.match(
@@ -151,6 +206,353 @@ test('scroll coordinator makes smooth requests instant for reduced motion', () =
   frames.shift()();
 
   assert.deepEqual({ ...calls[0] }, { top: 900, behavior: 'auto' });
+});
+
+test('message read coordinator rejects stale room and older-page acknowledgements', () => {
+  const helpers = loadHelpers();
+  const pending = [];
+  const coordinator = helpers.createMessageReadCoordinator({
+    onOlderPendingChange(value) { pending.push(value); }
+  });
+
+  coordinator.activate('ABC123', 4, 'cursor-a');
+  const token = coordinator.beginOlder();
+  assert.ok(token);
+  assert.equal(Object.isFrozen(token), true);
+  assert.equal(coordinator.beginOlder(), null, 'only one older page may be pending');
+  coordinator.activate('XYZ789', 5, 'cursor-b');
+  const currentToken = coordinator.beginOlder();
+
+  assert.equal(coordinator.finishOlder(token, {
+    serverCode: 'ABC123', clientContextId: 4, messages: [], nextCursor: null
+  }), null);
+  assert.deepEqual({ ...coordinator.current() }, {
+    epoch: 2,
+    roomCode: 'XYZ789',
+    clientContextId: 5,
+    nextCursor: 'cursor-b',
+    olderPending: true
+  });
+  assert.equal(pending.at(-1), true, 'a stale acknowledgement cannot enable a newer request');
+  assert.ok(coordinator.finishOlder(currentToken, {
+    serverCode: 'XYZ789', clientContextId: 5, messages: [], nextCursor: null
+  }));
+  assert.deepEqual(pending, [false, true, false, true, false]);
+});
+
+test('message read coordinator replaces cursors only for accepted older pages', () => {
+  const helpers = loadHelpers();
+  const olderPending = [];
+  const searchPending = [];
+  const coordinator = helpers.createMessageReadCoordinator({
+    onOlderPendingChange(value) { olderPending.push(value); },
+    onSearchPendingChange(value) { searchPending.push(value); }
+  });
+
+  coordinator.activate('ABC123', 7, 'cursor-a');
+  const wrongEcho = coordinator.beginOlder();
+  assert.equal(coordinator.finishOlder(wrongEcho, {
+    serverCode: 'XYZ789', clientContextId: 7, messages: [], nextCursor: 'wrong-cursor'
+  }), null);
+  assert.equal(coordinator.current().nextCursor, 'cursor-a');
+  assert.equal(coordinator.current().olderPending, false, 'a current malformed ack releases its control');
+
+  const acceptedToken = coordinator.beginOlder();
+  const accepted = coordinator.finishOlder(acceptedToken, {
+    serverCode: 'ABC123', clientContextId: 7,
+    messages: [{ _id: '1' }], nextCursor: 'cursor-b'
+  });
+  assert.deepEqual(structuredClone(accepted), {
+    serverCode: 'ABC123', clientContextId: 7,
+    messages: [{ _id: '1' }], nextCursor: 'cursor-b'
+  });
+  assert.equal(coordinator.current().nextCursor, 'cursor-b');
+
+  const terminalToken = coordinator.beginOlder();
+  assert.ok(coordinator.finishOlder(terminalToken, {
+    serverCode: 'ABC123', clientContextId: 7, messages: [], nextCursor: null
+  }));
+  assert.equal(coordinator.current().nextCursor, null);
+  assert.equal(coordinator.beginOlder(), null, 'terminal pages cannot be requested again');
+
+  coordinator.activate('ABC123', 8, 'cursor-c');
+  coordinator.beginOlder();
+  coordinator.invalidate();
+  assert.deepEqual({ ...coordinator.current() }, {
+    epoch: 3,
+    roomCode: null,
+    clientContextId: null,
+    nextCursor: null,
+    olderPending: false
+  });
+  assert.equal(olderPending.at(-1), false, 'lost older acknowledgement is reset');
+  assert.equal(searchPending.at(-1), false, 'full invalidation resets search controls too');
+});
+
+test('prepend scroll preserves the visible anchor and history rows deduplicate', () => {
+  const helpers = loadHelpers();
+  assert.equal(helpers.prependScrollTop({
+    oldScrollHeight: 800, oldScrollTop: 120, newScrollHeight: 1100
+  }), 420);
+  assert.deepEqual(
+    structuredClone(helpers.uniqueMessages(
+      new Set(['2']),
+      [{ _id: '1' }, { _id: '2' }, { _id: '1' }, { _id: null }]
+    )),
+    [{ _id: '1' }]
+  );
+});
+
+test('older message request sends its frozen room context and ignores stale acknowledgements', () => {
+  const helpers = loadHelpers();
+  const calls = [];
+  const applied = [];
+  const socket = {
+    emit(event, payload, callback) { calls.push({ event, payload, callback }); }
+  };
+  const coordinator = helpers.createMessageReadCoordinator();
+  coordinator.activate('ABC123', 11, 'cursor-a');
+
+  assert.equal(helpers.requestOlderMessages({
+    coordinator, socket, onAccepted: response => applied.push(structuredClone(response))
+  }), true);
+  assert.deepEqual(structuredClone(calls[0].payload), {
+    serverCode: 'ABC123', clientContextId: 11, cursor: 'cursor-a'
+  });
+  assert.equal(calls[0].event, 'list_messages');
+
+  coordinator.activate('XYZ789', 12, 'cursor-b');
+  calls[0].callback({
+    serverCode: 'ABC123', clientContextId: 11,
+    messages: [{ _id: 'old-room' }], nextCursor: null
+  });
+  assert.deepEqual(applied, []);
+  assert.equal(coordinator.current().nextCursor, 'cursor-b');
+});
+
+test('older message control is hidden without a cursor and disabled only while pending', () => {
+  const helpers = loadHelpers();
+  const control = { hidden: false, disabled: false };
+
+  helpers.applyOlderControlState(control, {
+    roomCode: null, nextCursor: null, olderPending: false
+  });
+  assert.deepEqual(control, { hidden: true, disabled: false });
+
+  helpers.applyOlderControlState(control, {
+    roomCode: 'ABC123', nextCursor: 'cursor-a', olderPending: true
+  });
+  assert.deepEqual(control, { hidden: false, disabled: true });
+});
+
+test('older message page prepends chronological unique rows and preserves its DOM anchor', () => {
+  const helpers = loadHelpers();
+  const historyControls = { id: 'history-controls' };
+  const existing = {
+    id: '2',
+    getAttribute(name) { return name === 'data-id' ? this.id : null; }
+  };
+  const children = [historyControls, existing];
+  const chatWindow = {
+    scrollHeight: 800,
+    scrollTop: 120,
+    querySelectorAll() { return children.slice(1); }
+  };
+  Object.defineProperty(historyControls, 'nextSibling', {
+    get() { return children[children.indexOf(historyControls) + 1] || null; }
+  });
+
+  const rendered = helpers.prependMessagePage({
+    chatWindow,
+    historyControls,
+    messages: [{ _id: '0' }, { _id: '1' }, { _id: '2' }],
+    renderMessage(message, anchor) {
+      const index = anchor ? children.indexOf(anchor) : children.length;
+      children.splice(index, 0, {
+        id: message._id,
+        getAttribute(name) { return name === 'data-id' ? this.id : null; }
+      });
+      chatWindow.scrollHeight += 150;
+    },
+    afterRender() {
+      chatWindow.scrollHeight -= 40;
+    }
+  });
+
+  assert.deepEqual(structuredClone(rendered).map(message => message._id), ['0', '1']);
+  assert.deepEqual(children.slice(1).map(row => row.id), ['0', '1', '2']);
+  assert.equal(chatWindow.scrollTop, 380, 'terminal control removal is included in the anchor correction');
+});
+
+test('initial message history renders without motion and requests one bottom scroll', () => {
+  const helpers = loadHelpers();
+  const rendered = [];
+  const scrolls = [];
+
+  helpers.renderInitialMessagePage({
+    messages: [{ _id: '1' }, { _id: '2' }],
+    renderMessage(message, options) { rendered.push({ id: message._id, ...options }); },
+    requestScroll(behavior) { scrolls.push(behavior); }
+  });
+
+  assert.deepEqual(rendered, [
+    { id: '1', history: true },
+    { id: '2', history: true }
+  ]);
+  assert.deepEqual(scrolls, ['auto']);
+});
+
+test('current-user room access fallback invalidates reads on membership loss', () => {
+  const helpers = loadHelpers();
+  const calls = [];
+
+  assert.equal(helpers.syncCurrentUserRoomAccess({
+    roomUsers: [{ username: 'Alice', roomRole: 'mod' }],
+    username: 'Alice',
+    globalRole: 'user',
+    applyRole: role => calls.push(`role:${role}`),
+    onAccessLoss: () => calls.push('lost')
+  }), true);
+  assert.deepEqual(calls, ['role:mod']);
+
+  assert.equal(helpers.syncCurrentUserRoomAccess({
+    roomUsers: [],
+    username: 'Alice',
+    globalRole: 'user',
+    applyRole: role => calls.push(`role:${role}`),
+    onAccessLoss: () => calls.push('lost')
+  }), false);
+  assert.deepEqual(calls, ['role:mod', 'lost', 'role:user']);
+
+  helpers.syncCurrentUserRoomAccess({
+    roomUsers: [],
+    username: 'Alice',
+    globalRole: 'admin',
+    applyRole: role => calls.push(`role:${role}`),
+    onAccessLoss: () => calls.push('admin-lost')
+  });
+  assert.equal(calls.includes('admin-lost'), false, 'admin ghost rooms do not imply access loss');
+});
+
+test('production message read lifecycle invalidates real lobby logout switch and socket paths', async () => {
+  const lobbyCalls = [];
+  const lobbyDocument = createClientDocument();
+  const lobby = loadClientFunction('enterLobby', {
+    currentServerCode: 'ABC123',
+    myRoomRole: 'mod',
+    typingTimeout: null,
+    typingUsers: new Map(),
+    document: lobbyDocument,
+    chatWindow: lobbyDocument.getElementById('chat-window'),
+    msgInput: createClientElement(),
+    sendBtn: createClientElement(),
+    attachmentButton: createClientElement(),
+    emojiButton: createClientElement(),
+    fileUpload: createClientElement(),
+    restrictionNotice: createClientElement(),
+    compositionDisabled: false,
+    invalidateMessageReads: () => lobbyCalls.push('reads'),
+    compositionContextCoordinator: { invalidate: () => lobbyCalls.push('composition') },
+    restrictionCoordinator: { clear() {} },
+    clearTimeout() {},
+    updateTypingUI() {},
+    clearRenderedMessages: () => lobbyCalls.push('clear'),
+    closeModeratorCenter() {},
+    closeModerationPrompt() {},
+    closeReportPrompt() {},
+    closeResolutionPrompt() {},
+    updateModeratorCenterAccess() {},
+    cancelAction() {},
+    ChatClientHelpers: { applyLobbyState() {} }
+  });
+  lobby.fn();
+  assert.deepEqual(lobbyCalls.slice(0, 3), ['reads', 'composition', 'clear']);
+
+  const logoutCalls = [];
+  const logout = loadClientFunction('logoutApp', {
+    showAppConfirm: async () => true,
+    invalidateMessageReads: () => logoutCalls.push('reads'),
+    localStorage: { removeItem: () => logoutCalls.push('storage') },
+    location: { reload: () => logoutCalls.push('reload') }
+  });
+  await logout.fn();
+  assert.deepEqual(logoutCalls, ['reads', 'storage', 'reload']);
+
+  const replacementCalls = [];
+  const oldSocket = { disconnect() { replacementCalls.push('disconnect'); } };
+  const newSocket = {};
+  const replacement = loadClientFunction('replaceClientSocket', {
+    socket: oldSocket,
+    socketUrl: 'https://old.test',
+    io: () => newSocket,
+    ChatClientHelpers: {
+      replaceSocket(socket) {
+        socket.disconnect();
+        return { socket: newSocket, socketUrl: 'https://new.test' };
+      }
+    },
+    invalidateMessageReads: () => replacementCalls.push('reads'),
+    compositionContextCoordinator: { invalidate: () => replacementCalls.push('composition') },
+    closeModerationPrompt() {},
+    closeReportPrompt() {},
+    invalidatePrivilegedAccess() {},
+    setupSocket: () => replacementCalls.push('setup')
+  });
+  replacement.fn('https://new.test');
+  assert.deepEqual(replacementCalls, ['disconnect', 'reads', 'composition', 'setup']);
+
+  const switchCalls = [];
+  const switchDocument = createClientDocument();
+  const switching = loadClientFunction('handleSwitchResult', {
+    currentServerCode: 'global',
+    serversCache: { ABC123: { name: 'Room', owner: 'Owner' } },
+    myRole: 'user',
+    myRoomRole: 'user',
+    myJoinedServers: ['global', 'ABC123'],
+    myUsername: 'Alice',
+    typingUsers: new Map(),
+    document: switchDocument,
+    showAppAlert() {},
+    invalidateMessageReads: () => switchCalls.push('invalidate'),
+    closeModeratorCenter() {},
+    closeModerationPrompt() {},
+    closeReportPrompt() {},
+    compositionContextCoordinator: {
+      activate: () => switchCalls.push('composition'),
+      current: () => ({ clientContextId: 9 })
+    },
+    messageReadCoordinator: {
+      activate: (...args) => switchCalls.push(['activate', ...args])
+    },
+    applyRestrictionState() {},
+    renderServerAccess() {},
+    updateModeratorCenterAccess() {},
+    updateTypingUI() {},
+    cancelAction() {},
+    loadHistory: (...args) => switchCalls.push(['history', ...args]),
+    renderOlderControl: () => switchCalls.push('control'),
+    ChatClientHelpers: {
+      applySwitchResult(options) {
+        options.applySuccess(options.targetServerCode, options.response);
+        return true;
+      },
+      appendTextElement(doc, parent) {
+        const child = createClientElement();
+        parent.appendChild(child);
+        return child;
+      }
+    }
+  });
+  switching.fn('ABC123', {
+    history: [{ _id: '1', username: 'Alice' }],
+    nextCursor: 'cursor-a', roomRole: 'user', restriction: null
+  });
+  assert.equal(switchCalls[0], 'invalidate');
+  assert.deepEqual(switchCalls[2], ['activate', 'ABC123', 9, 'cursor-a']);
+  assert.deepEqual(structuredClone(switchCalls[3]), [
+    'history', [{ _id: '1', username: 'Alice' }], { replace: true }
+  ]);
+  assert.equal(switchCalls[4], 'control');
 });
 
 test('backend URLs allow only HTTP and HTTPS', () => {

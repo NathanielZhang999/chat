@@ -97,6 +97,12 @@
         .header-btn.logout { display: block; }
 
         #chat-window { flex: 1; overflow-y: auto; padding: 1rem; display: flex; flex-direction: column; gap: 1rem; background: var(--surface); scroll-behavior: auto; }
+        .history-controls { display: flex; justify-content: center; flex: 0 0 auto; min-height: 0; }
+        .history-controls[hidden] { display: none; }
+        #load-older-messages { border: 1px solid var(--border); border-radius: 999px; padding: 5px 12px; background: var(--bg); color: var(--text); font: inherit; font-size: 0.78rem; font-weight: 600; cursor: pointer; }
+        #load-older-messages:hover:not(:disabled) { filter: brightness(1.12); }
+        #load-older-messages:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+        #load-older-messages:disabled { cursor: wait; opacity: 0.6; }
         
         /* --- SMOOTH MESSAGES & PING HIGHLIGHTS --- */
         @keyframes messageSlideIn {
@@ -568,7 +574,11 @@
             </div>
         </header>
         
-        <div id="chat-window"></div>
+        <div id="chat-window">
+            <div id="history-controls" class="history-controls" hidden>
+                <button type="button" id="load-older-messages" hidden>Load older messages</button>
+            </div>
+        </div>
         <div id="typing-indicator"></div>
         
         <div style="position: relative;">
@@ -635,6 +645,190 @@
                 socket: ioFactory(newUrl, { reconnectionAttempts: Infinity }),
                 socketUrl: newUrl
             };
+        },
+
+        createMessageReadCoordinator({
+            onOlderPendingChange = () => {},
+            onSearchPendingChange = () => {}
+        } = {}) {
+            let epoch = 0;
+            let roomCode = null;
+            let clientContextId = null;
+            let nextCursor = null;
+            let pendingOlderToken = null;
+            let nextOlderRequestId = 0;
+
+            const resetPending = () => {
+                pendingOlderToken = null;
+                onOlderPendingChange(false);
+                onSearchPendingChange(false);
+            };
+
+            return {
+                activate(nextRoomCode, nextClientContextId, cursor = null) {
+                    epoch += 1;
+                    resetPending();
+                    roomCode = typeof nextRoomCode === 'string' && nextRoomCode
+                        ? nextRoomCode
+                        : null;
+                    clientContextId = Number.isSafeInteger(nextClientContextId) && nextClientContextId > 0
+                        ? nextClientContextId
+                        : null;
+                    nextCursor = typeof cursor === 'string' && cursor ? cursor : null;
+                    if (!roomCode || clientContextId === null) {
+                        roomCode = null;
+                        clientContextId = null;
+                        nextCursor = null;
+                    }
+                    return this.current();
+                },
+                invalidate() {
+                    epoch += 1;
+                    resetPending();
+                    roomCode = null;
+                    clientContextId = null;
+                    nextCursor = null;
+                    return epoch;
+                },
+                beginOlder() {
+                    if (!roomCode || clientContextId === null || !nextCursor || pendingOlderToken) {
+                        return null;
+                    }
+                    const token = Object.freeze({
+                        epoch,
+                        roomCode,
+                        clientContextId,
+                        cursor: nextCursor,
+                        requestId: ++nextOlderRequestId
+                    });
+                    pendingOlderToken = token;
+                    onOlderPendingChange(true);
+                    return token;
+                },
+                finishOlder(token, response) {
+                    const isCurrentRequest = Boolean(token && pendingOlderToken &&
+                        token === pendingOlderToken && token.epoch === epoch &&
+                        token.roomCode === roomCode && token.clientContextId === clientContextId);
+                    if (!isCurrentRequest) return null;
+
+                    pendingOlderToken = null;
+                    onOlderPendingChange(false);
+                    const accepted = Boolean(response && Array.isArray(response.messages) &&
+                        response.serverCode === roomCode &&
+                        response.clientContextId === clientContextId &&
+                        (response.nextCursor === null ||
+                            (typeof response.nextCursor === 'string' && response.nextCursor)));
+                    if (!accepted) return null;
+                    nextCursor = response.nextCursor;
+                    return response;
+                },
+                current() {
+                    return {
+                        epoch,
+                        roomCode,
+                        clientContextId,
+                        nextCursor,
+                        olderPending: Boolean(pendingOlderToken)
+                    };
+                }
+            };
+        },
+
+        requestOlderMessages({ coordinator, socket, onAccepted = () => {} } = {}) {
+            if (!coordinator || !socket || typeof socket.emit !== 'function') return false;
+            const token = coordinator.beginOlder();
+            if (!token) return false;
+            socket.emit('list_messages', {
+                serverCode: token.roomCode,
+                clientContextId: token.clientContextId,
+                cursor: token.cursor
+            }, response => {
+                const accepted = coordinator.finishOlder(token, response);
+                if (!accepted) return;
+                onAccepted(accepted);
+            });
+            return true;
+        },
+
+        prependScrollTop({ oldScrollHeight, oldScrollTop, newScrollHeight } = {}) {
+            const beforeHeight = Number(oldScrollHeight) || 0;
+            const beforeTop = Number(oldScrollTop) || 0;
+            const afterHeight = Number(newScrollHeight) || 0;
+            return Math.max(0, beforeTop + afterHeight - beforeHeight);
+        },
+
+        uniqueMessages(existingIds, messages) {
+            const seen = new Set(existingIds && typeof existingIds[Symbol.iterator] === 'function'
+                ? existingIds
+                : []);
+            if (!Array.isArray(messages)) return [];
+            return messages.filter(message => {
+                if (!message || message._id == null) return false;
+                const id = String(message._id);
+                if (!id || seen.has(id)) return false;
+                seen.add(id);
+                return true;
+            });
+        },
+
+        prependMessagePage({
+            chatWindow,
+            historyControls,
+            messages,
+            renderMessage,
+            afterRender = () => {}
+        } = {}) {
+            if (!chatWindow || !historyControls || typeof renderMessage !== 'function') return [];
+            const oldScrollHeight = chatWindow.scrollHeight;
+            const oldScrollTop = chatWindow.scrollTop;
+            const existingIds = new Set(
+                [...chatWindow.querySelectorAll('.msg[data-id]')]
+                    .map(row => row.getAttribute('data-id'))
+                    .filter(Boolean)
+            );
+            const unique = this.uniqueMessages(existingIds, messages);
+            const anchor = historyControls.nextSibling;
+            unique.forEach(message => renderMessage(message, anchor));
+            afterRender();
+            chatWindow.scrollTop = this.prependScrollTop({
+                oldScrollHeight,
+                oldScrollTop,
+                newScrollHeight: chatWindow.scrollHeight
+            });
+            return unique;
+        },
+
+        renderInitialMessagePage({ messages, renderMessage, requestScroll } = {}) {
+            const history = Array.isArray(messages) ? messages : [];
+            if (typeof renderMessage === 'function') {
+                history.forEach(message => renderMessage(message, { history: true }));
+            }
+            if (typeof requestScroll === 'function') requestScroll('auto');
+        },
+
+        syncCurrentUserRoomAccess({
+            roomUsers,
+            username,
+            globalRole,
+            applyRole = () => {},
+            onAccessLoss = () => {}
+        } = {}) {
+            const users = Array.isArray(roomUsers) ? roomUsers : [];
+            const currentUser = users.find(user => user && user.username === username);
+            if (currentUser) {
+                applyRole(currentUser.roomRole || 'user');
+                return true;
+            }
+            if (globalRole === 'admin') return true;
+            onAccessLoss();
+            applyRole('user');
+            return false;
+        },
+
+        applyOlderControlState(control, { roomCode, nextCursor, olderPending } = {}) {
+            if (!control) return;
+            control.hidden = !(roomCode && nextCursor);
+            control.disabled = Boolean(olderPending);
         },
 
         createDialogRequestCoordinator({ onPendingChange = () => {} } = {}) {
@@ -1409,6 +1603,11 @@
     const authBtn = document.getElementById('auth-btn');
     const authError = document.getElementById('auth-error');
     const chatWindow = document.getElementById('chat-window');
+    const historyControls = document.getElementById('history-controls');
+    const loadOlderButton = document.getElementById('load-older-messages');
+    const messageReadCoordinator = ChatClientHelpers.createMessageReadCoordinator({
+        onOlderPendingChange: pending => { loadOlderButton.disabled = pending; }
+    });
     const scheduleAnimationFrame = window.requestAnimationFrame
         ? callback => window.requestAnimationFrame(callback)
         : callback => setTimeout(callback, 0);
@@ -1493,7 +1692,27 @@
         }
     }
 
+    function renderOlderControl() {
+        ChatClientHelpers.applyOlderControlState(
+            loadOlderButton,
+            messageReadCoordinator.current()
+        );
+        historyControls.hidden = loadOlderButton.hidden;
+    }
+
+    function invalidateMessageReads() {
+        messageReadCoordinator.invalidate();
+        renderOlderControl();
+    }
+
+    function clearRenderedMessages() {
+        [...chatWindow.children].forEach(child => {
+            if (child !== historyControls) child.remove();
+        });
+    }
+
     function enterLobby() {
+        invalidateMessageReads();
         compositionContextCoordinator.invalidate();
         currentServerCode = null;
         myRoomRole = 'user';
@@ -1501,7 +1720,7 @@
         clearTimeout(typingTimeout);
         typingUsers.clear();
         updateTypingUI();
-        chatWindow.textContent = '';
+        clearRenderedMessages();
         document.getElementById('online-list').textContent = '';
         document.getElementById('online-header').textContent = 'No active room';
         document.getElementById('server-title').textContent = 'Lobby';
@@ -2279,8 +2498,25 @@
 
     async function logoutApp() {
         if (await showAppConfirm("Log Out", "Are you sure you want to log out of your account?", "Log Out", true)) {
+            invalidateMessageReads();
             localStorage.removeItem('pro_chat_user'); location.reload(); 
         }
+    }
+
+    function replaceClientSocket(url) {
+        const previousSocket = socket;
+        const replacement = ChatClientHelpers.replaceSocket(socket, socketUrl, url, io);
+        socket = replacement.socket;
+        socketUrl = replacement.socketUrl;
+        if (socket !== previousSocket) {
+            invalidateMessageReads();
+            compositionContextCoordinator.invalidate();
+            closeModerationPrompt();
+            closeReportPrompt();
+            invalidatePrivilegedAccess();
+            setupSocket(socket);
+        }
+        return socket;
     }
 
     // --- AUTHENTICATION ---
@@ -2301,18 +2537,7 @@
         
         authError.style.color = "var(--text)"; authError.textContent = "Connecting to server..."; authBtn.disabled = true;
 
-        const previousSocket = socket;
-        const replacement = ChatClientHelpers.replaceSocket(socket, socketUrl, url, io);
-        socket = replacement.socket;
-        socketUrl = replacement.socketUrl;
-        if (socket !== previousSocket) {
-            compositionContextCoordinator.invalidate();
-            closeModerationPrompt();
-            closeReportPrompt();
-            invalidatePrivilegedAccess();
-            setupSocket(socket);
-        }
-        const authSocket = socket;
+        const authSocket = replaceClientSocket(url);
 
         const action = isLoginMode ? 'login' : 'register';
         const payload = isLoginMode ? { username: user, password: pass } : { username: user, password: pass, displayName: dName };
@@ -2380,6 +2605,8 @@
         });
         
         activeSocket.on('force_logout', (msg) => {
+            invalidateMessageReads();
+            compositionContextCoordinator.invalidate();
             localStorage.removeItem('pro_chat_user'); alert(msg || "You have been logged out remotely."); location.reload(); 
         });
 
@@ -2403,7 +2630,10 @@
         activeSocket.on('global_role_updated', (data) => {
             if (data.username === myUsername) {
                 myRole = data.role;
-                if (data.role !== 'admin') invalidatePrivilegedAccess();
+                if (data.role !== 'admin') {
+                    invalidateMessageReads();
+                    invalidatePrivilegedAccess();
+                }
                 renderServerAccess();
                 showAppAlert(data.role === 'admin' ? "Promoted!" : "Demoted", `You have been ${data.role === 'admin' ? 'promoted to' : 'demoted from'} Global Admin!`);
                 if (currentServerCode) roomSwitchCoordinator.request(currentServerCode);
@@ -2414,6 +2644,7 @@
         activeSocket.on('room_role_updated', (data) => {
             if (data.username === myUsername && data.targetServer === currentServerCode) {
                 myRoomRole = 'user';
+                invalidateMessageReads();
                 invalidatePrivilegedAccess();
                 roomSwitchCoordinator.request(currentServerCode);
             }
@@ -2577,14 +2808,19 @@
             
             usersCache = {}; // Rebuild local lookup
 
-            const me = roomUsers.find(u => u.username === myUsername);
-            if (me) {
-                myRoomRole = me.roomRole || 'user';
-                updateModeratorCenterAccess();
-            } else if (myRole !== 'admin') {
-                myRoomRole = 'user';
-                invalidatePrivilegedAccess();
-            }
+            ChatClientHelpers.syncCurrentUserRoomAccess({
+                roomUsers,
+                username: myUsername,
+                globalRole: myRole,
+                applyRole(role) {
+                    myRoomRole = role;
+                    updateModeratorCenterAccess();
+                },
+                onAccessLoss() {
+                    invalidateMessageReads();
+                    invalidatePrivilegedAccess();
+                }
+            });
 
             const isGlobal = currentServerCode === 'global';
             const roomType = isGlobal ? 'Global Online' : 'Room Members';
@@ -2875,7 +3111,7 @@
     }
 
     function requestServerSwitch(code) {
-        if (currentServerCode === code && chatWindow.innerHTML !== '' &&
+        if (currentServerCode === code && chatWindow.querySelector('.msg, .system-msg') &&
             !roomSwitchCoordinator.isPending()) return;
         roomSwitchCoordinator.request(code);
     }
@@ -2900,11 +3136,17 @@
                 const srv = serversCache[targetServerCode] || { name: 'Unknown', owner: '' };
                 const isStealth = myRole === 'admin' && !myJoinedServers.includes(targetServerCode) && targetServerCode !== 'global';
 
+                invalidateMessageReads();
                 closeModeratorCenter();
                 closeModerationPrompt();
                 closeReportPrompt();
                 currentServerCode = targetServerCode;
                 compositionContextCoordinator.activate(targetServerCode);
+                messageReadCoordinator.activate(
+                    targetServerCode,
+                    compositionContextCoordinator.current().clientContextId,
+                    response.nextCursor || null
+                );
                 myRoomRole = response.roomRole || 'user';
                 applyRestrictionState(response.restriction, targetServerCode);
                 renderServerAccess();
@@ -2937,7 +3179,6 @@
                     }
                 }
 
-                chatWindow.textContent = '';
                 cancelAction();
 
                 const serverTitle = document.getElementById('server-title');
@@ -2960,7 +3201,8 @@
                     ghost.style.fontStyle = 'italic';
                 }
 
-                if (response.history) loadHistory(response.history);
+                loadHistory(response.history, { replace: true });
+                renderOlderControl();
             }
         });
     }
@@ -3060,7 +3302,7 @@
         let text = msgInput.value.trim();
         
         if (text === '/clear') {
-            chatWindow.innerHTML = '';
+            clearRenderedMessages();
             cancelAction();
             return;
         } else if (text.startsWith('/shrug')) {
@@ -3210,13 +3452,41 @@
         });
     }
 
-    function loadHistory(msgs) {
-        if (!msgs || !Array.isArray(msgs)) return; 
-        msgs.forEach(message => appendMessage(message, message.username === myUsername, { history: true }));
-        chatScrollCoordinator.request('auto');
+    function loadHistory(msgs, { replace = false } = {}) {
+        if (replace) clearRenderedMessages();
+        ChatClientHelpers.renderInitialMessagePage({
+            messages: msgs,
+            renderMessage(message, options) {
+                appendMessage(message, message.username === myUsername, options);
+            },
+            requestScroll: behavior => chatScrollCoordinator.request(behavior)
+        });
     }
 
-    function appendMessage(data, isMe, { history = false } = {}) {
+    function loadOlderMessages() {
+        ChatClientHelpers.requestOlderMessages({
+            coordinator: messageReadCoordinator,
+            socket,
+            onAccepted(response) {
+                ChatClientHelpers.prependMessagePage({
+                    chatWindow,
+                    historyControls,
+                    messages: response.messages,
+                    renderMessage(message, before) {
+                        appendMessage(message, message.username === myUsername, {
+                            history: true,
+                            before
+                        });
+                    },
+                    afterRender: renderOlderControl
+                });
+            }
+        });
+    }
+
+    loadOlderButton.addEventListener('click', loadOlderMessages);
+
+    function appendMessage(data, isMe, { history = false, before = null } = {}) {
         const renderPolicy = ChatClientHelpers.messageRenderPolicy({
             history,
             wasNearBottom: ChatClientHelpers.isNearScrollEnd(chatWindow)
@@ -3246,7 +3516,7 @@
                 viewTag.onclick = () => viewDeleted(data._id); 
                 wrapper.appendChild(viewTag);
             }
-            chatWindow.appendChild(wrapper);
+            chatWindow.insertBefore(wrapper, before);
             if (renderPolicy.shouldScroll) chatScrollCoordinator.request(renderPolicy.behavior);
             return;
         }
@@ -3398,7 +3668,7 @@
         bodyDiv.appendChild(reactionsContainer);
 
         wrapper.appendChild(avatarDiv); wrapper.appendChild(bodyDiv);
-        chatWindow.appendChild(wrapper); 
+        chatWindow.insertBefore(wrapper, before);
         if (renderPolicy.shouldScroll) chatScrollCoordinator.request(renderPolicy.behavior);
     }
 
