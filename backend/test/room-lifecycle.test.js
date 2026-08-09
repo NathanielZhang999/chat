@@ -18,6 +18,13 @@ function register(overrides = {}) {
         };
       }
     },
+    ChatServerModel: {
+      async find(query = {}) {
+        const codes = query.code && Array.isArray(query.code.$in) ? query.code.$in : ['global'];
+        return codes.map(code => ({ code, moderators: [] }));
+      },
+      async findOne() { return null; }
+    },
     RoomRestrictionModel: { async findOne() { return null; }, async find() { return []; } },
     onlineUsersMap: new Map(),
     broadcastOnlineUsersFn: async () => {},
@@ -41,6 +48,13 @@ function registerSharedSocket(overrides, id) {
             ? [...socket.joinedServers] : ['global']
         };
       }
+    },
+    ChatServerModel: {
+      async find(query = {}) {
+        const codes = query.code && Array.isArray(query.code.$in) ? query.code.$in : ['global'];
+        return codes.map(code => ({ code, moderators: [] }));
+      },
+      async findOne() { return null; }
     },
     RoomRestrictionModel: { async findOne() { return null; }, async find() { return []; } },
     broadcastOnlineUsersFn: async () => {},
@@ -1138,7 +1152,7 @@ test('leaving a room revokes membership and transport access from every live ses
     assert.deepEqual(liveSocket.outbound.at(-1), {
       target: 'self',
       event: 'room_access_updated',
-      payload: { username: 'alice', joinedServers: ['global'], serverCode: 'global' }
+      payload: { username: 'alice', joinedServers: ['global'], serverCode: 'global', bannedRooms: [] }
     });
   }
   assert.deepEqual(onlineUsersMap.get('socket-1').joinedServers, ['global']);
@@ -1274,6 +1288,92 @@ test('deleting an active room keeps the socket and mapped session in global', as
   assert.equal(socket.joinedRooms.has('ABC123'), false);
   assert.equal(socket.joinedRooms.has('global'), true);
   assert.equal(onlineUsersMap.get('socket-1').serverCode, 'global');
+});
+
+test('room deletion computes fallback from fresh restrictions instead of stale cached bannedRooms', async () => {
+  const rooms = [
+    { code: 'global', owner: 'System', moderators: [] },
+    { code: 'ABC123', owner: 'alice', moderators: [] },
+    { code: 'XYZ789', owner: 'bob', moderators: [] }
+  ];
+  const users = {
+    alice: { username: 'alice', role: 'admin', servers: ['global', 'ABC123'] },
+    bob: { username: 'Bob', role: 'user', servers: ['global', 'ABC123', 'XYZ789'] }
+  };
+  const ioInstance = new FakeIo();
+  const onlineUsersMap = new Map();
+  const { socket } = register({
+    ioInstance,
+    onlineUsersMap,
+    UserModel: {
+      async findOne(query) {
+        const matcher = query.username && query.username.$regex;
+        if (matcher) return Object.values(users).find(user => matcher.test(user.username));
+        return users[query.username];
+      },
+      async updateMany() {
+        for (const user of Object.values(users)) {
+          user.servers = user.servers.filter(code => code !== 'ABC123');
+        }
+      }
+    },
+    ChatServerModel: {
+      async find(query = {}) {
+        const codes = query.code && Array.isArray(query.code.$in) ? query.code.$in : [];
+        return rooms.filter(room => codes.includes(room.code));
+      },
+      async findOne(query) { return rooms.find(room => room.code === query.code) || null; },
+      async deleteOne(query) {
+        const index = rooms.findIndex(room => room.code === query.code);
+        if (index >= 0) rooms.splice(index, 1);
+      }
+    },
+    RoomRestrictionModel: {
+      async find(query) {
+        return query.username === 'bob'
+          ? [{ serverCode: 'global', username: 'bob', bannedAt: new Date() }]
+          : [];
+      },
+      async findOne() { return null; }
+    },
+    MessageModel: { async deleteMany() {} }
+  });
+  Object.assign(socket, {
+    username: 'alice', displayName: 'Alice', role: 'admin', serverCode: 'global',
+    joinedServers: ['global', 'ABC123'], bannedRooms: []
+  });
+  onlineUsersMap.set(socket.id, {
+    username: 'alice', role: 'admin', serverCode: 'global',
+    joinedServers: ['global', 'ABC123'], bannedRooms: []
+  });
+  const target = new FakeSocket();
+  target.id = 'target-delete-fallback';
+  Object.assign(target, {
+    username: 'Bob', role: 'user', serverCode: 'ABC123',
+    joinedServers: ['global', 'ABC123', 'XYZ789'], bannedRooms: []
+  });
+  target.joinedRooms.add('ABC123');
+  onlineUsersMap.set(target.id, {
+    username: 'Bob', role: 'user', serverCode: 'ABC123',
+    joinedServers: ['global', 'ABC123', 'XYZ789'], bannedRooms: []
+  });
+  onlineUsersMap.set('target-delete-map-only', {
+    username: 'bob', role: 'user', serverCode: 'ABC123',
+    joinedServers: ['global', 'ABC123', 'XYZ789'], bannedRooms: []
+  });
+  ioInstance.sockets = [socket, target];
+
+  const ack = acknowledge();
+  await socket.trigger('delete_server', 'ABC123', ack.callback);
+
+  assert.deepEqual(ack.value(), { success: true });
+  assert.equal(target.serverCode, 'XYZ789');
+  assert.deepEqual(target.joinedServers, ['XYZ789']);
+  assert.deepEqual(target.bannedRooms, ['global']);
+  assert.equal(target.joinedRooms.has('global'), false);
+  assert.equal(target.joinedRooms.has('XYZ789'), true);
+  assert.equal(onlineUsersMap.get('target-delete-map-only').serverCode, 'XYZ789');
+  assert.deepEqual(onlineUsersMap.get('target-delete-map-only').bannedRooms, ['global']);
 });
 
 test('room deletion preflights live sockets before destructive writes', async () => {
@@ -2117,13 +2217,20 @@ test('profile updates reserve the system owner name for every account', async ()
 
 test('promoting a non-member does not write the room moderator list', async () => {
   let roomWrites = 0;
+  const actor = { username: 'alice', displayName: 'Alice', role: 'admin', servers: ['global'] };
   const target = { username: 'bob', displayName: 'Bob', servers: ['global'], async save() {} };
   const room = {
     code: 'ABC123', owner: 'alice', moderators: [],
     async save() { roomWrites += 1; }
   };
   const { socket } = register({
-    UserModel: { findOne: async () => target },
+    UserModel: {
+      async findOne(query) {
+        const matcher = query.username && query.username.$regex;
+        if (matcher) return matcher.test(actor.username) ? actor : target;
+        return query.username === actor.username ? actor : target;
+      }
+    },
     ChatServerModel: { findOne: async () => room }
   });
   socket.username = 'alice';
@@ -2148,7 +2255,13 @@ test('a stale nonmember moderator cannot promote a current room member', async (
     async save() { roomWrites += 1; }
   };
   const { socket } = register({
-    UserModel: { async findOne(query) { return users[query.username]; } },
+    UserModel: {
+      async findOne(query) {
+        const matcher = query.username && query.username.$regex;
+        if (matcher) return Object.values(users).find(user => matcher.test(user.username));
+        return users[query.username];
+      }
+    },
     ChatServerModel: { async findOne() { return room; } }
   });
   socket.username = 'alice';
