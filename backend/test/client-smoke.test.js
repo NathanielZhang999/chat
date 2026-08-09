@@ -42,8 +42,7 @@ function loadHelpers() {
   });
 }
 
-function loadClientFunction(name, values = {}) {
-  const source = fs.readFileSync(chatPath, 'utf8');
+function extractClientFunction(source, name) {
   const plainStart = source.indexOf(`function ${name}(`);
   const asyncStart = source.indexOf(`async function ${name}(`);
   const start = plainStart === -1 ? asyncStart :
@@ -52,17 +51,31 @@ function loadClientFunction(name, values = {}) {
 
   for (let end = source.indexOf('}', start); end !== -1; end = source.indexOf('}', end + 1)) {
     const candidate = source.slice(start, end + 1);
-    const context = vm.createContext({ ...values });
     try {
-      vm.runInContext(`globalThis.__clientFunction = (${candidate});`, context, {
-        filename: `${name}.js`
-      });
-      return { fn: context.__clientFunction, context };
+      new vm.Script(`(${candidate});`, { filename: `${name}.js` });
+      return candidate;
     } catch (error) {
       if (!(error instanceof SyntaxError) && error?.name !== 'SyntaxError') throw error;
     }
   }
   assert.fail(`could not compile production function ${name}`);
+}
+
+function loadClientFunctions(names, values = {}) {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  const declarations = names.map(name => extractClientFunction(source, name)).join('\n');
+  const context = vm.createContext({ ...values });
+  vm.runInContext(
+    `${declarations}\nglobalThis.__clientFunctions = { ${names.join(', ')} };`,
+    context,
+    { filename: 'chat-client-functions.js' }
+  );
+  return { functions: context.__clientFunctions, context };
+}
+
+function loadClientFunction(name, values = {}) {
+  const runtime = loadClientFunctions([name], values);
+  return { fn: runtime.functions[name], context: runtime.context };
 }
 
 function createClientElement() {
@@ -342,6 +355,164 @@ test('latest accepted room search wins and close invalidates late results', () =
   }
 });
 
+test('search control requires the exact active positive room read context', () => {
+  const helpers = loadHelpers();
+  const button = createClientElement();
+  const modal = createClientElement();
+  let readState = { roomCode: 'ABC123', clientContextId: 9 };
+  const runtime = loadClientFunction('renderSearchControl', {
+    currentServerCode: 'ABC123',
+    myRole: 'admin',
+    myJoinedServers: ['global'],
+    myBannedRooms: new Set(),
+    messageReadCoordinator: { current: () => readState },
+    messageSearchButton: button,
+    messageSearchModal: modal,
+    closeMessageSearch() {},
+    ChatClientHelpers: helpers
+  });
+
+  runtime.fn();
+  assert.equal(button.style.display, 'block');
+
+  for (const inactive of [
+    { roomCode: 'XYZ789', clientContextId: 9 },
+    { roomCode: 'ABC123', clientContextId: null },
+    { roomCode: 'ABC123', clientContextId: 0 },
+    { roomCode: 'ABC123', clientContextId: -1 }
+  ]) {
+    readState = inactive;
+    runtime.fn();
+    assert.equal(button.style.display, 'none');
+  }
+});
+
+test('admin current-room leave keeps real Search hidden until forced switch activation', async () => {
+  const helpers = loadHelpers();
+  const messageReadCoordinator = helpers.createMessageReadCoordinator();
+  const compositionContextCoordinator = helpers.createCompositionContextCoordinator();
+  compositionContextCoordinator.activate('ABC123');
+  messageReadCoordinator.activate(
+    'ABC123', compositionContextCoordinator.current().clientContextId, null
+  );
+
+  class Element {
+    constructor(id = '') {
+      this.id = id;
+      this.children = [];
+      this.style = {};
+      this.attributes = new Map();
+      this.classes = new Set();
+      this.classList = {
+        add: (...names) => names.forEach(name => this.classes.add(name)),
+        remove: (...names) => names.forEach(name => this.classes.delete(name)),
+        contains: name => this.classes.has(name)
+      };
+      this.textContent = '';
+    }
+    appendChild(child) { this.children.push(child); return child; }
+    setAttribute(name, value) { this.attributes.set(name, String(value)); }
+    removeAttribute(name) { this.attributes.delete(name); }
+    remove() { this.removed = true; }
+  }
+  const elements = new Map();
+  const element = id => {
+    if (!elements.has(id)) elements.set(id, new Element(id));
+    return elements.get(id);
+  };
+  const document = {
+    createElement: tag => new Element(tag),
+    getElementById: element,
+    querySelectorAll(selector) {
+      return selector === '.server-icon'
+        ? [...elements.values()].filter(value => value.classes.has('server-icon'))
+        : [];
+    }
+  };
+  const chatWindow = element('chat-window');
+  chatWindow.querySelector = selector => selector === '.msg, .system-msg' ? new Element('loaded') : null;
+  const searchButton = element('message-search-btn');
+  const searchModal = element('message-search-modal');
+  const leaveCallbacks = [];
+  const switchRequests = [];
+  const runtime = loadClientFunctions([
+    'renderSearchControl',
+    'invalidateMessageReads',
+    'renderServerAccess',
+    'requestServerSwitch',
+    'switchServer',
+    'handleSwitchResult',
+    'leaveServer'
+  ], {
+    ChatClientHelpers: helpers,
+    document,
+    chatWindow,
+    messageSearchButton: searchButton,
+    messageSearchModal: searchModal,
+    messageReadCoordinator,
+    compositionContextCoordinator,
+    currentServerCode: 'ABC123',
+    myRole: 'admin',
+    myRoomRole: 'user',
+    myUsername: 'Admin',
+    myJoinedServers: ['global', 'ABC123'],
+    myBannedRooms: new Set(),
+    serversCache: { ABC123: { name: 'Room', owner: 'Other' } },
+    roomSwitchCoordinator: null,
+    roomAccessCoordinator: null,
+    socket: {
+      emit(event, payload, callback) {
+        assert.equal(event, 'leave_server');
+        leaveCallbacks.push({ payload, callback });
+      }
+    },
+    showAppConfirm: async () => true,
+    showAppAlert() {},
+    closeMessageSearch() {},
+    closeHistoryModal() {},
+    stopOlderAnchor() {},
+    olderRequestHandle: null,
+    renderOlderControl() {},
+    closeModeratorCenter() {},
+    closeModerationPrompt() {},
+    closeReportPrompt() {},
+    applyRestrictionState() {},
+    updateModeratorCenterAccess() {},
+    typingUsers: new Map(),
+    updateTypingUI() {},
+    cancelAction() {},
+    loadHistory() {}
+  });
+  runtime.context.roomSwitchCoordinator = helpers.createSwitchCoordinator(
+    (code, callback) => switchRequests.push({ code, callback }),
+    runtime.functions.handleSwitchResult
+  );
+  runtime.context.roomAccessCoordinator = helpers.createRoomAccessCoordinator({
+    getCurrentRoom: () => runtime.context.currentServerCode,
+    requestSwitch: runtime.functions.requestServerSwitch,
+    enterLobby() {},
+    renderAccess() {},
+    applyRestriction() {}
+  });
+
+  runtime.functions.renderSearchControl();
+  assert.equal(searchButton.style.display, 'block');
+  await runtime.functions.leaveServer();
+  leaveCallbacks[0].callback({ success: true });
+
+  assert.equal(searchButton.style.display, 'none', 'invalidation stays visible to the real renderer');
+  assert.equal(switchRequests.length, 1, 'the loaded same-room shortcut is force-bypassed once');
+  assert.equal(switchRequests[0].code, 'ABC123');
+  runtime.functions.renderServerAccess();
+  assert.equal(searchButton.style.display, 'none', 'access rerenders cannot precede activation');
+
+  switchRequests[0].callback({ history: [], nextCursor: null, roomRole: 'user', restriction: null });
+  assert.equal(messageReadCoordinator.current().roomCode, 'ABC123');
+  assert.ok(messageReadCoordinator.current().clientContextId > 0);
+  assert.equal(searchButton.style.display, 'block', 'accepted activation restores Search');
+  assert.equal(switchRequests.length, 1, 'the force refresh does not duplicate switching');
+});
+
 test('room read token guards privileged modal callbacks after a switch or close', () => {
   const helpers = loadHelpers();
   const coordinator = helpers.createMessageReadCoordinator();
@@ -450,6 +621,61 @@ test('room read token access-loss handlers invalidate before navigating away', a
   assert.deepEqual(deletionCalls, [
     'invalidate', 'search-control', 'switch:global', 'alert'
   ]);
+});
+
+test('Search uses NFKC, an exact DOM bound, and installed Enter and Escape controls', () => {
+  const helpers = loadHelpers();
+  assert.equal(helpers.normalizeMessageSearchQuery('  ＡＢ  '), 'AB');
+
+  class EventTarget {
+    constructor() {
+      this.listeners = new Map();
+      this.attributes = new Map();
+      this._maxLength = -1;
+    }
+    addEventListener(type, listener) { this.listeners.set(type, listener); }
+    dispatch(type, event = {}) { return this.listeners.get(type)?.(event); }
+    set maxLength(value) {
+      this._maxLength = Number(value);
+      this.attributes.set('maxlength', String(value));
+    }
+    get maxLength() { return this._maxLength; }
+    getAttribute(name) { return this.attributes.get(name) ?? null; }
+  }
+  const targets = new Map([
+    ['message-search-form', new EventTarget()],
+    ['message-search-x', new EventTarget()],
+    ['message-search-close', new EventTarget()],
+    ['history-modal-close', new EventTarget()]
+  ]);
+  const input = new EventTarget();
+  const button = new EventTarget();
+  let submits = 0;
+  let closes = 0;
+  const runtime = loadClientFunctions(
+    ['handleMessageSearchKeydown', 'bindMessageSearchControls'],
+    {
+      messageSearchButton: button,
+      messageSearchInput: input,
+      document: { getElementById: id => targets.get(id) },
+      openMessageSearch() {},
+      submitMessageSearch() { submits += 1; return true; },
+      closeMessageSearch() { closes += 1; },
+      closeHistoryModal() {}
+    }
+  );
+  runtime.functions.bindMessageSearchControls();
+  assert.equal(input.getAttribute('maxlength'), '80');
+  assert.equal(input.maxLength, 80);
+
+  let prevented = 0;
+  input.dispatch('keydown', { key: 'Enter', preventDefault() { prevented += 1; } });
+  assert.equal(submits, 1);
+  assert.equal(closes, 0);
+  input.dispatch('keydown', { key: 'Escape', preventDefault() { prevented += 1; } });
+  assert.equal(submits, 1, 'Escape closes instead of submitting');
+  assert.equal(closes, 1);
+  assert.equal(prevented, 2);
 });
 
 test('search modal sends exact context, keeps hostile results inert, and recovers from a lost ack', () => {

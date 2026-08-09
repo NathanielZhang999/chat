@@ -1482,9 +1482,9 @@
                 bannedRooms = new Set(Array.isArray(rooms) ? rooms : []);
                 renderAccess([...bannedRooms]);
             };
-            const requestRoom = code => {
+            const requestRoom = (code, options) => {
                 if (!code || bannedRooms.has(code)) return false;
-                requestSwitch(code);
+                requestSwitch(code, options);
                 return true;
             };
             return {
@@ -2036,7 +2036,11 @@
     }
 
     function renderSearchControl(forceHidden = false) {
-        const accessible = !forceHidden && Boolean(currentServerCode) && ChatClientHelpers.isRoomRailAccessible({
+        const activeRead = messageReadCoordinator.current();
+        const hasActiveContext = activeRead.roomCode === currentServerCode &&
+            Number.isSafeInteger(activeRead.clientContextId) && activeRead.clientContextId > 0;
+        const accessible = !forceHidden && Boolean(currentServerCode) && hasActiveContext &&
+            ChatClientHelpers.isRoomRailAccessible({
             serverCode: currentServerCode,
             role: myRole,
             joinedServers: myJoinedServers,
@@ -2144,6 +2148,10 @@
     function handleMessageSearchKeydown(event) {
         if (!event || (event.key !== 'Enter' && event.key !== 'Escape')) return false;
         event.preventDefault();
+        if (event.key === 'Escape') {
+            closeMessageSearch();
+            return true;
+        }
         return submitMessageSearch();
     }
 
@@ -2159,15 +2167,20 @@
         renderSearchControl(true);
     }
 
-    messageSearchButton.addEventListener('click', openMessageSearch);
-    document.getElementById('message-search-form').addEventListener('submit', event => {
-        event.preventDefault();
-        submitMessageSearch();
-    });
-    messageSearchInput.addEventListener('keydown', handleMessageSearchKeydown);
-    document.getElementById('message-search-x').addEventListener('click', closeMessageSearch);
-    document.getElementById('message-search-close').addEventListener('click', closeMessageSearch);
-    document.getElementById('history-modal-close').addEventListener('click', closeHistoryModal);
+    function bindMessageSearchControls() {
+        messageSearchInput.maxLength = 80;
+        messageSearchButton.addEventListener('click', openMessageSearch);
+        document.getElementById('message-search-form').addEventListener('submit', event => {
+            event.preventDefault();
+            submitMessageSearch();
+        });
+        messageSearchInput.addEventListener('keydown', handleMessageSearchKeydown);
+        document.getElementById('message-search-x').addEventListener('click', closeMessageSearch);
+        document.getElementById('message-search-close').addEventListener('click', closeMessageSearch);
+        document.getElementById('history-modal-close').addEventListener('click', closeHistoryModal);
+    }
+
+    bindMessageSearchControls();
 
     function clearRenderedMessages() {
         stopOlderAnchor();
@@ -3583,20 +3596,20 @@
         renderServerAccess();
     }
 
-    function requestServerSwitch(code) {
-        if (currentServerCode === code && chatWindow.querySelector('.msg, .system-msg') &&
+    function requestServerSwitch(code, { forceRefresh = false } = {}) {
+        if (!forceRefresh && currentServerCode === code && chatWindow.querySelector('.msg, .system-msg') &&
             !roomSwitchCoordinator.isPending()) return;
         roomSwitchCoordinator.request(code);
     }
 
-    function switchServer(code) {
+    function switchServer(code, options) {
         if (!ChatClientHelpers.isRoomRailAccessible({
             serverCode: code,
             role: myRole,
             joinedServers: myJoinedServers,
             bannedRooms: [...myBannedRooms]
         })) return false;
-        return roomAccessCoordinator.requestRoom(code);
+        return roomAccessCoordinator.requestRoom(code, options);
     }
 
     function handleSwitchResult(code, res) {
@@ -3704,7 +3717,7 @@
             if (currentServerCode !== serverCode) return;
             invalidateMessageReads();
             renderSearchControl();
-            if (myRole === 'admin') switchServer(serverCode);
+            if (myRole === 'admin') switchServer(serverCode, { forceRefresh: true });
             else if (myBannedRooms.has('global')) enterLobby();
             else switchServer('global');
         });
