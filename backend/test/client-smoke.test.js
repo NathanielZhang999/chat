@@ -26,8 +26,16 @@ function loadHelpers() {
       if (typeof value !== 'function') return value;
       return (...args) => {
         const result = value.apply(target, args);
-        if (property === 'moderationActionsFor') return [...result];
+        if (['moderationActionsFor', 'restrictionActionsFor'].includes(property)) return [...result];
         if (property === 'normalizeModerationPrompt' && result) return { ...result };
+        if ([
+          'normalizeReportPrompt',
+          'dispatchModerationReport',
+          'normalizeResolutionPrompt',
+          'normalizeAutoModPrompt',
+          'moderatorCenterRequestFor',
+          'moderatorCenterMutationRequestFor'
+        ].includes(property) && result) return structuredClone(result);
         return result;
       };
     }
@@ -429,42 +437,7 @@ test('moderation prompt requires bounded reason and timeout duration', () => {
   assert.equal(client.normalizeModerationPrompt({ action: 'timeout', reason: 'spam', duration: '2h' }), null);
 });
 
-test('Global context and private menu contracts include reports without granting authority', () => {
-  const source = fs.readFileSync(chatPath, 'utf8');
-  const roleManagerStart = source.indexOf('function openRoleManager');
-  const roleManagerEnd = source.indexOf('// --- REACTION UI ENGINE ---', roleManagerStart);
-  const roleManager = source.slice(roleManagerStart, roleManagerEnd);
-
-  assert.notEqual(roleManagerStart, -1);
-  assert.match(roleManager, /list_room_restrictions/);
-  assert.match(roleManager, /moderationActionsFor/);
-  assert.match(roleManager, /Report User/);
-  assert.match(source, /Report Message/);
-  assert.match(source, /report_moderation_target/);
-  assert.doesNotMatch(
-    roleManager,
-    /currentServerCode\s*===\s*['"]global['"][\s\S]{0,500}(?:Kick|action:\s*['"]kick['"])/
-  );
-});
-
-test('reports restrictions and audit rows render API text with textContent', () => {
-  const source = fs.readFileSync(chatPath, 'utf8');
-  for (const [functionName, nextFunction] of [
-    ['renderModerationReports', 'renderRoomRestrictions'],
-    ['renderRoomRestrictions', 'renderModerationAudit'],
-    ['renderModerationAudit', 'loadAutoModSettings']
-  ]) {
-    const start = source.indexOf(`function ${functionName}`);
-    const end = source.indexOf(`function ${nextFunction}`, start);
-    const body = source.slice(start, end);
-    assert.notEqual(start, -1, `${functionName} exists`);
-    assert.notEqual(end, -1, `${functionName} has a bounded source region`);
-    assert.match(body, /textContent/, `${functionName} uses inert text nodes`);
-    assert.doesNotMatch(body, /innerHTML/, `${functionName} never interprets API text as markup`);
-  }
-});
-
-test('direct event handlers and defaultServerCode drive room access updates', () => {
+test('production client wires moderation coordinators and direct room events', () => {
   const source = fs.readFileSync(chatPath, 'utf8');
   for (const event of [
     'room_access_updated', 'room_restriction_updated', 'moderation_queue_updated', 'message_blocked'
@@ -473,118 +446,388 @@ test('direct event handlers and defaultServerCode drive room access updates', ()
   }
   assert.match(source, /Object\.prototype\.hasOwnProperty\.call\(res,\s*['"]defaultServerCode['"]\)/);
   assert.match(source, /if\s*\(initialCode\)\s*switchServer\(initialCode\);\s*else\s*enterLobby\(\);/s);
-  assert.doesNotMatch(source, /renderServers\(res\.servers\s*\|\|\s*\[\]\);\s*switchServer\(['"]global['"]\)/s);
-  assert.match(source, /Your message was blocked by this room's content policy\./);
+  assert.match(source, /roomAccessCoordinator\.handleAccessUpdate\(data\)/);
+  assert.match(source, /roomAccessCoordinator\.handleRestrictionUpdate\(data\)/);
+  assert.match(source, /dispatchModeratorCenterRequest/);
+  assert.match(source, /appendModerationItemRow/);
+  assert.doesNotMatch(source, /internalSecret|storageSecret/);
 });
 
-test('Lobby state disables composition and leaves room discovery controls enabled', () => {
-  const client = loadHelpers();
-  const elements = {
-    messageInput: { disabled: false },
-    sendButton: { disabled: false },
-    attachmentButton: { disabled: false },
-    emojiButton: { disabled: false },
-    infoBar: { textContent: '' },
-    roomLabel: ''
+function createDeferredSocket() {
+  const calls = [];
+  return {
+    calls,
+    emit(event, payload, callback) { calls.push({ event, payload, callback }); }
   };
+}
 
+function createTextOnlyDocument() {
+  class Element {
+    constructor(tagName) {
+      this.tagName = tagName;
+      this.className = '';
+      this.children = [];
+      this._textContent = '';
+    }
+    appendChild(child) { this.children.push(child); return child; }
+    set textContent(value) { this._textContent = value == null ? '' : String(value); }
+    get textContent() { return this._textContent; }
+    set innerHTML(_value) { throw new Error('unsafe HTML assignment'); }
+  }
+  return { createElement: tagName => new Element(tagName), Element };
+}
+
+test('behavioral moderation helpers build exact report, resolution, and AutoMod payloads', () => {
+  const client = loadHelpers();
+  const reportSocket = createDeferredSocket();
+  const base = {
+    serverCode: 'ABC123', actorRole: 'user', actorRoomRole: 'mod', targetRole: 'user',
+    targetRoomRole: 'user', targetIsBanned: false, targetIsTimedOut: false,
+    targetUsername: 'Member', isSelf: false
+  };
+  assert.deepEqual(client.moderationActionsFor(base), ['kick', 'timeout', 'ban']);
+  assert.deepEqual(client.moderationActionsFor({ ...base, isSelf: true }), []);
+  assert.deepEqual(client.moderationActionsFor({ ...base, targetUsername: 'System' }), []);
+  assert.deepEqual(client.moderationActionsFor({ ...base, targetRole: 'admin' }), []);
+  assert.deepEqual(client.moderationActionsFor({ ...base, serverCode: 'global', actorRole: 'admin', actorRoomRole: 'user' }), ['timeout', 'ban']);
+
+  assert.deepEqual(client.normalizeReportPrompt({
+    serverCode: 'ABC123', targetUser: 'Member', reason: ' abuse '
+  }), { serverCode: 'ABC123', targetUser: 'Member', reason: 'abuse' });
+  assert.deepEqual(client.normalizeReportPrompt({
+    serverCode: 'ABC123', targetUser: 'Member', messageId: '507f1f77bcf86cd799439011', reason: ' spam '
+  }), {
+    serverCode: 'ABC123', targetUser: 'Member', messageId: '507f1f77bcf86cd799439011', reason: 'spam'
+  });
+  assert.equal(client.normalizeReportPrompt({ serverCode: 'ABC123', targetUser: 'Member', reason: '' }), null);
+  client.dispatchModerationReport(reportSocket, {
+    serverCode: 'ABC123', targetUser: 'Member', reason: ' user abuse '
+  }, () => {});
+  client.dispatchModerationReport(reportSocket, {
+    serverCode: 'ABC123', targetUser: 'Member', messageId: 'message-1', reason: ' message spam '
+  }, () => {});
+  assert.deepEqual(reportSocket.calls.map(call => ({
+    event: call.event,
+    payload: structuredClone(call.payload)
+  })), [
+    {
+      event: 'report_moderation_target',
+      payload: { serverCode: 'ABC123', targetUser: 'Member', reason: 'user abuse' }
+    },
+    {
+      event: 'report_moderation_target',
+      payload: {
+        serverCode: 'ABC123', targetUser: 'Member', messageId: 'message-1', reason: 'message spam'
+      }
+    }
+  ]);
+
+  assert.deepEqual(client.normalizeResolutionPrompt({
+    serverCode: 'ABC123', reportId: '507f1f77bcf86cd799439012', status: 'dismissed', resolution: ' duplicate '
+  }), {
+    serverCode: 'ABC123', reportId: '507f1f77bcf86cd799439012', status: 'dismissed', resolution: 'duplicate'
+  });
+  assert.equal(client.normalizeResolutionPrompt({
+    serverCode: 'ABC123', reportId: '507f1f77bcf86cd799439012', status: 'open', resolution: 'no'
+  }), null);
+
+  assert.deepEqual(client.normalizeAutoModPrompt({
+    keywordsText: ' Spam\nspoilers ', mentionLimit: '4', repeatLimit: '5', repeatWindowSeconds: '60'
+  }), {
+    blockedKeywords: ['spam', 'spoilers'], mentionLimit: 4, repeatLimit: 5, repeatWindowSeconds: 60
+  });
+  assert.equal(client.normalizeAutoModPrompt({
+    keywordsText: 'spam', mentionLimit: '21', repeatLimit: '5', repeatWindowSeconds: '60'
+  }), null);
+});
+
+test('behavioral moderation row renderer keeps hostile API text inert', () => {
+  const client = loadHelpers();
+  const doc = createTextOnlyDocument();
+  const list = new doc.Element('div');
+  const rendered = client.appendModerationItemRow(doc, list, 'report', {
+    targetUsername: '<img src=x onerror=alert(1)>',
+    reporterUsername: 'Reporter',
+    status: 'open',
+    reason: '<script>steal()</script>',
+    createdAt: 1,
+    internalSecret: 'must-not-render',
+    storageSecret: 'also-private'
+  }, value => `date:${value}`);
+
+  assert.equal(list.children.length, 1);
+  assert.equal(rendered.title.textContent, '@<img src=x onerror=alert(1)> — open');
+  assert.equal(rendered.detail.textContent.includes('<script>steal()</script>'), true);
+  assert.equal(rendered.detail.textContent.includes('must-not-render'), false);
+  assert.equal(rendered.detail.textContent.includes('also-private'), false);
+});
+
+test('behavioral room access coordinator suppresses banned switches and applies unban events', () => {
+  const client = loadHelpers();
+  let currentRoom = 'ABC123';
+  const switched = [];
+  const rendered = [];
+  const restrictions = [];
+  let lobbyEntries = 0;
+  const access = client.createRoomAccessCoordinator({
+    getCurrentRoom: () => currentRoom,
+    requestSwitch: code => switched.push(code),
+    enterLobby: () => { lobbyEntries += 1; currentRoom = null; },
+    renderAccess: rooms => rendered.push([...rooms]),
+    applyRestriction: (data, room) => restrictions.push({ data, room })
+  });
+
+  access.replaceBannedRooms(['global']);
+  assert.equal(access.requestRoom('global'), false);
+  assert.equal(access.requestRoom('XYZ789'), true);
+  assert.deepEqual(switched, ['XYZ789']);
+
+  access.handleRestrictionUpdate({ serverCode: 'global', banned: false, bannedRooms: [] });
+  assert.deepEqual(rendered.at(-1), []);
+  assert.equal(access.requestRoom('global'), true);
+  assert.deepEqual(switched, ['XYZ789', 'global']);
+
+  access.handleAccessUpdate({ serverCode: null, bannedRooms: ['global'] });
+  assert.equal(lobbyEntries, 1);
+  assert.deepEqual([...access.bannedRooms()], ['global']);
+
+  currentRoom = 'ABC123';
+  access.handleRestrictionUpdate({
+    serverCode: 'ABC123', banned: false, timedOut: true,
+    timeoutUntil: '2026-08-08T22:00:00.000Z', bannedRooms: []
+  });
+  assert.equal(restrictions.length, 1);
+  assert.equal(restrictions[0].room, 'ABC123');
+});
+
+test('behavioral lobby and restriction coordinators disable controls and reject stale expiry work', () => {
+  const client = loadHelpers();
+  let typingClears = 0;
+  const discoveryActions = [{ disabled: true }, { disabled: true }];
+  const elements = {
+    messageInput: { disabled: false }, sendButton: { disabled: false },
+    attachmentButton: { disabled: false }, emojiButton: { disabled: false },
+    infoBar: { textContent: '' }, roomLabel: '',
+    messageActions: [{ disabled: false }, { disabled: false }],
+    roomDiscoveryActions: discoveryActions,
+    typingState: { clear() { typingClears += 1; } }
+  };
   client.applyLobbyState(elements, true);
+  assert.equal(elements.messageActions.every(action => action.disabled), true);
+  assert.equal(typingClears, 1);
   assert.equal(elements.messageInput.disabled, true);
   assert.equal(elements.sendButton.disabled, true);
-  assert.equal(elements.attachmentButton.disabled, true);
-  assert.equal(elements.emojiButton.disabled, true);
-  assert.equal(elements.infoBar.textContent, 'Lobby — join or create a room to chat');
+  assert.equal(discoveryActions.every(action => !action.disabled), true, 'join/create remain available');
 
-  const source = fs.readFileSync(chatPath, 'utf8');
-  const enterLobbyStart = source.indexOf('function enterLobby');
-  const enterLobbyEnd = source.indexOf('function applyRestrictionState', enterLobbyStart);
-  const enterLobby = source.slice(enterLobbyStart, enterLobbyEnd);
-  assert.match(enterLobby, /typingUsers\.clear\(\)/);
-  assert.match(enterLobby, /applyLobbyState/);
-  assert.doesNotMatch(enterLobby, /submit-(?:join|create)-btn[^\n]*disabled\s*=\s*true/);
+  let room = null;
+  let handled = 0;
+  assert.equal(client.dispatchRoomEvent(room, () => { handled += 1; }, {}), false);
+  room = 'ABC123';
+  assert.equal(client.dispatchRoomEvent(room, () => { handled += 1; }, {}), true);
+  assert.equal(handled, 1);
+
+  let now = 1_000;
+  let nextTimerId = 0;
+  const timers = new Map();
+  const canceled = [];
+  const states = [];
+  const restrictions = client.createRestrictionCoordinator({
+    schedule(callback, delay) {
+      const id = ++nextTimerId;
+      timers.set(id, { callback, delay });
+      return id;
+    },
+    cancel(id) { canceled.push(id); },
+    now: () => now,
+    getCurrentRoom: () => room,
+    applyState: state => states.push({ ...state })
+  });
+
+  restrictions.apply({ timedOut: true, timeoutUntil: 1_100 }, 'ABC123');
+  const staleTimer = timers.get(1);
+  assert.equal(states.at(-1).timedOut, true);
+  restrictions.apply({ timedOut: false, timeoutUntil: null }, 'ABC123');
+  staleTimer.callback();
+  assert.equal(states.at(-1).timedOut, false);
+  assert.deepEqual(canceled, [1]);
+
+  restrictions.apply({ timedOut: true, timeoutUntil: 1_200 }, 'ABC123');
+  room = 'XYZ789';
+  const roomScopedStateCount = states.length;
+  timers.get(2).callback();
+  assert.equal(states.length, roomScopedStateCount, 'old-room expiry cannot enable the new room');
+
+  room = 'ABC123';
+  restrictions.apply({ timedOut: true, timeoutUntil: 1_200 }, 'ABC123');
+  now = 1_200;
+  timers.get(3).callback();
+  assert.equal(states.at(-1).timedOut, false);
 });
 
-test('Lobby state ignores late room traffic after transport eviction', () => {
-  const source = fs.readFileSync(chatPath, 'utf8');
-  for (const event of ['chat_message', 'system_message', 'online_users', 'typing']) {
-    const start = source.indexOf(`activeSocket.on('${event}'`);
-    const end = source.indexOf('activeSocket.on(', start + 20);
-    const handler = source.slice(start, end);
-    assert.notEqual(start, -1, `${event} handler exists`);
-    assert.match(handler, /if\s*\(!currentServerCode\)\s*return/, `${event} ignores lobby traffic`);
+test('moderator center rejects same-room close and reopen callbacks by epoch', () => {
+  const client = loadHelpers();
+  const socket = createDeferredSocket();
+  const center = client.createModeratorCenterCoordinator();
+  const applied = [];
+
+  center.open('ABC123', 'reports');
+  const oldRequest = client.moderatorCenterRequestFor({
+    tab: 'reports', roomCode: 'ABC123', status: 'open'
+  });
+  client.dispatchModeratorCenterRequest({
+    coordinator: center, socket, request: oldRequest,
+    apply: response => applied.push(`old:${response.items[0]}`)
+  });
+
+  center.close();
+  center.open('ABC123', 'reports');
+  const newRequest = client.moderatorCenterRequestFor({
+    tab: 'reports', roomCode: 'ABC123', status: 'open'
+  });
+  client.dispatchModeratorCenterRequest({
+    coordinator: center, socket, request: newRequest,
+    apply: response => applied.push(`new:${response.items[0]}`)
+  });
+
+  socket.calls[0].callback({ items: ['stale'] });
+  assert.deepEqual(applied, []);
+  socket.calls[1].callback({ items: ['fresh'] });
+  assert.deepEqual(applied, ['new:fresh']);
+});
+
+test('moderator center rejects rapid report-filter and stale audit-cursor responses', () => {
+  const client = loadHelpers();
+  const socket = createDeferredSocket();
+  const pending = new Map();
+  const center = client.createModeratorCenterCoordinator({
+    onPendingChange: (key, value) => pending.set(key, value)
+  });
+  const applied = [];
+  center.open('ABC123', 'reports');
+
+  for (const status of ['open', 'resolved']) {
+    const request = client.moderatorCenterRequestFor({
+      tab: 'reports', roomCode: 'ABC123', status
+    });
+    client.dispatchModeratorCenterRequest({
+      coordinator: center, socket, request,
+      apply: response => applied.push(`${status}:${response.items[0]}`)
+    });
   }
+  assert.deepEqual(socket.calls.map(call => call.payload.status), ['open', 'resolved']);
+  socket.calls[0].callback({ items: ['stale-open'] });
+  socket.calls[1].callback({ items: ['fresh-resolved'] });
+  assert.deepEqual(applied, ['resolved:fresh-resolved']);
+
+  center.selectView('audit');
+  const cursorRequest = client.moderatorCenterRequestFor({
+    tab: 'audit', roomCode: 'ABC123', before: 'cursor-1', append: true
+  });
+  const firstCursorToken = client.dispatchModeratorCenterRequest({
+    coordinator: center, socket, request: cursorRequest, blockWhilePending: true,
+    apply: response => applied.push(`cursor:${response.items[0]}`)
+  });
+  const duplicateCursorToken = client.dispatchModeratorCenterRequest({
+    coordinator: center, socket, request: cursorRequest, blockWhilePending: true,
+    apply: () => applied.push('duplicate')
+  });
+  assert.ok(firstCursorToken);
+  assert.equal(duplicateCursorToken, null);
+  assert.equal(pending.get('audit:list'), true, 'load-more is disabled while its request is pending');
+
+  const refreshRequest = client.moderatorCenterRequestFor({
+    tab: 'audit', roomCode: 'ABC123', append: false
+  });
+  client.dispatchModeratorCenterRequest({
+    coordinator: center, socket, request: refreshRequest,
+    apply: response => applied.push(`refresh:${response.items[0]}`)
+  });
+  assert.equal(socket.calls.at(-1).event, 'get_moderation_audit');
+  assert.equal(Object.prototype.hasOwnProperty.call(socket.calls.at(-1).payload, 'before'), false);
+  socket.calls[2].callback({ items: ['stale-page'] });
+  socket.calls[3].callback({ items: ['fresh-page'] });
+  assert.deepEqual(applied, ['resolved:fresh-resolved', 'refresh:fresh-page']);
+  assert.equal(pending.get('audit:list'), false, 'latest response re-enables load-more');
 });
 
-test('banned client suppresses rail switches and restores Global after unban', () => {
-  const source = fs.readFileSync(chatPath, 'utf8');
-  assert.match(source, /myBannedRooms\s*=\s*new Set\(res\.bannedRooms\s*\|\|\s*\[\]\)/);
-  assert.match(source, /aria-disabled/);
-  assert.match(source, /myBannedRooms\.has\(code\)[\s\S]{0,120}return/);
-  assert.match(source, /room_restriction_updated[\s\S]{0,1000}myBannedRooms\s*=\s*new Set/s);
-  assert.match(source, /room_restriction_updated[\s\S]{0,1400}renderServerAccess/s);
-  assert.match(source, /if\s*\(data\.serverCode\s*===\s*currentServerCode\)[\s\S]{0,300}applyRestrictionState/s);
-});
+test('moderator center request builders cover restrictions, audit, resolve, and AutoMod safely', () => {
+  const client = loadHelpers();
+  assert.deepEqual(client.restrictionActionsFor({
+    targetUsername: 'absent-from-roster', banned: true, timedOut: false
+  }), ['unban']);
+  assert.deepEqual(client.restrictionActionsFor({
+    targetUsername: 'absent-from-roster', banned: true, timedOut: true
+  }), ['unban', 'clear_timeout']);
+  assert.deepEqual(client.moderatorCenterRequestFor({
+    tab: 'restrictions', roomCode: 'ABC123', before: 'cursor-r'
+  }).payload, { serverCode: 'ABC123', limit: 20, before: 'cursor-r' });
+  assert.deepEqual(client.moderatorCenterRequestFor({
+    tab: 'audit', roomCode: 'ABC123', before: 'cursor-a'
+  }).payload, { serverCode: 'ABC123', limit: 20, before: 'cursor-a' });
+  assert.deepEqual(client.moderatorCenterRequestFor({
+    tab: 'automod', roomCode: 'ABC123'
+  }).payload, { serverCode: 'ABC123' });
 
-test('current-room timeout expiry is guarded by room and restriction version', () => {
-  const source = fs.readFileSync(chatPath, 'utf8');
-  const applyStart = source.indexOf('function applyRestrictionState');
-  const applyEnd = source.indexOf('function renderServerAccess', applyStart);
-  const applyRestriction = source.slice(applyStart, applyEnd);
-  assert.notEqual(applyStart, -1);
-  assert.match(applyRestriction, /clearTimeout\(restrictionExpiryTimer\)/);
-  assert.match(applyRestriction, /restrictionVersion\s*\+=\s*1/);
-  assert.match(applyRestriction, /capturedRoom/);
-  assert.match(applyRestriction, /capturedVersion/);
-  assert.match(applyRestriction, /currentServerCode\s*!==\s*capturedRoom/);
-  assert.match(applyRestriction, /restrictionVersion\s*!==\s*capturedVersion/);
-  assert.match(source, /applyRestrictionState\(res\.restriction/);
-  assert.match(source, /applyRestrictionState\(response\.restriction/);
-});
+  const socket = createDeferredSocket();
+  const center = client.createModeratorCenterCoordinator();
+  const applied = [];
+  center.open('ABC123', 'automod');
+  const getRequest = client.moderatorCenterRequestFor({ tab: 'automod', roomCode: 'ABC123' });
+  client.dispatchModeratorCenterRequest({
+    coordinator: center, socket, request: getRequest,
+    apply: response => applied.push(response.autoMod.mentionLimit)
+  });
+  center.close();
+  center.open('ABC123', 'automod');
+  socket.calls[0].callback({ autoMod: { mentionLimit: 99 } });
+  assert.deepEqual(applied, []);
 
-test('moderation center supports absent-roster unban and clears room data on reopen', () => {
-  const source = fs.readFileSync(chatPath, 'utf8');
-  const openStart = source.indexOf('function openModeratorCenter');
-  const openEnd = source.indexOf('function closeModeratorCenter', openStart);
-  const openCenter = source.slice(openStart, openEnd);
-  const restrictionsStart = source.indexOf('function renderRoomRestrictions');
-  const restrictionsEnd = source.indexOf('function renderModerationAudit', restrictionsStart);
-  const restrictions = source.slice(restrictionsStart, restrictionsEnd);
+  const autoModPayload = {
+    serverCode: 'ABC123', blockedKeywords: ['spam'], mentionLimit: 4,
+    repeatLimit: 3, repeatWindowSeconds: 30
+  };
+  const autoModSave = client.moderatorCenterMutationRequestFor('automod', autoModPayload);
+  assert.equal(autoModSave.event, 'update_automod');
+  assert.deepEqual(autoModSave.payload, autoModPayload);
+  client.dispatchModeratorCenterRequest({
+    coordinator: center, socket, request: autoModSave,
+    apply: () => applied.push('stale-save')
+  });
+  center.close();
+  center.open('ABC123', 'automod');
+  socket.calls[1].callback({ ok: true });
+  assert.deepEqual(applied, []);
 
-  assert.match(openCenter, /clearModeratorRows\(\)/);
-  assert.match(openCenter, /moderatorCenterRoom\s*=\s*currentServerCode/);
-  assert.match(restrictions, /targetUsername/);
-  assert.match(restrictions, /Unban/);
-  assert.match(restrictions, /Clear Timeout/);
-  assert.match(restrictions, /openModerationPrompt/);
-  assert.match(source, /resolve_moderation_report/);
-  assert.match(source, /['"]resolved['"]/);
-  assert.match(source, /['"]dismissed['"]/);
-});
+  center.selectView('restrictions');
+  const restrictionRequest = client.moderatorCenterRequestFor({
+    tab: 'restrictions', roomCode: 'ABC123'
+  });
+  client.dispatchModeratorCenterRequest({
+    coordinator: center, socket, request: restrictionRequest,
+    apply: () => applied.push('stale-restrictions')
+  });
+  center.selectView('audit');
+  socket.calls[2].callback({ items: [{ targetUsername: 'private' }] });
+  assert.deepEqual(applied, []);
 
-test('stale restriction and moderator-center callbacks stay scoped to their room', () => {
-  const source = fs.readFileSync(chatPath, 'utf8');
-  const roleManagerStart = source.indexOf('function openRoleManager');
-  const roleManagerEnd = source.indexOf('// --- REACTION UI ENGINE ---', roleManagerStart);
-  const roleManager = source.slice(roleManagerStart, roleManagerEnd);
-  assert.match(roleManager, /requestedRoom/);
-  assert.match(roleManager, /currentServerCode\s*!==\s*requestedRoom/);
-
-  const centerStart = source.indexOf('function loadModeratorCenterTab');
-  const centerEnd = source.indexOf('function renderModerationReports', centerStart);
-  const centerLoader = source.slice(centerStart, centerEnd);
-  assert.match(centerLoader, /moderatorCenterRoom/);
-  assert.match(centerLoader, /currentServerCode\s*!==\s*requestedRoom/);
-  assert.match(centerLoader, /moderator-center-modal[^\n]*active|classList\.contains\(['"]active['"]\)/);
-});
-
-test('moderator center keeps API projections private and validates AutoMod bounds', () => {
-  const source = fs.readFileSync(chatPath, 'utf8');
-  assert.match(source, /get_automod/);
-  assert.match(source, /update_automod/);
-  assert.match(source, /blockedKeywords/);
-  assert.match(source, /\.slice\(0,\s*50\)/);
-  assert.match(source, /mentionLimit[\s\S]{0,500}(?:1[^\d]+20|value\s*>\s*20)/);
-  assert.match(source, /repeatLimit[\s\S]{0,500}(?:2[^\d]+10|value\s*>\s*10)/);
-  assert.match(source, /repeatWindowSeconds[\s\S]{0,500}(?:5[^\d]+300|value\s*>\s*300)/);
-  assert.doesNotMatch(source, /internalSecret|storageSecret/);
+  center.selectView('reports');
+  for (const status of ['resolved', 'dismissed']) {
+    const payload = client.normalizeResolutionPrompt({
+      serverCode: 'ABC123', reportId: `report-${status}`, status, resolution: `${status} reason`
+    });
+    const mutation = client.moderatorCenterMutationRequestFor('resolve', payload);
+    assert.equal(mutation.event, 'resolve_moderation_report');
+    assert.deepEqual(mutation.payload, payload);
+    client.dispatchModeratorCenterRequest({
+      coordinator: center, socket, request: mutation, apply: () => {}
+    });
+  }
+  assert.deepEqual(socket.calls.slice(-2).map(call => ({
+    event: call.event,
+    status: call.payload.status,
+    resolution: call.payload.resolution
+  })), [
+    { event: 'resolve_moderation_report', status: 'resolved', resolution: 'resolved reason' },
+    { event: 'resolve_moderation_report', status: 'dismissed', resolution: 'dismissed reason' }
+  ]);
 });

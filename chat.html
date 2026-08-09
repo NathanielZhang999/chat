@@ -684,6 +684,351 @@
             elements.attachmentButton.disabled = active;
             elements.emojiButton.disabled = active;
             elements.infoBar.textContent = active ? 'Lobby — join or create a room to chat' : elements.roomLabel;
+            for (const action of elements.messageActions || []) action.disabled = active;
+            if (active) {
+                for (const action of elements.roomDiscoveryActions || []) action.disabled = false;
+            }
+            if (active && elements.typingState && typeof elements.typingState.clear === 'function') {
+                elements.typingState.clear();
+            }
+        },
+
+        normalizeReportPrompt(input) {
+            if (!input || typeof input.serverCode !== 'string' || !input.serverCode ||
+                typeof input.targetUser !== 'string' || !input.targetUser ||
+                typeof input.reason !== 'string') return null;
+            const reason = input.reason.normalize('NFKC').trim();
+            if (!reason || reason.length > 300) return null;
+            const payload = { serverCode: input.serverCode, targetUser: input.targetUser };
+            if (input.messageId !== undefined && input.messageId !== null) {
+                if (typeof input.messageId !== 'string' || !input.messageId) return null;
+                payload.messageId = input.messageId;
+            }
+            payload.reason = reason;
+            return payload;
+        },
+
+        dispatchModerationReport(socket, input, callback) {
+            const payload = this.normalizeReportPrompt(input);
+            if (!payload || !socket || typeof socket.emit !== 'function') return null;
+            socket.emit('report_moderation_target', payload, callback);
+            return payload;
+        },
+
+        normalizeResolutionPrompt(input) {
+            const statuses = new Set(['resolved', 'dismissed']);
+            if (!input || typeof input.serverCode !== 'string' || !input.serverCode ||
+                typeof input.reportId !== 'string' || !input.reportId ||
+                !statuses.has(input.status) || typeof input.resolution !== 'string') return null;
+            const resolution = input.resolution.normalize('NFKC').trim();
+            if (!resolution || resolution.length > 300) return null;
+            return {
+                serverCode: input.serverCode,
+                reportId: input.reportId,
+                status: input.status,
+                resolution
+            };
+        },
+
+        normalizeAutoModPrompt(input) {
+            if (!input || typeof input.keywordsText !== 'string') return null;
+            const candidateKeywords = input.keywordsText
+                .split(/\r?\n/)
+                .map(value => value.normalize('NFKC').trim().toLowerCase())
+                .filter(Boolean);
+            const blockedKeywords = candidateKeywords.slice(0, 50);
+            const settings = {
+                blockedKeywords,
+                mentionLimit: Number(input.mentionLimit),
+                repeatLimit: Number(input.repeatLimit),
+                repeatWindowSeconds: Number(input.repeatWindowSeconds)
+            };
+            const bounds = {
+                mentionLimit: [1, 20],
+                repeatLimit: [2, 10],
+                repeatWindowSeconds: [5, 300]
+            };
+            const invalidNumber = Object.entries(bounds).some(([key, [min, max]]) =>
+                !Number.isInteger(settings[key]) || settings[key] < min || settings[key] > max);
+            const invalidKeywords = candidateKeywords.length > 50 ||
+                blockedKeywords.some(value => value.length < 1 || value.length > 40);
+            return invalidNumber || invalidKeywords ? null : settings;
+        },
+
+        restrictionActionsFor(restriction) {
+            if (!restriction) return [];
+            const actions = [];
+            if (restriction.banned) actions.push('unban');
+            if (restriction.timedOut) actions.push('clear_timeout');
+            return actions;
+        },
+
+        appendSafeModerationRow(doc, list, titleText, detailText) {
+            const row = doc.createElement('article');
+            row.className = 'moderator-row';
+            const title = doc.createElement('div');
+            title.className = 'moderator-row-title';
+            title.textContent = titleText == null ? '' : String(titleText);
+            const detail = doc.createElement('div');
+            detail.className = 'moderator-row-detail';
+            detail.textContent = detailText == null ? '' : String(detailText);
+            row.appendChild(title);
+            row.appendChild(detail);
+            list.appendChild(row);
+            return { row, title, detail };
+        },
+
+        appendModerationItemRow(doc, list, kind, item, formatDate) {
+            if (!item || typeof formatDate !== 'function') return null;
+            let titleText;
+            let detailText;
+            if (kind === 'report') {
+                titleText = `@${item.targetUsername || 'Unknown'} — ${item.status || 'open'}`;
+                detailText = `Reported by @${item.reporterUsername || 'Unknown'}${item.messageId ? `\nMessage: ${item.messageId}` : ''}\nReason: ${item.reason || ''}\nCreated: ${formatDate(item.createdAt)}`;
+            } else if (kind === 'restriction') {
+                const states = [item.banned ? 'Banned' : '', item.timedOut ? 'Timed out' : ''].filter(Boolean);
+                const details = [];
+                if (item.banned) details.push(
+                    `Ban reason: ${item.banReason || ''}`,
+                    `Banned by: @${item.bannedBy || 'Unknown'}`
+                );
+                if (item.timedOut) details.push(
+                    `Timeout reason: ${item.timeoutReason || ''}`,
+                    `Until: ${formatDate(item.timeoutUntil)}`
+                );
+                titleText = `@${item.targetUsername || 'Unknown'} — ${states.join(' + ')}`;
+                detailText = details.join('\n');
+            } else if (kind === 'audit') {
+                titleText = `${item.action || 'moderation'} by @${item.actorUsername || 'Unknown'}`;
+                detailText = `${item.targetUsername ? `Target: @${item.targetUsername}\n` : ''}Reason: ${item.reason || ''}${item.duration ? `\nDuration: ${item.duration}` : ''}\nCreated: ${formatDate(item.createdAt)}`;
+            } else {
+                return null;
+            }
+            return this.appendSafeModerationRow(doc, list, titleText, detailText);
+        },
+
+        dispatchRoomEvent(currentRoom, handler, data) {
+            if (!currentRoom) return false;
+            handler(data);
+            return true;
+        },
+
+        createRestrictionCoordinator({ schedule, cancel, now, getCurrentRoom, applyState }) {
+            let timerId = null;
+            let version = 0;
+
+            const clearTimer = () => {
+                if (timerId !== null) cancel(timerId);
+                timerId = null;
+            };
+
+            return {
+                clear() {
+                    clearTimer();
+                    version += 1;
+                },
+                apply(restriction, roomCode) {
+                    clearTimer();
+                    version += 1;
+                    const capturedVersion = version;
+                    const capturedRoom = roomCode;
+                    const timeoutUntil = restriction && restriction.timeoutUntil !== null &&
+                        restriction.timeoutUntil !== undefined
+                        ? new Date(restriction.timeoutUntil).getTime()
+                        : NaN;
+                    const timedOut = Boolean(restriction && restriction.timedOut &&
+                        Number.isFinite(timeoutUntil) && timeoutUntil > now());
+                    applyState({
+                        timedOut,
+                        timeoutUntil: timedOut ? timeoutUntil : null,
+                        roomCode,
+                        version: capturedVersion
+                    });
+                    if (!timedOut) return;
+                    timerId = schedule(() => {
+                        if (getCurrentRoom() !== capturedRoom || version !== capturedVersion) return;
+                        timerId = null;
+                        version += 1;
+                        applyState({ timedOut: false, timeoutUntil: null, roomCode, version });
+                    }, Math.max(0, timeoutUntil - now()));
+                },
+                version() { return version; }
+            };
+        },
+
+        createRoomAccessCoordinator({
+            getCurrentRoom,
+            requestSwitch,
+            enterLobby,
+            renderAccess,
+            applyRestriction
+        }) {
+            let bannedRooms = new Set();
+            const replaceBannedRooms = rooms => {
+                bannedRooms = new Set(Array.isArray(rooms) ? rooms : []);
+                renderAccess([...bannedRooms]);
+            };
+            const requestRoom = code => {
+                if (!code || bannedRooms.has(code)) return false;
+                requestSwitch(code);
+                return true;
+            };
+            return {
+                replaceBannedRooms,
+                requestRoom,
+                bannedRooms() { return [...bannedRooms]; },
+                isBanned(code) { return bannedRooms.has(code); },
+                handleAccessUpdate(data) {
+                    if (!data) return;
+                    replaceBannedRooms(data.bannedRooms);
+                    if (data.serverCode === null) enterLobby();
+                    else if (data.serverCode && data.serverCode !== getCurrentRoom()) requestRoom(data.serverCode);
+                },
+                handleRestrictionUpdate(data) {
+                    if (!data) return;
+                    replaceBannedRooms(data.bannedRooms);
+                    if (data.serverCode !== getCurrentRoom()) return;
+                    if (data.banned) enterLobby();
+                    else applyRestriction(data, data.serverCode);
+                }
+            };
+        },
+
+        createModeratorCenterCoordinator({ onPendingChange = () => {} } = {}) {
+            let epoch = 0;
+            let room = null;
+            let view = null;
+            let nextRequestId = 0;
+            const latestByKey = new Map();
+            const pendingKeys = new Set();
+
+            const clearRequests = () => {
+                for (const key of pendingKeys) onPendingChange(key, false);
+                latestByKey.clear();
+                pendingKeys.clear();
+            };
+
+            return {
+                open(nextRoom, nextView = 'reports') {
+                    epoch += 1;
+                    clearRequests();
+                    room = nextRoom;
+                    view = nextView;
+                    return epoch;
+                },
+                close() {
+                    epoch += 1;
+                    clearRequests();
+                    room = null;
+                    view = null;
+                    return epoch;
+                },
+                selectView(nextView) {
+                    epoch += 1;
+                    clearRequests();
+                    view = nextView;
+                    return epoch;
+                },
+                beginRequest(request, blockWhilePending = false) {
+                    if (!request || !room || request.roomCode !== room || request.view !== view) return null;
+                    if (blockWhilePending && pendingKeys.has(request.key)) return null;
+                    const requestId = ++nextRequestId;
+                    const token = Object.freeze({
+                        epoch,
+                        room,
+                        view,
+                        key: request.key,
+                        identity: request.identity,
+                        requestId
+                    });
+                    latestByKey.set(request.key, token);
+                    if (!pendingKeys.has(request.key)) {
+                        pendingKeys.add(request.key);
+                        onPendingChange(request.key, true);
+                    }
+                    return token;
+                },
+                finishRequest(token) {
+                    const latest = token && latestByKey.get(token.key);
+                    const current = Boolean(token && latest &&
+                        token.epoch === epoch && token.room === room && token.view === view &&
+                        latest.requestId === token.requestId && latest.identity === token.identity);
+                    if (!current) return false;
+                    latestByKey.delete(token.key);
+                    pendingKeys.delete(token.key);
+                    onPendingChange(token.key, false);
+                    return true;
+                },
+                isPending(key) { return pendingKeys.has(key); },
+                current() { return { epoch, room, view }; }
+            };
+        },
+
+        moderatorCenterRequestFor({ tab, roomCode, status = 'open', before = null, append = false }) {
+            if (!roomCode || !['reports', 'restrictions', 'audit', 'automod'].includes(tab)) return null;
+            const specs = {
+                reports: {
+                    event: 'list_moderation_reports',
+                    payload: { serverCode: roomCode, status, limit: 20 },
+                    key: 'reports:list'
+                },
+                restrictions: {
+                    event: 'list_room_restrictions',
+                    payload: { serverCode: roomCode, limit: 20 },
+                    key: 'restrictions:list'
+                },
+                audit: {
+                    event: 'get_moderation_audit',
+                    payload: { serverCode: roomCode, limit: 20 },
+                    key: 'audit:list'
+                },
+                automod: {
+                    event: 'get_automod',
+                    payload: { serverCode: roomCode },
+                    key: 'automod:get'
+                }
+            };
+            const spec = specs[tab];
+            if (before) spec.payload.before = before;
+            return {
+                ...spec,
+                view: tab,
+                roomCode,
+                append,
+                identity: JSON.stringify({ tab, roomCode, status: tab === 'reports' ? status : null, before, append })
+            };
+        },
+
+        moderatorCenterMutationRequestFor(kind, payload) {
+            if (!payload || !payload.serverCode) return null;
+            const specs = {
+                resolve: { event: 'resolve_moderation_report', key: 'reports:resolve', view: 'reports' },
+                automod: { event: 'update_automod', key: 'automod:save', view: 'automod' }
+            };
+            const spec = specs[kind];
+            if (!spec) return null;
+            return {
+                ...spec,
+                payload,
+                roomCode: payload.serverCode,
+                identity: JSON.stringify(payload)
+            };
+        },
+
+        dispatchModeratorCenterRequest({
+            coordinator,
+            socket,
+            request,
+            apply,
+            blockWhilePending = false
+        }) {
+            const token = coordinator.beginRequest(request, blockWhilePending);
+            if (!token) return null;
+            socket.emit(request.event, request.payload, response => {
+                if (!coordinator.finishRequest(token)) return;
+                apply(response || { error: 'No response from server.' }, token);
+            });
+            return token;
         },
 
         sanitizeAttachment(value) {
@@ -916,8 +1261,6 @@
     let myBannedRooms = new Set();
     let serversCache = { 'global': { name: 'Global Chat', owner: 'System' } }; 
     let usersCache = {}; 
-    let restrictionExpiryTimer = null;
-    let restrictionVersion = 0;
     let compositionDisabled = true;
     let selectedModerationRequest = null;
     let selectedReportRequest = null;
@@ -957,6 +1300,39 @@
         (code, callback) => socket.emit('switch_server', code, callback),
         handleSwitchResult
     );
+    const restrictionCoordinator = ChatClientHelpers.createRestrictionCoordinator({
+        schedule: (callback, delay) => setTimeout(callback, delay),
+        cancel: timerId => clearTimeout(timerId),
+        now: () => Date.now(),
+        getCurrentRoom: () => currentServerCode,
+        applyState({ timedOut, timeoutUntil }) {
+            const notice = timedOut
+                ? `You are timed out in this room until ${formatExactDate(timeoutUntil)}.`
+                : '';
+            setCompositionDisabled(timedOut, notice);
+        }
+    });
+    const roomAccessCoordinator = ChatClientHelpers.createRoomAccessCoordinator({
+        getCurrentRoom: () => currentServerCode,
+        requestSwitch: requestServerSwitch,
+        enterLobby,
+        renderAccess(rooms) {
+            myBannedRooms = new Set(rooms);
+            renderServerAccess();
+        },
+        applyRestriction: applyRestrictionState
+    });
+    const moderatorCenterCoordinator = ChatClientHelpers.createModeratorCenterCoordinator({
+        onPendingChange(key, pending) {
+            const loadMoreIds = {
+                'reports:list': 'moderator-reports-more',
+                'restrictions:list': 'moderator-restrictions-more',
+                'audit:list': 'moderator-audit-more'
+            };
+            const button = document.getElementById(loadMoreIds[key]);
+            if (button) button.disabled = pending;
+        }
+    });
 
     function setCompositionDisabled(disabled, notice = '') {
         compositionDisabled = Boolean(disabled);
@@ -976,9 +1352,7 @@
     function enterLobby() {
         currentServerCode = null;
         myRoomRole = 'user';
-        if (restrictionExpiryTimer !== null) clearTimeout(restrictionExpiryTimer);
-        restrictionExpiryTimer = null;
-        restrictionVersion += 1;
+        restrictionCoordinator.clear();
         typingUsers.clear();
         updateTypingUI();
         chatWindow.textContent = '';
@@ -998,35 +1372,18 @@
             attachmentButton,
             emojiButton,
             infoBar: restrictionNotice,
-            roomLabel: ''
+            roomLabel: '',
+            roomDiscoveryActions: [
+                document.getElementById('submit-join-btn'),
+                document.getElementById('submit-create-btn')
+            ]
         }, true);
         fileUpload.disabled = true;
         compositionDisabled = true;
     }
 
     function applyRestrictionState(restriction, roomCode = currentServerCode) {
-        if (restrictionExpiryTimer !== null) clearTimeout(restrictionExpiryTimer);
-        restrictionExpiryTimer = null;
-        restrictionVersion += 1;
-        const capturedRoom = roomCode;
-        const capturedVersion = restrictionVersion;
-        const timeoutTime = restriction && restriction.timeoutUntil
-            ? new Date(restriction.timeoutUntil).getTime()
-            : NaN;
-        const timedOut = Boolean(restriction && restriction.timedOut &&
-            Number.isFinite(timeoutTime) && timeoutTime > Date.now());
-        const notice = timedOut
-            ? `You are timed out in this room until ${formatExactDate(timeoutTime)}.`
-            : '';
-        setCompositionDisabled(timedOut, notice);
-        if (!timedOut) return;
-
-        restrictionExpiryTimer = setTimeout(() => {
-            if (currentServerCode !== capturedRoom || restrictionVersion !== capturedVersion) return;
-            restrictionExpiryTimer = null;
-            restrictionVersion += 1;
-            setCompositionDisabled(false, '');
-        }, Math.max(0, timeoutTime - Date.now()));
+        restrictionCoordinator.apply(restriction, roomCode);
     }
 
     function renderServerAccess() {
@@ -1145,8 +1502,13 @@
     function submitReport() {
         if (!selectedReportRequest) return;
         const request = selectedReportRequest;
-        const reason = document.getElementById('report-reason').value.normalize('NFKC').trim();
-        if (!reason || reason.length > 300) {
+        const payload = ChatClientHelpers.normalizeReportPrompt({
+            serverCode: request.roomCode,
+            targetUser: request.targetUsername,
+            messageId: request.messageId || undefined,
+            reason: document.getElementById('report-reason').value
+        });
+        if (!payload) {
             document.getElementById('report-error').textContent = 'Enter a reason of 1–300 characters.';
             return;
         }
@@ -1156,12 +1518,7 @@
         }
         const confirmButton = document.getElementById('report-confirm');
         confirmButton.disabled = true;
-        socket.emit('report_moderation_target', {
-            serverCode: request.roomCode,
-            targetUser: request.targetUsername,
-            messageId: request.messageId || undefined,
-            reason
-        }, response => {
+        ChatClientHelpers.dispatchModerationReport(socket, payload, response => {
             confirmButton.disabled = false;
             const result = response || { error: 'No response from server.' };
             if (result.error) return showAppAlert('Report failed', result.error);
@@ -1182,6 +1539,7 @@
         clearModeratorRows();
         moderatorCenterRoom = currentServerCode;
         moderatorCenterTab = 'reports';
+        moderatorCenterCoordinator.open(moderatorCenterRoom, moderatorCenterTab);
         document.getElementById('moderator-center-title').textContent =
             `Moderator Center — ${serversCache[moderatorCenterRoom]?.name || moderatorCenterRoom}`;
         document.querySelectorAll('.moderator-tab').forEach(button => {
@@ -1194,6 +1552,7 @@
     }
 
     function closeModeratorCenter() {
+        moderatorCenterCoordinator.close();
         document.getElementById('moderator-center-modal').classList.remove('active');
         moderatorCenterRoom = null;
         clearModeratorRows();
@@ -1219,6 +1578,7 @@
     function selectModeratorTab(tab) {
         if (!['reports', 'restrictions', 'audit', 'automod'].includes(tab)) return;
         moderatorCenterTab = tab;
+        moderatorCenterCoordinator.selectView(tab);
         document.querySelectorAll('.moderator-tab').forEach(button => {
             button.classList.toggle('active', button.dataset.moderatorTab === tab);
         });
@@ -1231,39 +1591,28 @@
         const requestedRoom = moderatorCenterRoom;
         const modal = document.getElementById('moderator-center-modal');
         if (!requestedRoom || currentServerCode !== requestedRoom || !modal.classList.contains('active')) return;
-        if (tab === 'automod') {
-            loadAutoModSettings(requestedRoom);
-            return;
-        }
-        const requests = {
-            reports: {
-                event: 'list_moderation_reports',
-                payload: {
-                    serverCode: requestedRoom,
-                    status: document.getElementById('moderator-report-status').value,
-                    limit: 20
-                },
-                render: renderModerationReports
-            },
-            restrictions: {
-                event: 'list_room_restrictions',
-                payload: { serverCode: requestedRoom, limit: 20 },
-                render: renderRoomRestrictions
-            },
-            audit: {
-                event: 'get_moderation_audit',
-                payload: { serverCode: requestedRoom, limit: 20 },
-                render: renderModerationAudit
-            }
-        };
-        const request = requests[tab];
+        const request = ChatClientHelpers.moderatorCenterRequestFor({
+            tab,
+            roomCode: requestedRoom,
+            status: document.getElementById('moderator-report-status').value,
+            before,
+            append
+        });
         if (!request) return;
-        if (before) request.payload.before = before;
-        socket.emit(request.event, request.payload, response => {
-            if (currentServerCode !== requestedRoom || moderatorCenterRoom !== requestedRoom ||
-                !document.getElementById('moderator-center-modal').classList.contains('active')) return;
-            const result = response || { error: 'No response from server.' };
-            request.render(result, append);
+        const renderers = {
+            reports: renderModerationReports,
+            restrictions: renderRoomRestrictions,
+            audit: renderModerationAudit,
+            automod: renderAutoModSettings
+        };
+        ChatClientHelpers.dispatchModeratorCenterRequest({
+            coordinator: moderatorCenterCoordinator,
+            socket,
+            request,
+            blockWhilePending: append,
+            apply(response) {
+                renderers[tab](response, append);
+            }
         });
     }
 
@@ -1277,16 +1626,9 @@
             list.appendChild(errorRow);
         } else {
             for (const report of Array.isArray(response.items) ? response.items : []) {
-                const row = document.createElement('article');
-                row.className = 'moderator-row';
-                const title = document.createElement('div');
-                title.className = 'moderator-row-title';
-                title.textContent = `@${report.targetUsername || 'Unknown'} — ${report.status || 'open'}`;
-                const detail = document.createElement('div');
-                detail.className = 'moderator-row-detail';
-                detail.textContent = `Reported by @${report.reporterUsername || 'Unknown'}${report.messageId ? `\nMessage: ${report.messageId}` : ''}\nReason: ${report.reason || ''}\nCreated: ${formatExactDate(report.createdAt)}`;
-                row.appendChild(title);
-                row.appendChild(detail);
+                const { row } = ChatClientHelpers.appendModerationItemRow(
+                    document, list, 'report', report, formatExactDate
+                );
                 if (report.status === 'open') {
                     const actions = document.createElement('div');
                     actions.className = 'moderator-row-actions';
@@ -1308,7 +1650,6 @@
                     resolution.textContent = `Resolution by @${report.resolvedBy || 'Unknown'}: ${report.resolution}`;
                     row.appendChild(resolution);
                 }
-                list.appendChild(row);
             }
             if (!list.children.length) {
                 const empty = document.createElement('div');
@@ -1332,18 +1673,9 @@
             list.appendChild(errorRow);
         } else {
             for (const restriction of Array.isArray(response.items) ? response.items : []) {
-                const row = document.createElement('article');
-                row.className = 'moderator-row';
-                const title = document.createElement('div');
-                title.className = 'moderator-row-title';
-                const states = [restriction.banned ? 'Banned' : '', restriction.timedOut ? 'Timed out' : ''].filter(Boolean);
-                title.textContent = `@${restriction.targetUsername || 'Unknown'} — ${states.join(' + ')}`;
-                const detail = document.createElement('div');
-                detail.className = 'moderator-row-detail';
-                const details = [];
-                if (restriction.banned) details.push(`Ban reason: ${restriction.banReason || ''}`, `Banned by: @${restriction.bannedBy || 'Unknown'}`);
-                if (restriction.timedOut) details.push(`Timeout reason: ${restriction.timeoutReason || ''}`, `Until: ${formatExactDate(restriction.timeoutUntil)}`);
-                detail.textContent = details.join('\n');
+                const { row } = ChatClientHelpers.appendModerationItemRow(
+                    document, list, 'restriction', restriction, formatExactDate
+                );
                 const actions = document.createElement('div');
                 actions.className = 'moderator-row-actions';
                 const roomCode = moderatorCenterRoom;
@@ -1352,34 +1684,19 @@
                         loadModeratorCenterTab('restrictions');
                     }
                 };
-                if (restriction.banned) {
-                    const unbanButton = document.createElement('button');
-                    unbanButton.type = 'button';
-                    unbanButton.textContent = 'Unban';
-                    unbanButton.onclick = () => openModerationPrompt({
+                for (const action of ChatClientHelpers.restrictionActionsFor(restriction)) {
+                    const button = document.createElement('button');
+                    button.type = 'button';
+                    button.textContent = moderationActionLabels[action];
+                    button.onclick = () => openModerationPrompt({
                         targetUsername: restriction.targetUsername,
-                        action: 'unban',
+                        action,
                         roomCode,
                         onSuccess: refresh
                     });
-                    actions.appendChild(unbanButton);
+                    actions.appendChild(button);
                 }
-                if (restriction.timedOut) {
-                    const clearButton = document.createElement('button');
-                    clearButton.type = 'button';
-                    clearButton.textContent = 'Clear Timeout';
-                    clearButton.onclick = () => openModerationPrompt({
-                        targetUsername: restriction.targetUsername,
-                        action: 'clear_timeout',
-                        roomCode,
-                        onSuccess: refresh
-                    });
-                    actions.appendChild(clearButton);
-                }
-                row.appendChild(title);
-                row.appendChild(detail);
                 row.appendChild(actions);
-                list.appendChild(row);
             }
             if (!list.children.length) {
                 const empty = document.createElement('div');
@@ -1403,17 +1720,9 @@
             list.appendChild(errorRow);
         } else {
             for (const item of Array.isArray(response.items) ? response.items : []) {
-                const row = document.createElement('article');
-                row.className = 'moderator-row';
-                const title = document.createElement('div');
-                title.className = 'moderator-row-title';
-                title.textContent = `${item.action || 'moderation'} by @${item.actorUsername || 'Unknown'}`;
-                const detail = document.createElement('div');
-                detail.className = 'moderator-row-detail';
-                detail.textContent = `${item.targetUsername ? `Target: @${item.targetUsername}\n` : ''}Reason: ${item.reason || ''}${item.duration ? `\nDuration: ${item.duration}` : ''}\nCreated: ${formatExactDate(item.createdAt)}`;
-                row.appendChild(title);
-                row.appendChild(detail);
-                list.appendChild(row);
+                ChatClientHelpers.appendModerationItemRow(
+                    document, list, 'audit', item, formatExactDate
+                );
             }
             if (!list.children.length) {
                 const empty = document.createElement('div');
@@ -1428,66 +1737,55 @@
     }
 
     function loadAutoModSettings(requestedRoom = moderatorCenterRoom) {
-        if (!requestedRoom) return;
-        socket.emit('get_automod', { serverCode: requestedRoom }, response => {
-            if (currentServerCode !== requestedRoom || moderatorCenterRoom !== requestedRoom ||
-                !document.getElementById('moderator-center-modal').classList.contains('active')) return;
-            const result = response || { error: 'No response from server.' };
-            if (result.error || !result.autoMod) {
-                document.getElementById('automod-error').textContent = result.error || 'Invalid AutoMod response.';
-                return;
-            }
-            const autoMod = result.autoMod;
-            document.getElementById('automod-keywords').value = Array.isArray(autoMod.blockedKeywords)
-                ? autoMod.blockedKeywords.slice(0, 50).join('\n')
-                : '';
-            document.getElementById('automod-mention-limit').value = autoMod.mentionLimit;
-            document.getElementById('automod-repeat-limit').value = autoMod.repeatLimit;
-            document.getElementById('automod-repeat-window').value = autoMod.repeatWindowSeconds;
-            document.getElementById('automod-error').textContent = '';
-        });
+        if (!requestedRoom || requestedRoom !== moderatorCenterRoom) return;
+        loadModeratorCenterTab('automod');
+    }
+
+    function renderAutoModSettings(result) {
+        if (result.error || !result.autoMod) {
+            document.getElementById('automod-error').textContent = result.error || 'Invalid AutoMod response.';
+            return;
+        }
+        const autoMod = result.autoMod;
+        document.getElementById('automod-keywords').value = Array.isArray(autoMod.blockedKeywords)
+            ? autoMod.blockedKeywords.slice(0, 50).join('\n')
+            : '';
+        document.getElementById('automod-mention-limit').value = autoMod.mentionLimit;
+        document.getElementById('automod-repeat-limit').value = autoMod.repeatLimit;
+        document.getElementById('automod-repeat-window').value = autoMod.repeatWindowSeconds;
+        document.getElementById('automod-error').textContent = '';
     }
 
     function saveAutoModSettings() {
         const requestedRoom = moderatorCenterRoom;
         if (!requestedRoom || currentServerCode !== requestedRoom) return;
-        const candidateKeywords = document.getElementById('automod-keywords').value
-            .split(/\r?\n/)
-            .map(value => value.normalize('NFKC').trim().toLowerCase())
-            .filter(Boolean);
-        const blockedKeywords = candidateKeywords.slice(0, 50);
-        const settings = {
-            blockedKeywords,
-            mentionLimit: Number(document.getElementById('automod-mention-limit').value),
-            repeatLimit: Number(document.getElementById('automod-repeat-limit').value),
-            repeatWindowSeconds: Number(document.getElementById('automod-repeat-window').value)
-        };
-        const bounds = {
-            mentionLimit: [1, 20],
-            repeatLimit: [2, 10],
-            repeatWindowSeconds: [5, 300]
-        };
-        const invalidNumber = Object.entries(bounds).some(([key, [min, max]]) =>
-            !Number.isInteger(settings[key]) || settings[key] < min || settings[key] > max);
-        const invalidKeywords = candidateKeywords.length > 50 ||
-            blockedKeywords.some(value => value.length < 1 || value.length > 40);
-        if (invalidNumber || invalidKeywords) {
+        const settings = ChatClientHelpers.normalizeAutoModPrompt({
+            keywordsText: document.getElementById('automod-keywords').value,
+            mentionLimit: document.getElementById('automod-mention-limit').value,
+            repeatLimit: document.getElementById('automod-repeat-limit').value,
+            repeatWindowSeconds: document.getElementById('automod-repeat-window').value
+        });
+        if (!settings) {
             document.getElementById('automod-error').textContent =
                 'Use up to 50 keywords (1–40 characters each) and values within the displayed bounds.';
             return;
         }
         const saveButton = document.getElementById('automod-save');
         saveButton.disabled = true;
-        socket.emit('update_automod', { serverCode: requestedRoom, ...settings }, response => {
-            saveButton.disabled = false;
-            if (currentServerCode !== requestedRoom || moderatorCenterRoom !== requestedRoom) return;
-            const result = response || { error: 'No response from server.' };
-            if (result.error) {
-                document.getElementById('automod-error').textContent = result.error;
-                return;
+        const payload = { serverCode: requestedRoom, ...settings };
+        ChatClientHelpers.dispatchModeratorCenterRequest({
+            coordinator: moderatorCenterCoordinator,
+            socket,
+            request: ChatClientHelpers.moderatorCenterMutationRequestFor('automod', payload),
+            apply(result) {
+                saveButton.disabled = false;
+                if (result.error) {
+                    document.getElementById('automod-error').textContent = result.error;
+                    return;
+                }
+                document.getElementById('automod-error').textContent = 'AutoMod settings saved.';
+                loadAutoModSettings(requestedRoom);
             }
-            document.getElementById('automod-error').textContent = 'AutoMod settings saved.';
-            loadAutoModSettings(requestedRoom);
         });
     }
 
@@ -1513,8 +1811,13 @@
     function submitResolution() {
         if (!selectedResolutionRequest) return;
         const request = selectedResolutionRequest;
-        const resolution = document.getElementById('resolution-reason').value.normalize('NFKC').trim();
-        if (!resolution || resolution.length > 300) {
+        const payload = ChatClientHelpers.normalizeResolutionPrompt({
+            serverCode: request.roomCode,
+            reportId: request.reportId,
+            status: request.status,
+            resolution: document.getElementById('resolution-reason').value
+        });
+        if (!payload) {
             document.getElementById('resolution-error').textContent = 'Enter a resolution of 1–300 characters.';
             return;
         }
@@ -1524,21 +1827,19 @@
         }
         const confirmButton = document.getElementById('resolution-confirm');
         confirmButton.disabled = true;
-        socket.emit('resolve_moderation_report', {
-            serverCode: request.roomCode,
-            reportId: request.reportId,
-            status: request.status,
-            resolution
-        }, response => {
-            confirmButton.disabled = false;
-            if (currentServerCode !== request.roomCode || moderatorCenterRoom !== request.roomCode) return;
-            const result = response || { error: 'No response from server.' };
-            if (result.error) {
-                document.getElementById('resolution-error').textContent = result.error;
-                return;
+        ChatClientHelpers.dispatchModeratorCenterRequest({
+            coordinator: moderatorCenterCoordinator,
+            socket,
+            request: ChatClientHelpers.moderatorCenterMutationRequestFor('resolve', payload),
+            apply(result) {
+                confirmButton.disabled = false;
+                if (result.error) {
+                    document.getElementById('resolution-error').textContent = result.error;
+                    return;
+                }
+                closeResolutionPrompt();
+                loadModeratorCenterTab('reports');
             }
-            closeResolutionPrompt();
-            loadModeratorCenterTab('reports');
         });
     }
 
@@ -1809,7 +2110,7 @@
                     myRole = res.role || 'user';
                     myRoomRole = 'user'; 
                     myJoinedServers = res.joinedServers || ['global'];
-                    myBannedRooms = new Set(res.bannedRooms || []);
+                    roomAccessCoordinator.replaceBannedRooms(res.bannedRooms || []);
                     myAvatarUrl = res.avatarUrl || ''; 
                     myColor = res.color || '';
                     
@@ -1817,7 +2118,6 @@
                     
                     document.getElementById('auth-modal').classList.remove('active');
                     renderServers(res.servers || []);
-                    renderServerAccess();
                     const initialCode = Object.prototype.hasOwnProperty.call(res, 'defaultServerCode')
                         ? res.defaultServerCode : 'global';
                     applyRestrictionState(res.restriction, initialCode);
@@ -1860,21 +2160,20 @@
         });
 
         activeSocket.on('chat_message', (msg) => {
-            if (!currentServerCode) return;
-            const isMe = msg.username === myUsername;
-            appendMessage(msg, isMe); 
-            typingUsers.delete(msg.username); updateTypingUI(); 
-            
-            if (!isMe) {
-                // Determine if we need to play the special Ping sound
-                const isPinged = ChatClientHelpers.hasTrustedPing(msg.text, myUsername, myDisplayName);
-                playSound(isPinged ? 'ping' : 'msg');
-            }
+            ChatClientHelpers.dispatchRoomEvent(currentServerCode, data => {
+                const isMe = data.username === myUsername;
+                appendMessage(data, isMe);
+                typingUsers.delete(data.username); updateTypingUI();
+
+                if (!isMe) {
+                    const isPinged = ChatClientHelpers.hasTrustedPing(data.text, myUsername, myDisplayName);
+                    playSound(isPinged ? 'ping' : 'msg');
+                }
+            }, msg);
         });
         
         activeSocket.on('system_message', (txt) => {
-            if (!currentServerCode) return;
-            appendSystemMessage(txt);
+            ChatClientHelpers.dispatchRoomEvent(currentServerCode, appendSystemMessage, txt);
         });
 
         activeSocket.on('global_role_updated', (data) => {
@@ -1895,21 +2194,11 @@
         activeSocket.on('room_access_updated', (data) => {
             if (!data || data.username !== myUsername) return;
             myJoinedServers = Array.isArray(data.joinedServers) ? data.joinedServers : ['global'];
-            myBannedRooms = new Set(Array.isArray(data.bannedRooms) ? data.bannedRooms : []);
-            renderServerAccess();
-            if (data.serverCode === null) enterLobby();
-            else if (data.serverCode && data.serverCode !== currentServerCode) switchServer(data.serverCode);
+            roomAccessCoordinator.handleAccessUpdate(data);
         });
 
         activeSocket.on('room_restriction_updated', (data) => {
-            if (!data) return;
-            myBannedRooms = new Set(Array.isArray(data.bannedRooms) ? data.bannedRooms : []);
-            renderServerAccess();
-            if (data.serverCode === currentServerCode && data.banned) {
-                enterLobby();
-                return;
-            }
-            if (data.serverCode === currentServerCode) applyRestrictionState(data, currentServerCode);
+            roomAccessCoordinator.handleRestrictionUpdate(data);
         });
 
         activeSocket.on('moderation_queue_updated', (data) => {
@@ -2043,13 +2332,13 @@
 
         // --- ONLINE USERS RENDERER & ROLE SYNC ---
         activeSocket.on('online_users', (users) => {
-            if (!currentServerCode) return;
+            ChatClientHelpers.dispatchRoomEvent(currentServerCode, roomUsers => {
             const list = document.getElementById('online-list');
             list.innerHTML = '';
             
             usersCache = {}; // Rebuild local lookup
 
-            const me = users.find(u => u.username === myUsername);
+            const me = roomUsers.find(u => u.username === myUsername);
             if (me) {
                 myRoomRole = me.roomRole || 'user';
                 updateModeratorCenterAccess();
@@ -2058,8 +2347,8 @@
             const isGlobal = currentServerCode === 'global';
             const roomType = isGlobal ? 'Global Online' : 'Room Members';
             
-            const onlineCount = users.filter(u => u.online !== false).length;
-            const totalCount = users.length;
+            const onlineCount = roomUsers.filter(u => u.online !== false).length;
+            const totalCount = roomUsers.length;
             
             const isHiddenAdmin = myRole === 'admin' && !myJoinedServers.includes(currentServerCode) && !isGlobal;
             const displayCount = isGlobal ? onlineCount + (isHiddenAdmin ? 1 : 0) : totalCount + (isHiddenAdmin ? 1 : 0);
@@ -2083,7 +2372,7 @@
                 usersCache[myUsername] = myDisplayName;
             }
 
-            users.forEach((u, index) => {
+            roomUsers.forEach((u, index) => {
                 usersCache[u.username] = u.displayName || u.username;
 
                 const li = document.createElement('li');
@@ -2136,13 +2425,15 @@
 
                 list.appendChild(li);
             });
+            }, users);
         });
 
         activeSocket.on('typing', (data) => {
-            if (!currentServerCode) return;
-            if (data.isTyping) typingUsers.set(data.username, ChatClientHelpers.typingDisplayName(data));
-            else typingUsers.delete(data.username); 
-            updateTypingUI(); 
+            ChatClientHelpers.dispatchRoomEvent(currentServerCode, typing => {
+                if (typing.isTyping) typingUsers.set(typing.username, ChatClientHelpers.typingDisplayName(typing));
+                else typingUsers.delete(typing.username);
+                updateTypingUI();
+            }, data);
         });
     }
 
@@ -2340,11 +2631,14 @@
         renderServerAccess();
     }
 
-    function switchServer(code) {
-        if (!code || myBannedRooms.has(code)) return;
+    function requestServerSwitch(code) {
         if (currentServerCode === code && chatWindow.innerHTML !== '' &&
             !roomSwitchCoordinator.isPending()) return;
         roomSwitchCoordinator.request(code);
+    }
+
+    function switchServer(code) {
+        return roomAccessCoordinator.requestRoom(code);
     }
 
     function handleSwitchResult(code, res) {
