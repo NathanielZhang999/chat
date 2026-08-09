@@ -831,3 +831,95 @@ test('moderator center request builders cover restrictions, audit, resolve, and 
     { event: 'resolve_moderation_report', status: 'dismissed', resolution: 'dismissed reason' }
   ]);
 });
+
+test('AutoMod save control resets on invalidation and stale acknowledgements cannot affect a newer save', () => {
+  const client = loadHelpers();
+  const socket = createDeferredSocket();
+  const controls = {
+    automodSave: { disabled: false },
+    resolutionConfirm: { disabled: false }
+  };
+  const center = client.createModeratorCenterCoordinator({
+    onPendingChange(key, pending) {
+      client.applyModeratorPendingState(controls, key, pending);
+    }
+  });
+  const applied = [];
+  const request = value => client.moderatorCenterMutationRequestFor('automod', {
+    serverCode: 'ABC123', blockedKeywords: [value], mentionLimit: 4,
+    repeatLimit: 3, repeatWindowSeconds: 30
+  });
+
+  center.open('ABC123', 'automod');
+  client.dispatchModeratorCenterRequest({
+    coordinator: center, socket, request: request('old'),
+    apply: () => applied.push('old')
+  });
+  assert.equal(controls.automodSave.disabled, true);
+
+  center.close();
+  assert.equal(controls.automodSave.disabled, false, 'close cleans up without an acknowledgement');
+  center.open('ABC123', 'automod');
+  client.dispatchModeratorCenterRequest({
+    coordinator: center, socket, request: request('new'),
+    apply: () => applied.push('new')
+  });
+  assert.equal(controls.automodSave.disabled, true);
+
+  socket.calls[0].callback({ ok: true });
+  assert.equal(controls.automodSave.disabled, true, 'old acknowledgement cannot enable a newer save');
+  assert.deepEqual(applied, []);
+  socket.calls[1].callback({ ok: true });
+  assert.equal(controls.automodSave.disabled, false);
+  assert.deepEqual(applied, ['new']);
+
+  client.dispatchModeratorCenterRequest({
+    coordinator: center, socket, request: request('room-change'),
+    apply: () => applied.push('wrong-room')
+  });
+  center.open('XYZ789', 'automod');
+  assert.equal(controls.automodSave.disabled, false, 'room change cleans up immediately');
+  socket.calls[2].callback({ ok: true });
+  assert.deepEqual(applied, ['new']);
+});
+
+test('resolve and dismiss controls reset across same-room reopen and view invalidation', () => {
+  const client = loadHelpers();
+  const socket = createDeferredSocket();
+  const controls = {
+    automodSave: { disabled: false },
+    resolutionConfirm: { disabled: false }
+  };
+  const center = client.createModeratorCenterCoordinator({
+    onPendingChange(key, pending) {
+      client.applyModeratorPendingState(controls, key, pending);
+    }
+  });
+  const applied = [];
+  const request = status => client.moderatorCenterMutationRequestFor('resolve', {
+    serverCode: 'ABC123', reportId: `report-${status}`, status, resolution: `${status} reason`
+  });
+
+  center.open('ABC123', 'reports');
+  client.dispatchModeratorCenterRequest({
+    coordinator: center, socket, request: request('resolved'),
+    apply: () => applied.push('old-resolve')
+  });
+  assert.equal(controls.resolutionConfirm.disabled, true);
+  center.close();
+  assert.equal(controls.resolutionConfirm.disabled, false);
+
+  center.open('ABC123', 'reports');
+  client.dispatchModeratorCenterRequest({
+    coordinator: center, socket, request: request('dismissed'),
+    apply: () => applied.push('new-dismiss')
+  });
+  socket.calls[0].callback({ ok: true });
+  assert.equal(controls.resolutionConfirm.disabled, true, 'stale resolve cannot enable the new dismiss');
+  assert.deepEqual(applied, []);
+
+  center.selectView('audit');
+  assert.equal(controls.resolutionConfirm.disabled, false, 'tab change cleans up immediately');
+  socket.calls[1].callback({ ok: true });
+  assert.deepEqual(applied, [], 'dismiss acknowledgement cannot mutate the audit view');
+});

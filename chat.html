@@ -1015,6 +1015,20 @@
             };
         },
 
+        applyModeratorPendingState(controls, key, pending) {
+            const controlNames = {
+                'reports:list': 'reportsMore',
+                'restrictions:list': 'restrictionsMore',
+                'audit:list': 'auditMore',
+                'automod:save': 'automodSave',
+                'reports:resolve': 'resolutionConfirm'
+            };
+            const control = controls && controls[controlNames[key]];
+            if (!control) return false;
+            control.disabled = Boolean(pending);
+            return true;
+        },
+
         dispatchModeratorCenterRequest({
             coordinator,
             socket,
@@ -1322,16 +1336,16 @@
         },
         applyRestriction: applyRestrictionState
     });
+    const moderatorPendingControls = {
+        reportsMore: document.getElementById('moderator-reports-more'),
+        restrictionsMore: document.getElementById('moderator-restrictions-more'),
+        auditMore: document.getElementById('moderator-audit-more'),
+        automodSave: document.getElementById('automod-save'),
+        resolutionConfirm: document.getElementById('resolution-confirm')
+    };
     const moderatorCenterCoordinator = ChatClientHelpers.createModeratorCenterCoordinator({
-        onPendingChange(key, pending) {
-            const loadMoreIds = {
-                'reports:list': 'moderator-reports-more',
-                'restrictions:list': 'moderator-restrictions-more',
-                'audit:list': 'moderator-audit-more'
-            };
-            const button = document.getElementById(loadMoreIds[key]);
-            if (button) button.disabled = pending;
-        }
+        onPendingChange: (key, pending) =>
+            ChatClientHelpers.applyModeratorPendingState(moderatorPendingControls, key, pending)
     });
 
     function setCompositionDisabled(disabled, notice = '') {
@@ -1770,15 +1784,12 @@
                 'Use up to 50 keywords (1–40 characters each) and values within the displayed bounds.';
             return;
         }
-        const saveButton = document.getElementById('automod-save');
-        saveButton.disabled = true;
         const payload = { serverCode: requestedRoom, ...settings };
         ChatClientHelpers.dispatchModeratorCenterRequest({
             coordinator: moderatorCenterCoordinator,
             socket,
             request: ChatClientHelpers.moderatorCenterMutationRequestFor('automod', payload),
             apply(result) {
-                saveButton.disabled = false;
                 if (result.error) {
                     document.getElementById('automod-error').textContent = result.error;
                     return;
@@ -1825,14 +1836,11 @@
             closeResolutionPrompt();
             return;
         }
-        const confirmButton = document.getElementById('resolution-confirm');
-        confirmButton.disabled = true;
         ChatClientHelpers.dispatchModeratorCenterRequest({
             coordinator: moderatorCenterCoordinator,
             socket,
             request: ChatClientHelpers.moderatorCenterMutationRequestFor('resolve', payload),
             apply(result) {
-                confirmButton.disabled = false;
                 if (result.error) {
                     document.getElementById('resolution-error').textContent = result.error;
                     return;
