@@ -20,7 +20,18 @@ function loadHelpers() {
   const helperBlock = source.slice(start + startDelimiter.length, end);
   const context = vm.createContext({ URL });
   vm.runInContext(helperBlock, context, { filename: 'chat-client-helpers.js' });
-  return context.ChatClientHelpers;
+  return new Proxy(context.ChatClientHelpers, {
+    get(target, property) {
+      const value = target[property];
+      if (typeof value !== 'function') return value;
+      return (...args) => {
+        const result = value.apply(target, args);
+        if (property === 'moderationActionsFor') return [...result];
+        if (property === 'normalizeModerationPrompt' && result) return { ...result };
+        return result;
+      };
+    }
+  });
 }
 
 test('new users receive the deployed Render backend URL by default', () => {
@@ -357,4 +368,223 @@ test('selecting the displayed room while another switch is pending returns to it
   acknowledgements[1]({ history: [] });
   assert.equal(displayedRoom, 'AAAAAA');
   assert.equal(coordinator.isPending(), false);
+});
+
+test('client moderation menu matches global and exact private-room policy', () => {
+  const client = loadHelpers();
+  assert.deepEqual(client.moderationActionsFor({
+    serverCode: 'global', actorRole: 'admin', actorRoomRole: 'user', targetRole: 'user',
+    targetRoomRole: 'user', targetIsBanned: false, targetIsTimedOut: false,
+    targetUsername: 'Member', isSelf: false
+  }), ['timeout', 'ban']);
+  assert.deepEqual(client.moderationActionsFor({
+    serverCode: 'ABC123', actorRole: 'user', actorRoomRole: 'mod', targetRole: 'user',
+    targetRoomRole: 'user', targetIsBanned: true, targetIsTimedOut: false,
+    targetUsername: 'Member', isSelf: false
+  }), ['unban']);
+  assert.deepEqual(client.moderationActionsFor({
+    serverCode: 'XYZ789', actorRole: 'user', actorRoomRole: 'user', targetRole: 'user',
+    targetRoomRole: 'user', targetIsBanned: false, targetIsTimedOut: false,
+    targetUsername: 'Member', isSelf: false
+  }), []);
+  assert.deepEqual(client.moderationActionsFor({
+    serverCode: 'global', actorRole: 'admin', actorRoomRole: 'user', targetRole: 'user',
+    targetRoomRole: 'user', targetIsBanned: false, targetIsTimedOut: false,
+    targetUsername: 'NYZhang1', isSelf: false
+  }), []);
+});
+
+test('private menu exposes only the target-specific moderation transitions', () => {
+  const client = loadHelpers();
+  const base = {
+    serverCode: 'ABC123', actorRole: 'user', actorRoomRole: 'mod', targetRole: 'user',
+    targetRoomRole: 'user', targetUsername: 'Member', isSelf: false
+  };
+
+  assert.deepEqual(client.moderationActionsFor({
+    ...base, targetIsBanned: false, targetIsTimedOut: false
+  }), ['kick', 'timeout', 'ban']);
+  assert.deepEqual(client.moderationActionsFor({
+    ...base, targetIsBanned: false, targetIsTimedOut: true
+  }), ['kick', 'clear_timeout', 'ban']);
+  assert.deepEqual(client.moderationActionsFor({
+    ...base, targetIsBanned: true, targetIsTimedOut: false
+  }), ['unban']);
+  assert.deepEqual(client.moderationActionsFor({
+    ...base, targetRole: 'admin', targetIsBanned: false, targetIsTimedOut: false
+  }), []);
+  assert.deepEqual(client.moderationActionsFor({
+    ...base, targetRoomRole: 'mod', targetIsBanned: false, targetIsTimedOut: false
+  }), []);
+  assert.deepEqual(client.moderationActionsFor({
+    ...base, actorRole: 'admin', targetRoomRole: 'mod', targetIsBanned: false,
+    targetIsTimedOut: false
+  }), ['kick', 'timeout', 'ban']);
+});
+
+test('moderation prompt requires bounded reason and timeout duration', () => {
+  const client = loadHelpers();
+  assert.deepEqual(client.normalizeModerationPrompt({ action: 'timeout', reason: ' spam ', duration: '1h' }), { action: 'timeout', reason: 'spam', duration: '1h' });
+  assert.equal(client.normalizeModerationPrompt({ action: 'timeout', reason: '', duration: '1h' }), null);
+  assert.equal(client.normalizeModerationPrompt({ action: 'timeout', reason: 'spam', duration: '2h' }), null);
+});
+
+test('Global context and private menu contracts include reports without granting authority', () => {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  const roleManagerStart = source.indexOf('function openRoleManager');
+  const roleManagerEnd = source.indexOf('// --- REACTION UI ENGINE ---', roleManagerStart);
+  const roleManager = source.slice(roleManagerStart, roleManagerEnd);
+
+  assert.notEqual(roleManagerStart, -1);
+  assert.match(roleManager, /list_room_restrictions/);
+  assert.match(roleManager, /moderationActionsFor/);
+  assert.match(roleManager, /Report User/);
+  assert.match(source, /Report Message/);
+  assert.match(source, /report_moderation_target/);
+  assert.doesNotMatch(
+    roleManager,
+    /currentServerCode\s*===\s*['"]global['"][\s\S]{0,500}(?:Kick|action:\s*['"]kick['"])/
+  );
+});
+
+test('reports restrictions and audit rows render API text with textContent', () => {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  for (const [functionName, nextFunction] of [
+    ['renderModerationReports', 'renderRoomRestrictions'],
+    ['renderRoomRestrictions', 'renderModerationAudit'],
+    ['renderModerationAudit', 'loadAutoModSettings']
+  ]) {
+    const start = source.indexOf(`function ${functionName}`);
+    const end = source.indexOf(`function ${nextFunction}`, start);
+    const body = source.slice(start, end);
+    assert.notEqual(start, -1, `${functionName} exists`);
+    assert.notEqual(end, -1, `${functionName} has a bounded source region`);
+    assert.match(body, /textContent/, `${functionName} uses inert text nodes`);
+    assert.doesNotMatch(body, /innerHTML/, `${functionName} never interprets API text as markup`);
+  }
+});
+
+test('direct event handlers and defaultServerCode drive room access updates', () => {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  for (const event of [
+    'room_access_updated', 'room_restriction_updated', 'moderation_queue_updated', 'message_blocked'
+  ]) {
+    assert.match(source, new RegExp(`activeSocket\\.on\\(['"]${event}['"]`), event);
+  }
+  assert.match(source, /Object\.prototype\.hasOwnProperty\.call\(res,\s*['"]defaultServerCode['"]\)/);
+  assert.match(source, /if\s*\(initialCode\)\s*switchServer\(initialCode\);\s*else\s*enterLobby\(\);/s);
+  assert.doesNotMatch(source, /renderServers\(res\.servers\s*\|\|\s*\[\]\);\s*switchServer\(['"]global['"]\)/s);
+  assert.match(source, /Your message was blocked by this room's content policy\./);
+});
+
+test('Lobby state disables composition and leaves room discovery controls enabled', () => {
+  const client = loadHelpers();
+  const elements = {
+    messageInput: { disabled: false },
+    sendButton: { disabled: false },
+    attachmentButton: { disabled: false },
+    emojiButton: { disabled: false },
+    infoBar: { textContent: '' },
+    roomLabel: ''
+  };
+
+  client.applyLobbyState(elements, true);
+  assert.equal(elements.messageInput.disabled, true);
+  assert.equal(elements.sendButton.disabled, true);
+  assert.equal(elements.attachmentButton.disabled, true);
+  assert.equal(elements.emojiButton.disabled, true);
+  assert.equal(elements.infoBar.textContent, 'Lobby — join or create a room to chat');
+
+  const source = fs.readFileSync(chatPath, 'utf8');
+  const enterLobbyStart = source.indexOf('function enterLobby');
+  const enterLobbyEnd = source.indexOf('function applyRestrictionState', enterLobbyStart);
+  const enterLobby = source.slice(enterLobbyStart, enterLobbyEnd);
+  assert.match(enterLobby, /typingUsers\.clear\(\)/);
+  assert.match(enterLobby, /applyLobbyState/);
+  assert.doesNotMatch(enterLobby, /submit-(?:join|create)-btn[^\n]*disabled\s*=\s*true/);
+});
+
+test('Lobby state ignores late room traffic after transport eviction', () => {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  for (const event of ['chat_message', 'system_message', 'online_users', 'typing']) {
+    const start = source.indexOf(`activeSocket.on('${event}'`);
+    const end = source.indexOf('activeSocket.on(', start + 20);
+    const handler = source.slice(start, end);
+    assert.notEqual(start, -1, `${event} handler exists`);
+    assert.match(handler, /if\s*\(!currentServerCode\)\s*return/, `${event} ignores lobby traffic`);
+  }
+});
+
+test('banned client suppresses rail switches and restores Global after unban', () => {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  assert.match(source, /myBannedRooms\s*=\s*new Set\(res\.bannedRooms\s*\|\|\s*\[\]\)/);
+  assert.match(source, /aria-disabled/);
+  assert.match(source, /myBannedRooms\.has\(code\)[\s\S]{0,120}return/);
+  assert.match(source, /room_restriction_updated[\s\S]{0,1000}myBannedRooms\s*=\s*new Set/s);
+  assert.match(source, /room_restriction_updated[\s\S]{0,1400}renderServerAccess/s);
+  assert.match(source, /if\s*\(data\.serverCode\s*===\s*currentServerCode\)[\s\S]{0,300}applyRestrictionState/s);
+});
+
+test('current-room timeout expiry is guarded by room and restriction version', () => {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  const applyStart = source.indexOf('function applyRestrictionState');
+  const applyEnd = source.indexOf('function renderServerAccess', applyStart);
+  const applyRestriction = source.slice(applyStart, applyEnd);
+  assert.notEqual(applyStart, -1);
+  assert.match(applyRestriction, /clearTimeout\(restrictionExpiryTimer\)/);
+  assert.match(applyRestriction, /restrictionVersion\s*\+=\s*1/);
+  assert.match(applyRestriction, /capturedRoom/);
+  assert.match(applyRestriction, /capturedVersion/);
+  assert.match(applyRestriction, /currentServerCode\s*!==\s*capturedRoom/);
+  assert.match(applyRestriction, /restrictionVersion\s*!==\s*capturedVersion/);
+  assert.match(source, /applyRestrictionState\(res\.restriction/);
+  assert.match(source, /applyRestrictionState\(response\.restriction/);
+});
+
+test('moderation center supports absent-roster unban and clears room data on reopen', () => {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  const openStart = source.indexOf('function openModeratorCenter');
+  const openEnd = source.indexOf('function closeModeratorCenter', openStart);
+  const openCenter = source.slice(openStart, openEnd);
+  const restrictionsStart = source.indexOf('function renderRoomRestrictions');
+  const restrictionsEnd = source.indexOf('function renderModerationAudit', restrictionsStart);
+  const restrictions = source.slice(restrictionsStart, restrictionsEnd);
+
+  assert.match(openCenter, /clearModeratorRows\(\)/);
+  assert.match(openCenter, /moderatorCenterRoom\s*=\s*currentServerCode/);
+  assert.match(restrictions, /targetUsername/);
+  assert.match(restrictions, /Unban/);
+  assert.match(restrictions, /Clear Timeout/);
+  assert.match(restrictions, /openModerationPrompt/);
+  assert.match(source, /resolve_moderation_report/);
+  assert.match(source, /['"]resolved['"]/);
+  assert.match(source, /['"]dismissed['"]/);
+});
+
+test('stale restriction and moderator-center callbacks stay scoped to their room', () => {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  const roleManagerStart = source.indexOf('function openRoleManager');
+  const roleManagerEnd = source.indexOf('// --- REACTION UI ENGINE ---', roleManagerStart);
+  const roleManager = source.slice(roleManagerStart, roleManagerEnd);
+  assert.match(roleManager, /requestedRoom/);
+  assert.match(roleManager, /currentServerCode\s*!==\s*requestedRoom/);
+
+  const centerStart = source.indexOf('function loadModeratorCenterTab');
+  const centerEnd = source.indexOf('function renderModerationReports', centerStart);
+  const centerLoader = source.slice(centerStart, centerEnd);
+  assert.match(centerLoader, /moderatorCenterRoom/);
+  assert.match(centerLoader, /currentServerCode\s*!==\s*requestedRoom/);
+  assert.match(centerLoader, /moderator-center-modal[^\n]*active|classList\.contains\(['"]active['"]\)/);
+});
+
+test('moderator center keeps API projections private and validates AutoMod bounds', () => {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  assert.match(source, /get_automod/);
+  assert.match(source, /update_automod/);
+  assert.match(source, /blockedKeywords/);
+  assert.match(source, /\.slice\(0,\s*50\)/);
+  assert.match(source, /mentionLimit[\s\S]{0,500}(?:1[^\d]+20|value\s*>\s*20)/);
+  assert.match(source, /repeatLimit[\s\S]{0,500}(?:2[^\d]+10|value\s*>\s*10)/);
+  assert.match(source, /repeatWindowSeconds[\s\S]{0,500}(?:5[^\d]+300|value\s*>\s*300)/);
+  assert.doesNotMatch(source, /internalSecret|storageSecret/);
 });
