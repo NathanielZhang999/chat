@@ -289,6 +289,361 @@ test('message read coordinator replaces cursors only for accepted older pages', 
   assert.equal(searchPending.at(-1), false, 'full invalidation resets search controls too');
 });
 
+test('latest accepted room search wins and close invalidates late results', () => {
+  const helpers = loadHelpers();
+  const pending = [];
+  const coordinator = helpers.createMessageReadCoordinator({
+    onSearchPendingChange(value) { pending.push(value); }
+  });
+  const response = token => ({
+    serverCode: token.roomCode,
+    clientContextId: token.clientContextId,
+    requestId: token.requestId,
+    results: []
+  });
+
+  coordinator.activate('ABC123', 7, null);
+  const first = coordinator.beginSearch();
+  const second = coordinator.beginSearch({ supersede: true });
+  assert.ok(first);
+  assert.ok(second);
+  assert.equal(Object.isFrozen(first), true);
+  assert.deepEqual({ ...second }, {
+    epoch: 1, roomCode: 'ABC123', clientContextId: 7, requestId: 2
+  });
+  assert.equal(coordinator.finishSearch(first, response(first)), null);
+  assert.equal(pending.at(-1), true, 'an older response cannot release the latest search control');
+  assert.ok(coordinator.finishSearch(second, response(second)));
+  assert.equal(pending.at(-1), false);
+
+  const beforeClose = coordinator.beginSearch();
+  coordinator.closeSearch();
+  assert.equal(pending.at(-1), false, 'close resets a search whose acknowledgement was lost');
+  const afterReopen = coordinator.beginSearch();
+  assert.equal(coordinator.finishSearch(beforeClose, response(beforeClose)), null);
+  assert.equal(pending.at(-1), true, 'a late closed-modal response cannot release the reopened search');
+
+  coordinator.activate('XYZ789', 8, null);
+  assert.equal(coordinator.finishSearch(afterReopen, response(afterReopen)), null);
+  assert.equal(pending.at(-1), false, 'room switches reset pending search controls');
+
+  for (const wrongEcho of [
+    { serverCode: 'WRONG1' },
+    { clientContextId: 999 },
+    { requestId: 999 }
+  ]) {
+    const token = coordinator.beginSearch();
+    assert.equal(
+      coordinator.finishSearch(token, { ...response(token), ...wrongEcho }),
+      null,
+      `rejects wrong current search echo ${Object.keys(wrongEcho)[0]}`
+    );
+    assert.equal(pending.at(-1), false, 'a malformed current acknowledgement releases its control');
+  }
+});
+
+test('room read token guards privileged modal callbacks after a switch or close', () => {
+  const helpers = loadHelpers();
+  const coordinator = helpers.createMessageReadCoordinator();
+  coordinator.activate('ABC123', 7, null);
+
+  const editToken = coordinator.beginDetail('ABC123', 7, 'edit-message-id');
+  assert.ok(editToken);
+  assert.equal(Object.isFrozen(editToken), true);
+  coordinator.activate('XYZ789', 8, null);
+  assert.equal(coordinator.finishDetail(editToken), false);
+
+  const deletedToken = coordinator.beginDetail('deleted-message-id');
+  assert.ok(deletedToken);
+  coordinator.closeDetail();
+  assert.equal(coordinator.finishDetail(deletedToken), false);
+
+  const calls = [];
+  const socket = {
+    emit(event, messageId, callback) { calls.push({ event, messageId, callback }); }
+  };
+  const doc = createClientDocument();
+  doc.createElement = () => createClientElement();
+  const values = {
+    socket,
+    messageReadCoordinator: coordinator,
+    document: doc,
+    showAppAlert() { throw new Error('stale response reached alert rendering'); },
+    formatExactDate() { throw new Error('stale response reached date rendering'); },
+    formatMessageText() { throw new Error('stale response reached text rendering'); },
+    ChatClientHelpers: helpers
+  };
+  const history = loadClientFunction('viewHistory', values);
+  const deleted = loadClientFunction('viewDeleted', values);
+
+  history.fn('history-message-id');
+  assert.deepEqual({ event: calls[0].event, messageId: calls[0].messageId }, {
+    event: 'get_edit_history', messageId: 'history-message-id'
+  });
+  coordinator.activate('NEXT01', 9, null);
+  const unreadableResponse = new Proxy({}, {
+    get() { throw new Error('stale privileged response was inspected'); }
+  });
+  assert.doesNotThrow(() => calls[0].callback(unreadableResponse));
+  assert.equal(doc.getElementById('history-modal').classList.contains('active'), false);
+
+  deleted.fn('deleted-message-id');
+  assert.deepEqual({ event: calls[1].event, messageId: calls[1].messageId }, {
+    event: 'get_deleted_message', messageId: 'deleted-message-id'
+  });
+  coordinator.invalidate();
+  assert.doesNotThrow(() => calls[1].callback(unreadableResponse));
+  assert.equal(doc.getElementById('history-list').children.length, 0);
+
+  coordinator.activate('SAME01', 10, null);
+  history.fn('same-room-old');
+  doc.getElementById('history-modal').classList.add('active');
+  const close = loadClientFunction('closeHistoryModal', {
+    messageReadCoordinator: coordinator,
+    document: doc
+  });
+  close.fn();
+  assert.equal(doc.getElementById('history-modal').classList.contains('active'), false);
+  history.fn('same-room-new');
+  assert.doesNotThrow(() => calls[2].callback(unreadableResponse));
+  calls[3].callback({ history: [] });
+  assert.equal(doc.getElementById('history-modal').classList.contains('active'), true);
+});
+
+test('room read token access-loss handlers invalidate before navigating away', async () => {
+  const leaveCalls = [];
+  const leaveSocketCalls = [];
+  const leaveDocument = { getElementById() { return null; } };
+  const leaving = loadClientFunction('leaveServer', {
+    currentServerCode: 'ABC123',
+    myJoinedServers: ['global', 'ABC123'],
+    myBannedRooms: new Set(),
+    myRole: 'user',
+    showAppConfirm: async () => true,
+    socket: {
+      emit(event, payload, callback) { leaveSocketCalls.push({ event, payload, callback }); }
+    },
+    document: leaveDocument,
+    showAppAlert() {},
+    invalidateMessageReads: () => leaveCalls.push('invalidate'),
+    renderSearchControl: () => leaveCalls.push('search-control'),
+    switchServer: code => leaveCalls.push(`switch:${code}`),
+    enterLobby: () => leaveCalls.push('lobby')
+  });
+  await leaving.fn();
+  leaveSocketCalls[0].callback({ success: true });
+  assert.deepEqual(leaveCalls, ['invalidate', 'search-control', 'switch:global']);
+
+  const deletionCalls = [];
+  const deleted = loadClientFunction('handleServerDeleted', {
+    currentServerCode: 'ABC123',
+    myJoinedServers: ['global', 'ABC123'],
+    myBannedRooms: new Set(),
+    document: createClientDocument(),
+    invalidateMessageReads: () => deletionCalls.push('invalidate'),
+    renderSearchControl: () => deletionCalls.push('search-control'),
+    enterLobby: () => deletionCalls.push('lobby'),
+    switchServer: code => deletionCalls.push(`switch:${code}`),
+    showAppAlert: () => deletionCalls.push('alert')
+  });
+  deleted.fn('ABC123');
+  assert.deepEqual(deletionCalls, [
+    'invalidate', 'search-control', 'switch:global', 'alert'
+  ]);
+});
+
+test('search modal sends exact context, keeps hostile results inert, and recovers from a lost ack', () => {
+  const helpers = loadHelpers();
+  class Element {
+    constructor(tagName = 'div') {
+      this.tagName = tagName;
+      this.children = [];
+      this.className = '';
+      this.style = {};
+      this.disabled = false;
+      this.hidden = false;
+      this.value = '';
+      this.onclick = null;
+      this.attributes = new Map();
+      this.classes = new Set();
+      this.classList = {
+        add: (...names) => names.forEach(name => this.classes.add(name)),
+        remove: (...names) => names.forEach(name => this.classes.delete(name)),
+        contains: name => this.classes.has(name)
+      };
+      this._textContent = '';
+    }
+    appendChild(child) { this.children.push(child); return child; }
+    addEventListener(type, callback) { this[`on${type}`] = callback; }
+    setAttribute(name, value) { this.attributes.set(name, String(value)); }
+    getAttribute(name) { return this.attributes.get(name) || null; }
+    scrollIntoView(options) { this.scrolledWith = options; }
+    focus() { this.focused = true; }
+    set textContent(value) {
+      this._textContent = value == null ? '' : String(value);
+      if (this._textContent === '') this.children = [];
+    }
+    get textContent() { return this._textContent; }
+    set innerHTML(_value) { throw new Error('unsafe HTML assignment'); }
+  }
+  const elements = new Map([
+    ['message-search-input', new Element('input')],
+    ['message-search-submit', new Element('button')],
+    ['message-search-status', new Element('div')],
+    ['message-search-results', new Element('div')],
+    ['message-search-modal', new Element('div')]
+  ]);
+  const loadedRows = [];
+  const document = {
+    createElement: tagName => new Element(tagName),
+    getElementById: id => elements.get(id),
+    querySelectorAll: selector => selector === '.msg[data-id]' ? loadedRows : []
+  };
+  const input = elements.get('message-search-input');
+  const submit = elements.get('message-search-submit');
+  const status = elements.get('message-search-status');
+  const results = elements.get('message-search-results');
+  const socketCalls = [];
+  const timers = [];
+  const canceledTimers = [];
+  const socket = {
+    emit(event, payload, callback) { socketCalls.push({ event, payload, callback }); }
+  };
+  const coordinator = helpers.createMessageReadCoordinator({
+    onSearchPendingChange(value) { submit.disabled = value; }
+  });
+  coordinator.activate('ABC123', 12, null);
+
+  const select = loadClientFunction('selectSearchResult', {
+    document,
+    messageSearchStatus: status,
+    closeMessageSearch: () => elements.get('message-search-modal').classList.remove('active'),
+    prefersReducedMotion: () => false,
+    setTimeout(callback, delay) { timers.push({ callback, delay }); }
+  });
+  const render = loadClientFunction('renderSearchResults', {
+    document,
+    messageSearchResults: results,
+    messageSearchStatus: status,
+    formatExactDate: value => `date:${value}`,
+    selectSearchResult: select.fn,
+    ChatClientHelpers: helpers
+  });
+  const runtime = loadClientFunction('submitMessageSearch', {
+    messageSearchInput: input,
+    messageSearchStatus: status,
+    messageSearchResults: results,
+    searchRequestHandle: null,
+    messageReadCoordinator: coordinator,
+    socket,
+    scheduleSearchAckTimeout(callback, delay) {
+      const timer = { callback, delay };
+      timers.push(timer);
+      return timer;
+    },
+    cancelSearchAckTimeout(timer) { canceledTimers.push(timer); },
+    searchRequestTimeoutMs: 25,
+    renderSearchResults: render.fn,
+    ChatClientHelpers: helpers
+  });
+
+  input.value = ' first query ';
+  assert.equal(runtime.fn(), true);
+  assert.equal(socketCalls[0].event, 'search_messages');
+  assert.deepEqual(structuredClone(socketCalls[0].payload), {
+    serverCode: 'ABC123', clientContextId: 12, query: 'first query', requestId: 1
+  });
+  assert.equal(submit.disabled, true);
+
+  input.value = 'second query';
+  assert.equal(runtime.fn(), true);
+  assert.deepEqual(structuredClone(socketCalls[1].payload), {
+    serverCode: 'ABC123', clientContextId: 12, query: 'second query', requestId: 2
+  });
+  socketCalls[0].callback({
+    serverCode: 'ABC123', clientContextId: 12, requestId: 1,
+    results: [{ _id: 'stale', displayName: 'Stale', text: 'must not render', timestamp: 1 }]
+  });
+  assert.equal(results.children.length, 0);
+  assert.equal(submit.disabled, true, 'older ack cannot enable the current Search button');
+
+  socketCalls[1].callback({
+    serverCode: 'ABC123', clientContextId: 12, requestId: 2,
+    results: [{
+      _id: 'hostile-id',
+      displayName: '<img src=x onerror=alert(1)>',
+      text: '<script>steal()</script> {{PING:everyone|everyone}}',
+      timestamp: 99
+    }]
+  });
+  assert.equal(submit.disabled, false);
+  assert.equal(results.children.length, 1);
+  const resultRow = results.children[0];
+  assert.equal(resultRow.children[0].textContent, '<img src=x onerror=alert(1)>');
+  assert.equal(resultRow.children[2].children[0].textContent, '<script>steal()</script> ');
+  assert.equal(resultRow.children[2].children[1].textContent, '@everyone');
+
+  resultRow.onclick();
+  assert.equal(status.textContent, 'This message is outside the loaded history.');
+  const loaded = new Element('div');
+  loaded.setAttribute('data-id', 'hostile-id');
+  loadedRows.push(loaded);
+  resultRow.onclick();
+  assert.deepEqual(structuredClone(loaded.scrolledWith), { block: 'center', behavior: 'smooth' });
+  assert.equal(loaded.classList.contains('search-highlight'), true);
+
+  input.value = 'x';
+  assert.equal(runtime.fn(), false);
+  assert.equal(socketCalls.length, 2, 'short local validation never emits');
+  assert.equal(status.textContent, 'Enter 2–80 characters.');
+
+  input.value = 'lost acknowledgement';
+  assert.equal(runtime.fn(), true);
+  const ackTimer = timers.find(timer => timer.delay === 25 && !canceledTimers.includes(timer));
+  assert.ok(ackTimer);
+  ackTimer.callback();
+  assert.equal(submit.disabled, false);
+  assert.equal(status.textContent, 'Search timed out. Try again.');
+
+  input.value = 'close and reopen';
+  assert.equal(runtime.fn(), true);
+  elements.get('message-search-modal').classList.add('active');
+  const close = loadClientFunction('closeMessageSearch', {
+    searchRequestHandle: runtime.context.searchRequestHandle,
+    messageReadCoordinator: coordinator,
+    messageSearchModal: elements.get('message-search-modal'),
+    messageSearchInput: input,
+    messageSearchResults: results,
+    messageSearchStatus: status,
+    messageSearchSubmit: submit
+  });
+  const closeTimer = timers.filter(timer => timer.delay === 25).at(-1);
+  close.fn();
+  assert.equal(canceledTimers.includes(closeTimer), true);
+  assert.equal(submit.disabled, false);
+  assert.equal(elements.get('message-search-modal').classList.contains('active'), false);
+
+  const searchButton = new Element('button');
+  searchButton.style.display = 'block';
+  const open = loadClientFunction('openMessageSearch', {
+    currentServerCode: 'ABC123',
+    messageSearchButton: searchButton,
+    messageReadCoordinator: coordinator,
+    messageSearchInput: input,
+    messageSearchResults: results,
+    messageSearchStatus: status,
+    messageSearchModal: elements.get('message-search-modal')
+  });
+  assert.equal(open.fn(), true);
+  assert.equal(input.focused, true);
+  socketCalls[3].callback({
+    serverCode: 'ABC123', clientContextId: 12, requestId: 4,
+    results: [{ _id: 'late-close', displayName: 'Late', text: 'private', timestamp: 3 }]
+  });
+  assert.equal(results.children.length, 0);
+  assert.equal(status.textContent, 'Enter 2–80 characters to search this room.');
+});
+
 test('prepend scroll preserves the visible anchor and history rows deduplicate', () => {
   const helpers = loadHelpers();
   assert.equal(helpers.prependScrollTop({
@@ -564,13 +919,18 @@ test('current-user room access fallback invalidates reads on membership loss', (
 test('production message read lifecycle invalidates real lobby logout switch and socket paths', async () => {
   const invalidationCalls = [];
   const invalidation = loadClientFunction('invalidateMessageReads', {
+    closeMessageSearch: () => invalidationCalls.push('search'),
+    closeHistoryModal: () => invalidationCalls.push('detail'),
     stopOlderAnchor: () => invalidationCalls.push('anchor'),
     olderRequestHandle: { cancel: () => invalidationCalls.push('timer') },
     messageReadCoordinator: { invalidate: () => invalidationCalls.push('coordinator') },
-    renderOlderControl: () => invalidationCalls.push('control')
+    renderOlderControl: () => invalidationCalls.push('control'),
+    renderSearchControl: forceHidden => invalidationCalls.push(`search-control:${forceHidden}`)
   });
   invalidation.fn();
-  assert.deepEqual(invalidationCalls, ['anchor', 'timer', 'coordinator', 'control']);
+  assert.deepEqual(invalidationCalls, [
+    'search', 'detail', 'anchor', 'timer', 'coordinator', 'control', 'search-control:true'
+  ]);
   assert.equal(invalidation.context.olderRequestHandle, null);
 
   const lobbyCalls = [];
@@ -600,6 +960,7 @@ test('production message read lifecycle invalidates real lobby logout switch and
     closeReportPrompt() {},
     closeResolutionPrompt() {},
     updateModeratorCenterAccess() {},
+    renderSearchControl() {},
     cancelAction() {},
     ChatClientHelpers: { applyLobbyState() {} }
   });

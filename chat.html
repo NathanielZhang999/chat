@@ -103,6 +103,7 @@
         #load-older-messages:hover:not(:disabled) { filter: brightness(1.12); }
         #load-older-messages:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
         #load-older-messages:disabled { cursor: wait; opacity: 0.6; }
+        .msg.search-highlight { background: rgba(88, 101, 242, 0.2); border-left-color: var(--primary); }
         
         /* --- SMOOTH MESSAGES & PING HIGHLIGHTS --- */
         @keyframes messageSlideIn {
@@ -264,6 +265,16 @@
         .hist-item { background: var(--surface-dark); padding: 1rem; border-radius: 4px; margin-bottom: 0.5rem; border-left: 3px solid var(--primary); }
         .hist-time { font-size: 0.75rem; color: var(--text-muted); margin-bottom: 0.5rem; font-weight: 600;}
         .hist-text { font-size: 0.95rem; white-space: pre-wrap; word-break: break-word; color: var(--text); }
+        .message-search-form { display: flex; gap: 8px; align-items: center; }
+        .message-search-form .text-input { flex: 1; min-width: 0; }
+        .message-search-form .btn-primary { width: auto; flex: 0 0 auto; }
+        #message-search-status { min-height: 1.2rem; margin: 0.75rem 0; color: var(--text-muted); font-size: 0.85rem; }
+        #message-search-results { display: flex; flex-direction: column; gap: 8px; max-height: 48vh; overflow-y: auto; }
+        .message-search-result { width: 100%; display: grid; grid-template-columns: 1fr auto; gap: 4px 10px; padding: 10px 12px; border: 1px solid var(--border); border-left: 3px solid var(--primary); border-radius: 4px; background: var(--surface-dark); color: var(--text); cursor: pointer; text-align: left; }
+        .message-search-result:hover { background: #40444b; }
+        .message-search-author { min-width: 0; overflow: hidden; text-overflow: ellipsis; color: white; font-size: 0.9rem; font-weight: 700; }
+        .message-search-time { color: var(--text-muted); font-size: 0.75rem; }
+        .message-search-snippet { grid-column: 1 / -1; color: var(--text); font-size: 0.88rem; line-height: 1.4; overflow-wrap: anywhere; white-space: pre-wrap; }
         
         /* --- DYNAMIC CONTEXT MENU --- */
         .context-menu {
@@ -439,9 +450,23 @@
         </div>
     </div>
 
+    <div id="message-search-modal" class="modal">
+        <div class="modal-box" style="max-width: 560px;">
+            <button class="close-btn" id="message-search-x" type="button" aria-label="Close message search">&times;</button>
+            <h2>Search Messages</h2>
+            <form id="message-search-form" class="message-search-form">
+                <input type="text" id="message-search-input" class="text-input" maxlength="80" autocomplete="off" aria-label="Search the current room" placeholder="Search this room">
+                <button type="submit" id="message-search-submit" class="btn-primary">Search</button>
+            </form>
+            <div id="message-search-status" role="status" aria-live="polite"></div>
+            <div id="message-search-results"></div>
+            <button type="button" id="message-search-close" class="btn-primary btn-secondary" style="margin-top: 12px;">Close</button>
+        </div>
+    </div>
+
     <div id="history-modal" class="modal">
         <div class="modal-box" style="max-width: 500px;">
-            <button class="close-btn" onclick="document.getElementById('history-modal').classList.remove('active')">&times;</button>
+            <button class="close-btn" id="history-modal-close" type="button" aria-label="Close message details">&times;</button>
             <h2 id="history-modal-title">Message Edit History</h2>
             <div id="history-list"></div>
         </div>
@@ -569,6 +594,7 @@
                 <button class="header-btn delete" id="delete-server-btn" onclick="deleteServer()" style="display: none;">Delete</button>
                 <button class="header-btn success" id="join-server-btn" onclick="joinFromSnoop()" style="display: none;">Join (Visible)</button>
                 <button class="header-btn primary" id="moderator-center-btn" onclick="openModeratorCenter()" style="display: none;">Moderate</button>
+                <button class="header-btn primary" id="message-search-btn" type="button" style="display: none;">Search</button>
                 <button class="header-btn settings always-on" onclick="openSettings()">⚙️ Settings</button>
                 <button class="header-btn logout always-on" onclick="logoutApp()">Log Out</button>
             </div>
@@ -657,6 +683,10 @@
             let nextCursor = null;
             let pendingOlderToken = null;
             let nextOlderRequestId = 0;
+            let pendingSearchToken = null;
+            let nextSearchRequestId = 0;
+            let pendingDetailToken = null;
+            let nextDetailRequestId = 0;
 
             const isCurrentOlder = token => Boolean(token && pendingOlderToken &&
                 token === pendingOlderToken && token.epoch === epoch &&
@@ -667,9 +697,24 @@
                 onOlderPendingChange(false);
                 return true;
             };
+            const isCurrentSearch = token => Boolean(token && pendingSearchToken &&
+                token === pendingSearchToken && token.epoch === epoch &&
+                token.roomCode === roomCode && token.clientContextId === clientContextId);
+            const clearSearch = token => {
+                if (!isCurrentSearch(token)) return false;
+                pendingSearchToken = null;
+                onSearchPendingChange(false);
+                return true;
+            };
+            const isCurrentDetail = token => Boolean(token && pendingDetailToken &&
+                token === pendingDetailToken && token.epoch === epoch &&
+                token.roomCode === roomCode && token.clientContextId === clientContextId &&
+                token.messageId === pendingDetailToken.messageId);
 
             const resetPending = () => {
                 pendingOlderToken = null;
+                pendingSearchToken = null;
+                pendingDetailToken = null;
                 onOlderPendingChange(false);
                 onSearchPendingChange(false);
             };
@@ -729,6 +774,63 @@
                 cancelOlder(token) {
                     return clearOlder(token);
                 },
+                beginSearch({ supersede = false } = {}) {
+                    if (!roomCode || clientContextId === null) return null;
+                    if (pendingSearchToken && !supersede) return null;
+                    if (pendingSearchToken) clearSearch(pendingSearchToken);
+                    const token = Object.freeze({
+                        epoch,
+                        roomCode,
+                        clientContextId,
+                        requestId: ++nextSearchRequestId
+                    });
+                    pendingSearchToken = token;
+                    onSearchPendingChange(true);
+                    return token;
+                },
+                finishSearch(token, response) {
+                    if (!clearSearch(token)) return null;
+                    return response && Array.isArray(response.results) &&
+                        response.serverCode === token.roomCode &&
+                        response.clientContextId === token.clientContextId &&
+                        response.requestId === token.requestId
+                        ? response
+                        : null;
+                },
+                cancelSearch(token) {
+                    return clearSearch(token);
+                },
+                closeSearch() {
+                    pendingSearchToken = null;
+                    onSearchPendingChange(false);
+                },
+                beginDetail(roomOrMessageId, contextId, maybeMessageId) {
+                    const hasExplicitContext = arguments.length >= 3;
+                    const messageId = hasExplicitContext ? maybeMessageId : roomOrMessageId;
+                    if (!roomCode || clientContextId === null ||
+                        typeof messageId !== 'string' || !messageId ||
+                        (hasExplicitContext &&
+                            (roomOrMessageId !== roomCode || contextId !== clientContextId))) {
+                        return null;
+                    }
+                    const token = Object.freeze({
+                        epoch,
+                        roomCode,
+                        clientContextId,
+                        messageId,
+                        requestId: ++nextDetailRequestId
+                    });
+                    pendingDetailToken = token;
+                    return token;
+                },
+                finishDetail(token) {
+                    if (!isCurrentDetail(token)) return false;
+                    pendingDetailToken = null;
+                    return true;
+                },
+                closeDetail() {
+                    pendingDetailToken = null;
+                },
                 matches(token) {
                     return Boolean(token && token.epoch === epoch &&
                         token.roomCode === roomCode && token.clientContextId === clientContextId);
@@ -786,6 +888,121 @@
                     return coordinator.cancelOlder(token);
                 }
             });
+        },
+
+        normalizeMessageSearchQuery(value) {
+            if (typeof value !== 'string') return null;
+            const query = value.normalize('NFKC').trim();
+            return query.length >= 2 && query.length <= 80 ? query : null;
+        },
+
+        requestMessageSearch({
+            coordinator,
+            socket,
+            query,
+            onAccepted = () => {},
+            onTimeout = () => {},
+            scheduleTimeout = null,
+            cancelTimeout = null,
+            timeoutMs = 10000
+        } = {}) {
+            if (!coordinator || !socket || typeof socket.emit !== 'function') return false;
+            const normalizedQuery = this.normalizeMessageSearchQuery(query);
+            if (!normalizedQuery) return false;
+            const token = coordinator.beginSearch({ supersede: true });
+            if (!token) return false;
+            let timerId = null;
+            const clearTimer = () => {
+                if (timerId !== null && typeof cancelTimeout === 'function') cancelTimeout(timerId);
+                timerId = null;
+            };
+            if (typeof scheduleTimeout === 'function') {
+                timerId = scheduleTimeout(() => {
+                    timerId = null;
+                    if (!coordinator.cancelSearch(token)) return;
+                    onTimeout(token);
+                }, timeoutMs);
+            }
+            socket.emit('search_messages', {
+                serverCode: token.roomCode,
+                clientContextId: token.clientContextId,
+                query: normalizedQuery,
+                requestId: token.requestId
+            }, response => {
+                const accepted = coordinator.finishSearch(token, response);
+                clearTimer();
+                if (!accepted) return;
+                onAccepted(accepted, token);
+            });
+            return Object.freeze({
+                token,
+                cancel() {
+                    clearTimer();
+                    return coordinator.cancelSearch(token);
+                }
+            });
+        },
+
+        appendTrustedSearchText(doc, parent, value) {
+            const text = String(value || '');
+            const tokenPattern = /(?<!\{)\{\{PING:([A-Za-z0-9_-]{1,20})\|([A-Za-z0-9_ -]{1,30})\}\}(?!\})/g;
+            let lastIndex = 0;
+            let match;
+            while ((match = tokenPattern.exec(text)) !== null) {
+                if (match.index > lastIndex) {
+                    this.appendTextElement(doc, parent, 'span', '', text.slice(lastIndex, match.index));
+                }
+                const isEveryone = match[1] === 'everyone' && match[2] === 'everyone';
+                const mismatchedEveryone = (match[1] === 'everyone' || match[2] === 'everyone') && !isEveryone;
+                if (mismatchedEveryone) {
+                    this.appendTextElement(doc, parent, 'span', '', match[0]);
+                } else {
+                    this.appendTextElement(
+                        doc,
+                        parent,
+                        'span',
+                        isEveryone ? 'ping-tag everyone' : 'ping-tag',
+                        `@${isEveryone ? 'everyone' : match[2]}`
+                    );
+                }
+                lastIndex = tokenPattern.lastIndex;
+            }
+            if (lastIndex < text.length || !parent.children || parent.children.length === 0) {
+                this.appendTextElement(doc, parent, 'span', '', text.slice(lastIndex));
+            }
+            return parent;
+        },
+
+        appendSearchResultRow(doc, list, result, { formatDate, onSelect } = {}) {
+            if (!doc || !list || !result || result._id == null) return null;
+            const messageId = String(result._id);
+            if (!messageId) return null;
+            const row = doc.createElement('button');
+            row.type = 'button';
+            row.className = 'message-search-result';
+            const author = this.appendTextElement(
+                doc,
+                row,
+                'span',
+                'message-search-author',
+                result.displayName || result.username || 'Unknown'
+            );
+            const time = this.appendTextElement(
+                doc,
+                row,
+                'span',
+                'message-search-time',
+                typeof formatDate === 'function' ? formatDate(result.timestamp) : String(result.timestamp || '')
+            );
+            const snippet = doc.createElement('span');
+            snippet.className = 'message-search-snippet';
+            this.appendTrustedSearchText(doc, snippet, result.text);
+            row.appendChild(snippet);
+            row.onclick = () => {
+                if (typeof onSelect === 'function') onSelect(messageId);
+            };
+            list.appendChild(row);
+            return { row, author, time, snippet };
         },
 
         prependScrollTop({ oldScrollHeight, oldScrollTop, newScrollHeight } = {}) {
@@ -1697,14 +1914,32 @@
     const chatWindow = document.getElementById('chat-window');
     const historyControls = document.getElementById('history-controls');
     const loadOlderButton = document.getElementById('load-older-messages');
+    const messageSearchButton = document.getElementById('message-search-btn');
+    const messageSearchModal = document.getElementById('message-search-modal');
+    const messageSearchInput = document.getElementById('message-search-input');
+    const messageSearchSubmit = document.getElementById('message-search-submit');
+    const messageSearchStatus = document.getElementById('message-search-status');
+    const messageSearchResults = document.getElementById('message-search-results');
     const messageReadCoordinator = ChatClientHelpers.createMessageReadCoordinator({
-        onOlderPendingChange: pending => { loadOlderButton.disabled = pending; }
+        onOlderPendingChange: pending => { loadOlderButton.disabled = pending; },
+        onSearchPendingChange: pending => {
+            messageSearchSubmit.disabled = pending;
+            messageSearchSubmit.textContent = pending ? 'Searching…' : 'Search';
+            if (pending) messageSearchStatus.textContent = 'Searching…';
+            else if (messageSearchStatus.textContent === 'Searching…') {
+                messageSearchStatus.textContent = 'Search unavailable. Please try again.';
+            }
+        }
     });
     let olderRequestHandle = null;
+    let searchRequestHandle = null;
     let stopOlderAnchor = () => {};
     const olderRequestTimeoutMs = 10000;
+    const searchRequestTimeoutMs = 10000;
     const scheduleOlderAckTimeout = (callback, delay) => setTimeout(callback, delay);
     const cancelOlderAckTimeout = timerId => clearTimeout(timerId);
+    const scheduleSearchAckTimeout = (callback, delay) => setTimeout(callback, delay);
+    const cancelSearchAckTimeout = timerId => clearTimeout(timerId);
     const createOlderResizeObserver = typeof window.ResizeObserver === 'function'
         ? callback => new window.ResizeObserver(callback)
         : null;
@@ -1800,14 +2035,139 @@
         historyControls.hidden = loadOlderButton.hidden;
     }
 
+    function renderSearchControl(forceHidden = false) {
+        const accessible = !forceHidden && Boolean(currentServerCode) && ChatClientHelpers.isRoomRailAccessible({
+            serverCode: currentServerCode,
+            role: myRole,
+            joinedServers: myJoinedServers,
+            bannedRooms: [...myBannedRooms]
+        });
+        messageSearchButton.style.display = accessible ? 'block' : 'none';
+        if (!accessible && messageSearchModal.classList.contains('active')) closeMessageSearch();
+    }
+
+    function openMessageSearch() {
+        if (!currentServerCode || messageSearchButton.style.display === 'none') return false;
+        messageReadCoordinator.closeSearch();
+        messageSearchInput.value = '';
+        messageSearchResults.textContent = '';
+        messageSearchStatus.textContent = 'Enter 2–80 characters to search this room.';
+        messageSearchModal.classList.add('active');
+        messageSearchInput.focus();
+        return true;
+    }
+
+    function closeMessageSearch() {
+        if (searchRequestHandle) searchRequestHandle.cancel();
+        searchRequestHandle = null;
+        messageReadCoordinator.closeSearch();
+        messageSearchModal.classList.remove('active');
+        messageSearchInput.value = '';
+        messageSearchResults.textContent = '';
+        messageSearchStatus.textContent = '';
+        messageSearchSubmit.disabled = false;
+        messageSearchSubmit.textContent = 'Search';
+    }
+
+    function closeHistoryModal() {
+        messageReadCoordinator.closeDetail();
+        document.getElementById('history-modal').classList.remove('active');
+        document.getElementById('history-list').textContent = '';
+    }
+
+    function selectSearchResult(messageId) {
+        const loadedMessage = [...document.querySelectorAll('.msg[data-id]')]
+            .find(row => row.getAttribute('data-id') === String(messageId));
+        if (!loadedMessage) {
+            messageSearchStatus.textContent = 'This message is outside the loaded history.';
+            return false;
+        }
+        closeMessageSearch();
+        loadedMessage.scrollIntoView({
+            block: 'center',
+            behavior: prefersReducedMotion() ? 'auto' : 'smooth'
+        });
+        loadedMessage.classList.add('search-highlight');
+        setTimeout(() => loadedMessage.classList.remove('search-highlight'), 1800);
+        return true;
+    }
+
+    function renderSearchResults(results) {
+        messageSearchResults.textContent = '';
+        const values = Array.isArray(results) ? results : [];
+        const rendered = values.map(result => ChatClientHelpers.appendSearchResultRow(
+            document,
+            messageSearchResults,
+            result,
+            { formatDate: formatExactDate, onSelect: selectSearchResult }
+        )).filter(Boolean);
+        messageSearchStatus.textContent = rendered.length
+            ? `${rendered.length} ${rendered.length === 1 ? 'result' : 'results'}.`
+            : 'No messages found.';
+        return rendered;
+    }
+
+    function submitMessageSearch() {
+        const query = ChatClientHelpers.normalizeMessageSearchQuery(messageSearchInput.value);
+        if (!query) {
+            messageSearchStatus.textContent = 'Enter 2–80 characters.';
+            return false;
+        }
+        if (searchRequestHandle) searchRequestHandle.cancel();
+        searchRequestHandle = null;
+        messageSearchResults.textContent = '';
+        messageSearchStatus.textContent = 'Searching…';
+        const requestHandle = ChatClientHelpers.requestMessageSearch({
+            coordinator: messageReadCoordinator,
+            socket,
+            query,
+            scheduleTimeout: scheduleSearchAckTimeout,
+            cancelTimeout: cancelSearchAckTimeout,
+            timeoutMs: searchRequestTimeoutMs,
+            onTimeout() {
+                searchRequestHandle = null;
+                messageSearchStatus.textContent = 'Search timed out. Try again.';
+            },
+            onAccepted(response) {
+                searchRequestHandle = null;
+                renderSearchResults(response.results);
+            }
+        });
+        searchRequestHandle = requestHandle || null;
+        if (!requestHandle) {
+            messageSearchStatus.textContent = 'Search unavailable. Please try again.';
+            return false;
+        }
+        return true;
+    }
+
+    function handleMessageSearchKeydown(event) {
+        if (!event || (event.key !== 'Enter' && event.key !== 'Escape')) return false;
+        event.preventDefault();
+        return submitMessageSearch();
+    }
+
     function invalidateMessageReads() {
+        closeMessageSearch();
+        closeHistoryModal();
         stopOlderAnchor();
         stopOlderAnchor = () => {};
         if (olderRequestHandle) olderRequestHandle.cancel();
         olderRequestHandle = null;
         messageReadCoordinator.invalidate();
         renderOlderControl();
+        renderSearchControl(true);
     }
+
+    messageSearchButton.addEventListener('click', openMessageSearch);
+    document.getElementById('message-search-form').addEventListener('submit', event => {
+        event.preventDefault();
+        submitMessageSearch();
+    });
+    messageSearchInput.addEventListener('keydown', handleMessageSearchKeydown);
+    document.getElementById('message-search-x').addEventListener('click', closeMessageSearch);
+    document.getElementById('message-search-close').addEventListener('click', closeMessageSearch);
+    document.getElementById('history-modal-close').addEventListener('click', closeHistoryModal);
 
     function clearRenderedMessages() {
         stopOlderAnchor();
@@ -1839,6 +2199,7 @@
         closeReportPrompt();
         closeResolutionPrompt();
         updateModeratorCenterAccess();
+        renderSearchControl();
         cancelAction();
         ChatClientHelpers.applyLobbyState({
             messageInput: msgInput,
@@ -1911,6 +2272,7 @@
                 icon.style.border = '';
             }
         });
+        renderSearchControl();
     }
 
     function canModerateCurrentRoom() {
@@ -2701,6 +3063,21 @@
 
     function showError(msg, success) { authError.style.color = success ? "var(--success)" : "var(--error)"; authError.textContent = msg; }
 
+    function handleServerDeleted(code) {
+        myJoinedServers = myJoinedServers.filter(joinedCode => joinedCode !== code);
+        const icon = document.getElementById(`srv-${code}`);
+        if (icon) icon.remove();
+        if (currentServerCode !== code) return;
+        invalidateMessageReads();
+        renderSearchControl(true);
+        if (myBannedRooms.has('global')) enterLobby();
+        else switchServer('global');
+        showAppAlert(
+            "Server Deleted",
+            "The server you were viewing was permanently deleted by its Owner or a Global Admin."
+        );
+    }
+
     function setupSocket(activeSocket) {
         ChatClientHelpers.bindConnectErrorRecovery({
             activeSocket,
@@ -2894,17 +3271,7 @@
         
         activeSocket.on('admin_new_server', (srv) => { if (myRole === 'admin') addServerToList(srv.code, srv.name, srv.owner); });
 
-        activeSocket.on('server_deleted', (code) => {
-            myJoinedServers = myJoinedServers.filter(c => c !== code);
-            const icon = document.getElementById(`srv-${code}`);
-            if (icon) icon.remove();
-            
-            if (currentServerCode === code) {
-                if (myBannedRooms.has('global')) enterLobby();
-                else switchServer('global');
-                showAppAlert("Server Deleted", "The server you were viewing was permanently deleted by its Owner or a Global Admin.");
-            }
-        });
+        activeSocket.on('server_deleted', handleServerDeleted);
 
         // --- ONLINE USERS RENDERER & ROLE SYNC ---
         activeSocket.on('online_users', (users) => {
@@ -3331,14 +3698,15 @@
             const icon = document.getElementById(`srv-${serverCode}`);
             if (myRole !== 'admin' && icon) {
                 icon.remove();
-                if (currentServerCode === serverCode) {
-                    if (myBannedRooms.has('global')) enterLobby();
-                    else switchServer('global');
-                }
             } else if (icon) {
                 icon.style.opacity = '0.4'; icon.style.border = '1px dashed #8e9297';
-                if (currentServerCode === serverCode) switchServer(serverCode);
             }
+            if (currentServerCode !== serverCode) return;
+            invalidateMessageReads();
+            renderSearchControl();
+            if (myRole === 'admin') switchServer(serverCode);
+            else if (myBannedRooms.has('global')) enterLobby();
+            else switchServer('global');
         });
     }
 
@@ -3504,13 +3872,21 @@
     }
 
     function viewHistory(msgId) {
+        const token = messageReadCoordinator.beginDetail(msgId);
+        if (!token) return;
         socket.emit('get_edit_history', msgId, (res) => {
+            if (!messageReadCoordinator.finishDetail(token)) return;
             res = res || { error: 'No response from server.' };
             if (res.error) return showAppAlert("Error", res.error);
-            const list = document.getElementById('history-list'); list.innerHTML = '';
+            const list = document.getElementById('history-list'); list.textContent = '';
             document.getElementById('history-modal-title').textContent = "Message Edit History";
 
-            if (!res.history || res.history.length === 0) { list.innerHTML = '<div class="hist-item" style="border-left-color: var(--text-muted);">No previous edits.</div>'; }
+            if (!res.history || res.history.length === 0) {
+                const empty = ChatClientHelpers.appendTextElement(
+                    document, list, 'div', 'hist-item', 'No previous edits.'
+                );
+                empty.style.borderLeftColor = 'var(--text-muted)';
+            }
             else {
                 res.history.forEach((item, index) => {
                     const el = document.createElement('div'); el.className = 'hist-item';
@@ -3530,10 +3906,13 @@
     }
 
     function viewDeleted(msgId) {
+        const token = messageReadCoordinator.beginDetail(msgId);
+        if (!token) return;
         socket.emit('get_deleted_message', msgId, (res) => {
+            if (!messageReadCoordinator.finishDetail(token)) return;
             res = res || { error: 'No response from server.' };
             if (res.error) return showAppAlert("Error", res.error);
-            const list = document.getElementById('history-list'); list.innerHTML = '';
+            const list = document.getElementById('history-list'); list.textContent = '';
             document.getElementById('history-modal-title').textContent = "Deleted Message";
 
             const el = document.createElement('div'); el.className = 'hist-item';
