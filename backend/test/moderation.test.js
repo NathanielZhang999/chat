@@ -1839,12 +1839,16 @@ test('complete moderation policy matrix uses real handlers and preserves private
       }
     }
 
+    const fixtureSockets = [setup.socket, ...setup.ioInstance.sockets];
     const targetUpdates = targetSocket.outbound.filter(item =>
       item.event === 'room_access_updated' || item.event === 'room_restriction_updated'
     );
     assert.deepEqual(
-      targetUpdates.map(item => item.event),
-      allowed ? ['room_access_updated', 'room_restriction_updated'] : [],
+      targetUpdates.map(item => ({ target: item.target, event: item.event })),
+      allowed ? [
+        { target: 'self', event: 'room_access_updated' },
+        { target: 'self', event: 'room_restriction_updated' }
+      ] : [],
       `target-only events: ${serverCode}/${actor}/${targetKind}/${action}`
     );
     if (allowed) {
@@ -1867,7 +1871,9 @@ test('complete moderation policy matrix uses real handlers and preserves private
     ), false);
     const roomWideEvents = [
       ...setup.ioInstance.outbound,
-      ...setup.socket.outbound.filter(item => item.target && item.target !== 'self')
+      ...fixtureSockets.flatMap(live =>
+        live.outbound.filter(item => item.target !== 'self')
+      )
     ];
     assert.equal(roomWideEvents.some(item =>
       item.event === 'room_access_updated' || item.event === 'room_restriction_updated'
