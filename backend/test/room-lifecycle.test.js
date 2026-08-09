@@ -1,7 +1,9 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { createConnectionHandler, seedSystem, withAccountTransitionLock } = require('../server');
-const { FakeSocket, FakeIo, queryResult, acknowledge, deferred } = require('./support/fakes');
+const {
+  FakeSocket, FakeIo, queryResult, acknowledge, deferred, createMemoryModel
+} = require('./support/fakes');
 
 function register(overrides = {}) {
   const socket = new FakeSocket();
@@ -545,7 +547,7 @@ test('authorized room switch leaves old room only after access succeeds', async 
   assert.deepEqual(socket.leftRooms, ['global']);
   assert.equal(socket.joinedRooms.has('ABC123'), true);
   assert.deepEqual(ack.value(), {
-    history: [], roomRole: 'user',
+    history: [], nextCursor: null, roomRole: 'user',
     restriction: { banned: false, timedOut: false, timeoutUntil: null }
   });
 });
@@ -1038,7 +1040,7 @@ test('room switch acknowledges success before broadcasting target presence', asy
   await socket.trigger('switch_server', 'ABC123', result => {
     events.push('ack');
     assert.deepEqual(result, {
-      history: [], roomRole: 'user',
+      history: [], nextCursor: null, roomRole: 'user',
       restriction: { banned: false, timedOut: false, timeoutUntil: null }
     });
   });
@@ -1052,9 +1054,14 @@ test('room switch acknowledges success before broadcasting target presence', asy
   ]);
 });
 
-test('room switch finishes role lookup before history lookup begins', async () => {
+test('room switch derives a fresh room role before serializing history', async () => {
   const events = [];
-  const ChatServerModel = { findOne: () => queryResult({ code: 'ABC123', moderators: [] }) };
+  const ChatServerModel = {
+    findOne() {
+      events.push('room:find');
+      return queryResult({ code: 'ABC123', moderators: ['alice'] });
+    }
+  };
   const MessageModel = {
     find() {
       events.push('history:find');
@@ -1072,9 +1079,7 @@ test('room switch finishes role lookup before history lookup begins', async () =
     ChatServerModel,
     MessageModel,
     async getRoomRoleFn() {
-      events.push('role:start');
-      await Promise.resolve();
-      events.push('role:end');
+      events.push('stale-role-lookup');
       return 'user';
     }
   });
@@ -1088,12 +1093,353 @@ test('room switch finishes role lookup before history lookup begins', async () =
   await socket.trigger('switch_server', 'ABC123', ack.callback);
 
   assert.deepEqual(ack.value(), {
-    history: [], roomRole: 'user',
+    history: [], nextCursor: null, roomRole: 'mod',
     restriction: { banned: false, timedOut: false, timeoutUntil: null }
   });
-  assert.deepEqual(events, [
-    'role:start', 'role:end', 'history:find', 'history:lean'
+  assert.equal(events.includes('stale-role-lookup'), false);
+  assert.ok(events.indexOf('room:find') < events.indexOf('history:find'));
+  assert.ok(events.indexOf('history:find') < events.indexOf('history:lean'));
+});
+
+function messageFixture({ count, serverCode = 'ABC123', timestampFor } = {}) {
+  return Array.from({ length: count }, (_, index) => {
+    const sequence = index + 1;
+    return {
+      _id: sequence.toString(16).padStart(24, '0'),
+      serverCode,
+      username: sequence === count ? 'bob' : 'alice',
+      displayName: sequence === count ? 'Bob' : 'Alice',
+      role: 'user',
+      roomRole: 'user',
+      color: '',
+      avatarUrl: '',
+      text: `message ${sequence}`,
+      attachment: null,
+      replyTo: null,
+      reactions: { '👍': ['alice'] },
+      edited: sequence === count,
+      deleted: sequence === count,
+      history: [{ text: 'internal edit history' }],
+      __v: 7,
+      timestamp: timestampFor
+        ? timestampFor(sequence)
+        : new Date(Date.UTC(2026, 7, 9, 12, 0, sequence))
+    };
+  });
+}
+
+function registerMessageReader({ messages, serverCode = 'ABC123', overrides = {} }) {
+  const MessageModel = createMemoryModel(messages);
+  const UserModel = createMemoryModel([{
+    username: 'alice', role: 'user', servers: ['global', 'ABC123']
+  }]);
+  const ChatServerModel = createMemoryModel([
+    { code: 'global', owner: 'System', moderators: [] },
+    { code: 'ABC123', owner: 'owner', moderators: [] }
   ]);
+  const RoomRestrictionModel = createMemoryModel([]);
+  const registered = register({
+    MessageModel, UserModel, ChatServerModel, RoomRestrictionModel, ...overrides
+  });
+  Object.assign(registered.socket, {
+    username: 'alice', role: 'admin', roomRole: 'mod',
+    joinedServers: ['global', 'ABC123'], serverCode
+  });
+  registered.socket.joinedRooms.add(serverCode);
+  return { ...registered, MessageModel, UserModel, ChatServerModel, RoomRestrictionModel };
+}
+
+test('in-memory query adapter supports list_messages pagination filters and chains', async () => {
+  const timestamp = new Date(Date.UTC(2026, 7, 9, 12));
+  const model = createMemoryModel([
+    { _id: '000000000000000000000001', timestamp, serverCode: 'global' },
+    { _id: '000000000000000000000003', timestamp, serverCode: null },
+    { _id: '000000000000000000000002', timestamp },
+    { _id: '000000000000000000000004', timestamp, serverCode: 'ABC123' }
+  ]);
+
+  const rows = await model.find({
+    $and: [
+      { $or: [
+        { serverCode: 'global' },
+        { serverCode: { $exists: false } },
+        { serverCode: null }
+      ] },
+      { $or: [
+        { timestamp: { $lt: new Date(timestamp.getTime() + 1) } },
+        { timestamp, _id: { $lt: 'ffffffffffffffffffffffff' } }
+      ] }
+    ]
+  }).sort({ timestamp: -1, _id: -1 }).limit(2).lean();
+
+  assert.deepEqual(rows.map(row => row._id), [
+    '000000000000000000000003',
+    '000000000000000000000002'
+  ]);
+});
+
+test('switch_server returns a safe initial page and cursor', async () => {
+  const messages = messageFixture({ count: 25 });
+  const { socket } = registerMessageReader({ messages, serverCode: 'global' });
+  const ack = acknowledge();
+
+  await socket.trigger('switch_server', 'ABC123', ack.callback);
+
+  const response = ack.value();
+  assert.equal(response.history.length, 20);
+  assert.ok(response.nextCursor);
+  assert.deepEqual(
+    response.history.map(row => row._id),
+    messages.slice(5).map(row => row._id)
+  );
+  assert.equal(response.history.some(row => 'history' in row || '__v' in row), false);
+  assert.deepEqual(response.history.at(-1), {
+    _id: '000000000000000000000019',
+    serverCode: 'ABC123',
+    username: 'bob',
+    displayName: 'Bob',
+    role: 'user',
+    roomRole: 'user',
+    color: '',
+    avatarUrl: '',
+    text: '',
+    attachment: null,
+    replyTo: null,
+    reactions: {},
+    edited: true,
+    deleted: true,
+    timestamp: new Date(Date.UTC(2026, 7, 9, 12, 0, 25))
+  });
+});
+
+test('list_messages paginates timestamp ties without gaps or duplicates', async () => {
+  const messages = messageFixture({
+    count: 45,
+    timestampFor: sequence => new Date(Date.UTC(2026, 7, 9, 12, 0, Math.floor((sequence - 1) / 5)))
+  });
+  const { socket } = registerMessageReader({ messages });
+  const firstAck = acknowledge();
+
+  await socket.trigger('list_messages', {
+    serverCode: 'ABC123', clientContextId: 4, limit: 20
+  }, firstAck.callback);
+  const first = firstAck.value();
+  const secondAck = acknowledge();
+  await socket.trigger('list_messages', {
+    serverCode: 'ABC123', clientContextId: 4, cursor: first.nextCursor, limit: 20
+  }, secondAck.callback);
+  const second = secondAck.value();
+
+  assert.equal(new Set([...first.messages, ...second.messages].map(row => row._id)).size, 40);
+  assert.deepEqual(first.messages.map(row => row._id), messages.slice(25).map(row => row._id));
+  assert.deepEqual(second.messages.map(row => row._id), messages.slice(5, 25).map(row => row._id));
+  assert.deepEqual(
+    { serverCode: first.serverCode, clientContextId: first.clientContextId },
+    { serverCode: 'ABC123', clientContextId: 4 }
+  );
+});
+
+test('list_messages validates pagination input and clamps the maximum page size', async () => {
+  const messages = messageFixture({ count: 55 });
+  const { socket } = registerMessageReader({ messages });
+  const cases = [
+    [{ serverCode: 'ABC123', clientContextId: 4, cursor: 'not-a-cursor' }, { error: 'Invalid input format.' }],
+    [{ serverCode: 'ABC123', clientContextId: 4, limit: 2.5 }, { error: 'Invalid input format.' }],
+    [{ serverCode: 'ABC123', clientContextId: 0 }, { error: 'Invalid input format.' }],
+    [{ serverCode: 'global', clientContextId: 4 }, { error: 'Invalid input format.' }]
+  ];
+  for (const [payload, expected] of cases) {
+    const ack = acknowledge();
+    await socket.trigger('list_messages', payload, ack.callback);
+    assert.deepEqual(ack.value(), expected);
+  }
+
+  const defaultAck = acknowledge();
+  await socket.trigger('list_messages', {
+    serverCode: 'ABC123', clientContextId: 7
+  }, defaultAck.callback);
+  assert.equal(defaultAck.value().messages.length, 20);
+
+  const clampedAck = acknowledge();
+  await socket.trigger('list_messages', {
+    serverCode: 'ABC123', clientContextId: 8, limit: 999
+  }, clampedAck.callback);
+  assert.equal(clampedAck.value().messages.length, 50);
+  assert.ok(clampedAck.value().nextCursor);
+});
+
+test('list_messages returns a terminal page and denies missing or inaccessible rooms', async () => {
+  const messages = messageFixture({ count: 3 });
+  const { socket, ChatServerModel, UserModel } = registerMessageReader({ messages });
+  const terminalAck = acknowledge();
+  await socket.trigger('list_messages', {
+    serverCode: 'ABC123', clientContextId: 9, limit: 20
+  }, terminalAck.callback);
+  assert.equal(terminalAck.value().nextCursor, null);
+  assert.equal(terminalAck.value().messages.length, 3);
+
+  ChatServerModel.rows.splice(ChatServerModel.rows.findIndex(row => row.code === 'ABC123'), 1);
+  const missingAck = acknowledge();
+  await socket.trigger('list_messages', {
+    serverCode: 'ABC123', clientContextId: 10, limit: 20
+  }, missingAck.callback);
+  assert.deepEqual(missingAck.value(), { error: 'Permission denied.' });
+
+  ChatServerModel.rows.push({ code: 'ABC123', owner: 'owner', moderators: [] });
+  socket.joinedServers = ['global'];
+  UserModel.rows[0].servers = ['global'];
+  const deniedAck = acknowledge();
+  await socket.trigger('list_messages', {
+    serverCode: 'ABC123', clientContextId: 11, limit: 20
+  }, deniedAck.callback);
+  assert.deepEqual(deniedAck.value(), { error: 'Permission denied.' });
+});
+
+test('legacy Global pagination includes missing and null serverCode rows only', async () => {
+  const missingServerCode = messageFixture({ count: 1 })[0];
+  delete missingServerCode.serverCode;
+  const messages = [
+    ...messageFixture({ count: 1, serverCode: 'global' }),
+    { ...missingServerCode, _id: '000000000000000000000002' },
+    { ...messageFixture({ count: 1, serverCode: null })[0], _id: '000000000000000000000003' },
+    { ...messageFixture({ count: 1, serverCode: 'ABC123' })[0], _id: '000000000000000000000004' }
+  ];
+  messages.forEach((message, index) => { message.timestamp = new Date(Date.UTC(2026, 7, 9, 12, 0, index)); });
+  const { socket } = registerMessageReader({ messages, serverCode: 'global' });
+  socket.joinedServers = ['global'];
+  const ack = acknowledge();
+
+  await socket.trigger('list_messages', {
+    serverCode: 'global', clientContextId: 12, limit: 20
+  }, ack.callback);
+
+  assert.deepEqual(ack.value().messages.map(row => row._id), [
+    '000000000000000000000001',
+    '000000000000000000000002',
+    '000000000000000000000003'
+  ]);
+  assert.equal(ack.value().nextCursor, null);
+});
+
+function registerModerationReadRace({ action }) {
+  const persistenceStarted = deferred();
+  const releasePersistence = deferred();
+  const queryStarted = deferred();
+  const releaseQuery = deferred();
+  let messageQueries = 0;
+  const UserModel = createMemoryModel([
+    { username: 'admin', displayName: 'Admin', role: 'admin', servers: ['global', 'ABC123'] },
+    { username: 'alice', displayName: 'Alice', role: 'user', servers: ['global', 'ABC123'] }
+  ]);
+  const ChatServerModel = createMemoryModel([
+    { code: 'global', owner: 'System', moderators: [] },
+    { code: 'ABC123', owner: 'owner', moderators: [] }
+  ]);
+  const RoomRestrictionModel = createMemoryModel([]);
+  const persistRestriction = RoomRestrictionModel.findOneAndUpdate.bind(RoomRestrictionModel);
+  RoomRestrictionModel.findOneAndUpdate = async (query, update, options) => {
+    if (update.$set && (update.$set.bannedAt || update.$set.timeoutUntil)) {
+      persistenceStarted.resolve();
+      await releasePersistence.promise;
+    }
+    return persistRestriction(query, update, options);
+  };
+  const messages = messageFixture({ count: 1 });
+  const MessageModel = {
+    find() {
+      messageQueries += 1;
+      queryStarted.resolve();
+      return {
+        sort() { return this; },
+        limit() { return this; },
+        async lean() {
+          await releaseQuery.promise;
+          return messages;
+        }
+      };
+    }
+  };
+  const shared = {
+    ioInstance: new FakeIo(),
+    onlineUsersMap: new Map(),
+    UserModel,
+    ChatServerModel,
+    RoomRestrictionModel,
+    MessageModel,
+    ModerationAuditModel: createMemoryModel([]),
+    broadcastOnlineUsersFn: async () => {},
+    logger: { error() {} }
+  };
+  const moderator = registerSharedSocket(shared, `moderator-${action}`);
+  Object.assign(moderator, {
+    username: 'admin', displayName: 'Admin', role: 'admin',
+    joinedServers: ['global', 'ABC123'], serverCode: 'ABC123'
+  });
+  moderator.joinedRooms.add('ABC123');
+  const reader = registerSharedSocket(shared, `reader-${action}`);
+  Object.assign(reader, {
+    username: 'alice', displayName: 'Alice', role: 'user',
+    joinedServers: ['global', 'ABC123'], serverCode: 'ABC123'
+  });
+  reader.joinedRooms.add('ABC123');
+  return {
+    moderator,
+    reader,
+    persistenceStarted,
+    releasePersistence,
+    queryStarted,
+    releaseQuery,
+    messageQueries: () => messageQueries
+  };
+}
+
+test('list_messages queued behind a completed ban denies before querying messages', async () => {
+  const race = registerModerationReadRace({ action: 'ban' });
+  const moderationAck = acknowledge();
+  const moderationPending = race.moderator.trigger('moderate_user', {
+    serverCode: 'ABC123', targetUser: 'alice', action: 'ban', reason: 'test ban'
+  }, moderationAck.callback);
+  await race.persistenceStarted.promise;
+
+  const readAck = acknowledge();
+  const readPending = race.reader.trigger('list_messages', {
+    serverCode: 'ABC123', clientContextId: 13, limit: 20
+  }, readAck.callback);
+  await Promise.resolve();
+  assert.equal(race.messageQueries(), 0);
+
+  race.releasePersistence.resolve();
+  await Promise.all([moderationPending, readPending]);
+  assert.deepEqual(moderationAck.value(), { success: true });
+  assert.deepEqual(readAck.value(), { error: 'Permission denied.' });
+  assert.equal(race.messageQueries(), 0);
+});
+
+test('list_messages queued behind a completed timeout may finish its deferred query', async () => {
+  const race = registerModerationReadRace({ action: 'timeout' });
+  const moderationAck = acknowledge();
+  const moderationPending = race.moderator.trigger('moderate_user', {
+    serverCode: 'ABC123', targetUser: 'alice', action: 'timeout',
+    duration: '10m', reason: 'test timeout'
+  }, moderationAck.callback);
+  await race.persistenceStarted.promise;
+
+  const readAck = acknowledge();
+  const readPending = race.reader.trigger('list_messages', {
+    serverCode: 'ABC123', clientContextId: 14, limit: 20
+  }, readAck.callback);
+  race.releasePersistence.resolve();
+  await moderationPending;
+  await race.queryStarted.promise;
+  assert.equal(readAck.value(), undefined);
+
+  race.releaseQuery.resolve();
+  await readPending;
+  assert.deepEqual(moderationAck.value(), { success: true });
+  assert.deepEqual(
+    { count: readAck.value().messages.length, nextCursor: readAck.value().nextCursor },
+    { count: 1, nextCursor: null }
+  );
 });
 
 test('leaving the active room removes transport and moderator access then moves to global', async () => {
@@ -1745,12 +2091,14 @@ test('deletion preflights sockets then waits for a queued switch account commit'
   const historyPrepared = deferred();
   const releaseMutation = deferred();
   const deletionFinished = deferred();
+  const deletionPreflight = deferred();
   const order = [];
   const state = { roomExists: true, mutationReleased: false, roomReads: 0 };
   const room = { code: 'ABC123', owner: 'alice', moderators: [] };
   const ioInstance = new FakeIo();
   ioInstance.fetchSockets = async () => {
     order.push('delete:fetchSockets');
+    deletionPreflight.resolve();
     return ioInstance.sockets;
   };
   const onlineUsersMap = new Map();
@@ -1837,17 +2185,14 @@ test('deletion preflights sockets then waits for a queued switch account commit'
   await mutationEntered.promise;
   const switchAck = acknowledge();
   const switchPending = late.trigger('switch_server', 'ABC123', switchAck.callback);
-  await historyEntered.promise;
-  historyPrepared.resolve([]);
-  await Promise.resolve();
-  await Promise.resolve();
   const deleteAck = acknowledge();
   const deletePending = deleter.trigger('delete_server', 'ABC123', deleteAck.callback);
-  await Promise.resolve();
-  await Promise.resolve();
+  await deletionPreflight.promise;
   state.mutationReleased = true;
   releaseMutation.resolve();
   await mutationPending;
+  await historyEntered.promise;
+  historyPrepared.resolve([]);
   await Promise.all([switchPending, deletePending]);
 
   const joinIndex = order.indexOf('late:join:ABC123');
@@ -1856,7 +2201,7 @@ test('deletion preflights sockets then waits for a queued switch account commit'
   assert.notEqual(fetchIndex, -1);
   assert.ok(fetchIndex < joinIndex);
   assert.deepEqual(switchAck.value(), {
-    history: [], roomRole: 'user',
+    history: [], nextCursor: null, roomRole: 'user',
     restriction: { banned: false, timedOut: false, timeoutUntil: null }
   });
   assert.deepEqual(deleteAck.value(), { success: true });
@@ -1870,10 +2215,9 @@ test('deletion preflights sockets then waits for a queued switch account commit'
 
 test('a switch waiting behind deletion cannot join the deleted room', async () => {
   const deleteEntered = deferred();
-  const historyEntered = deferred();
-  const historyPrepared = deferred();
   const releaseDelete = deferred();
   const state = { roomExists: true };
+  let messageQueries = 0;
   const room = { code: 'ABC123', owner: 'alice', moderators: [] };
   const ioInstance = new FakeIo();
   const onlineUsersMap = new Map();
@@ -1887,14 +2231,8 @@ test('a switch waiting behind deletion cannot join the deleted room', async () =
   };
   const MessageModel = {
     find() {
-      return {
-        sort() { return this; },
-        limit() { return this; },
-        lean() {
-          historyEntered.resolve();
-          return historyPrepared.promise;
-        }
-      };
+      messageQueries += 1;
+      return queryResult([]);
     },
     async deleteMany() {}
   };
@@ -1940,10 +2278,6 @@ test('a switch waiting behind deletion cannot join the deleted room', async () =
   await deleteEntered.promise;
   const switchAck = acknowledge();
   const switchPending = switcher.trigger('switch_server', 'ABC123', switchAck.callback);
-  await historyEntered.promise;
-  historyPrepared.resolve([]);
-  await Promise.resolve();
-  await Promise.resolve();
   releaseDelete.resolve();
   await Promise.all([deletePending, switchPending]);
 
@@ -1954,6 +2288,7 @@ test('a switch waiting behind deletion cannot join the deleted room', async () =
   assert.equal(switcher.joinedRooms.has('OLD123'), true);
   assert.equal(switcher.joinedRooms.has('ABC123'), false);
   assert.deepEqual(switcher.leftRooms, []);
+  assert.equal(messageQueries, 0);
 });
 
 test('room deletion clears every session cache before awaiting transport eviction', async () => {
@@ -2363,21 +2698,16 @@ for (const scenario of [
     expected: { error: 'Permission denied.' }
   }
 ]) {
-  test(`room switch rechecks ${scenario.name} after pending history work`, async () => {
-    const history = deferred();
-    const historyStarted = deferred();
+  test(`room switch rechecks ${scenario.name} after a pending account transition`, async () => {
+    const transitionStarted = deferred();
+    const releaseTransition = deferred();
+    let messageQueries = 0;
     const state = { room: { code: 'ABC123', moderators: [] } };
     const ChatServerModel = { async findOne() { return state.room; } };
     const MessageModel = {
       find() {
-        return {
-          sort() { return this; },
-          limit() { return this; },
-          async lean() {
-            historyStarted.resolve();
-            return history.promise;
-          }
-        };
+        messageQueries += 1;
+        return queryResult([]);
       }
     };
     const { socket } = register({ ChatServerModel, MessageModel });
@@ -2388,14 +2718,20 @@ for (const scenario of [
     socket.joinedRooms.add('global');
     if (scenario.configure) scenario.configure(socket);
 
+    const transition = withAccountTransitionLock('alice', async () => {
+      transitionStarted.resolve();
+      await releaseTransition.promise;
+    });
+    await transitionStarted.promise;
     const ack = acknowledge();
     const pending = socket.trigger('switch_server', 'ABC123', ack.callback);
-    await historyStarted.promise;
+    await Promise.resolve();
     scenario.mutate(state, socket);
-    history.resolve([]);
-    await pending;
+    releaseTransition.resolve();
+    await Promise.all([transition, pending]);
 
     assert.deepEqual(ack.value(), scenario.expected);
+    assert.equal(messageQueries, 0);
     assert.equal(socket.serverCode, 'global');
     assert.equal(socket.joinedRooms.has('ABC123'), false);
     assert.deepEqual(socket.leftRooms, []);

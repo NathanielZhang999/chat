@@ -2973,40 +2973,29 @@ function createConnectionHandler({
     }
   });
 
+  async function deliverMessageRead({ serverCode, clientContextId, callback, operation }) {
+    return withAccountTransitionLock(socket.username, () =>
+      withRoomMutationLock(serverCode, async () => {
+        const access = await loadRoomAccessState({
+          UserModel, ChatServerModel, RoomRestrictionModel,
+          username: socket.username, serverCode
+        });
+        if (!access.room || !access.allowed || socket.serverCode !== serverCode ||
+            !canAccessRoom(socket, serverCode)) {
+          callback({ error: 'Permission denied.' });
+          return;
+        }
+        const roomRole = currentRoomRole(access.room, access.user.username);
+        callback(await operation({ access, roomRole, clientContextId }));
+      })
+    );
+  }
+
   socket.on('switch_server', async (code, callback) => {
     callback = safeAck(callback);
     if (!socket.username) return callback({ error: 'Not authenticated.' });
     const serverCode = normalizeServerCode(code);
     if (!serverCode) return callback({ error: 'Invalid input format.' });
-
-    let safeHistory;
-    let roomRole;
-    try {
-      const access = await loadRoomAccessState({
-        UserModel, ChatServerModel, RoomRestrictionModel,
-        username: socket.username, serverCode
-      });
-      if (!access.room) return callback({ error: 'Server not found.' });
-      if (!access.allowed || !canAccessRoom(socket, serverCode)) return callback({ error: 'Permission denied.' });
-
-      let query = { serverCode };
-      if (serverCode === 'global') query = { $or: [{ serverCode: 'global' }, { serverCode: { $exists: false } }, { serverCode: null }] };
-
-      roomRole = await getRoomRoleFn(serverCode, socket.username);
-      const history = await MessageModel.find(query).sort({ timestamp: -1 }).limit(100).lean();
-
-      safeHistory = history.map(storedMessage => {
-          const msg = { ...storedMessage, attachment: sanitizeAttachment(storedMessage.attachment) };
-          if (msg.deleted && msg.username !== socket.username && socket.role !== 'admin' && roomRole !== 'mod') {
-              msg.text = ''; msg.attachment = null; msg.reactions = {};
-          }
-          if (!msg.reactions) msg.reactions = {};
-          return msg;
-      }).reverse();
-    } catch (err) {
-      logUnexpectedError(logger, 'switch_server_history', err);
-      return callback({ error: 'Failed to switch server.' });
-    }
 
     let result;
     try {
@@ -3015,8 +3004,26 @@ function createConnectionHandler({
           UserModel, ChatServerModel, RoomRestrictionModel,
           username: socket.username, serverCode
         });
-        if (!access.room) return { error: 'Server not found.' };
-        if (!access.allowed || !canAccessRoom(socket, serverCode)) return { error: 'Permission denied.' };
+        if (!access.room) {
+          callback({ error: 'Server not found.' });
+          return { success: false };
+        }
+        if (!access.allowed || !canAccessRoom(socket, serverCode)) {
+          callback({ error: 'Permission denied.' });
+          return { success: false };
+        }
+
+        const roomRole = currentRoomRole(access.room, access.user.username);
+        const rows = await MessageModel.find(messageRoomQuery(serverCode))
+          .sort({ timestamp: -1, _id: -1 })
+          .limit(21)
+          .lean();
+        const { page, nextCursor } = nextMessagePage(rows, 20);
+        const history = page.map(storedMessage => safeMessageForViewer(storedMessage, {
+          username: access.user.username,
+          role: access.user.role,
+          roomRole
+        })).reverse();
 
         const oldCode = socket.serverCode;
         const session = onlineUsersMap.get(socket.id);
@@ -3055,23 +3062,23 @@ function createConnectionHandler({
         }
         socket.serverCode = serverCode;
         if (session) session.serverCode = serverCode;
-        return { success: true, oldCode, restriction: access.restriction };
+        callback({
+          history,
+          nextCursor,
+          roomRole,
+          restriction: {
+            banned: access.restriction.banned,
+            timedOut: access.restriction.timedOut,
+            timeoutUntil: access.restriction.timeoutUntil
+          }
+        });
+        return { success: true, oldCode };
       }));
     } catch (err) {
       logUnexpectedError(logger, 'switch_server_recheck', err);
       return callback({ error: 'Failed to switch server.' });
     }
-    if (result.error) return callback(result);
-
-    callback({
-      history: safeHistory,
-      roomRole,
-      restriction: {
-        banned: result.restriction.banned,
-        timedOut: result.restriction.timedOut,
-        timeoutUntil: result.restriction.timeoutUntil
-      }
-    });
+    if (!result || !result.success) return;
 
     const broadcastCodes = [];
     if (result.oldCode && result.oldCode !== serverCode) broadcastCodes.push(result.oldCode);
@@ -3085,6 +3092,46 @@ function createConnectionHandler({
         logUnexpectedError(logger, 'switch_server_presence_broadcast', err);
       }
     });
+  });
+
+  socket.on('list_messages', async (data, callback) => {
+    callback = safeAck(callback);
+    if (!socket.username) return callback({ error: 'Not authenticated.' });
+    const serverCode = normalizeServerCode(data?.serverCode);
+    const clientContextId = normalizeClientContextId(data?.clientContextId);
+    const limit = normalizePageLimit(data?.limit);
+    const cursor = data?.cursor == null ? null : decodeCursor(data.cursor);
+    if (!serverCode || clientContextId === null || limit === null ||
+        (data?.cursor != null && !cursor) || serverCode !== socket.serverCode) {
+      return callback({ error: 'Invalid input format.' });
+    }
+
+    try {
+      await deliverMessageRead({
+        serverCode,
+        clientContextId,
+        callback,
+        operation: async ({ access, roomRole }) => {
+          const rows = await MessageModel.find({
+            $and: [messageRoomQuery(serverCode), messageCursorQuery(cursor)]
+          }).sort({ timestamp: -1, _id: -1 }).limit(limit + 1).lean();
+          const { page, nextCursor } = nextMessagePage(rows, limit);
+          return {
+            messages: page.map(storedMessage => safeMessageForViewer(storedMessage, {
+              username: access.user.username,
+              role: access.user.role,
+              roomRole
+            })).reverse(),
+            nextCursor,
+            serverCode,
+            clientContextId
+          };
+        }
+      });
+    } catch (err) {
+      logUnexpectedError(logger, 'list_messages', err);
+      callback({ error: 'Failed to load messages.' });
+    }
   });
 
   socket.on('chat_message', async (payload) => {
