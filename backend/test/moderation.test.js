@@ -1667,6 +1667,232 @@ for (const row of [
   });
 }
 
+test('complete moderation policy matrix uses real handlers and preserves private outcomes', async () => {
+  const cases = [
+    ['global', 'admin', 'user', 'timeout', true],
+    ['global', 'admin', 'timed-out-user', 'clear_timeout', true],
+    ['global', 'admin', 'user', 'ban', true],
+    ['global', 'admin', 'user', 'unban', true],
+    ['global', 'admin', 'user', 'kick', false],
+    ['global', 'mod', 'user', 'timeout', false],
+    ['ABC123', 'mod', 'user', 'kick', true],
+    ['ABC123', 'mod', 'user', 'timeout', true],
+    ['ABC123', 'mod', 'timed-out-user', 'clear_timeout', true],
+    ['ABC123', 'mod', 'user', 'ban', true],
+    ['ABC123', 'mod', 'user', 'unban', true],
+    ['XYZ789', 'mod-from-ABC123', 'user', 'ban', false],
+    ['ABC123', 'mod', 'mod', 'ban', false],
+    ['ABC123', 'admin', 'admin', 'ban', false],
+    ['ABC123', 'admin', 'NYZhang1', 'ban', false],
+    ['ABC123', 'admin', 'System', 'timeout', false]
+  ];
+
+  for (const [index, [serverCode, actor, targetKind, action, allowed]] of cases.entries()) {
+    const setup = moderationScenario({ room: serverCode, actor, action });
+    const actorUser = setup.UserModel.rows[0];
+    const targetUser = setup.UserModel.rows[1];
+    const room = setup.ChatServerModel.rows.find(candidate => candidate.code === serverCode);
+    const reason = `matrix private reason ${index}`;
+
+    room.moderators = room.moderators.filter(username =>
+      normalizeAccountKey(username) !== normalizeAccountKey(targetUser.username)
+    );
+    if (targetKind === 'mod') room.moderators.push(targetUser.username);
+    if (targetKind === 'admin') targetUser.role = 'admin';
+    if (targetKind === 'NYZhang1' || targetKind === 'System') {
+      targetUser.username = targetKind;
+      targetUser.displayName = targetKind;
+    }
+    if (action === 'unban' && serverCode !== 'global') {
+      targetUser.servers = targetUser.servers.filter(code => code !== serverCode);
+    }
+
+    const targetIsBanned = action === 'unban';
+    const targetJoinedServers = targetIsBanned
+      ? targetUser.servers.filter(code => code !== serverCode)
+      : [...targetUser.servers];
+    const targetServerCode = targetIsBanned
+      ? (serverCode === 'global' ? 'ABC123' : 'global')
+      : serverCode;
+    const targetSocket = connectAdditionalSocket(setup, {
+      id: `matrix-target-${index}`,
+      username: targetUser.username,
+      serverCode: targetServerCode,
+      joinedServers: targetJoinedServers,
+      role: targetUser.role,
+      bannedRooms: targetIsBanned ? [serverCode] : []
+    });
+    setup.UserModel.rows.push(userDocument({
+      username: `Observer${index}`,
+      displayName: `Observer ${index}`,
+      servers: ['global', 'ABC123', 'XYZ789']
+    }));
+    const observerSocket = connectAdditionalSocket(setup, {
+      id: `matrix-observer-${index}`,
+      username: `Observer${index}`,
+      serverCode,
+      joinedServers: ['global', 'ABC123', 'XYZ789']
+    });
+    const before = structuredClone({
+      target: targetUser,
+      room,
+      restrictions: setup.RoomRestrictionModel.rows
+    });
+
+    const ack = acknowledge();
+    await setup.socket.trigger('moderate_user', {
+      serverCode,
+      targetUser: targetUser.username,
+      action,
+      duration: action === 'timeout' ? '10m' : undefined,
+      reason
+    }, ack.callback);
+
+    assert.deepEqual(
+      ack.value(),
+      allowed ? { success: true } : { error: 'Permission denied.' },
+      `callback: ${serverCode}/${actor}/${targetKind}/${action}`
+    );
+    assert.equal(
+      setup.ModerationAuditModel.rows.length,
+      allowed ? 1 : 0,
+      `audit count: ${serverCode}/${actor}/${targetKind}/${action}`
+    );
+
+    if (!allowed) {
+      assert.deepEqual(structuredClone({
+        target: targetUser,
+        room,
+        restrictions: setup.RoomRestrictionModel.rows
+      }), before, `persistence unchanged: ${serverCode}/${actor}/${targetKind}/${action}`);
+    } else {
+      const audit = setup.ModerationAuditModel.rows[0];
+      assert.deepEqual({
+        action: audit.action,
+        serverCode: audit.serverCode,
+        actorUsername: audit.actorUsername,
+        targetUsername: audit.targetUsername,
+        reason: audit.reason
+      }, {
+        action,
+        serverCode,
+        actorUsername: actorUser.username,
+        targetUsername: targetUser.username,
+        reason
+      }, `audit contents: ${serverCode}/${actor}/${targetKind}/${action}`);
+
+      const persistedTarget = setup.UserModel.rows.find(user =>
+        normalizeAccountKey(user.username) === normalizeAccountKey(targetUser.username)
+      );
+      const expectedMemberships = serverCode !== 'global' && (action === 'kick' || action === 'ban')
+        ? before.target.servers.filter(code => code !== serverCode)
+        : before.target.servers;
+      assert.deepEqual(
+        structuredClone(persistedTarget),
+        { ...before.target, servers: expectedMemberships },
+        `target persistence mutation: ${serverCode}/${actor}/${targetKind}/${action}`
+      );
+      assert.deepEqual(
+        structuredClone(room),
+        before.room,
+        `room persistence mutation: ${serverCode}/${actor}/${targetKind}/${action}`
+      );
+
+      const restriction = setup.RoomRestrictionModel.rows.find(row =>
+        row.serverCode === serverCode &&
+        row.username === normalizeAccountKey(targetUser.username)
+      );
+      if (action === 'kick') {
+        assert.deepEqual(setup.RoomRestrictionModel.rows, before.restrictions);
+      } else {
+        assert.ok(restriction, `restriction exists: ${serverCode}/${actor}/${targetKind}/${action}`);
+      }
+      if (action === 'timeout') {
+        assert.equal(restriction.timeoutUntil instanceof Date, true);
+        assert.equal(restriction.timeoutBy, actorUser.username);
+        assert.equal(restriction.timeoutReason, reason);
+        assert.equal(Boolean(restriction.bannedAt), false);
+      }
+      if (action === 'clear_timeout') {
+        assert.deepEqual({
+          timeoutUntil: restriction.timeoutUntil,
+          timeoutBy: restriction.timeoutBy,
+          timeoutReason: restriction.timeoutReason
+        }, { timeoutUntil: null, timeoutBy: null, timeoutReason: null });
+      }
+      if (action === 'ban') {
+        assert.equal(restriction.bannedAt instanceof Date, true);
+        assert.equal(restriction.bannedBy, actorUser.username);
+        assert.equal(restriction.banReason, reason);
+        assert.deepEqual({
+          timeoutUntil: restriction.timeoutUntil,
+          timeoutBy: restriction.timeoutBy,
+          timeoutReason: restriction.timeoutReason
+        }, { timeoutUntil: null, timeoutBy: null, timeoutReason: null });
+      }
+      if (action === 'unban') {
+        assert.deepEqual({
+          bannedAt: restriction.bannedAt,
+          bannedBy: restriction.bannedBy,
+          banReason: restriction.banReason
+        }, { bannedAt: null, bannedBy: null, banReason: null });
+      }
+    }
+
+    const targetUpdates = targetSocket.outbound.filter(item =>
+      item.event === 'room_access_updated' || item.event === 'room_restriction_updated'
+    );
+    assert.deepEqual(
+      targetUpdates.map(item => item.event),
+      allowed ? ['room_access_updated', 'room_restriction_updated'] : [],
+      `target-only events: ${serverCode}/${actor}/${targetKind}/${action}`
+    );
+    if (allowed) {
+      assert.equal(targetUpdates[0].payload.username, targetUser.username);
+      assert.deepEqual({
+        serverCode: targetUpdates[1].payload.serverCode,
+        banned: targetUpdates[1].payload.banned,
+        timedOut: targetUpdates[1].payload.timedOut
+      }, {
+        serverCode,
+        banned: action === 'ban',
+        timedOut: action === 'timeout'
+      });
+    }
+    assert.equal(setup.socket.outbound.some(item =>
+      item.event === 'room_access_updated' || item.event === 'room_restriction_updated'
+    ), false);
+    assert.equal(observerSocket.outbound.some(item =>
+      item.event === 'room_access_updated' || item.event === 'room_restriction_updated'
+    ), false);
+    const roomWideEvents = [
+      ...setup.ioInstance.outbound,
+      ...setup.socket.outbound.filter(item => item.target && item.target !== 'self')
+    ];
+    assert.equal(roomWideEvents.some(item =>
+      item.event === 'room_access_updated' || item.event === 'room_restriction_updated'
+    ), false);
+
+    const roomNotices = roomWideEvents.filter(item =>
+      (item.room === serverCode || item.target === serverCode) && item.event === 'system_message'
+    );
+    assert.deepEqual(
+      roomNotices.map(item => item.payload),
+      allowed && (action === 'kick' || action === 'ban')
+        ? ['A member was removed by moderation.']
+        : [],
+      `generic room notice: ${serverCode}/${actor}/${targetKind}/${action}`
+    );
+    const roomWidePayloads = JSON.stringify(roomWideEvents);
+    assert.equal(roomWidePayloads.includes(reason), false);
+    assert.equal(roomWidePayloads.includes(actorUser.username), false);
+    assert.equal(roomWidePayloads.includes(targetUser.username), false);
+    for (const privateField of ['banReason', 'bannedBy', 'timeoutReason', 'timeoutBy']) {
+      assert.equal(roomWidePayloads.includes(privateField), false);
+    }
+  }
+});
+
 test('moderationScenario exposes the documented aggregate and individual model handles', () => {
   const setup = moderationScenario({ room: 'ABC123', actor: 'admin', action: 'kick' });
   assert.deepEqual(setup.models, {
