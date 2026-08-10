@@ -622,7 +622,6 @@ const UserSchema = new mongoose.Schema({
   avatarUrl: { type: String, default: '' },  
   servers: { type: [String], default: ['global'] } 
 });
-UserSchema.index({ servers: 1 });
 const User = mongoose.model('User', UserSchema);
 
 const ChatServerSchema = new mongoose.Schema({
@@ -743,7 +742,6 @@ const MessageSchema = new mongoose.Schema({
   history: [{ text: String, timestamp: Date }], 
   timestamp: { type: Date, default: Date.now }
 });
-MessageSchema.index({ serverCode: 1, timestamp: -1, _id: -1 });
 const Message = mongoose.model('Message', MessageSchema);
 
 // --- AUTO-SETUP SYSTEM ---
@@ -786,7 +784,7 @@ async function getRoomRole(serverCode, username) {
 
 // --- SECURE BACKEND PING RESOLVER ENGINE ---
 // Converts `@username` or `@DisplayName` securely into the `{{PING:username|DisplayName}}` format
-async function resolvePings(text, serverCode, senderRole, senderRoomRole, senderUsername, UserModel = User) {
+async function resolvePings(text, serverCode, senderRole, senderRoomRole, senderUsername) {
     let processed = text;
     if (!processed.includes('@')) return processed;
 
@@ -799,10 +797,7 @@ async function resolvePings(text, serverCode, senderRole, senderRoomRole, sender
     }
 
     if (processed.includes('@')) {
-        const roomUsers = await UserModel.find(
-            { servers: serverCode },
-            'username displayName'
-        ).lean();
+        const roomUsers = await User.find({ servers: serverCode }, 'username displayName');
         
         // Build search array mapping every possible matching handle
         const searchList = [];
@@ -3067,10 +3062,8 @@ function createConnectionHandler({
     });
 
     const broadcastCodes = [];
-    if (result.oldCode && result.oldCode !== serverCode && result.oldCode !== 'global') {
-      broadcastCodes.push(result.oldCode);
-    }
-    if (serverCode !== 'global') broadcastCodes.push(serverCode);
+    if (result.oldCode && result.oldCode !== serverCode) broadcastCodes.push(result.oldCode);
+    broadcastCodes.push(serverCode, 'global');
     [...new Set(broadcastCodes)].forEach(broadcastCode => {
       try {
         Promise.resolve(broadcastOnlineUsersFn(broadcastCode)).catch(err => {
@@ -3482,9 +3475,6 @@ module.exports = {
   start,
   seedSystem,
   createConnectionHandler,
-  UserSchema,
-  MessageSchema,
-  resolvePings,
   withAccountTransitionLock,
   withAccountTransitionLocks,
   safeAck,
