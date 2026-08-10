@@ -1,11 +1,13 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { createAutoModTracker, createConnectionHandler } = require('../server');
-const { FakeSocket, FakeIo, acknowledge, deferred } = require('./support/fakes');
+const { FakeSocket, FakeIo, acknowledge, deferred, createMemoryModel } = require('./support/fakes');
 
 function registerMessages(overrides = {}) {
   const socket = new FakeSocket();
   const ioInstance = new FakeIo();
+  const RoomMemberStateModel = overrides.RoomMemberStateModel || createMemoryModel([]);
+  const UserExperienceStateModel = overrides.UserExperienceStateModel || createMemoryModel([]);
   createConnectionHandler({
     ioInstance,
     UserModel: {
@@ -20,9 +22,11 @@ function registerMessages(overrides = {}) {
     getRoomRoleFn: async () => 'user',
     resolvePingsFn: async text => text,
     autoModTracker: createAutoModTracker(),
-    ...overrides
+    ...overrides,
+    RoomMemberStateModel,
+    UserExperienceStateModel
   })(socket);
-  return { socket, ioInstance };
+  return { socket, ioInstance, RoomMemberStateModel, UserExperienceStateModel };
 }
 
 function authenticate(socket, { serverCode = 'global', joinedServers = ['global'] } = {}) {
@@ -580,16 +584,27 @@ test('edit history reads return only the newest twenty legacy entries', async ()
 
 test('room history strips unsafe legacy attachments before acknowledgement', async () => {
   const history = [
-    { _id: '507f1f77bcf86cd799439011', serverCode: 'global', attachment: 'javascript:alert(1)' },
-    { _id: '507f191e810c19729de860ea', serverCode: 'global', attachment: 'data:image/png;base64,AAAA' }
+    {
+      _id: '507f1f77bcf86cd799439011', serverCode: 'global', username: 'Alice', authorKey: 'alice',
+      displayName: 'Alice', role: 'user', roomRole: 'user', color: '', avatarUrl: '', text: 'unsafe',
+      attachment: 'javascript:alert(1)', replyTo: null, reactions: {}, edited: false, deleted: false,
+      timestamp: new Date('2026-08-10T12:01:00.000Z')
+    },
+    {
+      _id: '507f191e810c19729de860ea', serverCode: 'global', username: 'Alice', authorKey: 'alice',
+      displayName: 'Alice', role: 'user', roomRole: 'user', color: '', avatarUrl: '', text: 'safe',
+      attachment: 'data:image/png;base64,AAAA', replyTo: null, reactions: {}, edited: false, deleted: false,
+      timestamp: new Date('2026-08-10T12:00:00.000Z')
+    }
   ];
-  const { socket } = registerMessages({
+  const { socket, RoomMemberStateModel } = registerMessages({
     MessageModel: {
       find() {
         return {
           sort() { return this; },
           limit() { return this; },
-          async lean() { return history; }
+          async lean() { return history; },
+          then(resolve, reject) { return Promise.resolve(history).then(resolve, reject); }
         };
       }
     }
@@ -599,6 +614,13 @@ test('room history strips unsafe legacy attachments before acknowledgement', asy
   await socket.trigger('switch_server', 'global', ack.callback);
   assert.equal(ack.value().history[0].attachment, 'data:image/png;base64,AAAA');
   assert.equal(ack.value().history[1].attachment, null);
+  assert.deepEqual(RoomMemberStateModel.rows.map(row => ({
+    usernameKey: row.usernameKey,
+    serverCode: row.serverCode,
+    lastReadMessageId: row.lastReadMessageId
+  })), [{
+    usernameKey: 'alice', serverCode: 'global', lastReadMessageId: '507f1f77bcf86cd799439011'
+  }]);
 });
 
 test('deleted-message reads strip unsafe legacy attachments', async () => {

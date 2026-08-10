@@ -29,7 +29,9 @@ function installSession(setup, { id, username, role = 'user', serverCode = 'ABC1
     ChatServerModel: setup.ChatServerModel,
     RoomRestrictionModel: setup.RoomRestrictionModel,
     ModerationAuditModel: setup.ModerationAuditModel,
-    MessageModel: createMemoryModel([]),
+    MessageModel: setup.MessageModel,
+    RoomMemberStateModel: setup.RoomMemberStateModel,
+    UserExperienceStateModel: setup.UserExperienceStateModel,
     onlineUsersMap: setup.onlineUsersMap,
     broadcastOnlineUsersFn: async () => {}, getRoomRoleFn: async () => 'user', resolvePingsFn: async text => text,
     logger: setup.logger
@@ -57,7 +59,10 @@ function createFixture({ metadataVersion = 0, legacy = false, logger = { error()
       restriction('ABC123', 'TimedOutOwner', { timeoutUntil: new Date(Date.now() + 60_000) }),
       restriction('ABC123', 'BannedAdmin', { bannedAt: new Date() })
     ]),
-    ModerationAuditModel: createMemoryModel([])
+    ModerationAuditModel: createMemoryModel([]),
+    MessageModel: createMemoryModel([]),
+    RoomMemberStateModel: createMemoryModel([]),
+    UserExperienceStateModel: createMemoryModel([])
   };
   if (legacy) delete setup.ChatServerModel.rows.find(row => row.code === 'ABC123').metadataVersion;
   return {
@@ -81,6 +86,12 @@ async function details(socket, payload) {
 async function update(socket, payload) {
   const ack = acknowledge();
   await socket.trigger('update_room_details', payload, ack.callback);
+  return ack.value();
+}
+
+async function updateNotification(socket, payload) {
+  const ack = acknowledge();
+  await socket.trigger('update_room_notification', payload, ack.callback);
   return ack.value();
 }
 
@@ -186,4 +197,110 @@ test('complete metadata permission matrix uses fresh users rooms and restriction
   }
   assert.equal((await update(setup.owner, { serverCode: 'ABC123', description: 'owner', rules: '' })).success, true);
   assert.equal((await update(setup.admin, { serverCode: 'ABC123', description: 'admin', rules: '' })).success, true);
+});
+
+test('legacy room state initializes at the newest exact-room message under account then room locks', async () => {
+  const setup = createFixture();
+  const timestamp = new Date('2026-08-10T12:00:00.000Z');
+  setup.MessageModel.rows.push(
+    { _id: '507f1f77bcf86cd799439011', serverCode: 'ABC123', timestamp },
+    { _id: '507f1f77bcf86cd799439012', serverCode: 'ABC123', timestamp },
+    { _id: '507f1f77bcf86cd799439099', serverCode: 'XYZ789', timestamp: new Date('2026-08-10T13:00:00.000Z') }
+  );
+
+  const result = await updateNotification(setup.member, { serverCode: 'ABC123', level: 'all' });
+
+  assert.deepEqual(result, {
+    serverCode: 'ABC123', usernameKey: 'member', notificationLevel: 'all',
+    lastReadAt: timestamp, lastReadMessageId: '507f1f77bcf86cd799439012',
+    unreadCount: 0, mentionCount: 0, version: 0, blockVersion: 0
+  });
+  assert.deepEqual(setup.RoomMemberStateModel.rows, [{
+    _id: setup.RoomMemberStateModel.rows[0]._id,
+    usernameKey: 'member', serverCode: 'ABC123', notificationLevel: 'all',
+    lastReadAt: timestamp, lastReadMessageId: '507f1f77bcf86cd799439012', version: 0
+  }]);
+});
+
+test('legacy Global cursor initialization includes missing and null serverCode messages', async () => {
+  const setup = createFixture();
+  const newestAt = new Date('2026-08-10T12:02:00.000Z');
+  setup.MessageModel.rows.push(
+    { _id: '507f1f77bcf86cd799439021', serverCode: 'global', timestamp: new Date('2026-08-10T12:00:00.000Z') },
+    { _id: '507f1f77bcf86cd799439022', timestamp: new Date('2026-08-10T12:01:00.000Z') },
+    { _id: '507f1f77bcf86cd799439023', serverCode: null, timestamp: newestAt },
+    { _id: '507f1f77bcf86cd799439099', serverCode: 'ABC123', timestamp: new Date('2026-08-10T13:00:00.000Z') }
+  );
+
+  const result = await updateNotification(setup.member, { serverCode: 'global', level: 'all' });
+
+  assert.equal(result.version, 0);
+  assert.equal(result.lastReadAt.getTime(), newestAt.getTime());
+  assert.equal(result.lastReadMessageId, '507f1f77bcf86cd799439023');
+});
+
+test('notification updates allow timed-out readers deny banned readers and validate exact levels', async () => {
+  const setup = createFixture();
+
+  assert.deepEqual(await updateNotification(setup.timedOutOwner, {
+    serverCode: 'ABC123', level: 'mentions'
+  }), {
+    serverCode: 'ABC123', usernameKey: 'timedoutowner', notificationLevel: 'mentions',
+    lastReadAt: null, lastReadMessageId: null, unreadCount: 0, mentionCount: 0,
+    version: 1, blockVersion: 0
+  });
+  assert.deepEqual(await updateNotification(setup.bannedAdmin, {
+    serverCode: 'ABC123', level: 'none'
+  }), { error: 'Permission denied.' });
+
+  const rowsBefore = setup.RoomMemberStateModel.rows.length;
+  for (const level of ['ALL', 'mentions ', '', null, undefined]) {
+    assert.deepEqual(await updateNotification(setup.member, { serverCode: 'ABC123', level }), {
+      error: 'Invalid input format.'
+    });
+  }
+  assert.equal(setup.RoomMemberStateModel.rows.length, rowsBefore);
+});
+
+test('notification and cursor mutations share one version and events carry complete state', async () => {
+  const setup = createFixture();
+  const cursorAt = new Date('2026-08-10T12:00:00.000Z');
+  setup.RoomMemberStateModel.rows.push({
+    _id: '507f1f77bcf86cd799439031', usernameKey: 'member', serverCode: 'ABC123',
+    notificationLevel: 'all', lastReadAt: cursorAt,
+    lastReadMessageId: '507f1f77bcf86cd799439032', version: 7
+  });
+
+  const result = await updateNotification(setup.member, { serverCode: 'ABC123', level: 'none' });
+
+  assert.deepEqual(result, {
+    serverCode: 'ABC123', usernameKey: 'member', notificationLevel: 'none',
+    lastReadAt: cursorAt, lastReadMessageId: '507f1f77bcf86cd799439032',
+    unreadCount: 0, mentionCount: 0, version: 8, blockVersion: 0
+  });
+  assert.deepEqual(setup.member.outbound.filter(item => item.event === 'room_notification_updated'), [{
+    target: 'self', event: 'room_notification_updated', payload: result
+  }]);
+});
+
+test('duplicate notification writes are idempotent and synchronize every account session', async () => {
+  const setup = createFixture();
+  setup.UserModel.rows.push(user('Alice'), user('Bob'));
+  const aliceRoom = installSession(setup, { id: 'alice-room', username: 'Alice' });
+  const aliceOther = installSession(setup, {
+    id: 'alice-other', username: 'ALICE', serverCode: 'global', joinedServers: ['global', 'ABC123']
+  });
+  const bob = installSession(setup, { id: 'bob', username: 'Bob' });
+
+  const first = await updateNotification(aliceRoom, { serverCode: 'ABC123', level: 'none' });
+  const second = await updateNotification(aliceRoom, { serverCode: 'ABC123', level: 'none' });
+
+  assert.deepEqual(second, first);
+  assert.equal(first.version, 1);
+  for (const live of [aliceRoom, aliceOther]) {
+    assert.deepEqual(live.outbound.filter(item => item.event === 'room_notification_updated'), [{
+      target: 'self', event: 'room_notification_updated', payload: first
+    }]);
+  }
+  assert.deepEqual(bob.outbound.filter(item => item.event === 'room_notification_updated'), []);
 });

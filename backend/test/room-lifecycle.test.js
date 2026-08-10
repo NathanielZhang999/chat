@@ -1,11 +1,14 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { createConnectionHandler, seedSystem, withAccountTransitionLock } = require('../server');
-const { FakeSocket, FakeIo, queryResult, acknowledge, deferred } = require('./support/fakes');
+const { FakeSocket, FakeIo, queryResult, acknowledge, deferred, createMemoryModel } = require('./support/fakes');
 
 function register(overrides = {}) {
   const socket = new FakeSocket();
   const ioInstance = new FakeIo();
+  const MessageModel = { ...createMemoryModel([]), ...(overrides.MessageModel || {}) };
+  const RoomMemberStateModel = overrides.RoomMemberStateModel || createMemoryModel([]);
+  const UserExperienceStateModel = overrides.UserExperienceStateModel || createMemoryModel([]);
   const defaultUserModel = {
     async findOne() {
       return {
@@ -31,14 +34,20 @@ function register(overrides = {}) {
     getRoomRoleFn: async () => 'user',
     resolvePingsFn: async text => text,
     ...overrides,
+    MessageModel,
+    RoomMemberStateModel,
+    UserExperienceStateModel,
     UserModel: { ...defaultUserModel, ...(overrides.UserModel || {}) }
   })(socket);
-  return { socket, ioInstance };
+  return { socket, ioInstance, MessageModel, RoomMemberStateModel, UserExperienceStateModel };
 }
 
 function registerSharedSocket(overrides, id) {
   const socket = new FakeSocket();
   socket.id = id;
+  const MessageModel = { ...createMemoryModel([]), ...(overrides.MessageModel || {}) };
+  const RoomMemberStateModel = overrides.RoomMemberStateModel || createMemoryModel([]);
+  const UserExperienceStateModel = overrides.UserExperienceStateModel || createMemoryModel([]);
   const defaultUserModel = {
     async findOne() {
       return {
@@ -62,10 +71,214 @@ function registerSharedSocket(overrides, id) {
     getRoomRoleFn: async () => 'user',
     resolvePingsFn: async text => text,
     ...overrides,
+    MessageModel,
+    RoomMemberStateModel,
+    UserExperienceStateModel,
     UserModel: { ...defaultUserModel, ...(overrides.UserModel || {}) }
   })(socket);
   return socket;
 }
+
+function emptySwitchSuccess(usernameKey = 'alice', { canEdit = false } = {}) {
+  return {
+    serverCode: 'ABC123',
+    history: [],
+    roomRole: 'user',
+    restriction: { banned: false, timedOut: false, timeoutUntil: null },
+    details: { description: '', rules: '', metadataVersion: 0, canEdit },
+    notification: {
+      serverCode: 'ABC123', usernameKey, notificationLevel: 'all',
+      lastReadAt: null, lastReadMessageId: null,
+      unreadCount: 0, mentionCount: 0, version: 0, blockVersion: 0
+    },
+    pin: { serverCode: 'ABC123', pinCount: 0, pinVersion: 0, blockVersion: 0 },
+    attention: { unreadCount: 0, mentionCount: 0 }
+  };
+}
+
+test('login returns safe room summaries and actual-member room attention without admin ghost counts', async () => {
+  const cursorAt = new Date('2026-08-10T12:00:00.000Z');
+  const UserModel = createMemoryModel([{
+    username: 'Admin', displayName: 'Admin', password: 'hash', role: 'admin',
+    color: '#123456', avatarUrl: '', servers: ['global']
+  }]);
+  const ChatServerModel = createMemoryModel([
+    {
+      code: 'global', name: 'Global Chat', owner: 'System', metadataVersion: 2,
+      pinnedMessages: [{ messageId: '507f1f77bcf86cd799439001' }], pinVersion: 3,
+      moderators: []
+    },
+    {
+      code: 'ABC123', name: 'Private', owner: 'Owner', metadataVersion: 4,
+      pinnedMessages: [{ messageId: '507f1f77bcf86cd799439002' }], pinVersion: 5,
+      moderators: []
+    }
+  ]);
+  const MessageModel = createMemoryModel([{
+    _id: '507f1f77bcf86cd799439010', serverCode: 'global', timestamp: cursorAt
+  }]);
+  const RoomMemberStateModel = createMemoryModel([]);
+  const UserExperienceStateModel = createMemoryModel([{
+    usernameKey: 'admin', blockedUsers: [{ usernameKey: 'bob', username: 'Bob', createdAt: new Date() }],
+    blockVersion: 6
+  }]);
+  const setup = register({
+    UserModel, ChatServerModel, MessageModel, RoomMemberStateModel, UserExperienceStateModel,
+    bcryptImpl: { async compare() { return true; } }
+  });
+  const ack = acknowledge();
+
+  await setup.socket.trigger('login', { username: 'admin', password: '123456' }, ack.callback);
+
+  assert.deepEqual(ack.value(), {
+    success: true,
+    username: 'Admin', displayName: 'Admin', role: 'admin', color: '#123456', avatarUrl: '',
+    servers: [
+      {
+        code: 'global', name: 'Global Chat', owner: 'System', metadataVersion: 2,
+        pin: { serverCode: 'global', pinCount: 1, pinVersion: 3, blockVersion: 6 }
+      },
+      {
+        code: 'ABC123', name: 'Private', owner: 'Owner', metadataVersion: 4,
+        pin: { serverCode: 'ABC123', pinCount: 1, pinVersion: 5, blockVersion: 6 }
+      }
+    ],
+    joinedServers: ['global'], defaultServerCode: 'global',
+    restriction: { banned: false, timedOut: false, timeoutUntil: null }, bannedRooms: [],
+    roomStates: [{
+      serverCode: 'global', usernameKey: 'admin', notificationLevel: 'all',
+      lastReadAt: cursorAt, lastReadMessageId: '507f1f77bcf86cd799439010',
+      unreadCount: 0, mentionCount: 0, version: 0, blockVersion: 6
+    }],
+    blockState: { blockedUsers: [{ usernameKey: 'bob', username: 'Bob' }], blockVersion: 6 },
+    attentionSnapshots: [{ serverCode: 'global', unreadCount: 0, mentionCount: 0 }]
+  });
+  assert.deepEqual(RoomMemberStateModel.rows.map(row => row.serverCode), ['global']);
+  assert.equal(setup.socket.blockedUserKeys.has('bob'), true);
+  assert.equal(setup.socket.blockVersion, 6);
+});
+
+test('switch returns details notification pin count attention and filtered history keys', async () => {
+  const olderAt = new Date('2026-08-10T12:00:00.000Z');
+  const newerAt = new Date('2026-08-10T12:01:00.000Z');
+  const UserModel = createMemoryModel([{
+    username: 'Alice', displayName: 'Alice', password: 'hash', role: 'user', servers: ['global', 'ABC123']
+  }]);
+  const ChatServerModel = createMemoryModel([{
+    code: 'ABC123', name: 'Private', owner: 'Owner', moderators: [],
+    description: 'Room description', rules: 'Room rules', metadataVersion: 4,
+    pinnedMessages: [{ messageId: '507f1f77bcf86cd799439031' }], pinVersion: 7
+  }]);
+  const MessageModel = createMemoryModel([
+    {
+      _id: '507f1f77bcf86cd799439031', serverCode: 'ABC123', username: 'Carol', displayName: 'Carol',
+      authorKey: 'carol', role: 'user', roomRole: 'user', color: '', avatarUrl: '', text: 'visible',
+      attachment: null, replyTo: null, reactions: {}, edited: false, deleted: false, timestamp: olderAt,
+      privateHistory: ['must-not-leak']
+    },
+    {
+      _id: '507f1f77bcf86cd799439032', serverCode: 'ABC123', username: 'Bob', displayName: 'Bob',
+      authorKey: 'bob', role: 'user', roomRole: 'user', color: '', avatarUrl: '', text: 'secret',
+      attachment: null, replyTo: null, reactions: {}, edited: false, deleted: false, timestamp: newerAt,
+      privateHistory: ['must-not-leak']
+    }
+  ]);
+  const RoomMemberStateModel = createMemoryModel([{
+    usernameKey: 'alice', serverCode: 'ABC123', notificationLevel: 'mentions',
+    lastReadAt: olderAt, lastReadMessageId: '507f1f77bcf86cd799439031', version: 3
+  }]);
+  const UserExperienceStateModel = createMemoryModel([{
+    usernameKey: 'alice', blockedUsers: [{ usernameKey: 'bob', username: 'Bob', createdAt: new Date() }],
+    blockVersion: 2
+  }]);
+  const setup = register({
+    UserModel, ChatServerModel, MessageModel, RoomMemberStateModel, UserExperienceStateModel
+  });
+  Object.assign(setup.socket, {
+    username: 'Alice', displayName: 'Alice', role: 'user', serverCode: 'global',
+    joinedServers: ['global', 'ABC123'], bannedRooms: []
+  });
+  setup.socket.joinedRooms.add('global');
+  const ack = acknowledge();
+
+  await setup.socket.trigger('switch_server', 'ABC123', ack.callback);
+
+  assert.deepEqual(ack.value(), {
+    serverCode: 'ABC123',
+    history: [
+      {
+        _id: '507f1f77bcf86cd799439031', serverCode: 'ABC123', username: 'Carol', displayName: 'Carol',
+        authorKey: 'carol', role: 'user', roomRole: 'user', color: '', avatarUrl: '', text: 'visible',
+        attachment: null, replyTo: null, reactions: {}, edited: false, deleted: false, timestamp: olderAt
+      },
+      {
+        _id: '507f1f77bcf86cd799439032', serverCode: 'ABC123', username: 'Bob', authorKey: 'bob',
+        timestamp: newerAt, blocked: true
+      }
+    ],
+    roomRole: 'user',
+    restriction: { banned: false, timedOut: false, timeoutUntil: null },
+    details: { description: 'Room description', rules: 'Room rules', metadataVersion: 4, canEdit: false },
+    notification: {
+      serverCode: 'ABC123', usernameKey: 'alice', notificationLevel: 'mentions',
+      lastReadAt: olderAt, lastReadMessageId: '507f1f77bcf86cd799439031',
+      unreadCount: 0, mentionCount: 0, version: 3, blockVersion: 2
+    },
+    pin: { serverCode: 'ABC123', pinCount: 1, pinVersion: 7, blockVersion: 2 },
+    attention: { unreadCount: 0, mentionCount: 0 }
+  });
+});
+
+test('leave retains room state while deletion removes every state row for that room', async () => {
+  const retainedState = createMemoryModel([{
+    usernameKey: 'alice', serverCode: 'ABC123', notificationLevel: 'none',
+    lastReadAt: null, lastReadMessageId: null, version: 2
+  }]);
+  const leaveSetup = register({
+    UserModel: createMemoryModel([{ username: 'Alice', role: 'user', servers: ['global', 'ABC123'] }]),
+    ChatServerModel: createMemoryModel([
+      { code: 'global', name: 'Global Chat', owner: 'System', moderators: [] },
+      { code: 'ABC123', name: 'Private', owner: 'Owner', moderators: [] }
+    ]),
+    RoomMemberStateModel: retainedState
+  });
+  Object.assign(leaveSetup.socket, {
+    username: 'Alice', displayName: 'Alice', role: 'user', serverCode: 'ABC123',
+    joinedServers: ['global', 'ABC123'], bannedRooms: []
+  });
+  leaveSetup.socket.joinedRooms.add('ABC123');
+  const leaveAck = acknowledge();
+  await leaveSetup.socket.trigger('leave_server', 'ABC123', leaveAck.callback);
+  assert.deepEqual(leaveAck.value(), { success: true });
+  assert.equal(retainedState.rows.length, 1);
+
+  const deletedState = createMemoryModel([
+    { usernameKey: 'alice', serverCode: 'ABC123', notificationLevel: 'all', version: 0 },
+    { usernameKey: 'bob', serverCode: 'ABC123', notificationLevel: 'mentions', version: 4 },
+    { usernameKey: 'alice', serverCode: 'global', notificationLevel: 'none', version: 1 }
+  ]);
+  const deleteSetup = register({
+    UserModel: createMemoryModel([{
+      username: 'Owner', displayName: 'Owner', role: 'user', servers: ['global', 'ABC123']
+    }]),
+    ChatServerModel: createMemoryModel([
+      { code: 'global', name: 'Global Chat', owner: 'System', moderators: [] },
+      { code: 'ABC123', name: 'Private', owner: 'Owner', moderators: [] }
+    ]),
+    MessageModel: createMemoryModel([]), RoomRestrictionModel: createMemoryModel([]),
+    RoomMemberStateModel: deletedState
+  });
+  Object.assign(deleteSetup.socket, {
+    username: 'Owner', displayName: 'Owner', role: 'user', serverCode: 'global',
+    joinedServers: ['global', 'ABC123'], bannedRooms: []
+  });
+  const deleteAck = acknowledge();
+  await deleteSetup.socket.trigger('delete_server', 'ABC123', deleteAck.callback);
+  assert.deepEqual(deleteAck.value(), { success: true });
+  assert.deepEqual(deletedState.rows.map(row => ({ usernameKey: row.usernameKey, serverCode: row.serverCode })), [
+    { usernameKey: 'alice', serverCode: 'global' }
+  ]);
+});
 
 test('account transition locks serialize one normalized account and release after failure', async () => {
   const firstGate = deferred();
@@ -544,10 +757,7 @@ test('authorized room switch leaves old room only after access succeeds', async 
   assert.equal(socket.serverCode, 'ABC123');
   assert.deepEqual(socket.leftRooms, ['global']);
   assert.equal(socket.joinedRooms.has('ABC123'), true);
-  assert.deepEqual(ack.value(), {
-    history: [], roomRole: 'user',
-    restriction: { banned: false, timedOut: false, timeoutUntil: null }
-  });
+  assert.deepEqual(ack.value(), emptySwitchSuccess());
 });
 
 test('room switch history failure preserves transport, socket, and presence state', async () => {
@@ -1037,10 +1247,7 @@ test('room switch acknowledges success before broadcasting target presence', asy
 
   await socket.trigger('switch_server', 'ABC123', result => {
     events.push('ack');
-    assert.deepEqual(result, {
-      history: [], roomRole: 'user',
-      restriction: { banned: false, timedOut: false, timeoutUntil: null }
-    });
+    assert.deepEqual(result, emptySwitchSuccess());
   });
 
   assert.equal(socket.serverCode, 'ABC123');
@@ -1087,12 +1294,9 @@ test('room switch finishes role lookup before history lookup begins', async () =
   const ack = acknowledge();
   await socket.trigger('switch_server', 'ABC123', ack.callback);
 
-  assert.deepEqual(ack.value(), {
-    history: [], roomRole: 'user',
-    restriction: { banned: false, timedOut: false, timeoutUntil: null }
-  });
+  assert.deepEqual(ack.value(), emptySwitchSuccess());
   assert.deepEqual(events, [
-    'role:start', 'role:end', 'history:find', 'history:lean'
+    'role:start', 'role:end', 'history:find', 'history:lean', 'history:find'
   ]);
 });
 
@@ -1745,12 +1949,14 @@ test('deletion preflights sockets then waits for a queued switch account commit'
   const historyPrepared = deferred();
   const releaseMutation = deferred();
   const deletionFinished = deferred();
+  const deleteFetchEntered = deferred();
   const order = [];
   const state = { roomExists: true, mutationReleased: false, roomReads: 0 };
   const room = { code: 'ABC123', owner: 'alice', moderators: [] };
   const ioInstance = new FakeIo();
   ioInstance.fetchSockets = async () => {
     order.push('delete:fetchSockets');
+    deleteFetchEntered.resolve();
     return ioInstance.sockets;
   };
   const onlineUsersMap = new Map();
@@ -1837,17 +2043,14 @@ test('deletion preflights sockets then waits for a queued switch account commit'
   await mutationEntered.promise;
   const switchAck = acknowledge();
   const switchPending = late.trigger('switch_server', 'ABC123', switchAck.callback);
-  await historyEntered.promise;
-  historyPrepared.resolve([]);
-  await Promise.resolve();
-  await Promise.resolve();
   const deleteAck = acknowledge();
   const deletePending = deleter.trigger('delete_server', 'ABC123', deleteAck.callback);
-  await Promise.resolve();
-  await Promise.resolve();
+  await deleteFetchEntered.promise;
   state.mutationReleased = true;
   releaseMutation.resolve();
   await mutationPending;
+  await historyEntered.promise;
+  historyPrepared.resolve([]);
   await Promise.all([switchPending, deletePending]);
 
   const joinIndex = order.indexOf('late:join:ABC123');
@@ -1855,10 +2058,7 @@ test('deletion preflights sockets then waits for a queued switch account commit'
   assert.notEqual(joinIndex, -1);
   assert.notEqual(fetchIndex, -1);
   assert.ok(fetchIndex < joinIndex);
-  assert.deepEqual(switchAck.value(), {
-    history: [], roomRole: 'user',
-    restriction: { banned: false, timedOut: false, timeoutUntil: null }
-  });
+  assert.deepEqual(switchAck.value(), emptySwitchSuccess('alice', { canEdit: true }));
   assert.deepEqual(deleteAck.value(), { success: true });
   assert.equal(late.serverCode, 'global');
   assert.equal(onlineUsersMap.get(late.id).serverCode, 'global');
@@ -1870,9 +2070,8 @@ test('deletion preflights sockets then waits for a queued switch account commit'
 
 test('a switch waiting behind deletion cannot join the deleted room', async () => {
   const deleteEntered = deferred();
-  const historyEntered = deferred();
-  const historyPrepared = deferred();
   const releaseDelete = deferred();
+  let historyReads = 0;
   const state = { roomExists: true };
   const room = { code: 'ABC123', owner: 'alice', moderators: [] };
   const ioInstance = new FakeIo();
@@ -1891,8 +2090,8 @@ test('a switch waiting behind deletion cannot join the deleted room', async () =
         sort() { return this; },
         limit() { return this; },
         lean() {
-          historyEntered.resolve();
-          return historyPrepared.promise;
+          historyReads += 1;
+          return Promise.resolve([]);
         }
       };
     },
@@ -1940,10 +2139,10 @@ test('a switch waiting behind deletion cannot join the deleted room', async () =
   await deleteEntered.promise;
   const switchAck = acknowledge();
   const switchPending = switcher.trigger('switch_server', 'ABC123', switchAck.callback);
-  await historyEntered.promise;
-  historyPrepared.resolve([]);
   await Promise.resolve();
   await Promise.resolve();
+  assert.equal(historyReads, 0);
+  assert.equal(switchAck.value(), undefined);
   releaseDelete.resolve();
   await Promise.all([deletePending, switchPending]);
 
@@ -1954,6 +2153,7 @@ test('a switch waiting behind deletion cannot join the deleted room', async () =
   assert.equal(switcher.joinedRooms.has('OLD123'), true);
   assert.equal(switcher.joinedRooms.has('ABC123'), false);
   assert.deepEqual(switcher.leftRooms, []);
+  assert.equal(historyReads, 0);
 });
 
 test('room deletion clears every session cache before awaiting transport eviction', async () => {

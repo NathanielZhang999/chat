@@ -203,6 +203,8 @@ function registerWithModels(seed = {}) {
     RoomRestrictionModel: seed.RoomRestrictionModel || createMemoryModel(seed.restrictions || []),
     ModerationAuditModel: seed.ModerationAuditModel || createMemoryModel(seed.audits || []),
     ModerationReportModel: seed.ModerationReportModel || createMemoryModel(seed.reports || []),
+    RoomMemberStateModel: seed.RoomMemberStateModel || createMemoryModel(seed.roomStates || []),
+    UserExperienceStateModel: seed.UserExperienceStateModel || createMemoryModel(seed.experienceStates || []),
     autoModTracker: seed.autoModTracker || createAutoModTracker()
   };
   for (const model of [setup.RoomRestrictionModel, setup.ModerationReportModel]) {
@@ -3647,6 +3649,193 @@ for (const transition of ['demotion', 'promotion']) {
     assert.equal(setup.RoomRestrictionModel.rows.length, transition === 'demotion' ? 1 : 0);
   });
 }
+
+test('join rejoin and restored access advance the cursor before publishing access', async () => {
+  const newestAt = new Date('2026-08-10T13:00:00.000Z');
+  const newestId = '507f1f77bcf86cd799439071';
+
+  for (const scenario of [
+    { name: 'join', initialState: [], expectedVersion: 0 },
+    {
+      name: 'rejoin after an initially empty room',
+      initialState: [{
+        usernameKey: 'alice', serverCode: 'ABC123', notificationLevel: 'none',
+        lastReadAt: null, lastReadMessageId: null, version: 0
+      }],
+      expectedVersion: 1
+    },
+    {
+      name: 'rejoin',
+      initialState: [{
+        usernameKey: 'alice', serverCode: 'ABC123', notificationLevel: 'none',
+        lastReadAt: new Date('2026-08-10T12:00:00.000Z'),
+        lastReadMessageId: '507f1f77bcf86cd799439070', version: 4
+      }],
+      expectedVersion: 5
+    }
+  ]) {
+    const RoomMemberStateModel = createMemoryModel(scenario.initialState);
+    const persisted = { username: 'Alice', displayName: 'Alice', role: 'user', servers: ['global'] };
+    const UserModel = {
+      async findOne() {
+        const document = { ...persisted, servers: [...persisted.servers] };
+        document.save = async () => {
+          const state = RoomMemberStateModel.rows.find(row =>
+            row.usernameKey === 'alice' && row.serverCode === 'ABC123'
+          );
+          assert.equal(state.lastReadAt.getTime(), newestAt.getTime(), `${scenario.name} cursor before save`);
+          assert.equal(state.lastReadMessageId, newestId, `${scenario.name} id before save`);
+          assert.equal(state.version, scenario.expectedVersion, `${scenario.name} version before save`);
+          Object.assign(persisted, document, { servers: [...document.servers] });
+        };
+        return document;
+      }
+    };
+    const setup = registerWithModels({
+      UserModel,
+      ChatServerModel: createMemoryModel([
+        roomDocument('global'), roomDocument('ABC123')
+      ]),
+      MessageModel: createMemoryModel([{
+        _id: newestId, serverCode: 'ABC123', timestamp: newestAt
+      }]),
+      RoomMemberStateModel
+    });
+    Object.assign(setup.socket, {
+      username: 'Alice', displayName: 'Alice', role: 'user', serverCode: 'global',
+      joinedServers: ['global'], bannedRooms: []
+    });
+    setup.onlineUsersMap.set(setup.socket.id, {
+      username: 'Alice', displayName: 'Alice', role: 'user', serverCode: 'global',
+      joinedServers: ['global'], bannedRooms: []
+    });
+    const ack = acknowledge();
+    await setup.socket.trigger('join_server', 'ABC123', ack.callback);
+    assert.equal(ack.value().success, true, scenario.name);
+  }
+
+  const RoomMemberStateModel = createMemoryModel([{
+    usernameKey: 'targetuser', serverCode: 'global', notificationLevel: 'mentions',
+    lastReadAt: new Date('2026-08-10T12:00:00.000Z'),
+    lastReadMessageId: '507f1f77bcf86cd799439072', version: 8
+  }]);
+  const restrictions = createMemoryModel([restrictionDocument('global', 'TargetUser', {
+    bannedAt: new Date('2026-08-10T12:30:00.000Z'), bannedBy: 'Admin', banReason: 'existing ban'
+  })]);
+  const originalUpdate = restrictions.findOneAndUpdate.bind(restrictions);
+  restrictions.findOneAndUpdate = (query, update, options) => {
+    const state = RoomMemberStateModel.rows[0];
+    assert.equal(state.lastReadAt.getTime(), newestAt.getTime());
+    assert.equal(state.lastReadMessageId, newestId);
+    assert.equal(state.version, 9);
+    return originalUpdate(query, update, options);
+  };
+  const restoreSetup = registerWithModels({
+    users: [
+      userDocument({ username: 'Admin', role: 'admin', servers: ['global'] }),
+      userDocument({ username: 'TargetUser', servers: ['global'] })
+    ],
+    rooms: [roomDocument('global')],
+    MessageModel: createMemoryModel([{ _id: newestId, serverCode: 'global', timestamp: newestAt }]),
+    RoomRestrictionModel: restrictions,
+    RoomMemberStateModel
+  });
+  Object.assign(restoreSetup.socket, {
+    username: 'Admin', displayName: 'Admin', role: 'admin', serverCode: 'global',
+    joinedServers: ['global'], bannedRooms: []
+  });
+  const restoreAck = acknowledge();
+  await restoreSetup.socket.trigger('moderate_user', {
+    serverCode: 'global', targetUser: 'TargetUser', action: 'unban', reason: 'restore access'
+  }, restoreAck.callback);
+  assert.deepEqual(restoreAck.value(), { success: true });
+});
+
+test('a failed membership or access grant leaves only a harmless early cursor advance', async () => {
+  const newestAt = new Date('2026-08-10T14:00:00.000Z');
+  const newestId = '507f1f77bcf86cd799439081';
+  const failedJoinState = createMemoryModel([]);
+  const failedJoin = registerWithModels({
+    UserModel: {
+      async findOne() {
+        return {
+          username: 'Alice', displayName: 'Alice', role: 'user', servers: ['global'],
+          async save() { throw new Error('membership write failed'); }
+        };
+      }
+    },
+    ChatServerModel: createMemoryModel([roomDocument('global'), roomDocument('ABC123')]),
+    MessageModel: createMemoryModel([{ _id: newestId, serverCode: 'ABC123', timestamp: newestAt }]),
+    RoomMemberStateModel: failedJoinState,
+    logger: { error() {} }
+  });
+  Object.assign(failedJoin.socket, {
+    username: 'Alice', displayName: 'Alice', role: 'user', serverCode: 'global',
+    joinedServers: ['global'], bannedRooms: []
+  });
+  const joinAck = acknowledge();
+  await failedJoin.socket.trigger('join_server', 'ABC123', joinAck.callback);
+  assert.deepEqual(joinAck.value(), { error: 'Join failed.' });
+  assert.deepEqual(failedJoinState.rows.map(row => ({
+    usernameKey: row.usernameKey, serverCode: row.serverCode, notificationLevel: row.notificationLevel,
+    lastReadAt: row.lastReadAt, lastReadMessageId: row.lastReadMessageId, version: row.version
+  })), [{
+    usernameKey: 'alice', serverCode: 'ABC123', notificationLevel: 'all',
+    lastReadAt: newestAt, lastReadMessageId: newestId, version: 0
+  }]);
+
+  const failedRestoreState = createMemoryModel([{
+    usernameKey: 'targetuser', serverCode: 'global', notificationLevel: 'all',
+    lastReadAt: new Date('2026-08-10T13:00:00.000Z'),
+    lastReadMessageId: '507f1f77bcf86cd799439080', version: 2
+  }]);
+  const failedRestrictions = createMemoryModel([restrictionDocument('global', 'TargetUser', {
+    bannedAt: new Date('2026-08-10T13:30:00.000Z'), bannedBy: 'Admin', banReason: 'existing ban'
+  })]);
+  failedRestrictions.findOneAndUpdate = async () => { throw new Error('unban write failed'); };
+  const failedRestore = registerWithModels({
+    users: [
+      userDocument({ username: 'Admin', role: 'admin', servers: ['global'] }),
+      userDocument({ username: 'TargetUser', servers: ['global'] })
+    ],
+    rooms: [roomDocument('global')],
+    MessageModel: createMemoryModel([{ _id: newestId, serverCode: 'global', timestamp: newestAt }]),
+    RoomRestrictionModel: failedRestrictions,
+    RoomMemberStateModel: failedRestoreState,
+    logger: { error() {} }
+  });
+  const cursorMutationSessions = [];
+  const baseStateUpdate = failedRestore.RoomMemberStateModel.findOneAndUpdate
+    .bind(failedRestore.RoomMemberStateModel);
+  failedRestore.RoomMemberStateModel.findOneAndUpdate = (query, update, options = {}) => {
+    cursorMutationSessions.push(options.session || null);
+    return baseStateUpdate(query, update, options);
+  };
+  const rollbackSession = { id: 'rollback-session' };
+  const sharedConnection = {
+    async transaction(operation) {
+      return operation(rollbackSession);
+    }
+  };
+  failedRestore.UserModel.db = sharedConnection;
+  failedRestore.ChatServerModel.db = sharedConnection;
+  failedRestore.RoomRestrictionModel.db = sharedConnection;
+  Object.assign(failedRestore.socket, {
+    username: 'Admin', displayName: 'Admin', role: 'admin', serverCode: 'global',
+    joinedServers: ['global'], bannedRooms: []
+  });
+  const restoreAck = acknowledge();
+  await failedRestore.socket.trigger('moderate_user', {
+    serverCode: 'global', targetUser: 'TargetUser', action: 'unban', reason: 'restore access'
+  }, restoreAck.callback);
+  assert.deepEqual(restoreAck.value(), { error: 'Moderation failed.' });
+  assert.equal(failedRestoreState.rows[0].lastReadAt.getTime(), newestAt.getTime());
+  assert.equal(failedRestoreState.rows[0].lastReadMessageId, newestId);
+  assert.equal(failedRestoreState.rows[0].version, 3);
+  assert.deepEqual(cursorMutationSessions, [null], 'early cursor write is outside the failed grant transaction');
+  assert.notEqual(failedRestrictions.rows[0].bannedAt, null);
+  assert.equal(failedRestore.ModerationAuditModel.rows.length, 0);
+});
 
 module.exports = {
   VALID_MESSAGE_ID,

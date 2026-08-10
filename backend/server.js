@@ -129,6 +129,14 @@ function roomMessageQuery(serverCode) {
     : { serverCode };
 }
 
+async function newestRoomMessage(MessageModel, serverCode, { session = null } = {}) {
+  const query = MessageModel.find(roomMessageQuery(serverCode))
+    .sort({ timestamp: -1, _id: -1 })
+    .limit(1);
+  const rows = await applyQuerySession(query, session);
+  return Array.isArray(rows) && rows.length > 0 ? rows[0] : null;
+}
+
 function cursorFromMessage(message) {
   if (!message || !isValidObjectId(String(message._id))) return null;
   const lastReadAt = new Date(message.timestamp);
@@ -139,7 +147,11 @@ function cursorFromMessage(message) {
 function compareCursor(left, right) {
   const leftTime = left && left.lastReadAt instanceof Date ? left.lastReadAt.getTime() : NaN;
   const rightTime = right && right.lastReadAt instanceof Date ? right.lastReadAt.getTime() : NaN;
-  if (Number.isNaN(leftTime) || Number.isNaN(rightTime)) return 0;
+  const leftValid = !Number.isNaN(leftTime);
+  const rightValid = !Number.isNaN(rightTime);
+  if (!leftValid && !rightValid) return 0;
+  if (!leftValid) return -1;
+  if (!rightValid) return 1;
   if (leftTime < rightTime) return -1;
   if (leftTime > rightTime) return 1;
   const leftId = String(left.lastReadMessageId || '').toLowerCase();
@@ -1188,6 +1200,117 @@ function createConnectionHandler({
     return [...byId.values()];
   }
 
+  async function loadDurableBlockState(usernameKey, { session = null } = {}) {
+    const row = await applyQuerySession(
+      UserExperienceStateModel.findOne({ usernameKey: normalizeAccountKey(usernameKey) }),
+      session
+    );
+    const snapshot = safeBlockState(row);
+    const blockedUserKeys = new Set(snapshot.blockedUsers.map(item => item.usernameKey));
+    blockedUserKeys.blockVersion = snapshot.blockVersion;
+    return { snapshot, blockedUserKeys };
+  }
+
+  async function countRoomAttention({ blockedUserKeys } = {}) {
+    return {
+      unreadCount: 0,
+      mentionCount: 0,
+      blockVersion: Number.isInteger(blockedUserKeys && blockedUserKeys.blockVersion)
+        ? blockedUserKeys.blockVersion : 0
+    };
+  }
+
+  async function ensureRoomState({ usernameKey, serverCode, session = null }) {
+    const key = normalizeAccountKey(usernameKey);
+    const query = { usernameKey: key, serverCode };
+    let row = await applyQuerySession(RoomMemberStateModel.findOne(query), session);
+    if (row) return row;
+
+    const newest = await newestRoomMessage(MessageModel, serverCode, { session });
+    const cursor = cursorFromMessage(newest) || { lastReadAt: null, lastReadMessageId: null };
+    try {
+      row = await RoomMemberStateModel.findOneAndUpdate(
+        query,
+        { $setOnInsert: {
+          ...query,
+          notificationLevel: 'all',
+          lastReadAt: cursor.lastReadAt,
+          lastReadMessageId: cursor.lastReadMessageId,
+          version: 0
+        } },
+        { upsert: true, new: true, setDefaultsOnInsert: true, ...(session ? { session } : {}) }
+      );
+      if (row) return row;
+    } catch (err) {
+      if (!err || err.code !== 11000) throw err;
+    }
+    row = await applyQuerySession(RoomMemberStateModel.findOne(query), session);
+    if (!row) throw new Error('Room state initialization failed.');
+    return row;
+  }
+
+  async function loadRoomStateSnapshot({ usernameKey, serverCode, blockedUserKeys, session = null }) {
+    const row = await ensureRoomState({ usernameKey, serverCode, session });
+    const counts = await countRoomAttention({
+      usernameKey: normalizeAccountKey(usernameKey),
+      serverCode,
+      cursor: {
+        lastReadAt: row.lastReadAt || null,
+        lastReadMessageId: row.lastReadMessageId || null
+      },
+      blockedUserKeys
+    });
+    return safeRoomState(row, counts);
+  }
+
+  async function advanceRoomCursorToNewest({ usernameKey, serverCode, session = null }) {
+    const key = normalizeAccountKey(usernameKey);
+    let row = await ensureRoomState({ usernameKey: key, serverCode, session });
+    const newest = await newestRoomMessage(MessageModel, serverCode, { session });
+    const cursor = cursorFromMessage(newest);
+    if (!cursor || compareCursor({
+      lastReadAt: row.lastReadAt,
+      lastReadMessageId: row.lastReadMessageId
+    }, cursor) >= 0) return row;
+
+    const currentVersion = Number.isInteger(row.version) && row.version >= 0 ? row.version : 0;
+    const versionPredicate = currentVersion === 0
+      ? { $or: [{ version: 0 }, { version: { $exists: false } }] }
+      : { version: currentVersion };
+    const updated = await RoomMemberStateModel.findOneAndUpdate(
+      { usernameKey: key, serverCode, ...versionPredicate },
+      { $set: {
+        lastReadAt: cursor.lastReadAt,
+        lastReadMessageId: cursor.lastReadMessageId
+      }, $inc: { version: 1 } },
+      { new: true, ...(session ? { session } : {}) }
+    );
+    if (updated) return updated;
+    row = await applyQuerySession(RoomMemberStateModel.findOne({ usernameKey: key, serverCode }), session);
+    if (!row) throw new Error('Room cursor advance failed.');
+    return row;
+  }
+
+  function safePinCountSnapshot(room, blockVersion) {
+    return {
+      serverCode: room.code,
+      pinCount: Array.isArray(room.pinnedMessages) ? room.pinnedMessages.length : 0,
+      pinVersion: Number.isInteger(room.pinVersion) && room.pinVersion >= 0 ? room.pinVersion : 0,
+      blockVersion: Number.isInteger(blockVersion) && blockVersion >= 0 ? blockVersion : 0
+    };
+  }
+
+  function safeRoomSummary(room, blockVersion) {
+    return {
+      code: room.code,
+      name: typeof room.name === 'string' ? room.name : '',
+      owner: typeof room.owner === 'string' ? room.owner : '',
+      metadataVersion: Number.isInteger(room.metadataVersion) && room.metadataVersion >= 0
+        ? room.metadataVersion : 0,
+      pin: safePinCountSnapshot(room, blockVersion)
+    };
+  }
+
   async function quarantineLiveSocket(live, session, roomCodes) {
     if (live.id === socket.id) {
       terminallyClosed = true;
@@ -1888,11 +2011,12 @@ function createConnectionHandler({
         if (needsSave) await user.save();
 
         const role = user.role || 'user';
-        const [rooms, restrictionRows] = await Promise.all([
+        const [rooms, restrictionRows, durableBlockState] = await Promise.all([
           role === 'admin'
             ? ChatServerModel.find()
             : ChatServerModel.find({ code: { $in: user.servers } }),
-          RoomRestrictionModel.find({ username: normalizeAccountKey(user.username) })
+          RoomRestrictionModel.find({ username: normalizeAccountKey(user.username) }),
+          loadDurableBlockState(user.username)
         ]);
         const restrictions = (restrictionRows || []).map(row => ({
           serverCode: row.serverCode,
@@ -1909,6 +2033,21 @@ function createConnectionHandler({
         const restriction = defaultServerCode
           ? (restrictions.find(item => item.serverCode === defaultServerCode) || activeRestrictionState(null))
           : activeRestrictionState(null);
+        const { snapshot: blockState, blockedUserKeys } = durableBlockState;
+        const roomStates = [];
+        for (const serverCode of joinedServers) {
+          roomStates.push(await withRoomMutationLock(serverCode, () => loadRoomStateSnapshot({
+            usernameKey: user.username,
+            serverCode,
+            blockedUserKeys
+          })));
+        }
+        const attentionSnapshots = roomStates.map(state => ({
+          serverCode: state.serverCode,
+          unreadCount: state.unreadCount,
+          mentionCount: state.mentionCount
+        }));
+        const roomSummaries = visibleRooms.map(room => safeRoomSummary(room, blockState.blockVersion));
 
         socket.username = user.username;
         socket.displayName = user.displayName;
@@ -1918,6 +2057,8 @@ function createConnectionHandler({
         socket.serverCode = defaultServerCode;
         socket.joinedServers = [...joinedServers];
         socket.bannedRooms = [...bannedRooms];
+        socket.blockedUserKeys = new Set(blockedUserKeys);
+        socket.blockVersion = blockState.blockVersion;
 
         if (defaultServerCode) await Promise.resolve(socket.join(defaultServerCode));
         onlineUsersMap.set(socket.id, {
@@ -1928,7 +2069,9 @@ function createConnectionHandler({
           avatarUrl: socket.avatarUrl,
           serverCode: defaultServerCode,
           joinedServers: [...joinedServers],
-          bannedRooms: [...bannedRooms]
+          bannedRooms: [...bannedRooms],
+          blockedUsers: [...blockedUserKeys],
+          blockVersion: blockState.blockVersion
         });
 
         const serversToUpdate = new Set(joinedServers);
@@ -1945,7 +2088,7 @@ function createConnectionHandler({
           role: socket.role,
           color: socket.color,
           avatarUrl: socket.avatarUrl,
-          servers: visibleRooms,
+          servers: roomSummaries,
           joinedServers: [...joinedServers],
           defaultServerCode,
           restriction: {
@@ -1953,7 +2096,10 @@ function createConnectionHandler({
             timedOut: restriction.timedOut,
             timeoutUntil: restriction.timeoutUntil
           },
-          bannedRooms: [...bannedRooms]
+          bannedRooms: [...bannedRooms],
+          roomStates,
+          blockState,
+          attentionSnapshots
         };
       });
 
@@ -2149,6 +2295,66 @@ function createConnectionHandler({
     } catch (err) {
       logUnexpectedError(logger, 'update_room_details', err);
       callback({ error: 'Failed to update room details.' });
+    }
+  });
+
+  socket.on('update_room_notification', async (data, callback) => {
+    callback = safeAck(callback);
+    if (!socket.username) return callback({ error: 'Not authenticated.' });
+    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+      return callback({ error: 'Invalid input format.' });
+    }
+    const serverCode = normalizeServerCode(data.serverCode);
+    const level = normalizeNotificationLevel(data.level);
+    if (!serverCode || !level) return callback({ error: 'Invalid input format.' });
+
+    try {
+      await withAccountTransitionLock(socket.username, () =>
+        withRoomMutationLock(serverCode, async () => {
+          const access = await loadRoomAccessState({
+            UserModel, ChatServerModel, RoomRestrictionModel, username: socket.username, serverCode
+          });
+          if (!access.allowed || access.restriction.banned || !access.user) {
+            callback({ error: 'Permission denied.' });
+            return;
+          }
+
+          const usernameKey = normalizeAccountKey(access.user.username);
+          const { blockedUserKeys } = await loadDurableBlockState(usernameKey);
+          const current = await ensureRoomState({ usernameKey, serverCode });
+          const changed = normalizeNotificationLevel(current.notificationLevel) !== level;
+          if (changed) {
+            const currentVersion = Number.isInteger(current.version) && current.version >= 0
+              ? current.version : 0;
+            const versionPredicate = currentVersion === 0
+              ? { $or: [{ version: 0 }, { version: { $exists: false } }] }
+              : { version: currentVersion };
+            const updated = await RoomMemberStateModel.findOneAndUpdate(
+              { usernameKey, serverCode, ...versionPredicate },
+              { $set: { notificationLevel: level }, $inc: { version: 1 } },
+              { new: true }
+            );
+            if (!updated) throw new Error('Room notification compare-and-set failed.');
+          }
+
+          const snapshot = await loadRoomStateSnapshot({
+            usernameKey, serverCode, blockedUserKeys
+          });
+          if (changed) {
+            const liveSockets = await fetchLiveSockets();
+            for (const live of liveSockets) {
+              const session = onlineUsersMap.get(live.id);
+              if (normalizeAccountKey(live.username || session?.username) === usernameKey) {
+                live.emit('room_notification_updated', snapshot);
+              }
+            }
+          }
+          callback(snapshot);
+        })
+      );
+    } catch (err) {
+      logUnexpectedError(logger, 'update_room_notification', err);
+      callback({ error: 'Notification update failed.' });
     }
   });
 
@@ -2381,6 +2587,12 @@ function createConnectionHandler({
             (serverCode !== 'global' && action === 'unban');
           const transactionConnection = moderationTransactionConnection();
           try {
+            if (action === 'unban' && serverCode === 'global') {
+              await advanceRoomCursorToNewest({
+                usernameKey: targetUser.username,
+                serverCode
+              });
+            }
             const persisted = await runModerationPersistence(async session => {
               const restrictionOptions = extra => ({
                 ...extra,
@@ -2994,12 +3206,16 @@ function createConnectionHandler({
           if (!err || err.code !== 11000 || attempt === 4) throw err;
         }
       }
-      await withAccountTransitionLock(socket.username, async () => {
+      await withAccountTransitionLock(socket.username, () => withRoomMutationLock(srv.code, async () => {
         const user = await UserModel.findOne({ username: socket.username });
         if (!user) throw new Error('User not found.');
         if (!Array.isArray(user.servers) || user.servers.length === 0) user.servers = ['global'];
 
         if (!user.servers.includes(srv.code)) {
+          await advanceRoomCursorToNewest({
+            usernameKey: user.username || socket.username,
+            serverCode: srv.code
+          });
           if (typeof user.servers.addToSet === 'function') user.servers.addToSet(srv.code);
           else user.servers.push(srv.code);
           await user.save();
@@ -3017,7 +3233,7 @@ function createConnectionHandler({
           });
           broadcastOnlineUsersFn(srv.code);
         }
-      });
+      }));
       callback({ success: true, server: srv });
       
       try {
@@ -3051,6 +3267,10 @@ function createConnectionHandler({
           if (restriction.banned) return { error: 'Permission denied.' };
           if (!Array.isArray(user.servers) || user.servers.length === 0) user.servers = ['global'];
           if (!user.servers.includes(srv.code)) {
+            await advanceRoomCursorToNewest({
+              usernameKey: user.username,
+              serverCode: srv.code
+            });
             if (typeof user.servers.addToSet === 'function') user.servers.addToSet(srv.code);
             else user.servers.push(srv.code);
             await user.save();
@@ -3209,6 +3429,13 @@ function createConnectionHandler({
         await ChatServerModel.deleteOne({ code: serverCode });
 
         let cleanupFailed = false;
+        try {
+          await RoomMemberStateModel.deleteMany({ serverCode });
+        } catch (err) {
+          cleanupFailed = true;
+          logUnexpectedError(logger, 'delete_server_room_state_cleanup', err);
+        }
+
         const affectedSockets = [];
         for (const live of sockets) {
           const session = onlineUsersMap.get(live.id);
@@ -3364,44 +3591,67 @@ function createConnectionHandler({
     const serverCode = normalizeServerCode(code);
     if (!serverCode) return callback({ error: 'Invalid input format.' });
 
-    let safeHistory;
-    let roomRole;
-    try {
-      const access = await loadRoomAccessState({
-        UserModel, ChatServerModel, RoomRestrictionModel,
-        username: socket.username, serverCode
-      });
-      if (!access.room) return callback({ error: 'Server not found.' });
-      if (!access.allowed || !canAccessRoom(socket, serverCode)) return callback({ error: 'Permission denied.' });
-
-      let query = { serverCode };
-      if (serverCode === 'global') query = { $or: [{ serverCode: 'global' }, { serverCode: { $exists: false } }, { serverCode: null }] };
-
-      roomRole = await getRoomRoleFn(serverCode, socket.username);
-      const history = await MessageModel.find(query).sort({ timestamp: -1 }).limit(100).lean();
-
-      safeHistory = history.map(storedMessage => {
-          const msg = { ...storedMessage, attachment: sanitizeAttachment(storedMessage.attachment) };
-          if (msg.deleted && msg.username !== socket.username && socket.role !== 'admin' && roomRole !== 'mod') {
-              msg.text = ''; msg.attachment = null; msg.reactions = {};
-          }
-          if (!msg.reactions) msg.reactions = {};
-          return msg;
-      }).reverse();
-    } catch (err) {
-      logUnexpectedError(logger, 'switch_server_history', err);
-      return callback({ error: 'Failed to switch server.' });
-    }
-
     let result;
     try {
       result = await withAccountTransitionLock(socket.username, () => withRoomMutationLock(serverCode, async () => {
-        const access = await loadRoomAccessState({
+        let access = await loadRoomAccessState({
           UserModel, ChatServerModel, RoomRestrictionModel,
           username: socket.username, serverCode
         });
-        if (!access.room) return { error: 'Server not found.' };
-        if (!access.allowed || !canAccessRoom(socket, serverCode)) return { error: 'Permission denied.' };
+        if (!access.room) {
+          const error = { error: 'Server not found.' };
+          callback(error);
+          return error;
+        }
+        if (!access.allowed || access.restriction.banned || !access.user) {
+          const error = { error: 'Permission denied.' };
+          callback(error);
+          return error;
+        }
+
+        const usernameKey = normalizeAccountKey(access.user.username);
+        const { snapshot: blockState, blockedUserKeys } = await loadDurableBlockState(usernameKey);
+        const roomRole = await getRoomRoleFn(serverCode, access.user.username);
+        const history = await MessageModel.find(roomMessageQuery(serverCode))
+          .sort({ timestamp: -1, _id: -1 })
+          .limit(100)
+          .lean();
+        const safeHistory = history
+          .map(storedMessage => safeMessageForViewer(storedMessage, { blockedUserKeys }))
+          .filter(Boolean)
+          .reverse();
+        access = await loadRoomAccessState({
+          UserModel, ChatServerModel, RoomRestrictionModel,
+          username: socket.username, serverCode
+        });
+        if (!access.room) {
+          const error = { error: 'Server not found.' };
+          callback(error);
+          return error;
+        }
+        if (!access.allowed || access.restriction.banned || !access.user) {
+          const error = { error: 'Permission denied.' };
+          callback(error);
+          return error;
+        }
+        const actualMember = Array.isArray(access.user.servers) && access.user.servers.includes(serverCode);
+        const notification = actualMember
+          ? await loadRoomStateSnapshot({ usernameKey, serverCode, blockedUserKeys })
+          : safeRoomState({
+            serverCode, usernameKey, notificationLevel: 'all',
+            lastReadAt: null, lastReadMessageId: null, version: 0
+          }, { blockVersion: blockState.blockVersion });
+        const detailSnapshot = safeRoomDetails(
+          access.room,
+          canEditRoomDetails({ serverCode, access })
+        );
+        const details = {
+          description: detailSnapshot.description,
+          rules: detailSnapshot.rules,
+          metadataVersion: detailSnapshot.metadataVersion,
+          canEdit: detailSnapshot.canEdit
+        };
+        const pin = safePinCountSnapshot(access.room, blockState.blockVersion);
 
         const oldCode = socket.serverCode;
         const session = onlineUsersMap.get(socket.id);
@@ -3439,24 +3689,37 @@ function createConnectionHandler({
           throw err;
         }
         socket.serverCode = serverCode;
-        if (session) session.serverCode = serverCode;
-        return { success: true, oldCode, restriction: access.restriction };
+        socket.blockedUserKeys = new Set(blockedUserKeys);
+        socket.blockVersion = blockState.blockVersion;
+        if (session) {
+          session.serverCode = serverCode;
+          session.blockedUsers = [...blockedUserKeys];
+          session.blockVersion = blockState.blockVersion;
+        }
+        callback({
+          serverCode,
+          history: safeHistory,
+          roomRole,
+          restriction: {
+            banned: access.restriction.banned,
+            timedOut: access.restriction.timedOut,
+            timeoutUntil: access.restriction.timeoutUntil
+          },
+          details,
+          notification,
+          pin,
+          attention: {
+            unreadCount: notification.unreadCount,
+            mentionCount: notification.mentionCount
+          }
+        });
+        return { success: true, oldCode };
       }));
     } catch (err) {
-      logUnexpectedError(logger, 'switch_server_recheck', err);
+      logUnexpectedError(logger, 'switch_server', err);
       return callback({ error: 'Failed to switch server.' });
     }
-    if (result.error) return callback(result);
-
-    callback({
-      history: safeHistory,
-      roomRole,
-      restriction: {
-        banned: result.restriction.banned,
-        timedOut: result.restriction.timedOut,
-        timeoutUntil: result.restriction.timeoutUntil
-      }
-    });
+    if (result.error) return;
 
     const broadcastCodes = [];
     if (result.oldCode && result.oldCode !== serverCode) broadcastCodes.push(result.oldCode);
@@ -3889,6 +4152,7 @@ module.exports = {
   authorKeyForMessage,
   extractNotificationMentions,
   roomMessageQuery,
+  newestRoomMessage,
   cursorFromMessage,
   compareCursor,
   safeReplyForViewer,
