@@ -611,6 +611,21 @@ function applyQuerySession(query, session) {
   return query;
 }
 
+function sharedTransactionConnection(models) {
+  const candidates = Array.isArray(models) ? models : [];
+  if (candidates.length === 0) return null;
+  const connection = candidates[0] && candidates[0].db;
+  return connection && typeof connection.transaction === 'function' &&
+    candidates.every(model => model && model.db === connection)
+    ? connection
+    : null;
+}
+
+async function runPersistence(operation, connection) {
+  if (!connection) return operation(null);
+  return connection.transaction(session => operation(session));
+}
+
 async function findUserByUsername(UserModel, value, { session = null } = {}) {
   const username = normalizeUsername(value);
   if (!username) return null;
@@ -1427,6 +1442,96 @@ function createConnectionHandler({
     }
   }
 
+  function exactStoredPin(room, messageId) {
+    const normalizedMessageId = String(messageId || '').toLowerCase();
+    const storedPin = (Array.isArray(room && room.pinnedMessages) ? room.pinnedMessages : [])
+      .find(pin => String(pin && pin.messageId || '').toLowerCase() === normalizedMessageId);
+    if (!storedPin) return null;
+    return {
+      messageId: storedPin.messageId,
+      pinnedAt: storedPin.pinnedAt,
+      pinnedBy: storedPin.pinnedBy
+    };
+  }
+
+  function roomPinVersionPredicate(room) {
+    const storedVersion = room && room.pinVersion;
+    if (storedVersion === undefined || storedVersion === 0) {
+      return { $or: [{ pinVersion: 0 }, { pinVersion: { $exists: false } }] };
+    }
+    if (!Number.isInteger(storedVersion) || storedVersion < 0) {
+      throw new Error('Invalid pin version.');
+    }
+    return { pinVersion: storedVersion };
+  }
+
+  async function removePinBeforeFallbackDelete({ room, message, blockVersion }) {
+    const messageId = String(message && message._id || '').toLowerCase();
+    const priorPin = exactStoredPin(room, messageId);
+    if (!priorPin) return { room, priorPin: null, blockVersion };
+    const updatedRoom = await ChatServerModel.findOneAndUpdate(
+      {
+        code: room.code,
+        ...roomPinVersionPredicate(room),
+        'pinnedMessages.messageId': messageId
+      },
+      { $pull: { pinnedMessages: { messageId } }, $inc: { pinVersion: 1 } },
+      { new: true }
+    );
+    if (!updatedRoom) throw new Error('Pinned message removal lost its version race.');
+    return { room: updatedRoom, priorPin, blockVersion };
+  }
+
+  function pinsMatchExactPrior(pin, priorPin) {
+    if (!pin || !priorPin ||
+        String(pin.messageId || '').toLowerCase() !== String(priorPin.messageId || '').toLowerCase() ||
+        pin.pinnedBy !== priorPin.pinnedBy) return false;
+    const pinTime = pin.pinnedAt instanceof Date ? pin.pinnedAt.getTime() : new Date(pin.pinnedAt).getTime();
+    const priorTime = priorPin.pinnedAt instanceof Date
+      ? priorPin.pinnedAt.getTime()
+      : new Date(priorPin.pinnedAt).getTime();
+    return !Number.isNaN(pinTime) && pinTime === priorTime;
+  }
+
+  async function restorePinAfterFailedDelete({ room, priorPin, blockVersion }) {
+    let observedRoom = room;
+    let lastError;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        if (!observedRoom) throw new Error('Pinned message room disappeared.');
+        const alreadyRestored = (Array.isArray(observedRoom.pinnedMessages)
+          ? observedRoom.pinnedMessages : []).some(pin => pinsMatchExactPrior(pin, priorPin));
+        if (!alreadyRestored) {
+          const updatedRoom = await ChatServerModel.findOneAndUpdate(
+            {
+              code: observedRoom.code,
+              ...roomPinVersionPredicate(observedRoom),
+              'pinnedMessages.messageId': { $ne: String(priorPin.messageId).toLowerCase() }
+            },
+            { $push: { pinnedMessages: priorPin }, $inc: { pinVersion: 1 } },
+            { new: true }
+          );
+          if (!updatedRoom) throw new Error('Pinned message restoration lost its version race.');
+          observedRoom = updatedRoom;
+        }
+      } catch (err) {
+        lastError = err;
+      }
+
+      try {
+        const verifiedRoom = await ChatServerModel.findOne({ code: room.code });
+        observedRoom = verifiedRoom;
+        const restored = Boolean(verifiedRoom &&
+          (Array.isArray(verifiedRoom.pinnedMessages) ? verifiedRoom.pinnedMessages : [])
+            .some(pin => pinsMatchExactPrior(pin, priorPin)));
+        if (restored) return { restored: true, room: verifiedRoom, blockVersion };
+      } catch (err) {
+        lastError = err;
+      }
+    }
+    return { restored: false, room: observedRoom, blockVersion, error: lastError };
+  }
+
   async function quarantineLiveSocket(live, session, roomCodes) {
     if (live.id === socket.id) {
       terminallyClosed = true;
@@ -1619,21 +1724,6 @@ function createConnectionHandler({
     }
     logUnexpectedError(logger, 'moderation_fail_closed_restriction', lastError);
     return false;
-  }
-
-  function moderationTransactionConnection() {
-    const connection = UserModel && UserModel.db;
-    const modelsShareConnection = connection &&
-      ChatServerModel && ChatServerModel.db === connection &&
-      RoomRestrictionModel && RoomRestrictionModel.db === connection;
-    return modelsShareConnection && typeof connection.transaction === 'function'
-      ? connection
-      : null;
-  }
-
-  async function runModerationPersistence(operation, connection) {
-    if (!connection) return operation(null);
-    return connection.transaction(session => operation(session));
   }
 
   async function reconcileAccountSessions({
@@ -2878,7 +2968,9 @@ function createConnectionHandler({
             (action === 'kick' || action === 'ban');
           const enforcesPrivateAbsence = removesPrivateMembership ||
             (serverCode !== 'global' && action === 'unban');
-          const transactionConnection = moderationTransactionConnection();
+          const transactionConnection = sharedTransactionConnection([
+            UserModel, ChatServerModel, RoomRestrictionModel
+          ]);
           try {
             if (action === 'unban' && serverCode === 'global') {
               await advanceRoomCursorToNewest({
@@ -2886,7 +2978,7 @@ function createConnectionHandler({
                 serverCode
               });
             }
-            const persisted = await runModerationPersistence(async session => {
+            const persisted = await runPersistence(async session => {
               const restrictionOptions = extra => ({
                 ...extra,
                 ...(session ? { session } : {})
@@ -4254,7 +4346,8 @@ function createConnectionHandler({
     }
   });
 
-  socket.on('delete_message', async (data) => {
+  socket.on('delete_message', async (data, callback) => {
+    callback = safeAck(callback);
     try {
       if (!socket.username || !data || typeof data !== 'object' || Array.isArray(data)) return;
       const msgId = data.id;
@@ -4262,29 +4355,128 @@ function createConnectionHandler({
       const clientContextId = normalizeClientContextId(data.clientContextId);
       if (!isValidObjectId(msgId) || intendedServerCode !== socket.serverCode ||
           clientContextId === null) return;
-      const msg = await MessageModel.findById(msgId);
-      if (msg && !msg.deleted && msg.serverCode === intendedServerCode) {
-        const identity = { role: socket.role, joinedServers: socket.joinedServers || [] };
-        if (!canAccessRoom(identity, msg.serverCode)) return;
-        await withRoomMutationLock(msg.serverCode, async () => {
+      const actorUsername = socket.username;
+      const result = await withAccountTransitionLock(actorUsername, () =>
+        withRoomMutationLock(intendedServerCode, async () => {
+          if (normalizeAccountKey(socket.username) !== normalizeAccountKey(actorUsername) ||
+              socket.serverCode !== intendedServerCode) return null;
           const access = await loadRoomAccessState({
             UserModel, ChatServerModel, RoomRestrictionModel,
-            username: socket.username, serverCode: msg.serverCode
+            username: actorUsername, serverCode: intendedServerCode
           });
-          if (msg.deleted || socket.serverCode !== intendedServerCode || !access.allowed ||
-              !canAccessRoom(socket, msg.serverCode)) return;
-          if (access.restriction.timedOut && msg.username !== socket.username) return;
-          const freshRoomRole = currentRoomRole(access.room, access.user.username);
+          if (!access.allowed || access.restriction.banned || !access.user || !access.room) return null;
 
-          // Sender, SysAdmin, or RoomMod can delete it
-          if (msg.username === socket.username || access.user.role === 'admin' || freshRoomRole === 'mod') {
-            msg.deleted = true; await msg.save();
-            ioInstance.to(msg.serverCode).emit('message_deleted', msgId);
+          const message = await MessageModel.findById(msgId);
+          if (!message || message.deleted || message.serverCode !== intendedServerCode) return null;
+          if (access.restriction.timedOut &&
+              normalizeAccountKey(message.username) !== normalizeAccountKey(access.user.username)) return null;
+          const freshRoomRole = currentRoomRole(access.room, access.user.username);
+          const mayDelete = normalizeAccountKey(message.username) === normalizeAccountKey(access.user.username) ||
+            access.user.role === 'admin' || freshRoomRole === 'mod';
+          if (!mayDelete) return null;
+
+          const targetAuthorKey = authorKeyForMessage(message);
+          const { snapshot: blockState, blockedUserKeys } = await loadDurableBlockState(access.user.username);
+          const blockVersion = blockState.blockVersion;
+          const priorPin = exactStoredPin(access.room, msgId);
+          let persistedRoom = access.room;
+          let pinChanged = false;
+
+          if (priorPin) {
+            const transactionConnection = sharedTransactionConnection([MessageModel, ChatServerModel]);
+            if (transactionConnection) {
+              const persisted = await runPersistence(async session => {
+                const [transactionMessage, transactionRoom] = await Promise.all([
+                  applyQuerySession(MessageModel.findById(msgId), session),
+                  applyQuerySession(ChatServerModel.findOne({ code: intendedServerCode }), session)
+                ]);
+                if (!transactionMessage || transactionMessage.deleted ||
+                    transactionMessage.serverCode !== intendedServerCode || !transactionRoom ||
+                    !exactStoredPin(transactionRoom, msgId)) {
+                  throw new Error('Pinned message transaction state changed.');
+                }
+                const transactionMayDelete =
+                  normalizeAccountKey(transactionMessage.username) === normalizeAccountKey(access.user.username) ||
+                  access.user.role === 'admin' || currentRoomRole(transactionRoom, access.user.username) === 'mod';
+                if (!transactionMayDelete) throw new Error('Pinned message transaction authority changed.');
+
+                transactionMessage.deleted = true;
+                await transactionMessage.save({ session });
+                const updatedRoom = await ChatServerModel.findOneAndUpdate(
+                  {
+                    code: intendedServerCode,
+                    ...roomPinVersionPredicate(transactionRoom),
+                    'pinnedMessages.messageId': msgId
+                  },
+                  { $pull: { pinnedMessages: { messageId: msgId } }, $inc: { pinVersion: 1 } },
+                  { new: true, session }
+                );
+                if (!updatedRoom) throw new Error('Pinned message transaction lost its version race.');
+                return { message: transactionMessage, room: updatedRoom };
+              }, transactionConnection);
+              persistedRoom = persisted.room;
+              pinChanged = true;
+            } else {
+              const removed = await removePinBeforeFallbackDelete({
+                room: access.room, message, blockVersion
+              });
+              persistedRoom = removed.room;
+              message.deleted = true;
+              try {
+                await message.save();
+              } catch (deleteError) {
+                message.deleted = false;
+                const restored = await restorePinAfterFailedDelete({
+                  room: persistedRoom, priorPin: removed.priorPin, blockVersion
+                });
+                persistedRoom = restored.room || persistedRoom;
+                if (restored.restored) {
+                  await emitMessagePinUpdated({
+                    serverCode: intendedServerCode,
+                    messageId: msgId,
+                    pinned: true,
+                    room: persistedRoom,
+                    targetAuthorKey
+                  });
+                } else {
+                  logUnexpectedError(logger, 'delete_message_pin_restore', restored.error || deleteError);
+                  await emitMessagePinUpdated({
+                    serverCode: intendedServerCode,
+                    messageId: msgId,
+                    pinned: false,
+                    room: persistedRoom,
+                    targetAuthorKey
+                  });
+                }
+                throw deleteError;
+              }
+              pinChanged = true;
+            }
+          } else {
+            message.deleted = true;
+            await message.save();
           }
-        });
-      }
+
+          if (pinChanged) {
+            await emitMessagePinUpdated({
+              serverCode: intendedServerCode,
+              messageId: msgId,
+              pinned: false,
+              room: persistedRoom,
+              targetAuthorKey
+            });
+          }
+          ioInstance.to(intendedServerCode).emit('message_deleted', msgId);
+          const pin = await visiblePinCountSnapshot({
+            room: persistedRoom, blockedUserKeys, blockVersion
+          });
+          return { success: true, messageId: msgId, pin };
+        })
+      );
+      if (result) callback(result);
     } catch (err) {
       logUnexpectedError(logger, 'delete_message', err);
+      callback({ error: 'Failed to delete message.' });
     }
   });
 
@@ -4431,6 +4623,8 @@ module.exports = {
   createConnectionHandler,
   withAccountTransitionLock,
   withAccountTransitionLocks,
+  sharedTransactionConnection,
+  runPersistence,
   safeAck,
   normalizeUsername,
   normalizeDisplayName,

@@ -124,6 +124,19 @@ async function listPins(socket, serverCode = socket.serverCode) {
   return ack.value();
 }
 
+async function deleteMessage(socket, messageId, serverCode = socket.serverCode) {
+  const ack = acknowledge();
+  await socket.trigger('delete_message', {
+    id: messageId, serverCode, clientContextId: 1
+  }, ack.callback);
+  return ack.value();
+}
+
+function pinEvents(setup) {
+  return setup.ioInstance.sockets.flatMap(live => live.outbound)
+    .filter(item => item.event === 'message_pin_updated');
+}
+
 function gateSwitchHistory(setup) {
   const started = deferred();
   const release = deferred();
@@ -145,6 +158,226 @@ function gateSwitchHistory(setup) {
   };
   return { started, release };
 }
+
+test('transactional pinned deletion marks deleted and pulls pin with one committed pinVersion', async () => {
+  const priorPin = { messageId: objectId(1), pinnedAt: new Date(10), pinnedBy: 'ExactMod' };
+  const setup = fixture({
+    rooms: [room('global'), room('ABC123', {
+      moderators: ['ExactMod'], pinnedMessages: [priorPin], pinVersion: 7
+    })]
+  });
+  const session = { id: 'delete-transaction' };
+  let transactionCalls = 0;
+  let committed = false;
+  const sharedConnection = {
+    async transaction(operation) {
+      transactionCalls += 1;
+      const value = await operation(session);
+      committed = true;
+      return value;
+    }
+  };
+  setup.MessageModel.db = sharedConnection;
+  setup.ChatServerModel.db = sharedConnection;
+  const roomUpdates = [];
+  const updateRoom = setup.ChatServerModel.findOneAndUpdate.bind(setup.ChatServerModel);
+  setup.ChatServerModel.findOneAndUpdate = (query, update, options) => {
+    roomUpdates.push({ query: structuredClone(query), update: structuredClone(update), options });
+    return updateRoom(query, update, options);
+  };
+  const toRoom = setup.ioInstance.to.bind(setup.ioInstance);
+  setup.ioInstance.to = serverCode => {
+    const channel = toRoom(serverCode);
+    return { emit(event, payload) {
+      if (event === 'message_deleted') assert.equal(committed, true);
+      channel.emit(event, payload);
+    } };
+  };
+  const author = authenticate(setup, { id: 'author', username: 'Author' });
+
+  const result = await deleteMessage(author, objectId(1));
+
+  assert.equal(transactionCalls, 1);
+  assert.deepEqual(setup.MessageModel.saveCalls[0].options, { session });
+  assert.equal(roomUpdates.length, 1);
+  assert.equal(roomUpdates[0].options.session, session);
+  assert.deepEqual(roomUpdates[0].update, {
+    $pull: { pinnedMessages: { messageId: objectId(1) } }, $inc: { pinVersion: 1 }
+  });
+  assert.equal(setup.MessageModel.rows[0].deleted, true);
+  assert.deepEqual(setup.ChatServerModel.rows.find(row => row.code === 'ABC123').pinnedMessages, []);
+  assert.equal(setup.ChatServerModel.rows.find(row => row.code === 'ABC123').pinVersion, 8);
+  assert.deepEqual(result, {
+    success: true, messageId: objectId(1),
+    pin: { serverCode: 'ABC123', pinCount: 0, pinVersion: 8, blockVersion: 0 }
+  });
+  assert.equal(pinEvents(setup).length, 1);
+  assert.equal(setup.ioInstance.outbound.filter(item => item.event === 'message_deleted').length, 1);
+});
+
+test('fallback deletion pulls and versions the pin before saving the message', async () => {
+  const priorPin = { messageId: objectId(1), pinnedAt: new Date(10), pinnedBy: 'ExactMod' };
+  const setup = fixture({
+    rooms: [room('global'), room('ABC123', {
+      moderators: ['ExactMod'], pinnedMessages: [priorPin], pinVersion: 7
+    })]
+  });
+  const order = [];
+  const saveStarted = deferred();
+  const releaseSave = deferred();
+  setup.MessageModel.saveHook = async () => {
+    order.push('message_save');
+    saveStarted.resolve();
+    await releaseSave.promise;
+  };
+  const updateRoom = setup.ChatServerModel.findOneAndUpdate.bind(setup.ChatServerModel);
+  setup.ChatServerModel.findOneAndUpdate = (query, update, options) => {
+    if (update.$pull) order.push('pin_pull');
+    return updateRoom(query, update, options);
+  };
+  const author = authenticate(setup, { id: 'author', username: 'Author' });
+
+  const pending = deleteMessage(author, objectId(1));
+  await saveStarted.promise;
+  const orderAtSave = [...order];
+  const roomAtSave = structuredClone(setup.ChatServerModel.rows.find(row => row.code === 'ABC123'));
+  releaseSave.resolve();
+  const result = await pending;
+
+  assert.deepEqual(orderAtSave, ['pin_pull', 'message_save']);
+  assert.deepEqual(roomAtSave.pinnedMessages, []);
+  assert.equal(roomAtSave.pinVersion, 8);
+  assert.equal(result.success, true);
+});
+
+test('fallback delete failure restores the exact prior pin and advances pinVersion again', async () => {
+  const priorPin = { messageId: objectId(1), pinnedAt: new Date(10), pinnedBy: 'ExactMod' };
+  const setup = fixture({
+    rooms: [room('global'), room('ABC123', {
+      moderators: ['ExactMod'], pinnedMessages: [priorPin], pinVersion: 7
+    })]
+  });
+  setup.MessageModel.saveHook = async () => { throw new Error('delete persistence failed'); };
+  const author = authenticate(setup, { id: 'author', username: 'Author' });
+
+  const result = await deleteMessage(author, objectId(1));
+
+  const storedRoom = setup.ChatServerModel.rows.find(row => row.code === 'ABC123');
+  assert.deepEqual(storedRoom.pinnedMessages, [priorPin]);
+  assert.equal(storedRoom.pinVersion, 9);
+  assert.equal(setup.MessageModel.rows[0].deleted, false);
+  assert.deepEqual(result, { error: 'Failed to delete message.' });
+  assert.deepEqual(pinEvents(setup).map(item => item.payload), [{
+    messageId: objectId(1), pinned: true,
+    pin: { serverCode: 'ABC123', pinCount: 1, pinVersion: 9, blockVersion: 0 }
+  }]);
+  assert.equal(setup.ioInstance.outbound.some(item => item.event === 'message_deleted'), false);
+});
+
+test('restore retry success publishes only the final authoritative pin snapshot', async () => {
+  const priorPin = { messageId: objectId(1), pinnedAt: new Date(10), pinnedBy: 'ExactMod' };
+  const setup = fixture({
+    rooms: [room('global'), room('ABC123', {
+      moderators: ['ExactMod'], pinnedMessages: [priorPin], pinVersion: 7
+    })]
+  });
+  setup.MessageModel.saveHook = async () => { throw new Error('delete persistence failed'); };
+  const updateRoom = setup.ChatServerModel.findOneAndUpdate.bind(setup.ChatServerModel);
+  let restoreAttempts = 0;
+  setup.ChatServerModel.findOneAndUpdate = (query, update, options) => {
+    if (update.$push) {
+      restoreAttempts += 1;
+      if (restoreAttempts === 1) return null;
+    }
+    return updateRoom(query, update, options);
+  };
+  const author = authenticate(setup, { id: 'author', username: 'Author' });
+
+  const result = await deleteMessage(author, objectId(1));
+
+  assert.deepEqual(result, { error: 'Failed to delete message.' });
+  assert.equal(restoreAttempts, 2);
+  assert.deepEqual(setup.ChatServerModel.rows.find(row => row.code === 'ABC123').pinnedMessages, [priorPin]);
+  assert.equal(setup.ChatServerModel.rows.find(row => row.code === 'ABC123').pinVersion, 9);
+  assert.deepEqual(pinEvents(setup).map(item => ({
+    pinned: item.payload.pinned, pinVersion: item.payload.pin.pinVersion
+  })), [{ pinned: true, pinVersion: 9 }]);
+});
+
+test('exhausted restore leaves the message safely unpinned emits newer state and logs no content', async () => {
+  const secret = 'DELETE_RESTORE_SECRET';
+  const attachmentSentinel = 'REVTVE9SRVNFQ1JFVA';
+  const priorPin = { messageId: objectId(1), pinnedAt: new Date(10), pinnedBy: 'ExactMod' };
+  const logged = [];
+  const setup = fixture({
+    logger: { error(...args) { logged.push(args); } },
+    rooms: [room('global'), room('ABC123', {
+      moderators: ['ExactMod'], pinnedMessages: [priorPin], pinVersion: 7
+    })],
+    messages: [message(1, {
+      text: secret, attachment: `data:image/png;base64,${attachmentSentinel}==`
+    })]
+  });
+  setup.MessageModel.saveHook = async () => { throw new Error(`${secret} delete persistence failed`); };
+  const updateRoom = setup.ChatServerModel.findOneAndUpdate.bind(setup.ChatServerModel);
+  let restoreAttempts = 0;
+  setup.ChatServerModel.findOneAndUpdate = (query, update, options) => {
+    if (update.$push) {
+      restoreAttempts += 1;
+      throw new Error(`${secret} restore failed`);
+    }
+    return updateRoom(query, update, options);
+  };
+  const author = authenticate(setup, { id: 'author', username: 'Author' });
+
+  const result = await deleteMessage(author, objectId(1));
+
+  const storedRoom = setup.ChatServerModel.rows.find(row => row.code === 'ABC123');
+  assert.deepEqual(result, { error: 'Failed to delete message.' });
+  assert.equal(restoreAttempts, 2);
+  assert.equal(setup.MessageModel.rows[0].deleted, false);
+  assert.deepEqual(storedRoom.pinnedMessages, []);
+  assert.equal(storedRoom.pinVersion, 8);
+  assert.deepEqual(pinEvents(setup).map(item => item.payload), [{
+    messageId: objectId(1), pinned: false,
+    pin: { serverCode: 'ABC123', pinCount: 0, pinVersion: 8, blockVersion: 0 }
+  }]);
+  const serialized = JSON.stringify({ logged, events: [setup.ioInstance.outbound, pinEvents(setup)] });
+  assert.equal(serialized.includes(secret), false);
+  assert.equal(serialized.includes(attachmentSentinel), false);
+});
+
+test('pin and delete races serialize under one room lock with no dangling live pin', async () => {
+  const priorPin = { messageId: objectId(1), pinnedAt: new Date(10), pinnedBy: 'ExactMod' };
+  const setup = fixture({
+    rooms: [room('global'), room('ABC123', {
+      moderators: ['ExactMod'], pinnedMessages: [priorPin], pinVersion: 7
+    })]
+  });
+  const saveStarted = deferred();
+  const releaseSave = deferred();
+  setup.MessageModel.saveHook = async () => {
+    saveStarted.resolve();
+    await releaseSave.promise;
+  };
+  const author = authenticate(setup, { id: 'author', username: 'Author' });
+  const mod = authenticate(setup, { id: 'mod', username: 'ExactMod' });
+
+  const deletionPending = author.trigger('delete_message', objectId(1));
+  await saveStarted.promise;
+  let pinSettled = false;
+  const pinPending = setPin(mod, objectId(1), true).finally(() => { pinSettled = true; });
+  await new Promise(resolve => setImmediate(resolve));
+  const pinSettledWhileDeleting = pinSettled;
+  releaseSave.resolve();
+  const [, pinResult] = await Promise.all([deletionPending, pinPending]);
+
+  assert.equal(pinSettledWhileDeleting, false);
+  assert.deepEqual(pinResult, { error: 'Permission denied.' });
+  assert.equal(setup.MessageModel.rows[0].deleted, true);
+  assert.deepEqual(setup.ChatServerModel.rows.find(row => row.code === 'ABC123').pinnedMessages, []);
+  assert.equal(setup.ChatServerModel.rows.find(row => row.code === 'ABC123').pinVersion, 8);
+});
 
 test('private pin policy allows owner exact moderator and global admin only', async () => {
   const setup = fixture({ messages: [message(1), message(2), message(3)] });

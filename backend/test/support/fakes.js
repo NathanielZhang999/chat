@@ -238,7 +238,9 @@ function querySeed(query) {
 
 function createMemoryModel(initialRows = []) {
   const rows = initialRows.map(cloneValue);
+  const saveCalls = [];
   let nextId = rows.length + 1;
+  let model;
 
   function documentFor(row) {
     if (!row) return null;
@@ -246,7 +248,10 @@ function createMemoryModel(initialRows = []) {
     Object.defineProperties(document, {
       markModified: { value: () => {}, enumerable: false },
       save: {
-        value: async () => {
+        value: async options => {
+          const call = { document, options: cloneValue(options) };
+          saveCalls.push(call);
+          if (typeof model.saveHook === 'function') await model.saveHook(call);
           const index = rows.indexOf(row);
           if (index >= 0) {
             for (const key of Object.keys(row)) delete row[key];
@@ -296,8 +301,10 @@ function createMemoryModel(initialRows = []) {
     return { matchedCount: selected.length, modifiedCount: selected.length };
   }
 
-  return {
+  model = {
     rows,
+    saveCalls,
+    saveHook: null,
     db: { transaction: async operation => operation({ id: 'memory-transaction' }) },
     find(query = {}) { return queryResult(documentsFor(rows.filter(row => matchesQuery(row, query)))); },
     findOne(query = {}) { return queryResult(documentFor(rows.find(row => matchesQuery(row, query)))); },
@@ -330,6 +337,7 @@ function createMemoryModel(initialRows = []) {
     },
     countDocuments(query = {}) { return Promise.resolve(rows.filter(row => matchesQuery(row, query)).length); }
   };
+  return model;
 }
 
 function acknowledge() {

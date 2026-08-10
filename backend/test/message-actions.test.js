@@ -75,6 +75,81 @@ function userDocumentForPinAction() {
   return { username: 'alice', displayName: 'Alice', role: 'admin', servers: ['global', 'ABC123'] };
 }
 
+test('unpinned deletion does not advance pinVersion', async () => {
+  const messageId = '507f1f77bcf86cd799439011';
+  const ChatServerModel = createMemoryModel([{
+    code: 'ABC123', owner: 'alice', moderators: [], pinnedMessages: [], pinVersion: 4
+  }]);
+  const MessageModel = createMemoryModel([{
+    _id: messageId, serverCode: 'ABC123', username: 'alice', displayName: 'Alice',
+    authorKey: 'alice', text: 'delete me', attachment: null, deleted: false,
+    timestamp: new Date(), history: [], reactions: {}
+  }]);
+  const { socket } = registerMessages({
+    ChatServerModel,
+    MessageModel,
+    UserModel: createMemoryModel([{
+      username: 'alice', displayName: 'Alice', role: 'user', servers: ['global', 'ABC123']
+    }]),
+    RoomRestrictionModel: createMemoryModel([])
+  });
+  authenticate(socket, { serverCode: 'ABC123', joinedServers: ['global', 'ABC123'] });
+  const ack = acknowledge();
+
+  await socket.trigger('delete_message', {
+    id: messageId, serverCode: 'ABC123', clientContextId: 1
+  }, ack.callback);
+
+  assert.equal(MessageModel.rows[0].deleted, true);
+  assert.equal(ChatServerModel.rows[0].pinVersion, 4);
+  assert.deepEqual(ChatServerModel.rows[0].pinnedMessages, []);
+  assert.deepEqual(ack.value(), {
+    success: true, messageId,
+    pin: { serverCode: 'ABC123', pinCount: 0, pinVersion: 4, blockVersion: 0 }
+  });
+  assert.equal(socket.outbound.some(item => item.event === 'message_pin_updated'), false);
+});
+
+test('edits preserve pin identity and are reflected by the next pin read', async () => {
+  const messageId = '507f1f77bcf86cd799439011';
+  const priorPin = { messageId, pinnedAt: new Date('2026-08-10T12:00:00.000Z'), pinnedBy: 'alice' };
+  const ChatServerModel = createMemoryModel([{
+    code: 'ABC123', owner: 'alice', moderators: [], pinnedMessages: [priorPin], pinVersion: 3,
+    autoMod: {
+      blockedKeywords: [], mentionLimit: 8, repeatLimit: 3, repeatWindowSeconds: 30,
+      messageLimit: 5, messageWindowSeconds: 5
+    }
+  }]);
+  const MessageModel = createMemoryModel([{
+    _id: messageId, serverCode: 'ABC123', username: 'alice', displayName: 'Alice',
+    authorKey: 'alice', role: 'user', roomRole: 'user', text: 'before', attachment: null,
+    deleted: false, edited: false, timestamp: new Date('2026-08-10T11:00:00.000Z'),
+    history: [], reactions: {}
+  }]);
+  const { socket } = registerMessages({
+    ChatServerModel,
+    MessageModel,
+    UserModel: createMemoryModel([{
+      username: 'alice', displayName: 'Alice', role: 'user', servers: ['global', 'ABC123']
+    }]),
+    RoomRestrictionModel: createMemoryModel([])
+  });
+  authenticate(socket, { serverCode: 'ABC123', joinedServers: ['global', 'ABC123'] });
+
+  await socket.trigger('edit_message', { id: messageId, text: 'after' });
+  const ack = acknowledge();
+  await socket.trigger('list_pinned_messages', {
+    serverCode: 'ABC123', clientContextId: 1
+  }, ack.callback);
+
+  assert.deepEqual(ChatServerModel.rows[0].pinnedMessages, [priorPin]);
+  assert.equal(ChatServerModel.rows[0].pinVersion, 3);
+  assert.equal(ack.value().pins[0].messageId, messageId);
+  assert.equal(ack.value().pins[0].text, 'after');
+  assert.equal(ack.value().pins[0].pinnedAt.getTime(), priorPin.pinnedAt.getTime());
+  assert.equal(ack.value().pins[0].pinnedBy, 'alice');
+});
+
 test('rate-limited messages skip reply lookup, ping resolution, persistence, and broadcast', async () => {
   let currentTime = 1_000;
   let replyLookups = 0;
