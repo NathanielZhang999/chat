@@ -108,6 +108,7 @@ test('default AutoMod accepts five immediate distinct sends and blocks the sixth
 test('strict one-per-second AutoMod expires at the exact rolling boundary', async () => {
   let currentTime = 0;
   let creates = 0;
+  const audits = [];
   const { socket } = registerMessages({
     autoModTracker: createAutoModTracker({ now: () => currentTime }),
     ChatServerModel: { async findOne(query) {
@@ -120,7 +121,7 @@ test('strict one-per-second AutoMod expires at the exact rolling boundary', asyn
       creates += 1;
       return { ...value, _id: String(creates).padStart(24, '0'), timestamp: new Date(currentTime) };
     } },
-    ModerationAuditModel: { async create(value) { return value; } }
+    ModerationAuditModel: { async create(value) { audits.push(value); return value; } }
   });
   authenticate(socket, { serverCode: 'ABC123', joinedServers: ['global', 'ABC123'] });
   await socket.trigger('chat_message', { text: 'first' });
@@ -128,11 +129,35 @@ test('strict one-per-second AutoMod expires at the exact rolling boundary', asyn
   await socket.trigger('chat_message', { text: 'blocked' });
   currentTime = 1_000;
   await socket.trigger('chat_message', { text: 'accepted at boundary' });
+  await socket.trigger('chat_message', { text: 'second episode rejection' });
   assert.equal(creates, 2);
-  assert.equal(socket.outbound.filter(item => item.event === 'message_blocked').length, 1);
+  assert.equal(socket.outbound.filter(item => item.event === 'message_blocked').length, 2);
+  assert.equal(audits.filter(item => item.metadata?.rule === 'message_rate').length, 2);
 });
 
-test('malformed stored message-rate settings and tracker failures fail closed without raw content', async () => {
+test('malformed stored message-rate settings fail closed without persistence or broadcast', async () => {
+  for (const invalid of [
+    { messageLimit: '1', messageWindowSeconds: 1 },
+    { messageLimit: 1, messageWindowSeconds: 61 }
+  ]) {
+    let creates = 0;
+    const { socket, ioInstance } = registerMessages({
+      ChatServerModel: { async findOne(query) {
+        return { code: query.code, moderators: [], autoMod: {
+          blockedKeywords: [], mentionLimit: 8, repeatLimit: 3, repeatWindowSeconds: 30,
+          ...invalid
+        } };
+      } },
+      MessageModel: { async create() { creates += 1; } }
+    });
+    authenticate(socket, { serverCode: 'ABC123', joinedServers: ['global', 'ABC123'] });
+    await socket.trigger('chat_message', { text: 'malformed setting must fail closed' });
+    assert.equal(creates, 0);
+    assert.deepEqual(ioInstance.outbound, []);
+  }
+});
+
+test('tracker failures fail closed without raw content', async () => {
   let creates = 0;
   const logged = [];
   const { socket, ioInstance } = registerMessages({
@@ -151,6 +176,98 @@ test('malformed stored message-rate settings and tracker failures fail closed wi
   assert.equal(creates, 0);
   assert.deepEqual(ioInstance.outbound, []);
   assert.equal(JSON.stringify(logged).includes('NeverLogRaw'), false);
+});
+
+test('attachment-only sends consume rate capacity while edits do not', async () => {
+  let currentTime = 0;
+  const tracker = createAutoModTracker({ now: () => currentTime });
+  const message = {
+    _id: '507f1f77bcf86cd799439011', serverCode: 'ABC123', username: 'alice', role: 'user', roomRole: 'user',
+    text: 'before', history: [], deleted: false, markModified() {}, async save() {}
+  };
+  let creates = 0;
+  const { socket } = registerMessages({
+    autoModTracker: tracker,
+    ChatServerModel: { async findOne(query) {
+      return { code: query.code, moderators: [], autoMod: {
+        blockedKeywords: [], mentionLimit: 8, repeatLimit: 3, repeatWindowSeconds: 30,
+        messageLimit: 2, messageWindowSeconds: 5
+      } };
+    } },
+    MessageModel: {
+      async findById() { return message; },
+      async create(value) {
+        creates += 1;
+        return { ...value, _id: String(creates).padStart(24, '0'), timestamp: new Date(currentTime) };
+      }
+    }
+  });
+  authenticate(socket, { serverCode: 'ABC123', joinedServers: ['global', 'ABC123'] });
+  await socket.trigger('chat_message', { text: '', attachment: 'data:image/png;base64,AA==' });
+  assert.equal(tracker.messageAttemptCount('ABC123\0alice'), 1);
+  await socket.trigger('edit_message', { id: message._id, text: 'after' });
+  assert.equal(tracker.messageAttemptCount('ABC123\0alice'), 1);
+  await socket.trigger('chat_message', { text: 'second accepted' });
+  assert.equal(creates, 2);
+  assert.equal(tracker.messageAttemptCount('ABC123\0alice'), 2);
+});
+
+test('content-blocked sends consume their admitted message-rate slot', async () => {
+  const tracker = createAutoModTracker({ now: () => 0 });
+  let creates = 0;
+  const { socket } = registerMessages({
+    autoModTracker: tracker,
+    ChatServerModel: { async findOne(query) {
+      return { code: query.code, moderators: [], autoMod: {
+        blockedKeywords: ['forbidden'], mentionLimit: 8, repeatLimit: 3, repeatWindowSeconds: 30,
+        messageLimit: 1, messageWindowSeconds: 5
+      } };
+    } },
+    MessageModel: { async create() { creates += 1; } },
+    ModerationAuditModel: { async create(value) { return value; } }
+  });
+  authenticate(socket, { serverCode: 'ABC123', joinedServers: ['global', 'ABC123'] });
+  await socket.trigger('chat_message', { text: 'forbidden content' });
+  assert.equal(tracker.messageAttemptCount('ABC123\0alice'), 1);
+  await socket.trigger('chat_message', { text: 'otherwise valid but rate limited' });
+  assert.equal(creates, 0);
+  assert.equal(socket.outbound.filter(item => item.event === 'message_blocked').length, 2);
+});
+
+test('mention and repeat content blocks consume their admitted message-rate slots', async () => {
+  for (const scenario of [
+    {
+      name: 'mention',
+      settings: { blockedKeywords: [], mentionLimit: 1, repeatLimit: 3, repeatWindowSeconds: 30, messageLimit: 1, messageWindowSeconds: 5 },
+      sends: ['two mentions'],
+      resolvePingsFn: async () => '{{PING:one|One}} {{PING:two|Two}}',
+      expectedCount: 1
+    },
+    {
+      name: 'repeat',
+      settings: { blockedKeywords: [], mentionLimit: 8, repeatLimit: 2, repeatWindowSeconds: 30, messageLimit: 2, messageWindowSeconds: 5 },
+      sends: ['same content', 'same content'],
+      resolvePingsFn: async text => text,
+      expectedCount: 2
+    }
+  ]) {
+    const tracker = createAutoModTracker({ now: () => 0 });
+    let creates = 0;
+    const { socket } = registerMessages({
+      autoModTracker: tracker,
+      ChatServerModel: { async findOne(query) { return { code: query.code, moderators: [], autoMod: scenario.settings }; } },
+      MessageModel: { async create(value) {
+        creates += 1;
+        return { ...value, _id: String(creates).padStart(24, '0'), timestamp: new Date() };
+      } },
+      resolvePingsFn: scenario.resolvePingsFn,
+      ModerationAuditModel: { async create(value) { return value; } }
+    });
+    authenticate(socket, { serverCode: 'ABC123', joinedServers: ['global', 'ABC123'] });
+    for (const text of scenario.sends) await socket.trigger('chat_message', { text });
+    assert.equal(tracker.messageAttemptCount('ABC123\0alice'), scenario.expectedCount, scenario.name);
+    assert.equal(socket.outbound.filter(item => item.event === 'message_blocked').length, 1, scenario.name);
+  }
 });
 
 test('reaction in an inaccessible message room does not save or emit', async () => {

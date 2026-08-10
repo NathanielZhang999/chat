@@ -1202,6 +1202,30 @@ test('moderation inputs accept only the supported actions, durations, reasons, a
     blockedKeywords: ['spam'], mentionLimit: 5, repeatLimit: 3, repeatWindowSeconds: 30,
     messageLimit: 5, messageWindowSeconds: 5
   });
+  assert.deepEqual(normalizeStoredAutoModSettings({
+    blockedKeywords: ['spam'], mentionLimit: 5, repeatLimit: 3, repeatWindowSeconds: 30,
+    messageLimit: undefined, messageWindowSeconds: undefined
+  }), {
+    blockedKeywords: ['spam'], mentionLimit: 5, repeatLimit: 3, repeatWindowSeconds: 30,
+    messageLimit: 5, messageWindowSeconds: 5
+  });
+  for (const invalid of [
+    { messageLimit: null, messageWindowSeconds: 5 },
+    { messageLimit: '5', messageWindowSeconds: 5 },
+    { messageLimit: 1.5, messageWindowSeconds: 5 },
+    { messageLimit: 5, messageWindowSeconds: null },
+    { messageLimit: 5, messageWindowSeconds: '5' },
+    { messageLimit: 5, messageWindowSeconds: 1.5 }
+  ]) {
+    assert.equal(normalizeAutoModSettings({
+      blockedKeywords: [], mentionLimit: 8, repeatLimit: 3, repeatWindowSeconds: 30,
+      ...invalid
+    }), null);
+    assert.equal(normalizeStoredAutoModSettings({
+      blockedKeywords: [], mentionLimit: 8, repeatLimit: 3, repeatWindowSeconds: 30,
+      ...invalid
+    }), null);
+  }
   assert.deepEqual(normalizeAutoModSettings({
     blockedKeywords: ['  SPAM  ', 'spam', 'ＢＡＤ'],
     mentionLimit: 5,
@@ -1411,6 +1435,10 @@ test('message-rate tracker trims immediately when a room lowers its configured l
   currentTime = 20;
   assert.deepEqual(tracker.recordMessageAttempt('ABC123\0alice', 1, 1_000), { allowed: false, shouldAudit: true });
   assert.ok(tracker.messageAttemptCount('ABC123\0alice') <= 1);
+  currentTime = 1_000;
+  assert.deepEqual(tracker.recordMessageAttempt('ABC123\0alice', 1, 1_000), { allowed: false, shouldAudit: false });
+  currentTime = 1_019;
+  assert.deepEqual(tracker.recordMessageAttempt('ABC123\0alice', 1, 1_000), { allowed: true, shouldAudit: false });
 });
 
 test('message-rate tracker shares one bounded map with repeat tracker state', () => {
@@ -1441,6 +1469,93 @@ test('AutoMod message-rate policy is role agnostic and canonical-account scoped'
   assert.deepEqual(evaluateMessageRate({ username: 'Alice', serverCode: 'XYZ789', settings, tracker }), { allowed: true });
   currentTime = 1_000;
   assert.deepEqual(evaluateMessageRate({ username: 'Alice', serverCode: 'ABC123', settings, tracker }), { allowed: true });
+});
+
+test('AutoMod message-rate handler shares canonical account state but isolates accounts, rooms, and current roles', async () => {
+  let currentTime = 0;
+  const tracker = createAutoModTracker({ now: () => currentTime });
+  const settings = {
+    blockedKeywords: [], mentionLimit: 8, repeatLimit: 3, repeatWindowSeconds: 30,
+    messageLimit: 2, messageWindowSeconds: 5
+  };
+  const setup = registerWithModels({
+    autoModTracker: tracker,
+    users: [
+      userDocument({ username: 'Alice', servers: ['global', 'ABC123', 'XYZ789'] }),
+      userDocument({ username: 'Bob', servers: ['global', 'ABC123'] }),
+      userDocument({ username: 'GlobalAdmin', role: 'admin', servers: ['global'] }),
+      userDocument({ username: 'RoomMod', servers: ['global', 'ABC123'] })
+    ],
+    rooms: [
+      roomDocument('global'),
+      roomDocument('ABC123', { moderators: ['RoomMod'], autoMod: settings }),
+      roomDocument('XYZ789', { autoMod: settings })
+    ]
+  });
+  Object.assign(setup.socket, {
+    username: 'Alice', displayName: 'Alice', role: 'user', serverCode: 'ABC123',
+    joinedServers: ['global', 'ABC123', 'XYZ789'], bannedRooms: []
+  });
+  const sameAccount = connectAdditionalSocket(setup, {
+    id: 'alice-case-variant', username: 'aLiCe', serverCode: 'ABC123',
+    joinedServers: ['global', 'ABC123', 'XYZ789']
+  });
+  const otherAccount = connectAdditionalSocket(setup, {
+    id: 'bob-rate', username: 'Bob', serverCode: 'ABC123', joinedServers: ['global', 'ABC123']
+  });
+  const otherRoom = connectAdditionalSocket(setup, {
+    id: 'alice-other-rate-room', username: 'Alice', serverCode: 'XYZ789',
+    joinedServers: ['global', 'ABC123', 'XYZ789']
+  });
+  const admin = connectAdditionalSocket(setup, {
+    id: 'global-admin-rate', username: 'GlobalAdmin', serverCode: 'ABC123', role: 'admin', joinedServers: ['global']
+  });
+  const roomMod = connectAdditionalSocket(setup, {
+    id: 'room-mod-rate', username: 'RoomMod', serverCode: 'ABC123', role: 'user', joinedServers: ['global', 'ABC123']
+  });
+
+  await setup.socket.trigger('chat_message', { text: 'alice one' });
+  await setup.socket.trigger('chat_message', { text: 'alice two' });
+  await sameAccount.trigger('chat_message', { text: 'alice third' });
+  await otherAccount.trigger('chat_message', { text: 'bob independent' });
+  await otherRoom.trigger('chat_message', { text: 'alice other room' });
+  for (const live of [admin, roomMod]) {
+    await live.trigger('chat_message', { text: `${live.username} one` });
+    await live.trigger('chat_message', { text: `${live.username} two` });
+    await live.trigger('chat_message', { text: `${live.username} third` });
+    assert.equal(live.outbound.filter(item => item.event === 'message_blocked').length, 1);
+  }
+
+  assert.equal(sameAccount.outbound.filter(item => item.event === 'message_blocked').length, 1);
+  assert.equal(setup.MessageModel.rows.length, 8);
+  assert.equal(tracker.messageAttemptCount('ABC123\0alice'), 2);
+  assert.equal(tracker.messageAttemptCount('ABC123\0bob'), 1);
+  assert.equal(tracker.messageAttemptCount('XYZ789\0alice'), 1);
+});
+
+test('AutoMod message-rate state survives a same-account reconnect in the running backend', async () => {
+  const tracker = createAutoModTracker({ now: () => 0 });
+  const settings = {
+    blockedKeywords: [], mentionLimit: 8, repeatLimit: 3, repeatWindowSeconds: 30,
+    messageLimit: 1, messageWindowSeconds: 5
+  };
+  const setup = registerWithModels({
+    autoModTracker: tracker,
+    users: [userDocument({ username: 'Alice', servers: ['global', 'ABC123'] })],
+    rooms: [roomDocument('global'), roomDocument('ABC123', { autoMod: settings })]
+  });
+  Object.assign(setup.socket, {
+    username: 'Alice', displayName: 'Alice', role: 'user', serverCode: 'ABC123',
+    joinedServers: ['global', 'ABC123'], bannedRooms: []
+  });
+  await setup.socket.trigger('chat_message', { text: 'before reconnect' });
+  await setup.socket.trigger('disconnect');
+  const reconnect = connectAdditionalSocket(setup, {
+    id: 'alice-reconnected', username: 'aLiCe', serverCode: 'ABC123', joinedServers: ['global', 'ABC123']
+  });
+  await reconnect.trigger('chat_message', { text: 'after reconnect' });
+  assert.equal(setup.MessageModel.rows.length, 1);
+  assert.equal(reconnect.outbound.filter(item => item.event === 'message_blocked').length, 1);
 });
 
 test('identical normalized messages share repeat state across same-account sockets but not rooms or accounts', async () => {
