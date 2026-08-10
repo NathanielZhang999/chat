@@ -2040,8 +2040,8 @@ test('block refresh suppression follows the accepted room generation and clears 
   const start = source.indexOf('function handleSwitchResult(');
   const end = source.indexOf('\n    function copyCode', start);
   const block = source.slice(start, end);
-  assert.match(block, /readSuppressionToken\s*=\s*Object\.freeze\(\{[\s\S]*roomGeneration:\s*currentRoomGeneration/);
-  assert.ok(block.indexOf('roomGeneration: currentRoomGeneration') < block.indexOf('loadHistory(response.history)'));
+  assert.match(block, /readSuppressionToken\s*=\s*ChatClientHelpers\.rebindSuppressionToken\([\s\S]*currentRoomGeneration/);
+  assert.ok(block.indexOf('ChatClientHelpers.rebindSuppressionToken') < block.indexOf('loadHistory(response.history)'));
   assert.match(block, /if\s*\(!outcome\.accepted\s*&&\s*options\.suppressAutoRead\s*===\s*true\)[\s\S]*disarmReadSuppression\(options\.suppressionToken\)/);
   assert.match(block, /return outcome/);
 });
@@ -2140,12 +2140,13 @@ test('overlapping block refreshes retain the newest suppression through the scro
   const switchStart = source.indexOf('function handleSwitchResult(');
   const switchEnd = source.indexOf('\n    function copyCode', switchStart);
   const switchBlock = source.slice(switchStart, switchEnd);
-  assert.match(switchBlock, /readSuppressionToken\s*===\s*options\.suppressionToken/);
+  assert.match(switchBlock, /ChatClientHelpers\.sameSuppressionOwner/);
+  assert.match(switchBlock, /ChatClientHelpers\.rebindSuppressionToken/);
   assert.match(switchBlock, /disarmReadSuppression\(options\.suppressionToken\)/);
   assert.doesNotMatch(switchBlock, /disarmReadSuppression\(\)/);
   assert.match(
     switchBlock,
-    /ChatClientHelpers\.scheduleAfterScrollFrame\([\s\S]*disarmReadSuppression\(acceptedSuppressionToken\)/
+    /ChatClientHelpers\.scheduleAfterScrollFrame\([\s\S]*disarmReadSuppression\(ownedToken\s*\|\|\s*acceptedSuppressionToken\)/
   );
 });
 
@@ -2275,4 +2276,323 @@ test('a stale switch acknowledgement cannot restore history scrubbed by a newer 
     switchBlock.indexOf('acceptedBlockVersion') < switchBlock.indexOf('invalidateRoomScopedFeatureCallbacks()'),
     'block authority is checked before any room or DOM mutation'
   );
+});
+
+function createRuntimeSocket() {
+  const handlers = new Map();
+  return {
+    handlers,
+    on(event, handler) {
+      handlers.set(event, handler);
+    },
+    trigger(event, payload) {
+      const handler = handlers.get(event);
+      assert.equal(typeof handler, 'function', `${event} listener is registered`);
+      return handler(payload);
+    }
+  };
+}
+
+function clientFunctionSource(source, functionName) {
+  const start = source.indexOf(`function ${functionName}(`);
+  assert.notEqual(start, -1, `${functionName} exists`);
+  const end = source.indexOf('\n    function ', start + 1);
+  assert.notEqual(end, -1, `${functionName} has a following function boundary`);
+  return source.slice(start, end);
+}
+
+function setupSocketSource(source) {
+  const start = source.indexOf('function setupSocket(');
+  const end = source.indexOf('\n    // --- REACTION UI ENGINE ---', start);
+  assert.notEqual(start, -1, 'setupSocket exists');
+  assert.notEqual(end, -1, 'setupSocket boundary exists');
+  return source.slice(start, end);
+}
+
+function createSetupSocketRuntime(overrides = {}, extraFunctions = []) {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  const client = loadHelpers();
+  const initialSocket = overrides.socket || createRuntimeSocket();
+  const context = vm.createContext({
+    ChatClientHelpers: client,
+    socket: initialSocket,
+    authModal: { classList: { contains: () => false } },
+    authBtn: { disabled: false },
+    showError() {},
+    localStorage: { removeItem() {} },
+    alert() {},
+    location: { reload() {} },
+    currentServerCode: 'ABC123',
+    myUsername: 'alice',
+    myDisplayName: 'Alice',
+    roomStateByCode: new Map([['ABC123', { notificationLevel: 'all' }]]),
+    typingUsers: new Map(),
+    appendMessage() {},
+    updateTypingUI() {},
+    scheduleMaybeMarkCurrentRoomRead() {},
+    playSound() {},
+    ...overrides
+  });
+  const functions = extraFunctions.map(name => clientFunctionSource(source, name)).join('\n');
+  vm.runInContext(
+    `${functions}\n${setupSocketSource(source)}\nglobalThis.__setupSocket = setupSocket;`,
+    context,
+    { filename: 'chat-setup-socket-runtime.js' }
+  );
+  return { client, context, setupSocket: context.__setupSocket };
+}
+
+test('replaced socket chat listener ignores old and wrong-room payloads before effects', () => {
+  const oldSocket = createRuntimeSocket();
+  const effects = { dom: 0, typing: 0, read: 0, sound: 0 };
+  const runtime = createSetupSocketRuntime({
+    socket: oldSocket,
+    appendMessage() { effects.dom += 1; },
+    updateTypingUI() { effects.typing += 1; },
+    scheduleMaybeMarkCurrentRoomRead() { effects.read += 1; },
+    playSound() { effects.sound += 1; }
+  });
+  runtime.setupSocket(oldSocket);
+
+  const replacementSocket = createRuntimeSocket();
+  runtime.context.socket = replacementSocket;
+  oldSocket.trigger('chat_message', {
+    _id: 'old-socket', serverCode: 'ABC123', username: 'bob', displayName: 'Bob',
+    text: 'old socket payload', blocked: false
+  });
+  assert.deepEqual(effects, { dom: 0, typing: 0, read: 0, sound: 0 });
+
+  runtime.setupSocket(replacementSocket);
+  replacementSocket.trigger('chat_message', {
+    _id: 'wrong-room', serverCode: 'XYZ789', username: 'bob', displayName: 'Bob',
+    text: 'wrong room payload', blocked: false
+  });
+  assert.deepEqual(effects, { dom: 0, typing: 0, read: 0, sound: 0 });
+
+  replacementSocket.trigger('chat_message', {
+    _id: 'current', serverCode: 'ABC123', username: 'bob', displayName: 'Bob',
+    text: 'current room payload', blocked: false
+  });
+  assert.deepEqual(effects, { dom: 1, typing: 1, read: 1, sound: 1 });
+});
+
+test('overlapping refresh acknowledgements keep newest suppression aligned through both scroll frames', () => {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  const client = loadHelpers();
+  const frames = [];
+  const observedEligibility = [];
+  const elements = new Map();
+  const element = id => {
+    if (!elements.has(id)) {
+      elements.set(id, {
+        id,
+        style: {},
+        classList: { add() {}, remove() {} },
+        appendChild() {},
+        textContent: '',
+        disabled: false
+      });
+    }
+    return elements.get(id);
+  };
+  let nextGeneration = 7;
+  let runtimeContext;
+  const scheduleFrame = callback => frames.push(callback);
+  const context = vm.createContext({
+    ChatClientHelpers: client,
+    currentServerCode: 'ABC123',
+    acceptedBlockVersion: 5,
+    currentRoomGeneration: 7,
+    readSuppressionToken: null,
+    serversCache: { ABC123: { name: 'Room', owner: 'owner' } },
+    myRole: 'user',
+    myRoomRole: 'user',
+    myJoinedServers: ['ABC123'],
+    myUsername: 'alice',
+    compositionContextCoordinator: { activate() {} },
+    featureGenerations: { begin() { return { generation: ++nextGeneration }; } },
+    showAppAlert() {},
+    invalidateRoomScopedFeatureCallbacks() {},
+    closeModeratorCenter() {}, closeModerationPrompt() {}, closeReportPrompt() {},
+    closeRoomInfo() {}, closePins() {}, closeRoleManager() {},
+    acceptRoomDetailsSnapshot() {}, acceptPinSnapshot() {}, acceptRoomStateSnapshot() {},
+    applyRestrictionState() {}, renderServerAccess() {}, updateModeratorCenterAccess() {},
+    updatePinsButton() {}, syncHeaderOverflowActions() {},
+    typingUsers: new Map(), updateTypingUI() {}, cancelAction() {},
+    consumeJoinedRoomInfoIntent() {}, scheduleMaybeMarkCurrentRoomRead() {},
+    scheduleAnimationFrame: scheduleFrame,
+    chatWindow: { textContent: '' },
+    document: {
+      querySelectorAll() { return []; },
+      getElementById: element,
+      createElement(tagName) { return { tagName, className: '', textContent: '' }; }
+    },
+    loadHistory() {
+      scheduleFrame(() => scheduleFrame(() => {
+        observedEligibility.push(client.isMarkReadEligible({
+          currentRoom: 'ABC123', roomCode: 'ABC123', visibilityState: 'visible',
+          nearBottom: true,
+          roomGeneration: runtimeContext.currentRoomGeneration,
+          suppressionToken: runtimeContext.readSuppressionToken
+        }));
+      }));
+    }
+  });
+  runtimeContext = context;
+  vm.runInContext(
+    `${clientFunctionSource(source, 'disarmReadSuppression')}\n` +
+      `${clientFunctionSource(source, 'handleSwitchResult')}\n` +
+      'globalThis.__handleSwitchResult = handleSwitchResult;',
+    context,
+    { filename: 'chat-switch-runtime.js' }
+  );
+
+  const callbacks = [];
+  const coordinator = client.createSwitchCoordinator(
+    (_target, callback) => callbacks.push(callback),
+    (target, response, token, options) =>
+      context.__handleSwitchResult(target, response, token, options)
+  );
+  const tokenA = Object.freeze({ refreshId: 1, roomCode: 'ABC123', roomGeneration: 7 });
+  const tokenB = Object.freeze({ refreshId: 2, roomCode: 'ABC123', roomGeneration: 7 });
+  context.readSuppressionToken = tokenA;
+  coordinator.request('ABC123', {
+    forceRefresh: true, suppressAutoRead: true, suppressionToken: tokenA
+  });
+  context.readSuppressionToken = tokenB;
+  coordinator.request('ABC123', {
+    forceRefresh: true, suppressAutoRead: true, suppressionToken: tokenB
+  });
+
+  const response = {
+    serverCode: 'ABC123', history: [{ _id: 'message', serverCode: 'ABC123' }],
+    roomRole: 'user', restriction: { timedOut: false, timeoutUntil: null },
+    details: null, notification: null,
+    pin: { serverCode: 'ABC123', pinCount: 0, pinVersion: 1, blockVersion: 5 }
+  };
+  callbacks[0](response);
+  frames.splice(0).forEach(callback => callback());
+  frames.splice(0).forEach(callback => callback());
+  assert.deepEqual(observedEligibility, [false], 'A scroll remains suppressed by newer owner B');
+  assert.equal(context.readSuppressionToken.refreshId, 2);
+  assert.equal(context.readSuppressionToken.roomGeneration, 8);
+
+  callbacks[1](response);
+  frames.splice(0).forEach(callback => callback());
+  frames.splice(0).forEach(callback => callback());
+  assert.deepEqual(observedEligibility, [false, false], 'B scroll remains suppressed until its mark frame');
+  assert.equal(context.readSuppressionToken, null, 'newest owner B releases only after its scroll mark frame');
+
+  const failureCallbacks = [];
+  const failureCoordinator = client.createSwitchCoordinator(
+    (_target, callback) => failureCallbacks.push(callback),
+    (target, responseValue, token, options) =>
+      context.__handleSwitchResult(target, responseValue, token, options)
+  );
+  const tokenC = Object.freeze({ refreshId: 3, roomCode: 'ABC123', roomGeneration: 9 });
+  const tokenD = Object.freeze({ refreshId: 4, roomCode: 'ABC123', roomGeneration: 9 });
+  context.readSuppressionToken = tokenC;
+  failureCoordinator.request('ABC123', {
+    forceRefresh: true, suppressAutoRead: true, suppressionToken: tokenC
+  });
+  context.readSuppressionToken = tokenD;
+  failureCoordinator.request('ABC123', {
+    forceRefresh: true, suppressAutoRead: true, suppressionToken: tokenD
+  });
+  failureCallbacks[0]({ error: 'older refresh failed' });
+  assert.equal(context.readSuppressionToken, tokenD, 'older failed owner C cannot clear newer owner D');
+});
+
+test('stale metadata and pin events cannot settle pending controls but authoritative equal or newer events can', () => {
+  const socket = createRuntimeSocket();
+  const client = loadHelpers();
+  const operationReceipts = client.createOperationReceiptCoordinator();
+  const roomInfoSave = { disabled: true };
+  const roomDetailsByCode = new Map([['ABC123', {
+    serverCode: 'ABC123', description: 'desired', rules: 'rules', metadataVersion: 5, canEdit: true
+  }]]);
+  const pinsByRoom = new Map([['ABC123', {
+    serverCode: 'ABC123', pinCount: 1, pinVersion: 5, blockVersion: 7,
+    pinsLoaded: false, pins: []
+  }]]);
+  const metadataIdentity = 'metadata:ABC123:desired:rules';
+  const pinIdentity = 'pin:ABC123:message:true';
+  const metadataToken = operationReceipts.begin('metadata', metadataIdentity);
+  const pinToken = operationReceipts.begin('pin', pinIdentity);
+  const pinControl = { disabled: true, isConnected: true };
+  const runtime = createSetupSocketRuntime({
+    ChatClientHelpers: client,
+    socket,
+    operationReceipts,
+    roomInfoSave,
+    roomInfoEditing: true,
+    roomDetailsByCode,
+    pinsByRoom,
+    acceptedBlockVersion: 7,
+    pendingMetadataOperation: {
+      receiptToken: metadataToken,
+      identity: metadataIdentity,
+      payload: { serverCode: 'ABC123', description: 'desired', rules: 'rules' }
+    },
+    pendingPinOperation: {
+      receiptToken: pinToken,
+      identity: pinIdentity,
+      payload: { serverCode: 'ABC123', messageId: 'message', pinned: true },
+      control: pinControl
+    },
+    renderRoomInfo() {}, updatePinsButton() {}, updateMessagePinControlState() {},
+    pinsDialogController: { isOpen: () => false },
+    featureGenerations: { invalidate() {} },
+    openPins() {},
+    document: { getElementById() { return {}; } }
+  }, [
+    'acceptRoomDetailsSnapshot', 'acceptPinSnapshot',
+    'settleMetadataControlFromEvent', 'settlePinControlFromEvent'
+  ]);
+  runtime.setupSocket(socket);
+
+  socket.trigger('room_details_updated', {
+    serverCode: 'ABC123', description: 'desired', rules: 'rules', metadataVersion: 4
+  });
+  socket.trigger('message_pin_updated', {
+    messageId: 'message', pinned: true,
+    pin: { serverCode: 'ABC123', pinCount: 1, pinVersion: 4, blockVersion: 7 }
+  });
+  assert.equal(roomInfoSave.disabled, true, 'stale metadata does not release Save');
+  assert.equal(pinControl.disabled, true, 'stale pin does not release Pin control');
+
+  socket.trigger('room_details_updated', {
+    serverCode: 'ABC123', description: 'desired', rules: 'rules', metadataVersion: 5
+  });
+  socket.trigger('message_pin_updated', {
+    messageId: 'message', pinned: true,
+    pin: { serverCode: 'ABC123', pinCount: 1, pinVersion: 5, blockVersion: 7 }
+  });
+  assert.equal(roomInfoSave.disabled, false, 'equal current metadata is authoritative and settles');
+  assert.equal(pinControl.disabled, false, 'equal current pin is authoritative and settles');
+
+  const newerMetadataIdentity = 'metadata:ABC123:newer:new-rules';
+  const newerPinIdentity = 'pin:ABC123:message:false';
+  runtime.context.pendingMetadataOperation = {
+    receiptToken: operationReceipts.begin('metadata', newerMetadataIdentity),
+    identity: newerMetadataIdentity,
+    payload: { serverCode: 'ABC123', description: 'newer', rules: 'new-rules' }
+  };
+  runtime.context.pendingPinOperation = {
+    receiptToken: operationReceipts.begin('pin', newerPinIdentity),
+    identity: newerPinIdentity,
+    payload: { serverCode: 'ABC123', messageId: 'message', pinned: false },
+    control: pinControl
+  };
+  roomInfoSave.disabled = true;
+  pinControl.disabled = true;
+  socket.trigger('room_details_updated', {
+    serverCode: 'ABC123', description: 'newer', rules: 'new-rules', metadataVersion: 6
+  });
+  socket.trigger('message_pin_updated', {
+    messageId: 'message', pinned: false,
+    pin: { serverCode: 'ABC123', pinCount: 0, pinVersion: 6, blockVersion: 7 }
+  });
+  assert.equal(roomInfoSave.disabled, false, 'newer accepted metadata settles');
+  assert.equal(pinControl.disabled, false, 'newer accepted pin settles');
 });

@@ -855,6 +855,26 @@
             return { ...current, pins: incoming.pins.slice(), pinsLoaded: true };
         },
 
+        matchesCurrentVersionedSnapshot(current, incoming, kind) {
+            const snapshot = incoming && incoming.pin ? incoming.pin : incoming;
+            if (!current || !snapshot) return false;
+            const canonicalRoom = value => {
+                if (typeof value !== 'string') return null;
+                if (value.trim().toLowerCase() === 'global') return 'global';
+                const upper = value.trim().toUpperCase();
+                return /^[A-Z0-9]{6}$/.test(upper) ? upper : null;
+            };
+            if (!canonicalRoom(current.serverCode) ||
+                canonicalRoom(current.serverCode) !== canonicalRoom(snapshot.serverCode)) return false;
+            const fields = kind === 'metadata' || kind === 'details'
+                ? ['metadataVersion', 'description', 'rules']
+                : (kind === 'pins' || kind === 'pin'
+                    ? ['pinVersion', 'pinCount', 'blockVersion']
+                    : []);
+            if (!fields.length) return false;
+            return fields.every(field => current[field] === snapshot[field]);
+        },
+
         createScopedGenerationCoordinator() {
             let socketGeneration = 0;
             const scopes = new Map();
@@ -997,6 +1017,24 @@
 
         releaseExactToken(currentToken, ownerToken) {
             return currentToken === ownerToken ? null : currentToken;
+        },
+
+        sameSuppressionOwner(leftToken, rightToken) {
+            if (!leftToken || !rightToken) return false;
+            const leftOwner = leftToken.ownerToken || leftToken;
+            const rightOwner = rightToken.ownerToken || rightToken;
+            return leftOwner === rightOwner;
+        },
+
+        rebindSuppressionToken(token, roomCode, roomGeneration) {
+            if (!token || token.roomCode !== roomCode ||
+                !Number.isInteger(roomGeneration) || roomGeneration <= 0) return token;
+            return Object.freeze({
+                ...token,
+                ownerToken: token.ownerToken || token,
+                roomCode,
+                roomGeneration
+            });
         },
 
         scheduleAfterScrollFrame(scheduleFrame, callback) {
@@ -3784,7 +3822,10 @@
         activeSocket.on('room_details_updated', (data) => {
             if (activeSocket !== socket) return;
             acceptRoomDetailsSnapshot(data);
-            settleMetadataControlFromEvent(data || {});
+            const current = data?.serverCode ? roomDetailsByCode.get(data.serverCode) : null;
+            if (ChatClientHelpers.matchesCurrentVersionedSnapshot(current, data, 'metadata')) {
+                settleMetadataControlFromEvent(data);
+            }
         });
 
         activeSocket.on('message_pin_updated', (data) => {
@@ -3794,7 +3835,10 @@
             if (accepted && pin?.serverCode) {
                 updateMessagePinControlState(pin.serverCode, data.messageId, data.pinned);
             }
-            settlePinControlFromEvent(data || {});
+            const current = pin?.serverCode ? pinsByRoom.get(pin.serverCode) : null;
+            if (ChatClientHelpers.matchesCurrentVersionedSnapshot(current, pin, 'pins')) {
+                settlePinControlFromEvent(data || {});
+            }
             if (accepted && pin?.serverCode === currentServerCode && pinsDialogController.isOpen()) {
                 featureGenerations.invalidate('pins');
                 openPins(document.getElementById('pins-btn'));
@@ -3837,6 +3881,8 @@
         });
 
         activeSocket.on('chat_message', (msg) => {
+            if (activeSocket !== socket) return;
+            if (!msg || msg.serverCode !== currentServerCode) return;
             ChatClientHelpers.dispatchRoomEvent(currentServerCode, data => {
                 const isMe = data.username === myUsername;
                 appendMessage(data, isMe);
@@ -4471,14 +4517,19 @@
                 compositionContextCoordinator.activate(targetServerCode);
                 const activeRoomToken = featureGenerations.begin('active-room', targetServerCode);
                 currentRoomGeneration = activeRoomToken.generation;
-                if (options.suppressAutoRead === true &&
-                    readSuppressionToken === options.suppressionToken &&
-                    readSuppressionToken?.roomCode === targetServerCode) {
-                    readSuppressionToken = Object.freeze({
-                        roomCode: targetServerCode,
-                        roomGeneration: currentRoomGeneration
-                    });
-                    acceptedSuppressionToken = readSuppressionToken;
+                if (readSuppressionToken?.roomCode === targetServerCode) {
+                    readSuppressionToken = ChatClientHelpers.rebindSuppressionToken(
+                        readSuppressionToken,
+                        targetServerCode,
+                        currentRoomGeneration
+                    );
+                    if (options.suppressAutoRead === true &&
+                        ChatClientHelpers.sameSuppressionOwner(
+                            readSuppressionToken,
+                            options.suppressionToken
+                        )) {
+                        acceptedSuppressionToken = readSuppressionToken;
+                    }
                 }
                 myRoomRole = response.roomRole || 'user';
                 if (response.details) acceptRoomDetailsSnapshot({
@@ -4551,7 +4602,13 @@
                     if (acceptedSuppressionToken) {
                         ChatClientHelpers.scheduleAfterScrollFrame(
                             scheduleAnimationFrame,
-                            () => disarmReadSuppression(acceptedSuppressionToken)
+                            () => {
+                                const ownedToken = ChatClientHelpers.sameSuppressionOwner(
+                                    readSuppressionToken,
+                                    acceptedSuppressionToken
+                                ) ? readSuppressionToken : null;
+                                disarmReadSuppression(ownedToken || acceptedSuppressionToken);
+                            }
                         );
                     }
                 } else {
@@ -4560,7 +4617,12 @@
             }
         });
         if (!outcome.accepted && options.suppressAutoRead === true) {
-            disarmReadSuppression(options.suppressionToken);
+            const ownedToken = ChatClientHelpers.sameSuppressionOwner(
+                readSuppressionToken,
+                options.suppressionToken
+            ) ? readSuppressionToken : null;
+            if (ownedToken) disarmReadSuppression(ownedToken);
+            else disarmReadSuppression(options.suppressionToken);
         }
         return outcome;
     }
