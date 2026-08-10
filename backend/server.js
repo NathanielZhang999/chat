@@ -1582,19 +1582,37 @@ function createConnectionHandler({
       }
       const actualMember = Array.isArray(access.user?.servers) && access.user.servers.includes(serverCode);
       if (!access.allowed || access.restriction.banned || !access.user || !access.room || !actualMember) continue;
-      for (const live of account.sockets) {
-        const session = onlineUsersMap.get(live.id);
-        const blockedUserKeys = blockCacheForLiveSession(live, session);
-        const blockVersion = blockVersionForLiveSession(live, session);
-        if (blockedUserKeys.has(authorKey)) continue;
-        live.emit('room_activity', {
-          serverCode,
-          messageId: String(message._id),
-          timestamp: messageCursor.lastReadAt,
-          authorKey,
-          mentioned: isNotificationMention(message, usernameKey),
-          blockVersion
+      try {
+        await withAccountTransitionLock(usernameKey, async () => {
+          const freshAccess = await loadRoomAccessState({
+            UserModel,
+            ChatServerModel,
+            RoomRestrictionModel,
+            username: account.username,
+            serverCode
+          });
+          const freshMember = Array.isArray(freshAccess.user?.servers) &&
+            freshAccess.user.servers.includes(serverCode);
+          if (!freshAccess.allowed || freshAccess.restriction.banned ||
+              !freshAccess.user || !freshAccess.room || !freshMember) return;
+          for (const live of account.sockets) {
+            const session = onlineUsersMap.get(live.id);
+            if (normalizeAccountKey(live.username || session?.username) !== usernameKey) continue;
+            const blockedUserKeys = blockCacheForLiveSession(live, session);
+            const blockVersion = blockVersionForLiveSession(live, session);
+            if (blockedUserKeys.has(authorKey)) continue;
+            live.emit('room_activity', {
+              serverCode,
+              messageId: String(message._id),
+              timestamp: messageCursor.lastReadAt,
+              authorKey,
+              mentioned: isNotificationMention(message, usernameKey),
+              blockVersion
+            });
+          }
         });
+      } catch (err) {
+        logUnexpectedError(logger, 'room_activity_locked_access', err);
       }
     }
   }
@@ -4646,7 +4664,7 @@ function createConnectionHandler({
       const rawText = neutralizePingTokens(payload.text.trim().substring(0, 2000));
       if (!rawText && !attachment) return;
 
-      await withRoomMutationLock(serverCode, async () => {
+      const createdMessage = await withRoomMutationLock(serverCode, async () => {
         const access = await loadRoomAccessState({
           UserModel, ChatServerModel, RoomRestrictionModel,
           username: socket.username, serverCode
@@ -4734,8 +4752,9 @@ function createConnectionHandler({
           event: 'chat_message',
           buildPayload: ({ blockedUserKeys }) => safeMessageForViewer(msg, { blockedUserKeys })
         });
-        await emitRoomActivity(msg);
+        return msg;
       });
+      if (createdMessage) await emitRoomActivity(createdMessage);
     } catch (err) {
       logUnexpectedError(logger, 'chat_message', err);
     }

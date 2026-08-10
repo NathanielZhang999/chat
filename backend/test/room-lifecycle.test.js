@@ -212,6 +212,45 @@ test('room activity carries the recipient current blockVersion and normalized me
   }]);
 });
 
+test('room activity cannot reach a member after a concurrent leave commits', async () => {
+  const setup = roomActivityFixture();
+  const activityAccessRead = deferred();
+  const releaseActivityAccess = deferred();
+  const findOne = setup.UserModel.findOne.bind(setup.UserModel);
+  let gated = false;
+  setup.UserModel.findOne = query => {
+    const result = findOne(query);
+    const usernamePattern = query?.username?.$regex;
+    if (gated || !(usernamePattern instanceof RegExp) || !usernamePattern.test('Member')) return result;
+    gated = true;
+    return {
+      then(resolve, reject) {
+        return Promise.resolve(result).then(async user => {
+          activityAccessRead.resolve();
+          await releaseActivityAccess.promise;
+          return user;
+        }).then(resolve, reject);
+      }
+    };
+  };
+  const author = setup.add({ id: 'author', username: 'Author', serverCode: 'ABC123' });
+  const recipient = setup.add({ id: 'member', username: 'Member', serverCode: 'global' });
+
+  const sendPending = author.trigger('chat_message', { text: 'race with membership removal' });
+  await activityAccessRead.promise;
+
+  const leaveAck = acknowledge();
+  await recipient.trigger('leave_server', 'ABC123', leaveAck.callback);
+  assert.deepEqual(leaveAck.value(), { success: true });
+  assert.deepEqual(setup.UserModel.rows.find(row => row.username === 'Member').servers, ['global']);
+  assert.deepEqual(recipient.joinedServers, ['global']);
+
+  releaseActivityAccess.resolve();
+  await sendPending;
+
+  assert.deepEqual(eventPayloads(recipient, 'room_activity'), []);
+});
+
 test('login reconnect and account events replace exact counts from MongoDB', async () => {
   const cursorAt = new Date('2026-08-10T12:00:00.000Z');
   const ioInstance = new FakeIo();
