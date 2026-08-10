@@ -37,6 +37,44 @@ function authenticate(socket, { serverCode = 'global', joinedServers = ['global'
   socket.joinedServers = joinedServers;
 }
 
+test('pin mutation binds the live target to the requested room without exposing message content', async () => {
+  const messageId = '507f1f77bcf86cd799439011';
+  const secret = 'PIN_ACTION_SECRET';
+  const ChatServerModel = createMemoryModel([{
+    code: 'ABC123', owner: 'alice', moderators: [], pinnedMessages: [], pinVersion: 0
+  }]);
+  const MessageModel = createMemoryModel([{
+    _id: messageId, serverCode: 'BBB222', username: 'bob', displayName: 'Bob', authorKey: 'bob',
+    text: secret, attachment: 'data:image/png;base64,UElOU0VDUkVU', deleted: false,
+    timestamp: new Date()
+  }]);
+  const audits = createMemoryModel([]);
+  const { socket, ioInstance } = registerMessages({
+    ChatServerModel,
+    MessageModel,
+    ModerationAuditModel: audits,
+    UserModel: createMemoryModel([userDocumentForPinAction()])
+  });
+  authenticate(socket, { serverCode: 'ABC123', joinedServers: ['global', 'ABC123'] });
+  socket.role = 'admin';
+  const ack = acknowledge();
+
+  await socket.trigger('set_message_pin', {
+    serverCode: 'ABC123', messageId, pinned: true, clientContextId: 1
+  }, ack.callback);
+
+  assert.deepEqual(ack.value(), { error: 'Permission denied.' });
+  assert.deepEqual(ChatServerModel.rows[0].pinnedMessages, []);
+  assert.equal(ChatServerModel.rows[0].pinVersion, 0);
+  assert.deepEqual(audits.rows, []);
+  assert.equal(JSON.stringify(ioInstance.outbound).includes(secret), false);
+  assert.equal(JSON.stringify(ioInstance.outbound).includes('UElOU0VDUkVU'), false);
+});
+
+function userDocumentForPinAction() {
+  return { username: 'alice', displayName: 'Alice', role: 'admin', servers: ['global', 'ABC123'] };
+}
+
 test('rate-limited messages skip reply lookup, ping resolution, persistence, and broadcast', async () => {
   let currentTime = 1_000;
   let replyLookups = 0;

@@ -136,11 +136,11 @@ test('login returns safe room summaries and actual-member room attention without
     servers: [
       {
         code: 'global', name: 'Global Chat', owner: 'System', metadataVersion: 2,
-        pin: { serverCode: 'global', pinCount: 1, pinVersion: 3, blockVersion: 6 }
+        pin: { serverCode: 'global', pinCount: 0, pinVersion: 3, blockVersion: 6 }
       },
       {
         code: 'ABC123', name: 'Private', owner: 'Owner', metadataVersion: 4,
-        pin: { serverCode: 'ABC123', pinCount: 1, pinVersion: 5, blockVersion: 6 }
+        pin: { serverCode: 'ABC123', pinCount: 0, pinVersion: 5, blockVersion: 6 }
       }
     ],
     joinedServers: ['global'], defaultServerCode: 'global',

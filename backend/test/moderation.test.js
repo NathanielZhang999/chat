@@ -14,6 +14,7 @@ const {
   withAccountTransitionLocks,
   withAccountTransitionLock,
   canModerateTarget,
+  canManagePins,
   activeRestrictionState,
   applySessionAccessSnapshot,
   rejectAuditMutation,
@@ -23,6 +24,37 @@ const {
 const { FakeSocket, FakeIo, createMemoryModel, acknowledge, deferred } = require('./support/fakes');
 
 const VALID_MESSAGE_ID = '507f1f77bcf86cd799439011';
+
+test('complete pin permission matrix respects bans timeouts exact-room roles and Global policy', () => {
+  function access({
+    username = 'Actor', role = 'user', allowed = true, banned = false, timedOut = false,
+    owner = 'Owner', moderators = []
+  } = {}) {
+    return {
+      allowed,
+      user: { username, role },
+      room: { code: 'ABC123', owner, moderators },
+      restriction: { banned, timedOut }
+    };
+  }
+  const cases = [
+    ['private owner', 'ABC123', access({ username: 'Owner' }), true],
+    ['exact moderator', 'ABC123', access({ username: 'ExactMod', moderators: ['ExactMod'] }), true],
+    ['global admin in private room', 'ABC123', access({ role: 'admin' }), true],
+    ['ordinary member', 'ABC123', access(), false],
+    ['other-room moderator', 'ABC123', access({ username: 'OtherMod', moderators: ['ExactMod'] }), false],
+    ['banned admin', 'ABC123', access({ role: 'admin', banned: true }), false],
+    ['timed-out owner', 'ABC123', access({ username: 'Owner', timedOut: true }), false],
+    ['nonaccess admin', 'ABC123', access({ role: 'admin', allowed: false }), false],
+    ['Global admin', 'global', access({ role: 'admin' }), true],
+    ['Global owner-shaped user', 'global', access({ username: 'Owner' }), false],
+    ['Global moderator-shaped user', 'global', access({ username: 'ExactMod', moderators: ['ExactMod'] }), false]
+  ];
+  for (const [label, serverCode, candidate, expected] of cases) {
+    const exactRoomAccess = { ...candidate, room: { ...candidate.room, code: serverCode } };
+    assert.equal(canManagePins({ serverCode, access: exactRoomAccess }), expected, label);
+  }
+});
 
 function saveableDocument(value) {
   const document = { ...value };

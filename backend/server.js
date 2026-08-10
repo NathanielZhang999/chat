@@ -741,6 +741,15 @@ function canEditRoomDetails({ serverCode, access }) {
   return serverCode !== 'global' && normalizeAccountKey(access.room.owner) === normalizeAccountKey(access.user.username);
 }
 
+function canManagePins({ serverCode, access }) {
+  if (!access || !access.allowed || access.restriction?.banned || access.restriction?.timedOut ||
+    !access.user || !access.room || access.room.code !== serverCode) return false;
+  if (serverCode === 'global') return access.user.role === 'admin';
+  return access.user.role === 'admin' ||
+    normalizeAccountKey(access.room.owner) === normalizeAccountKey(access.user.username) ||
+    isCurrentRoomModerator(access.room, access.user.username);
+}
+
 function canModerateTarget({ serverCode, action, actorUser, targetUser, room }) {
   if (!actorUser || !targetUser || !room || room.code !== serverCode) return false;
   const normalizedAction = normalizeModerationAction(action);
@@ -1291,24 +1300,131 @@ function createConnectionHandler({
     return row;
   }
 
-  function safePinCountSnapshot(room, blockVersion) {
+  function pinVersionForRoom(room) {
+    return Number.isInteger(room && room.pinVersion) && room.pinVersion >= 0 ? room.pinVersion : 0;
+  }
+
+  async function loadPinCandidates(room) {
+    const candidates = [];
+    for (const storedPin of Array.isArray(room && room.pinnedMessages) ? room.pinnedMessages : []) {
+      const messageId = String(storedPin && storedPin.messageId || '').toLowerCase();
+      if (!isValidObjectId(messageId)) continue;
+      const storedMessage = await MessageModel.findById(messageId);
+      if (!storedMessage || storedMessage.deleted || storedMessage.serverCode !== room.code) continue;
+      const authorKey = authorKeyForMessage(storedMessage);
+      if (!authorKey) continue;
+      const username = normalizeUsername(storedMessage.username) || authorKey;
+      const pinnedBy = normalizeUsername(storedPin.pinnedBy) || '';
+      const pinnedAt = storedPin.pinnedAt instanceof Date ? storedPin.pinnedAt : new Date(storedPin.pinnedAt);
+      const messageTimestamp = storedMessage.timestamp instanceof Date
+        ? storedMessage.timestamp : new Date(storedMessage.timestamp);
+      if (Number.isNaN(messageTimestamp.getTime())) continue;
+      candidates.push({
+        messageId,
+        authorKey,
+        username,
+        displayName: typeof storedMessage.displayName === 'string' ? storedMessage.displayName : '',
+        text: typeof storedMessage.text === 'string' ? storedMessage.text : '',
+        attachmentSummary: sanitizeAttachment(storedMessage.attachment) ? 'Image Attachment' : null,
+        messageTimestamp,
+        pinnedAt: Number.isNaN(pinnedAt.getTime()) ? null : pinnedAt,
+        pinnedBy
+      });
+    }
+    return candidates;
+  }
+
+  function visiblePinsFromCandidates(candidates, blockedUserKeys) {
+    const blocked = normalizedBlockedUserKeys(blockedUserKeys);
+    return candidates.filter(pin => !blocked.has(pin.authorKey));
+  }
+
+  async function loadVisiblePins({ room, blockedUserKeys }) {
+    return visiblePinsFromCandidates(await loadPinCandidates(room), blockedUserKeys);
+  }
+
+  async function visiblePinCountSnapshot({ room, blockedUserKeys, blockVersion }) {
+    const pins = await loadVisiblePins({ room, blockedUserKeys });
     return {
       serverCode: room.code,
-      pinCount: Array.isArray(room.pinnedMessages) ? room.pinnedMessages.length : 0,
-      pinVersion: Number.isInteger(room.pinVersion) && room.pinVersion >= 0 ? room.pinVersion : 0,
+      pinCount: pins.length,
+      pinVersion: pinVersionForRoom(room),
       blockVersion: Number.isInteger(blockVersion) && blockVersion >= 0 ? blockVersion : 0
     };
   }
 
-  function safeRoomSummary(room, blockVersion) {
+  async function visiblePinSnapshot({ room, blockedUserKeys, blockVersion }) {
+    const pins = await loadVisiblePins({ room, blockedUserKeys });
+    return {
+      serverCode: room.code,
+      pins,
+      pinCount: pins.length,
+      pinVersion: pinVersionForRoom(room),
+      blockVersion: Number.isInteger(blockVersion) && blockVersion >= 0 ? blockVersion : 0
+    };
+  }
+
+  function safeRoomSummary(room, pin) {
     return {
       code: room.code,
       name: typeof room.name === 'string' ? room.name : '',
       owner: typeof room.owner === 'string' ? room.owner : '',
       metadataVersion: Number.isInteger(room.metadataVersion) && room.metadataVersion >= 0
         ? room.metadataVersion : 0,
-      pin: safePinCountSnapshot(room, blockVersion)
+      pin
     };
+  }
+
+  function blockCacheForLiveSession(live, session) {
+    if (live && live.blockedUserKeys instanceof Set) return normalizedBlockedUserKeys(live.blockedUserKeys);
+    return normalizedBlockedUserKeys(Array.isArray(session && session.blockedUsers) ? session.blockedUsers : []);
+  }
+
+  async function emitMessagePinUpdated({ serverCode, messageId, pinned, room, targetAuthorKey }) {
+    let liveSockets;
+    try {
+      liveSockets = await fetchLiveSockets();
+    } catch (err) {
+      logUnexpectedError(logger, 'pin_notification_socket_discovery', err);
+      return;
+    }
+    const candidates = await loadPinCandidates(room);
+    const accounts = new Map();
+    for (const live of liveSockets) {
+      const session = onlineUsersMap.get(live.id);
+      const username = live.username || session?.username;
+      const accountKey = normalizeAccountKey(username);
+      if (!normalizeUsername(username) || !accountKey) continue;
+      if (!accounts.has(accountKey)) accounts.set(accountKey, { username, sockets: [] });
+      accounts.get(accountKey).sockets.push({ live, session });
+    }
+    for (const { username, sockets } of accounts.values()) {
+      try {
+        const access = await loadRoomAccessState({
+          UserModel, ChatServerModel, RoomRestrictionModel, username, serverCode
+        });
+        if (!access.allowed || access.restriction.banned || !access.user) continue;
+        const actualMember = Array.isArray(access.user.servers) && access.user.servers.includes(serverCode);
+        for (const { live, session } of sockets) {
+          const activeRoom = live.serverCode ?? session?.serverCode ?? null;
+          const adminInspecting = access.user.role === 'admin' && activeRoom === serverCode;
+          if (!actualMember && !adminInspecting) continue;
+          const blockedUserKeys = blockCacheForLiveSession(live, session);
+          if (blockedUserKeys.has(targetAuthorKey)) continue;
+          const pinCount = visiblePinsFromCandidates(candidates, blockedUserKeys).length;
+          const blockVersion = Number.isInteger(live.blockVersion) && live.blockVersion >= 0
+            ? live.blockVersion
+            : (Number.isInteger(session?.blockVersion) && session.blockVersion >= 0 ? session.blockVersion : 0);
+          live.emit('message_pin_updated', {
+            messageId,
+            pinned,
+            pin: { serverCode, pinCount, pinVersion: pinVersionForRoom(room), blockVersion }
+          });
+        }
+      } catch (err) {
+        logUnexpectedError(logger, 'pin_notification', err);
+      }
+    }
   }
 
   async function quarantineLiveSocket(live, session, roomCodes) {
@@ -2028,6 +2144,7 @@ function createConnectionHandler({
         const validatedRooms = [];
         const actualMemberships = new Set();
         const roomStateByCode = new Map();
+        const roomPinByCode = new Map();
         for (const candidateRoom of (rooms || []).filter(room => !blockedRooms.has(room.code))) {
           const validated = await withRoomMutationLock(candidateRoom.code, async () => {
             const [freshRoom, freshUser] = await Promise.all([
@@ -2045,7 +2162,12 @@ function createConnectionHandler({
                 usernameKey: freshUser.username,
                 serverCode: candidateRoom.code,
                 blockedUserKeys
-              }) : null
+              }) : null,
+              pin: await visiblePinCountSnapshot({
+                room: freshRoom,
+                blockedUserKeys,
+                blockVersion: blockState.blockVersion
+              })
             };
           });
           if (!validated) continue;
@@ -2054,6 +2176,7 @@ function createConnectionHandler({
             actualMemberships.add(candidateRoom.code);
             roomStateByCode.set(candidateRoom.code, validated.state);
           }
+          roomPinByCode.set(candidateRoom.code, validated.pin);
         }
         const joinedServers = user.servers.filter(code => actualMemberships.has(code));
         const roomStates = joinedServers.map(code => roomStateByCode.get(code));
@@ -2072,7 +2195,7 @@ function createConnectionHandler({
           unreadCount: state.unreadCount,
           mentionCount: state.mentionCount
         }));
-        const roomSummaries = validatedRooms.map(room => safeRoomSummary(room, blockState.blockVersion));
+        const roomSummaries = validatedRooms.map(room => safeRoomSummary(room, roomPinByCode.get(room.code)));
 
         socket.username = user.username;
         socket.displayName = user.displayName;
@@ -2320,6 +2443,146 @@ function createConnectionHandler({
     } catch (err) {
       logUnexpectedError(logger, 'update_room_details', err);
       callback({ error: 'Failed to update room details.' });
+    }
+  });
+
+  socket.on('list_pinned_messages', async (data, callback) => {
+    callback = safeAck(callback);
+    if (!socket.username) return callback({ error: 'Not authenticated.' });
+    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+      return callback({ error: 'Invalid input format.' });
+    }
+    const serverCode = normalizeServerCode(data.serverCode);
+    const clientContextId = normalizeClientContextId(data.clientContextId);
+    if (!serverCode || clientContextId === null) return callback({ error: 'Invalid input format.' });
+    if (serverCode !== socket.serverCode) return callback({ error: 'Permission denied.' });
+    try {
+      const result = await withAccountTransitionLock(socket.username, () =>
+        withRoomMutationLock(serverCode, async () => {
+          const access = await loadRoomAccessState({
+            UserModel, ChatServerModel, RoomRestrictionModel, username: socket.username, serverCode
+          });
+          if (!access.allowed || access.restriction.banned || !access.user || !access.room) {
+            return { error: 'Permission denied.' };
+          }
+          const { snapshot: blockState, blockedUserKeys } = await loadDurableBlockState(access.user.username);
+          const snapshot = await visiblePinSnapshot({
+            room: access.room, blockedUserKeys, blockVersion: blockState.blockVersion
+          });
+          return { success: true, ...snapshot };
+        })
+      );
+      callback(result);
+    } catch (err) {
+      logUnexpectedError(logger, 'list_pinned_messages', err);
+      callback({ error: 'Failed to load pinned messages.' });
+    }
+  });
+
+  socket.on('set_message_pin', async (data, callback) => {
+    callback = safeAck(callback);
+    if (!socket.username) return callback({ error: 'Not authenticated.' });
+    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+      return callback({ error: 'Invalid input format.' });
+    }
+    const serverCode = normalizeServerCode(data.serverCode);
+    const rawMessageId = typeof data.messageId === 'string' ? data.messageId : '';
+    const messageId = rawMessageId.toLowerCase();
+    const clientContextId = normalizeClientContextId(data.clientContextId);
+    if (!serverCode || !isValidObjectId(rawMessageId) || typeof data.pinned !== 'boolean' ||
+        clientContextId === null) return callback({ error: 'Invalid input format.' });
+    if (serverCode !== socket.serverCode) return callback({ error: 'Permission denied.' });
+
+    try {
+      const result = await withAccountTransitionLock(socket.username, () =>
+        withRoomMutationLock(serverCode, async () => {
+          const access = await loadRoomAccessState({
+            UserModel, ChatServerModel, RoomRestrictionModel, username: socket.username, serverCode
+          });
+          if (!canManagePins({ serverCode, access })) return { error: 'Permission denied.' };
+          const target = await MessageModel.findById(messageId);
+          const targetAuthorKey = authorKeyForMessage(target);
+          if (!target || target.deleted || target.serverCode !== serverCode || !targetAuthorKey) {
+            return { error: 'Permission denied.' };
+          }
+
+          let observedRoom = access.room;
+          let updatedRoom = null;
+          let changed = false;
+          for (let attempt = 0; attempt < 2; attempt += 1) {
+            if (!observedRoom) return { error: 'Pin state changed. Reload and try again.' };
+            const pinnedMessages = Array.isArray(observedRoom.pinnedMessages) ? observedRoom.pinnedMessages : [];
+            const alreadyPinned = pinnedMessages.some(pin =>
+              String(pin && pin.messageId || '').toLowerCase() === messageId);
+            if (alreadyPinned === data.pinned) {
+              updatedRoom = observedRoom;
+              break;
+            }
+            if (data.pinned && pinnedMessages.length >= 20) return { error: 'Pin limit reached.' };
+            const storedVersion = observedRoom.pinVersion;
+            const pinVersion = storedVersion === undefined ? 0
+              : (Number.isInteger(storedVersion) && storedVersion >= 0 ? storedVersion : null);
+            if (pinVersion === null) return { error: 'Pin state changed. Reload and try again.' };
+            const versionPredicate = pinVersion === 0
+              ? { $or: [{ pinVersion: 0 }, { pinVersion: { $exists: false } }] }
+              : { pinVersion };
+            const statePredicate = data.pinned
+              ? { 'pinnedMessages.messageId': { $ne: messageId } }
+              : { 'pinnedMessages.messageId': messageId };
+            const update = data.pinned
+              ? { $push: { pinnedMessages: {
+                messageId, pinnedAt: new Date(), pinnedBy: access.user.username
+              } }, $inc: { pinVersion: 1 } }
+              : { $pull: { pinnedMessages: { messageId } }, $inc: { pinVersion: 1 } };
+            updatedRoom = await ChatServerModel.findOneAndUpdate(
+              { code: serverCode, ...versionPredicate, ...statePredicate },
+              update,
+              { new: true }
+            );
+            if (updatedRoom) {
+              changed = true;
+              break;
+            }
+            observedRoom = await ChatServerModel.findOne({ code: serverCode });
+          }
+          if (!updatedRoom) {
+            const alreadyPinned = Array.isArray(observedRoom && observedRoom.pinnedMessages) &&
+              observedRoom.pinnedMessages.some(pin =>
+                String(pin && pin.messageId || '').toLowerCase() === messageId);
+            if (alreadyPinned !== data.pinned) return { error: 'Pin state changed. Reload and try again.' };
+            updatedRoom = observedRoom;
+          }
+
+          if (changed) {
+            await appendAuditReliably({
+              correlationId: new mongoose.Types.ObjectId().toString(),
+              action: data.pinned ? 'pin_message' : 'unpin_message',
+              serverCode,
+              actorUsername: access.user.username,
+              actorRole: access.user.role || 'user',
+              actorRoomRole: currentRoomRole(access.room, access.user.username),
+              targetUsername: normalizeUsername(target.username) || targetAuthorKey,
+              targetRole: typeof target.role === 'string' ? target.role : 'user',
+              targetRoomRole: typeof target.roomRole === 'string' ? target.roomRole : 'user',
+              messageId,
+              reason: data.pinned ? 'Pinned message' : 'Unpinned message',
+              metadata: {}
+            });
+            await emitMessagePinUpdated({
+              serverCode, messageId, pinned: data.pinned, room: updatedRoom, targetAuthorKey
+            });
+          }
+          const { snapshot: blockState, blockedUserKeys } = await loadDurableBlockState(access.user.username);
+          const pin = await visiblePinCountSnapshot({
+            room: updatedRoom, blockedUserKeys, blockVersion: blockState.blockVersion
+          });
+          return { success: true, messageId, pinned: data.pinned, pin };
+        })
+      );
+      callback(result);
+    } catch (err) {
+      logUnexpectedError(logger, 'set_message_pin', err);
+      callback({ error: 'Failed to update pin.' });
     }
   });
 
@@ -3675,7 +3938,11 @@ function createConnectionHandler({
           metadataVersion: detailSnapshot.metadataVersion,
           canEdit: detailSnapshot.canEdit
         };
-        const pin = safePinCountSnapshot(access.room, blockState.blockVersion);
+        const pin = await visiblePinCountSnapshot({
+          room: access.room,
+          blockedUserKeys,
+          blockVersion: blockState.blockVersion
+        });
 
         const oldCode = socket.serverCode;
         const session = onlineUsersMap.get(socket.id);
@@ -4197,6 +4464,7 @@ module.exports = {
   applySessionAccessSnapshot,
   loadRoomAccessState,
   canEditRoomDetails,
+  canManagePins,
   rejectAuditMutation,
   MODERATION_DURATIONS,
   RoomRestriction,
