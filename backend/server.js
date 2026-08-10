@@ -4183,16 +4183,40 @@ function createConnectionHandler({
 
       try {
         const sockets = await ioInstance.fetchSockets();
+        const recipientsByAccount = new Map();
         for (const live of sockets) {
           const session = onlineUsersMap.get(live.id);
-          if (!session || session.role !== 'admin') continue;
-          const blockedUserKeys = blockCacheForLiveSession(live, session);
-          const pin = await visiblePinCountSnapshot({
-            room: srv,
-            blockedUserKeys,
-            blockVersion: blockVersionForLiveSession(live, session)
-          });
-          live.emit('admin_new_server', safeRoomSummary(srv, pin));
+          const username = normalizeUsername(live.username || session?.username);
+          const accountKey = normalizeAccountKey(username);
+          if (!session || !username || !accountKey) continue;
+          if (!recipientsByAccount.has(accountKey)) {
+            recipientsByAccount.set(accountKey, { username, sockets: [] });
+          }
+          recipientsByAccount.get(accountKey).sockets.push(live);
+        }
+        for (const [accountKey, recipient] of recipientsByAccount.entries()) {
+          await withAccountTransitionLock(accountKey, () =>
+            withRoomMutationLock(srv.code, async () => {
+              const [freshUser, freshRoom] = await Promise.all([
+                findUserByUsername(UserModel, recipient.username),
+                ChatServerModel.findOne({ code: srv.code })
+              ]);
+              if (!freshUser || freshUser.role !== 'admin' || !freshRoom || freshRoom.code !== srv.code) return;
+              for (const live of recipient.sockets) {
+                let session = onlineUsersMap.get(live.id);
+                if (!session || normalizeAccountKey(live.username || session.username) !== accountKey) continue;
+                const blockedUserKeys = blockCacheForLiveSession(live, session);
+                const pin = await visiblePinCountSnapshot({
+                  room: freshRoom,
+                  blockedUserKeys,
+                  blockVersion: blockVersionForLiveSession(live, session)
+                });
+                session = onlineUsersMap.get(live.id);
+                if (!session || normalizeAccountKey(live.username || session.username) !== accountKey) continue;
+                live.emit('admin_new_server', safeRoomSummary(freshRoom, pin));
+              }
+            })
+          );
         }
       } catch (err) {
         logUnexpectedError(logger, 'create_server_admin_notification', err);

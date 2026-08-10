@@ -269,6 +269,211 @@ test('create join and admin room discovery payloads expose only exact safe summa
   }
 });
 
+function adminDiscoveryRaceFixture({ gateDemotionSave = false, gateRecipientPin = false } = {}) {
+  const pinMessageId = '507f1f77bcf86cd799439198';
+  const ioInstance = new FakeIo();
+  const onlineUsersMap = new Map();
+  const UserModel = createMemoryModel([
+    { username: 'Creator', displayName: 'Creator', role: 'user', servers: ['global'] },
+    { username: 'AdminTarget', displayName: 'Admin Target', role: 'admin', servers: ['global'] },
+    { username: 'RootAdmin', displayName: 'Root Admin', role: 'admin', servers: ['global'] }
+  ]);
+  const ChatServerModel = createMemoryModel([{
+    code: 'global', name: 'Global Chat', owner: 'System', moderators: [],
+    pinnedMessages: [], pinVersion: 0
+  }]);
+  const MessageModel = createMemoryModel([{
+    _id: pinMessageId,
+    serverCode: null,
+    username: 'Creator',
+    displayName: 'Creator',
+    authorKey: 'creator',
+    text: 'private pinned message',
+    attachment: null,
+    deleted: false,
+    timestamp: new Date('2026-08-10T16:00:00.000Z')
+  }]);
+  const createRoom = ChatServerModel.create.bind(ChatServerModel);
+  ChatServerModel.create = async value => {
+    MessageModel.rows[0].serverCode = value.code;
+    return createRoom({
+      ...value,
+      metadataVersion: 0,
+      pinnedMessages: [{
+        messageId: pinMessageId,
+        pinnedAt: new Date('2026-08-10T16:01:00.000Z'),
+        pinnedBy: 'Creator'
+      }],
+      pinVersion: 1
+    });
+  };
+
+  const demotionSaveStarted = deferred();
+  const releaseDemotionSave = deferred();
+  let demotionSaveHeld = false;
+  UserModel.saveHook = async ({ document }) => {
+    if (!gateDemotionSave || demotionSaveHeld || document.username !== 'AdminTarget' ||
+        document.role !== 'user') return;
+    demotionSaveHeld = true;
+    demotionSaveStarted.resolve();
+    await releaseDemotionSave.promise;
+  };
+
+  const recipientPinReadStarted = deferred();
+  const releaseRecipientPinRead = deferred();
+  const findPinnedMessage = MessageModel.findById.bind(MessageModel);
+  let pinReadCount = 0;
+  MessageModel.findById = async id => {
+    const result = await findPinnedMessage(id);
+    pinReadCount += 1;
+    if (gateRecipientPin && pinReadCount === 2) {
+      recipientPinReadStarted.resolve();
+      await releaseRecipientPinRead.promise;
+    }
+    return result;
+  };
+
+  const shared = {
+    ioInstance,
+    onlineUsersMap,
+    UserModel,
+    ChatServerModel,
+    MessageModel,
+    RoomRestrictionModel: createMemoryModel([]),
+    RoomMemberStateModel: createMemoryModel([]),
+    UserExperienceStateModel: createMemoryModel([]),
+    broadcastOnlineUsersFn: async () => {},
+    getRoomRoleFn: async () => 'user',
+    resolvePingsFn: async text => text,
+    logger: { error() {} }
+  };
+  function connect(id, username, role) {
+    const live = registerSharedSocket(shared, id);
+    Object.assign(live, {
+      username,
+      displayName: username,
+      role,
+      serverCode: 'global',
+      joinedServers: ['global'],
+      bannedRooms: [],
+      blockedUserKeys: new Set(),
+      blockVersion: 0
+    });
+    live.joinedRooms.add('global');
+    onlineUsersMap.set(id, {
+      username,
+      displayName: username,
+      role,
+      serverCode: 'global',
+      joinedServers: ['global'],
+      bannedRooms: [],
+      blockedUsers: [],
+      blockVersion: 0
+    });
+    return live;
+  }
+  const creator = connect('discovery-creator', 'Creator', 'user');
+  const recipients = [
+    connect('discovery-admin-1', 'AdminTarget', 'admin'),
+    connect('discovery-admin-2', 'admintarget', 'admin')
+  ];
+  const rootAdmin = connect('discovery-root', 'RootAdmin', 'admin');
+  ioInstance.sockets = [...recipients];
+
+  return {
+    creator,
+    recipients,
+    rootAdmin,
+    onlineUsersMap,
+    demotionSaveStarted,
+    releaseDemotionSave,
+    recipientPinReadStarted,
+    releaseRecipientPinRead,
+    demote(callback) {
+      return rootAdmin.trigger('manage_role', {
+        targetUser: 'AdminTarget',
+        action: 'demote_global_admin'
+      }, callback);
+    }
+  };
+}
+
+test('global demotion holding the recipient account lock prevents later private-room discovery', async () => {
+  const fixture = adminDiscoveryRaceFixture({ gateDemotionSave: true });
+  const demotionAck = acknowledge();
+  const demotionPending = fixture.demote(demotionAck.callback);
+  await fixture.demotionSaveStarted.promise;
+
+  let createResponse;
+  let createSettled = false;
+  const createAcknowledged = deferred();
+  const createPending = fixture.creator.trigger('create_server', 'Private Team', response => {
+    createResponse = response;
+    createAcknowledged.resolve();
+  }).then(() => { createSettled = true; });
+  await createAcknowledged.promise;
+  await new Promise(resolve => setImmediate(resolve));
+  await new Promise(resolve => setImmediate(resolve));
+  const discoveryBeforeDemotionCommit = fixture.recipients.reduce((count, live) =>
+    count + eventPayloads(live, 'admin_new_server').length, 0);
+  const createSettledBeforeDemotionCommit = createSettled;
+
+  fixture.releaseDemotionSave.resolve();
+  await Promise.all([demotionPending, createPending]);
+
+  assert.equal(createResponse.success, true);
+  assert.equal(discoveryBeforeDemotionCommit, 0);
+  assert.equal(createSettledBeforeDemotionCommit, false);
+  assert.deepEqual(demotionAck.value(), { success: true });
+  for (const live of fixture.recipients) {
+    assert.equal(eventPayloads(live, 'admin_new_server').length, 0);
+    assert.equal(live.role, 'user');
+    assert.equal(fixture.onlineUsersMap.get(live.id).role, 'user');
+  }
+});
+
+test('authorized private-room discovery emits synchronously before a queued global demotion acknowledges', async () => {
+  const fixture = adminDiscoveryRaceFixture({ gateRecipientPin: true });
+  const order = [];
+  for (const live of fixture.recipients) {
+    const emit = live.emit.bind(live);
+    live.emit = (event, payload) => {
+      if (event === 'admin_new_server') order.push(`discovery:${live.id}`);
+      emit(event, payload);
+    };
+  }
+
+  const createAck = acknowledge();
+  const createPending = fixture.creator.trigger('create_server', 'Private Team', createAck.callback);
+  await fixture.recipientPinReadStarted.promise;
+
+  let demotionResponse;
+  const demotionPending = fixture.demote(response => {
+    demotionResponse = response;
+    order.push('demotion-ack');
+  });
+  await new Promise(resolve => setImmediate(resolve));
+  await new Promise(resolve => setImmediate(resolve));
+  const demotionBeforeDiscoveryEmit = demotionResponse;
+
+  fixture.releaseRecipientPinRead.resolve();
+  await Promise.all([createPending, demotionPending]);
+
+  assert.equal(demotionBeforeDiscoveryEmit, undefined);
+  assert.deepEqual(order, [
+    'discovery:discovery-admin-1',
+    'discovery:discovery-admin-2',
+    'demotion-ack'
+  ]);
+  assert.equal(createAck.value().success, true);
+  assert.deepEqual(demotionResponse, { success: true });
+  for (const live of fixture.recipients) {
+    assert.equal(eventPayloads(live, 'admin_new_server').length, 1);
+    assert.equal(live.role, 'user');
+    assert.equal(fixture.onlineUsersMap.get(live.id).role, 'user');
+  }
+});
+
 test('room activity reaches inactive actual members but not admin ghost viewers nonmembers or banned users', async () => {
   const setup = roomActivityFixture();
   const author = setup.add({ id: 'author', username: 'Author', serverCode: 'ABC123' });
