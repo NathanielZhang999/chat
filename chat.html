@@ -1902,9 +1902,23 @@
             let nextRequestId = 0;
             let epoch = 0;
 
-            const cancelRequest = (request, reason) => {
-                if (!request || typeof request.options.onCancel !== 'function') return;
-                request.options.onCancel(reason, request.token);
+            const cancellationContextFor = request => request ? Object.freeze({
+                target: request.target,
+                token: request.token,
+                forceRefresh: request.options.forceRefresh === true,
+                suppressAutoRead: request.options.suppressAutoRead === true,
+                suppressionToken: request.options.suppressionToken || null
+            }) : null;
+
+            const cancelRequest = (request, reason, activeRequest = null) => {
+                if (!request || request.cancelled === true) return;
+                request.cancelled = true;
+                if (typeof request.options.onCancel !== 'function') return;
+                request.options.onCancel(
+                    reason,
+                    request.token,
+                    cancellationContextFor(activeRequest)
+                );
             };
 
             const start = request => {
@@ -1941,7 +1955,7 @@
                     if (inFlightRequest !== null) {
                         const displacedRequest = queuedRequest;
                         queuedRequest = request;
-                        cancelRequest(displacedRequest, 'replaced');
+                        cancelRequest(displacedRequest, 'replaced', inFlightRequest);
                         return token;
                     }
                     start(request);
@@ -2385,15 +2399,30 @@
             data.blockVersion !== acceptedBlockVersion || currentRoomGeneration <= 0) return;
         const suppressionToken = Object.freeze({
             roomCode: data.serverCode,
-            roomGeneration: currentRoomGeneration
+            roomGeneration: currentRoomGeneration,
+            blockVersion: data.blockVersion
         });
         readSuppressionToken = suppressionToken;
-        const releaseSuppressionOwner = () => {
+        const releaseSuppressionOwner = (_reason, _requestToken, activeRequest) => {
             const ownedToken = ChatClientHelpers.sameSuppressionOwner(
                 readSuppressionToken,
                 suppressionToken
             ) ? readSuppressionToken : null;
-            if (ownedToken) disarmReadSuppression(ownedToken);
+            if (!ownedToken) return;
+            const activeSuppressionToken = activeRequest?.suppressionToken;
+            const canTransferToActiveRefresh = activeRequest?.target === data.serverCode &&
+                activeRequest.forceRefresh === true && activeRequest.suppressAutoRead === true &&
+                activeSuppressionToken?.roomCode === data.serverCode &&
+                activeSuppressionToken.blockVersion === data.blockVersion;
+            if (canTransferToActiveRefresh) {
+                readSuppressionToken = ChatClientHelpers.rebindSuppressionToken(
+                    activeSuppressionToken,
+                    data.serverCode,
+                    currentRoomGeneration
+                );
+                return;
+            }
+            disarmReadSuppression(ownedToken);
         };
         requestServerSwitch(data.serverCode, {
             forceRefresh: true,
