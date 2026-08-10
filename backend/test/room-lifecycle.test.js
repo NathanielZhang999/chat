@@ -70,6 +70,60 @@ function registerSharedSocket(overrides, id) {
   return socket;
 }
 
+function createRecordingHistoryModel(rows, calls) {
+  const matches = (row, query) => Object.entries(query).every(([key, expected]) => {
+    if (key === '$or') return expected.some(clause => matches(row, clause));
+    if (expected && typeof expected === 'object' && '$exists' in expected) {
+      return Object.prototype.hasOwnProperty.call(row, key) === expected.$exists;
+    }
+    if (expected === null) return row[key] === null || row[key] === undefined;
+    return row[key] === expected;
+  });
+
+  return {
+    find(query) {
+      calls.push({ method: 'find', value: query });
+      let selected = rows.filter(row => matches(row, query)).map(row => ({ ...row }));
+      return {
+        sort(value) {
+          calls.push({ method: 'sort', value });
+          const direction = value.timestamp;
+          selected.sort((left, right) => direction * (Date.parse(left.timestamp) - Date.parse(right.timestamp)));
+          return this;
+        },
+        limit(value) {
+          calls.push({ method: 'limit', value });
+          selected = selected.slice(0, value);
+          return this;
+        },
+        async lean() {
+          calls.push({ method: 'lean' });
+          return selected;
+        }
+      };
+    }
+  };
+}
+
+async function switchWithRecordedHistory(targetCode, rows) {
+  const calls = [];
+  const ChatServerModel = {
+    findOne: query => queryResult({ code: query.code, moderators: [] })
+  };
+  const MessageModel = createRecordingHistoryModel(rows, calls);
+  const { socket } = register({ ChatServerModel, MessageModel });
+  Object.assign(socket, {
+    username: 'alice', role: 'user', serverCode: 'OLD123',
+    joinedServers: ['global', 'OLD123', 'ABC123']
+  });
+  socket.joinedRooms.add('OLD123');
+  const ack = acknowledge();
+
+  await socket.trigger('switch_server', targetCode, ack.callback);
+
+  return { acknowledgement: ack.value(), calls };
+}
+
 test('account transition locks serialize one normalized account and release after failure', async () => {
   const firstGate = deferred();
   const events = [];
@@ -1088,6 +1142,64 @@ test('room switching acknowledges first and publishes only affected private pres
     await socket.trigger('switch_server', scenario.targetCode, () => events.push('ack'));
     assert.deepEqual(events, ['ack', ...scenario.expected.map(code => `broadcast:${code}`)]);
   }
+});
+
+test('private room switch uses the exact bounded lean history query and returns chronological rows', async () => {
+  const { acknowledgement, calls } = await switchWithRecordedHistory('ABC123', [
+    { _id: 'private-new', username: 'alice', serverCode: 'ABC123', timestamp: '2026-01-03T00:00:00.000Z' },
+    { _id: 'other-room', username: 'alice', serverCode: 'BBB222', timestamp: '2026-01-04T00:00:00.000Z' },
+    { _id: 'private-old', username: 'alice', serverCode: 'ABC123', timestamp: '2026-01-01T00:00:00.000Z' }
+  ]);
+
+  assert.deepEqual(calls, [
+    { method: 'find', value: { serverCode: 'ABC123' } },
+    { method: 'sort', value: { timestamp: -1 } },
+    { method: 'limit', value: 100 },
+    { method: 'lean' }
+  ]);
+  assert.deepEqual(
+    acknowledgement.history.map(row => [row._id, row.timestamp]),
+    [
+      ['private-old', '2026-01-01T00:00:00.000Z'],
+      ['private-new', '2026-01-03T00:00:00.000Z']
+    ]
+  );
+});
+
+test('Global room switch preserves the exact legacy predicate including missing and null rows', async () => {
+  const { acknowledgement, calls } = await switchWithRecordedHistory('global', [
+    { _id: 'global-explicit', username: 'alice', serverCode: 'global', timestamp: '2026-01-04T00:00:00.000Z' },
+    { _id: 'global-missing', username: 'alice', timestamp: '2026-01-02T00:00:00.000Z' },
+    { _id: 'private-row', username: 'alice', serverCode: 'ABC123', timestamp: '2026-01-05T00:00:00.000Z' },
+    { _id: 'global-null', username: 'alice', serverCode: null, timestamp: '2026-01-03T00:00:00.000Z' }
+  ]);
+
+  assert.deepEqual(calls, [
+    {
+      method: 'find',
+      value: {
+        $or: [
+          { serverCode: 'global' },
+          { serverCode: { $exists: false } },
+          { serverCode: null }
+        ]
+      }
+    },
+    { method: 'sort', value: { timestamp: -1 } },
+    { method: 'limit', value: 100 },
+    { method: 'lean' }
+  ]);
+  assert.deepEqual(
+    acknowledgement.history.map(row => [
+      row._id,
+      Object.prototype.hasOwnProperty.call(row, 'serverCode') ? row.serverCode : '<missing>'
+    ]),
+    [
+      ['global-missing', '<missing>'],
+      ['global-null', null],
+      ['global-explicit', 'global']
+    ]
+  );
 });
 
 test('room switch finishes role lookup before history lookup begins', async () => {

@@ -42,6 +42,33 @@ function loadHelpers() {
   });
 }
 
+function sourceBetween(source, startMarker, endMarker) {
+  const start = source.indexOf(startMarker);
+  const end = source.indexOf(endMarker, start + startMarker.length);
+  assert.notEqual(start, -1, `missing source marker: ${startMarker}`);
+  assert.ok(end > start, `missing source marker after ${startMarker}: ${endMarker}`);
+  return source.slice(start, end);
+}
+
+function loadNamedFunction(source, startMarker, endMarker, name, sandbox = {}) {
+  const block = sourceBetween(source, startMarker, endMarker);
+  const context = vm.createContext(sandbox);
+  vm.runInContext(`${block}\nthis.__subject = ${name};`, context, {
+    filename: `chat-${name}-adapter.js`
+  });
+  return { block, context, subject: context.__subject };
+}
+
+function createStubElement() {
+  return {
+    children: [],
+    style: {},
+    classList: { values: [], add(value) { this.values.push(value); } },
+    setAttribute(name, value) { this[name] = value; },
+    appendChild(child) { this.children.push(child); return child; }
+  };
+}
+
 test('new users receive the deployed Render backend URL by default', () => {
   const source = fs.readFileSync(chatPath, 'utf8');
   assert.match(
@@ -76,6 +103,23 @@ test('browser title and AutoMod message-rate controls are exact and aligned', ()
     assert.match(panel.slice(labelIndex), inputPattern);
     previousIndex = labelIndex;
   }
+
+  const modalPadding = Number(source.match(/\.modal\s*\{[^}]*padding:\s*([0-9.]+)rem/s)[1]) * 16;
+  const boxPadding = Number(source.match(/\.modal-box\s*\{[^}]*padding:\s*([0-9.]+)rem/s)[1]) * 16;
+  const boxMax = Number(source.match(/id="moderator-center-modal"[\s\S]*?class="modal-box" style="max-width:\s*([0-9.]+)px/)[1]);
+  const gridRule = source.match(/\.automod-limits-grid\s*\{([^}]*)\}/s)[1];
+  const minimumTrack = Number(gridRule.match(/minmax\(([0-9.]+)px,\s*1fr\)/)[1]);
+  const gap = Number(gridRule.match(/gap:\s*([0-9.]+)px/)[1]);
+  const columnCount = viewportWidth => {
+    const boxWidth = Math.min(viewportWidth - (2 * modalPadding), boxMax);
+    const contentWidth = boxWidth - (2 * boxPadding);
+    return Math.max(1, Math.floor((contentWidth + gap) / (minimumTrack + gap)));
+  };
+  assert.deepEqual(
+    [760, 480, 320].map(viewportWidth => columnCount(viewportWidth)),
+    [3, 2, 1],
+    'AutoMod controls deterministically reflow to 3/2/1 columns at target widths'
+  );
 });
 
 test('client motion policy avoids broad transitions and respects reduced motion', () => {
@@ -179,10 +223,93 @@ test('history rendering skips layout measurements and performs one final scroll'
   assert.deepEqual({ ...livePolicy }, { animate: true, shouldScroll: true, behavior: 'smooth' });
 });
 
-test('production history path uses the measured helper boundary', () => {
+test('production loadHistory adapter forwards one hundred rows with history options and one final scroll', () => {
   const source = fs.readFileSync(chatPath, 'utf8');
-  assert.match(source, /function loadHistory\(msgs\)[\s\S]{0,500}ChatClientHelpers\.renderHistoryMessages/);
-  assert.match(source, /function appendMessage\([\s\S]{0,500}ChatClientHelpers\.messageRenderPolicyForElement\(chatWindow,\s*\{ history \}\)/);
+  const helpers = loadHelpers();
+  const appended = [];
+  const scrolls = [];
+  const rows = Array.from({ length: 100 }, (_, index) => ({
+    _id: String(index),
+    username: index % 2 === 0 ? 'alice' : 'bob'
+  }));
+  const { subject: loadHistory } = loadNamedFunction(
+    source,
+    'function loadHistory(msgs)',
+    '\n    function appendMessage',
+    'loadHistory',
+    {
+      ChatClientHelpers: helpers,
+      appendMessage(message, isMe, options) {
+        appended.push({ message, isMe, options: { ...options } });
+      },
+      myUsername: 'alice',
+      chatScrollCoordinator: { request: behavior => scrolls.push(behavior) }
+    }
+  );
+
+  assert.equal(loadHistory(rows), undefined);
+  assert.equal(appended.length, 100);
+  assert.deepEqual(
+    appended.map(item => [item.message._id, item.isMe, item.options.history]),
+    rows.map((row, index) => [row._id, index % 2 === 0, true])
+  );
+  assert.deepEqual(scrolls, ['auto']);
+});
+
+test('complete production appendMessage uses the exact history policy without direct near-scroll reads', () => {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  let measurements = 0;
+  const appended = [];
+  const policyCalls = [];
+  const chatWindow = {
+    get scrollHeight() { measurements += 1; return 1_000; },
+    get scrollTop() { measurements += 1; return 600; },
+    get clientHeight() { measurements += 1; return 320; },
+    appendChild(element) { appended.push(element); }
+  };
+  const ChatClientHelpers = {
+    messageRenderPolicyForElement(element, options) {
+      policyCalls.push({ element, options: { ...options } });
+      return { animate: false, shouldScroll: false, behavior: 'auto' };
+    },
+    appendTextElement(documentObject, parent, tagName, className, text) {
+      const element = documentObject.createElement(tagName);
+      element.className = className;
+      element.textContent = text;
+      parent.appendChild(element);
+      return element;
+    }
+  };
+  const { block, subject: appendMessage } = loadNamedFunction(
+    source,
+    'function appendMessage(data, isMe, { history = false } = {})',
+    '\n    function appendSystemMessage',
+    'appendMessage',
+    {
+      ChatClientHelpers,
+      chatWindow,
+      chatScrollCoordinator: { request() { throw new Error('history row must not request a live scroll'); } },
+      document: { createElement: () => createStubElement() },
+      myRole: 'user',
+      currentServerCode: 'global',
+      myRoomRole: 'user'
+    }
+  );
+
+  assert.doesNotMatch(block, /isNearScrollEnd/);
+  assert.equal((block.match(/messageRenderPolicyForElement/g) || []).length, 1);
+  assert.match(
+    block,
+    /const renderPolicy = ChatClientHelpers\.messageRenderPolicyForElement\(chatWindow, \{ history \}\);/
+  );
+  appendMessage({
+    _id: 'deleted-1', username: 'alice', displayName: 'Alice', text: '', deleted: true
+  }, true, { history: true });
+  assert.equal(policyCalls.length, 1);
+  assert.equal(policyCalls[0].element, chatWindow);
+  assert.deepEqual(policyCalls[0].options, { history: true });
+  assert.equal(measurements, 0);
+  assert.equal(appended.length, 1);
 });
 
 test('scroll coordinator coalesces requests and gives instant scroll priority', () => {
@@ -1285,6 +1412,309 @@ test('typing submit is ordered once and stale socket timers cannot emit', () => 
   context = { roomCode: null, clientContextId: 4 };
   assert.equal(typing.input(), false);
   assert.equal(events.length, eventCount, 'invalid socket or room fails closed');
+});
+
+test('typing identity transitions independently bind socket, room, and context changes', () => {
+  const helpers = loadHelpers();
+  const scenarios = [
+    {
+      name: 'socket only',
+      mutate(state) { state.socket = state.replacementSocket; },
+      expected: [
+        ['old', 'ABC123', 7, true],
+        ['new', 'ABC123', 7, true]
+      ]
+    },
+    {
+      name: 'room only',
+      mutate(state) { state.context = { roomCode: 'BBB222', clientContextId: 7 }; },
+      expected: [
+        ['old', 'ABC123', 7, true],
+        ['old', 'BBB222', 7, true]
+      ]
+    },
+    {
+      name: 'context only',
+      mutate(state) { state.context = { roomCode: 'ABC123', clientContextId: 8 }; },
+      expected: [
+        ['old', 'ABC123', 7, true],
+        ['old', 'ABC123', 8, true]
+      ]
+    }
+  ];
+
+  for (const scenario of scenarios) {
+    const emitted = [];
+    const callbacks = [];
+    const socketFor = source => ({
+      connected: true,
+      emit(event, payload) { emitted.push([source, payload.serverCode, payload.clientContextId, payload.isTyping]); }
+    });
+    const state = {
+      socket: socketFor('old'),
+      replacementSocket: socketFor('new'),
+      context: { roomCode: 'ABC123', clientContextId: 7 }
+    };
+    const typing = helpers.createTypingCoordinator({
+      schedule(callback) { callbacks.push(callback); return callbacks.length; },
+      cancel() {},
+      getSocket: () => state.socket,
+      getContext: () => ({ ...state.context })
+    });
+
+    assert.equal(typing.input(), true, `${scenario.name}: initial episode starts`);
+    const staleCallback = callbacks[0];
+    scenario.mutate(state);
+    assert.equal(typing.input(), true, `${scenario.name}: replacement episode starts`);
+    staleCallback();
+    assert.deepEqual(emitted, scenario.expected, `${scenario.name}: identity axis is independently enforced`);
+    assert.equal(typing.current().active, true, `${scenario.name}: stale timer cannot stop replacement`);
+  }
+});
+
+test('typing input rejects every invalid client context identifier', () => {
+  const helpers = loadHelpers();
+  const invalidIds = [undefined, null, 0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, '7', 2 ** 53];
+
+  for (const clientContextId of invalidIds) {
+    const emitted = [];
+    const typing = helpers.createTypingCoordinator({
+      schedule() { throw new Error('invalid context must not schedule a timer'); },
+      getSocket: () => ({ connected: true, emit: (...args) => emitted.push(args) }),
+      getContext: () => ({ roomCode: 'ABC123', clientContextId })
+    });
+    assert.equal(typing.input(), false, `rejects clientContextId ${String(clientContextId)}`);
+    assert.deepEqual(emitted, []);
+    assert.deepEqual({ ...typing.current() }, { active: false, timerPending: false });
+  }
+});
+
+test('production compose handler emits edits and chats before stopping typing', () => {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  const snippet = sourceBetween(
+    source,
+    "document.getElementById('compose').addEventListener('submit'",
+    "\n    msgInput.addEventListener('input'"
+  );
+  const events = [];
+  let submitHandler;
+  const msgInput = { value: 'hello', focus: () => events.push('focus') };
+  const context = vm.createContext({
+    document: {
+      getElementById(id) {
+        assert.equal(id, 'compose');
+        return { addEventListener(event, handler) { assert.equal(event, 'submit'); submitHandler = handler; } };
+      }
+    },
+    compositionDisabled: false,
+    currentServerCode: 'ABC123',
+    msgInput,
+    pendingAttachmentBase64: null,
+    socket: {
+      connected: true,
+      emit(event) { events.push(`emit:${event}`); }
+    },
+    editingMsgId: 'edit-1',
+    compositionContextCoordinator: {
+      payload(value) { return { ...value, serverCode: 'ABC123', clientContextId: 9 }; }
+    },
+    replyingToData: null,
+    typingCoordinator: { submit() { events.push('typing:stop'); } },
+    cancelAction() { events.push('cancel'); }
+  });
+  vm.runInContext(snippet, context, { filename: 'chat-compose-adapter.js' });
+  const event = { preventDefault: () => events.push('prevent') };
+
+  submitHandler(event);
+  assert.deepEqual(events, ['prevent', 'emit:edit_message', 'typing:stop', 'cancel', 'focus']);
+
+  events.length = 0;
+  context.editingMsgId = null;
+  msgInput.value = 'new message';
+  submitHandler(event);
+  assert.deepEqual(events, ['prevent', 'emit:chat_message', 'typing:stop', 'cancel', 'focus']);
+});
+
+test('production logout clears typing only after confirmation', async () => {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  const events = [];
+  let confirmed = false;
+  const { subject: logoutApp } = loadNamedFunction(
+    source,
+    'async function logoutApp()',
+    '\n\n    // --- AUTHENTICATION ---',
+    'logoutApp',
+    {
+      async showAppConfirm() { events.push('confirm'); return confirmed; },
+      typingCoordinator: { clear() { events.push('typing:clear'); } },
+      localStorage: { removeItem() { events.push('storage:remove'); } },
+      location: { reload() { events.push('reload'); } }
+    }
+  );
+
+  await logoutApp();
+  assert.deepEqual(events, ['confirm'], 'canceled logout preserves the typing episode');
+
+  events.length = 0;
+  confirmed = true;
+  await logoutApp();
+  assert.deepEqual(events, ['confirm', 'typing:clear', 'storage:remove', 'reload']);
+});
+
+test('production room-switch request clears only after the same-room fast return', () => {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  const events = [];
+  const roomSwitchCoordinator = {
+    pending: false,
+    isPending() { return this.pending; },
+    request(code) { events.push(`request:${code}`); }
+  };
+  const { context, subject: requestServerSwitch } = loadNamedFunction(
+    source,
+    'function requestServerSwitch(code)',
+    '\n\n    function switchServer',
+    'requestServerSwitch',
+    {
+      currentServerCode: 'ABC123',
+      chatWindow: { innerHTML: '<div>history</div>' },
+      roomSwitchCoordinator,
+      typingCoordinator: { clear() { events.push('typing:clear'); } }
+    }
+  );
+
+  requestServerSwitch('ABC123');
+  assert.deepEqual(events, [], 'same-room fast return does not clear active typing');
+
+  requestServerSwitch('BBB222');
+  assert.deepEqual(events, ['typing:clear', 'request:BBB222']);
+
+  events.length = 0;
+  context.chatWindow.innerHTML = '';
+  requestServerSwitch('ABC123');
+  assert.deepEqual(events, ['typing:clear', 'request:ABC123']);
+});
+
+test('production authentication clears typing only when the socket is actually replaced', () => {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  const snippet = sourceBetween(
+    source,
+    "authBtn.addEventListener('click'",
+    '\n\n    function showError'
+  );
+
+  const runAttempt = replaceSocket => {
+    const events = [];
+    let clickHandler;
+    const initialSocket = {
+      connected: true,
+      emit(event) { events.push(`emit:${event}`); }
+    };
+    const authBtn = {
+      disabled: false,
+      addEventListener(event, handler) { assert.equal(event, 'click'); clickHandler = handler; }
+    };
+    const fields = {
+      'url-input': { value: 'https://chat.example.test' },
+      'username-input': { value: 'alice' },
+      'password-input': { value: 'password' },
+      'displayname-input': { value: 'Alice' }
+    };
+    const context = vm.createContext({
+      authBtn,
+      document: { getElementById: id => fields[id] },
+      isLoginMode: true,
+      showError() { events.push('show:error'); },
+      ChatClientHelpers: {
+        normalizeBackendUrl: value => value,
+        replaceSocket(socket, socketUrl, url, ioFactory) {
+          events.push('replace');
+          return replaceSocket(socket, socketUrl, url, ioFactory);
+        }
+      },
+      localStorage: { setItem() {} },
+      authError: { style: {}, textContent: '' },
+      socket: initialSocket,
+      socketUrl: 'https://chat.example.test',
+      io: () => {},
+      typingCoordinator: { clear() { events.push('typing:clear'); } },
+      compositionContextCoordinator: { invalidate() { events.push('composition:invalidate'); } },
+      closeModerationPrompt() { events.push('moderation:close'); },
+      closeReportPrompt() { events.push('report:close'); },
+      invalidatePrivilegedAccess() { events.push('privilege:invalidate'); },
+      setupSocket() { events.push('socket:setup'); },
+      pendingAuthSocket: null,
+      pendingAuthConnectHandler: null
+    });
+    vm.runInContext(snippet, context, { filename: 'chat-auth-adapter.js' });
+    clickHandler();
+    return { events, initialSocket };
+  };
+
+  const unchanged = runAttempt((socket, socketUrl) => ({ socket, socketUrl }));
+  assert.deepEqual(unchanged.events, ['replace', 'emit:login']);
+
+  const replacementSocket = { connected: true, emit() {} };
+  const replaced = runAttempt(() => ({
+    socket: replacementSocket,
+    socketUrl: 'https://replacement.example.test'
+  }));
+  assert.deepEqual(replaced.events.slice(0, 7), [
+    'replace',
+    'typing:clear',
+    'composition:invalidate',
+    'moderation:close',
+    'report:close',
+    'privilege:invalidate',
+    'socket:setup'
+  ]);
+});
+
+test('production socket handlers clear typing before forced logout and direct role refreshes', () => {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  const handlers = new Map();
+  const events = [];
+  const activeSocket = { on(event, handler) { handlers.set(event, handler); } };
+  const { subject: setupSocket } = loadNamedFunction(
+    source,
+    'function setupSocket(activeSocket)',
+    '\n\n    // --- CONTEXT MENU MANAGER',
+    'setupSocket',
+    {
+      ChatClientHelpers: { bindConnectErrorRecovery() {} },
+      socket: activeSocket,
+      authModal: { classList: { contains: () => false } },
+      authBtn: {},
+      showError() {},
+      myUsername: 'alice',
+      myRole: 'admin',
+      myRoomRole: 'mod',
+      currentServerCode: 'ABC123',
+      typingCoordinator: { clear() { events.push('typing:clear'); } },
+      roomSwitchCoordinator: { request(code) { events.push(`direct-request:${code}`); } },
+      requestServerSwitch(code) { events.push(`wrapped-request:${code}`); },
+      invalidatePrivilegedAccess() { events.push('privilege:invalidate'); },
+      renderServerAccess() { events.push('server-access:render'); },
+      showAppAlert() { events.push('alert:role'); },
+      updateModeratorCenterAccess() { events.push('moderator-access:update'); },
+      localStorage: { removeItem() { events.push('storage:remove'); } },
+      alert() { events.push('alert:force'); },
+      location: { reload() { events.push('reload'); } }
+    }
+  );
+  setupSocket(activeSocket);
+
+  handlers.get('global_role_updated')({ username: 'alice', role: 'user' });
+  assert.deepEqual(events.slice(-2), ['typing:clear', 'direct-request:ABC123']);
+  assert.equal(events.includes('wrapped-request:ABC123'), false);
+
+  events.length = 0;
+  handlers.get('room_role_updated')({ username: 'alice', targetServer: 'ABC123' });
+  assert.deepEqual(events.slice(-2), ['typing:clear', 'direct-request:ABC123']);
+  assert.equal(events.includes('wrapped-request:ABC123'), false);
+
+  events.length = 0;
+  handlers.get('force_logout')('remote logout');
+  assert.deepEqual(events, ['typing:clear', 'storage:remove', 'alert:force', 'reload']);
 });
 
 test('room rail disables kicked and unbanned nonmembers but preserves admin ghost rooms', () => {
