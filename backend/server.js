@@ -4851,24 +4851,60 @@ function createConnectionHandler({
     if (!socket.username) return callback({ error: 'Not authenticated.' });
     try {
       if (!isValidObjectId(msgId)) return callback({ error: 'Invalid input format.' });
-      const msg = await MessageModel.findById(msgId);
-      if (msg) {
-        const authorKey = authorKeyForMessage(msg);
-        const blockState = await ensureBlockState(socket.username);
-        if (!authorKey || blockSetFromState(blockState).has(authorKey)) {
-          return callback({ error: 'Permission denied.' });
-        }
+      const actorUsername = socket.username;
+      const initialMessage = await MessageModel.findById(msgId);
+      const serverCode = normalizeServerCode(initialMessage?.serverCode || 'global');
+      let preflightAllowed = false;
+      if (initialMessage && serverCode) {
+        const authorKey = authorKeyForMessage(initialMessage);
+        const blockState = await ensureBlockState(actorUsername);
         const identity = { role: socket.role, joinedServers: socket.joinedServers || [] };
-        if (!canAccessRoom(identity, msg.serverCode)) return callback({ error: 'Permission denied.' });
-        const restriction = await getActiveRoomRestriction(RoomRestrictionModel, msg.serverCode, socket.username);
-        if (restriction.banned) return callback({ error: 'Permission denied.' });
-        if (!(await roomExists(msg.serverCode))) return callback({ error: 'Permission denied.' });
-        const roomRole = await getRoomRoleFn(msg.serverCode, socket.username);
-        if (msg.username === socket.username || socket.role === 'admin' || roomRole === 'mod') {
-            return callback({ success: true, history: (Array.isArray(msg.history) ? msg.history : []).slice(-20) });
+        if (authorKey && !blockSetFromState(blockState).has(authorKey) && canAccessRoom(identity, serverCode)) {
+          const restriction = await getActiveRoomRestriction(RoomRestrictionModel, serverCode, actorUsername);
+          if (!restriction.banned && await roomExists(serverCode)) {
+            const roomRole = await getRoomRoleFn(serverCode, actorUsername);
+            preflightAllowed = normalizeAccountKey(initialMessage.username) === normalizeAccountKey(actorUsername) ||
+              socket.role === 'admin' || roomRole === 'mod';
+          }
         }
       }
-      callback({ error: 'Permission denied.' });
+      if (!initialMessage || !serverCode) return callback({ error: 'Permission denied.' });
+
+      await withAccountTransitionLock(actorUsername, () => withRoomMutationLock(serverCode, async () => {
+        if (!preflightAllowed || normalizeAccountKey(socket.username) !== normalizeAccountKey(actorUsername) ||
+            normalizeServerCode(socket.serverCode) !== serverCode) {
+          callback({ error: 'Permission denied.' });
+          return;
+        }
+        const access = await loadRoomAccessState({
+          UserModel, ChatServerModel, RoomRestrictionModel, username: actorUsername, serverCode
+        });
+        if (!access.allowed || access.restriction.banned || !access.user || !access.room) {
+          callback({ error: 'Permission denied.' });
+          return;
+        }
+        const message = await MessageModel.findById(msgId);
+        const authorKey = authorKeyForMessage(message);
+        if (!message || normalizeServerCode(message.serverCode || 'global') !== serverCode || !authorKey) {
+          callback({ error: 'Permission denied.' });
+          return;
+        }
+        const blockState = await ensureBlockState(access.user.username);
+        if (blockSetFromState(blockState).has(authorKey)) {
+          callback({ error: 'Permission denied.' });
+          return;
+        }
+        const mayRead = normalizeAccountKey(message.username) === normalizeAccountKey(access.user.username) ||
+          access.user.role === 'admin' || currentRoomRole(access.room, access.user.username) === 'mod';
+        if (!mayRead) {
+          callback({ error: 'Permission denied.' });
+          return;
+        }
+        callback({
+          success: true,
+          history: (Array.isArray(message.history) ? message.history : []).slice(-20)
+        });
+      }));
     } catch (err) {
       logUnexpectedError(logger, 'get_edit_history', err);
       callback({ error: 'Failed to load history.' });
@@ -4880,24 +4916,61 @@ function createConnectionHandler({
     if (!socket.username) return callback({ error: 'Not authenticated.' });
     try {
       if (!isValidObjectId(msgId)) return callback({ error: 'Invalid input format.' });
-      const msg = await MessageModel.findById(msgId);
-      if (msg && msg.deleted) {
-        const authorKey = authorKeyForMessage(msg);
-        const blockState = await ensureBlockState(socket.username);
-        if (!authorKey || blockSetFromState(blockState).has(authorKey)) {
-          return callback({ error: 'Permission denied.' });
-        }
+      const actorUsername = socket.username;
+      const initialMessage = await MessageModel.findById(msgId);
+      const serverCode = normalizeServerCode(initialMessage?.serverCode || 'global');
+      let preflightAllowed = false;
+      if (initialMessage?.deleted && serverCode) {
+        const authorKey = authorKeyForMessage(initialMessage);
+        const blockState = await ensureBlockState(actorUsername);
         const identity = { role: socket.role, joinedServers: socket.joinedServers || [] };
-        if (!canAccessRoom(identity, msg.serverCode)) return callback({ error: 'Permission denied.' });
-        const restriction = await getActiveRoomRestriction(RoomRestrictionModel, msg.serverCode, socket.username);
-        if (restriction.banned) return callback({ error: 'Permission denied.' });
-        if (!(await roomExists(msg.serverCode))) return callback({ error: 'Permission denied.' });
-        const roomRole = await getRoomRoleFn(msg.serverCode, socket.username);
-        if (msg.username === socket.username || socket.role === 'admin' || roomRole === 'mod') {
-            return callback({ success: true, text: msg.text, attachment: sanitizeAttachment(msg.attachment) });
+        if (authorKey && !blockSetFromState(blockState).has(authorKey) && canAccessRoom(identity, serverCode)) {
+          const restriction = await getActiveRoomRestriction(RoomRestrictionModel, serverCode, actorUsername);
+          if (!restriction.banned && await roomExists(serverCode)) {
+            const roomRole = await getRoomRoleFn(serverCode, actorUsername);
+            preflightAllowed = normalizeAccountKey(initialMessage.username) === normalizeAccountKey(actorUsername) ||
+              socket.role === 'admin' || roomRole === 'mod';
+          }
         }
       }
-      callback({ error: 'Permission denied.' });
+      if (!initialMessage || !serverCode) return callback({ error: 'Permission denied.' });
+
+      await withAccountTransitionLock(actorUsername, () => withRoomMutationLock(serverCode, async () => {
+        if (!preflightAllowed || normalizeAccountKey(socket.username) !== normalizeAccountKey(actorUsername) ||
+            normalizeServerCode(socket.serverCode) !== serverCode) {
+          callback({ error: 'Permission denied.' });
+          return;
+        }
+        const access = await loadRoomAccessState({
+          UserModel, ChatServerModel, RoomRestrictionModel, username: actorUsername, serverCode
+        });
+        if (!access.allowed || access.restriction.banned || !access.user || !access.room) {
+          callback({ error: 'Permission denied.' });
+          return;
+        }
+        const message = await MessageModel.findById(msgId);
+        const authorKey = authorKeyForMessage(message);
+        if (!message || !message.deleted || normalizeServerCode(message.serverCode || 'global') !== serverCode || !authorKey) {
+          callback({ error: 'Permission denied.' });
+          return;
+        }
+        const blockState = await ensureBlockState(access.user.username);
+        if (blockSetFromState(blockState).has(authorKey)) {
+          callback({ error: 'Permission denied.' });
+          return;
+        }
+        const mayRead = normalizeAccountKey(message.username) === normalizeAccountKey(access.user.username) ||
+          access.user.role === 'admin' || currentRoomRole(access.room, access.user.username) === 'mod';
+        if (!mayRead) {
+          callback({ error: 'Permission denied.' });
+          return;
+        }
+        callback({
+          success: true,
+          text: typeof message.text === 'string' ? message.text : '',
+          attachment: sanitizeAttachment(message.attachment)
+        });
+      }));
     } catch (err) {
       logUnexpectedError(logger, 'get_deleted_message', err);
       callback({ error: 'Failed to load deleted message.' });

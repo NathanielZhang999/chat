@@ -60,6 +60,7 @@ function fixture(overrides = {}) {
     RoomMemberStateModel: overrides.RoomMemberStateModel || createMemoryModel(overrides.roomStates || []),
     UserExperienceStateModel: overrides.UserExperienceStateModel || createMemoryModel(overrides.experienceStates || [])
   };
+  setup.getRoomRoleFn = overrides.getRoomRoleFn;
   setup.logger = overrides.logger || { error(...args) { setup.logs.push(args); } };
   setup.broadcastOnlineUsersFn = overrides.broadcastOnlineUsersFn || (async code => {
     setup.presenceCalls.push(code);
@@ -81,10 +82,10 @@ function register(setup, id) {
     UserExperienceStateModel: setup.UserExperienceStateModel,
     onlineUsersMap: setup.onlineUsersMap,
     broadcastOnlineUsersFn: setup.broadcastOnlineUsersFn,
-    getRoomRoleFn: async (code, username) => {
+    getRoomRoleFn: setup.getRoomRoleFn || (async (code, username) => {
       const stored = setup.ChatServerModel.rows?.find(candidate => candidate.code === code);
       return stored?.moderators?.some(candidate => candidate.toLowerCase() === username.toLowerCase()) ? 'mod' : 'user';
-    },
+    }),
     resolvePingsFn: async text => text,
     autoModTracker: createAutoModTracker(),
     bcryptImpl: { async compare() { return true; }, async hash(value) { return value; } },
@@ -326,6 +327,163 @@ test('live delivery linearizes entirely before or after synchronous cache replac
   const after = events(blocker, 'chat_message').at(-1);
   assert.equal(after.blocked, true);
   assert.deepEqual(Object.keys(after).sort(), ['_id', 'authorKey', 'blocked', 'serverCode', 'timestamp', 'username']);
+});
+
+test('edit history cannot acknowledge blocked content after a concurrent block acknowledgement', async () => {
+  const roleLookupStarted = deferred();
+  const releaseRoleLookup = deferred();
+  let gated = false;
+  const target = message(1, { history: [{ text: HISTORY_SECRET, timestamp: new Date() }] });
+  const setup = fixture({
+    users: [user('Blocker', { role: 'admin' }), user('Author')],
+    messages: [target],
+    getRoomRoleFn: async () => {
+      if (!gated) {
+        gated = true;
+        roleLookupStarted.resolve();
+        await releaseRoleLookup.promise;
+      }
+      return 'user';
+    }
+  });
+  const reader = authenticate(setup, { id: 'reader', username: 'Blocker', role: 'admin' });
+  const blocker = authenticate(setup, { id: 'blocker', username: 'Blocker', role: 'admin' });
+  const detailAck = acknowledge();
+
+  const readPending = reader.trigger('get_edit_history', target._id, detailAck.callback);
+  await roleLookupStarted.promise;
+  const blockAck = await setBlock(blocker, 'Author', true);
+  assert.equal(blockAck.success, true);
+  assert.equal(reader.blockedUserKeys.has('author'), true);
+  releaseRoleLookup.resolve();
+  await readPending;
+
+  assert.deepEqual(detailAck.value(), { error: 'Permission denied.' });
+  assert.equal(JSON.stringify(detailAck.value()).includes(HISTORY_SECRET), false);
+});
+
+test('deleted message cannot acknowledge blocked content after a concurrent block acknowledgement', async () => {
+  const roleLookupStarted = deferred();
+  const releaseRoleLookup = deferred();
+  let gated = false;
+  const target = message(1, {
+    deleted: true,
+    text: TEXT_SECRET,
+    attachment: `data:image/png;base64,${Buffer.from(ATTACHMENT_SECRET).toString('base64')}`
+  });
+  const setup = fixture({
+    rooms: [room('global'), room('ABC123', { moderators: ['Blocker'] }), room('XYZ789')],
+    messages: [target],
+    getRoomRoleFn: async () => {
+      if (!gated) {
+        gated = true;
+        roleLookupStarted.resolve();
+        await releaseRoleLookup.promise;
+      }
+      return 'mod';
+    }
+  });
+  const reader = authenticate(setup, { id: 'reader', username: 'Blocker' });
+  const blocker = authenticate(setup, { id: 'blocker', username: 'Blocker' });
+  const detailAck = acknowledge();
+
+  const readPending = reader.trigger('get_deleted_message', target._id, detailAck.callback);
+  await roleLookupStarted.promise;
+  const blockAck = await setBlock(blocker, 'Author', true);
+  assert.equal(blockAck.success, true);
+  assert.equal(reader.blockedUserKeys.has('author'), true);
+  releaseRoleLookup.resolve();
+  await readPending;
+
+  assert.deepEqual(detailAck.value(), { error: 'Permission denied.' });
+  assertNoNormalSecrets(blockerOutput(setup, [reader], [detailAck.value()]));
+});
+
+test('unblocked authors moderators and administrators retain detail access with existing timeout and ban behavior', async () => {
+  const historyTarget = message(1, {
+    username: 'Author', authorKey: 'author', history: [{ text: 'allowed history', timestamp: new Date() }]
+  });
+  const deletedTarget = message(2, {
+    username: 'Author', authorKey: 'author', text: 'allowed deleted text', deleted: true
+  });
+  const setup = fixture({
+    users: [user('Author'), user('Blocker'), user('Admin', { role: 'admin' })],
+    rooms: [room('global'), room('ABC123', { moderators: ['Blocker'] }), room('XYZ789')],
+    messages: [historyTarget, deletedTarget],
+    restrictions: [{
+      serverCode: 'ABC123', username: 'author', bannedAt: null,
+      timeoutUntil: new Date(Date.now() + 60_000)
+    }]
+  });
+  const author = authenticate(setup, { id: 'author', username: 'Author' });
+  const moderator = authenticate(setup, { id: 'moderator', username: 'Blocker' });
+  const admin = authenticate(setup, { id: 'admin', username: 'Admin', role: 'admin' });
+
+  const authorHistory = acknowledge();
+  const moderatorDeleted = acknowledge();
+  const adminHistory = acknowledge();
+  await author.trigger('get_edit_history', historyTarget._id, authorHistory.callback);
+  await moderator.trigger('get_deleted_message', deletedTarget._id, moderatorDeleted.callback);
+  await admin.trigger('get_edit_history', historyTarget._id, adminHistory.callback);
+  assert.equal(authorHistory.value().history[0].text, 'allowed history');
+  assert.equal(moderatorDeleted.value().text, 'allowed deleted text');
+  assert.equal(adminHistory.value().history[0].text, 'allowed history');
+
+  setup.RoomRestrictionModel.rows.push({
+    serverCode: 'ABC123', username: 'blocker', bannedAt: new Date(), timeoutUntil: null
+  });
+  const bannedModerator = acknowledge();
+  await moderator.trigger('get_deleted_message', deletedTarget._id, bannedModerator.callback);
+  assert.deepEqual(bannedModerator.value(), { error: 'Permission denied.' });
+});
+
+test('modern reply snapshots use the post-replacement block cache without suppressing the visible wrapper', async () => {
+  const accessStarted = deferred();
+  const releaseAccess = deferred();
+  const users = createMemoryModel([user('Blocker'), user('Author'), user('Other')]);
+  const baseFind = users.findOne.bind(users);
+  let gateBlockerAccess = false;
+  users.findOne = query => {
+    const found = baseFind(query);
+    const regex = query?.username?.$regex;
+    if (gateBlockerAccess && regex instanceof RegExp && regex.test('Blocker')) {
+      gateBlockerAccess = false;
+      return {
+        then(resolve, reject) {
+          accessStarted.resolve();
+          return releaseAccess.promise.then(() => found).then(resolve, reject);
+        }
+      };
+    }
+    return found;
+  };
+  const referenced = message(1, { text: REPLY_SECRET });
+  const setup = fixture({ UserModel: users, messages: [referenced] });
+  const reader = authenticate(setup, { id: 'reader', username: 'Blocker' });
+  const blocker = authenticate(setup, { id: 'blocker', username: 'Blocker' });
+  const wrapperAuthor = authenticate(setup, { id: 'wrapper', username: 'Other' });
+
+  await wrapperAuthor.trigger('chat_message', {
+    text: 'visible wrapper before block', replyTo: { id: referenced._id }
+  });
+  assert.equal(events(reader, 'chat_message').at(-1).replyTo.text, REPLY_SECRET);
+
+  gateBlockerAccess = true;
+  const sendPending = wrapperAuthor.trigger('chat_message', {
+    text: 'visible wrapper after block', replyTo: { id: referenced._id }
+  });
+  await accessStarted.promise;
+  const blockAck = await setBlock(blocker, 'Author', true);
+  assert.equal(blockAck.success, true);
+  assert.equal(reader.blockedUserKeys.has('author'), true);
+  releaseAccess.resolve();
+  await sendPending;
+
+  const delivered = events(reader, 'chat_message').at(-1);
+  assert.equal(delivered.authorKey, 'other');
+  assert.equal(delivered.text, 'visible wrapper after block');
+  assert.equal(delivered.replyTo, null);
+  assert.equal(JSON.stringify(delivered).includes(REPLY_SECRET), false);
 });
 
 test('history sends an explicit content-free placeholder for blocked authors', async () => {
