@@ -39,6 +39,9 @@ test('rate-limited messages skip reply lookup, ping resolution, persistence, and
   let pingResolutions = 0;
   let creates = 0;
   const audits = [];
+  const logs = [];
+  const attachmentSentinel = 'PRIVATEATTACHMENT123';
+  const privateAttachment = `data:image/png;base64,${attachmentSentinel}==`;
   const { socket, ioInstance } = registerMessages({
     autoModTracker: createAutoModTracker({ now: () => currentTime }),
     ChatServerModel: { async findOne(query) {
@@ -55,7 +58,8 @@ test('rate-limited messages skip reply lookup, ping resolution, persistence, and
       }
     },
     resolvePingsFn: async text => { pingResolutions += 1; return text; },
-    ModerationAuditModel: { async create(value) { audits.push(value); return value; } }
+    ModerationAuditModel: { async create(value) { audits.push(value); return value; } },
+    logger: { error(...args) { logs.push(args); } }
   });
   authenticate(socket, { serverCode: 'ABC123', joinedServers: ['global', 'ABC123'] });
 
@@ -65,6 +69,7 @@ test('rate-limited messages skip reply lookup, ping resolution, persistence, and
   pingResolutions = 0;
   await socket.trigger('chat_message', {
     serverCode: 'ABC123', clientContextId: 1, text: 'blocked secret',
+    attachment: privateAttachment,
     replyTo: { id: '507f1f77bcf86cd799439011' }
   });
   await socket.trigger('chat_message', { serverCode: 'ABC123', clientContextId: 1, text: 'blocked again' });
@@ -75,8 +80,16 @@ test('rate-limited messages skip reply lookup, ping resolution, persistence, and
   assert.equal(ioInstance.outbound.filter(item => item.event === 'chat_message').length, 2);
   assert.equal(socket.outbound.filter(item => item.event === 'message_blocked').length, 2);
   assert.equal(audits.filter(item => item.metadata?.rule === 'message_rate').length, 1);
-  assert.equal(JSON.stringify(audits).includes('blocked secret'), false);
-  assert.equal(JSON.stringify(socket.outbound).includes('blocked secret'), false);
+  for (const [label, records] of [
+    ['direct socket events', socket.outbound],
+    ['room broadcasts', ioInstance.outbound],
+    ['moderation audits', audits],
+    ['captured logs', logs]
+  ]) {
+    const serialized = JSON.stringify(records);
+    assert.equal(serialized.includes('blocked secret'), false, `${label} must not expose rejected text`);
+    assert.equal(serialized.includes(attachmentSentinel), false, `${label} must not expose rejected attachments`);
+  }
 });
 
 test('default AutoMod accepts five immediate distinct sends and blocks the sixth', async () => {

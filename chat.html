@@ -1077,6 +1077,10 @@
                 beginRequest(request, blockWhilePending = false) {
                     if (!request || !room || request.roomCode !== room || request.view !== view) return null;
                     if (blockWhilePending && pendingKeys.has(request.key)) return null;
+                    for (const key of new Set(Array.isArray(request.supersedes) ? request.supersedes : [])) {
+                        latestByKey.delete(key);
+                        if (pendingKeys.delete(key)) onPendingChange(key, false);
+                    }
                     const requestId = ++nextRequestId;
                     const token = Object.freeze({
                         epoch,
@@ -1148,7 +1152,12 @@
             if (!payload || !payload.serverCode) return null;
             const specs = {
                 resolve: { event: 'resolve_moderation_report', key: 'reports:resolve', view: 'reports' },
-                automod: { event: 'update_automod', key: 'automod:save', view: 'automod' }
+                automod: {
+                    event: 'update_automod',
+                    key: 'automod:save',
+                    view: 'automod',
+                    supersedes: ['automod:get']
+                }
             };
             const spec = specs[kind];
             if (!spec) return null;

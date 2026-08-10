@@ -1455,6 +1455,23 @@ test('message-rate tracker shares one bounded map with repeat tracker state', ()
   assert.equal(tracker.hasKey('RATE5000\0user5000'), true);
 });
 
+test('AutoMod tracker global pruning uses each key stored repeat and rate windows', () => {
+  let currentTime = 0;
+  const tracker = createAutoModTracker({ now: () => currentTime });
+  tracker.recordAndCheck('SHORT_REPEAT\0alice', 'same', 3, 100);
+  tracker.recordAndCheck('LONG_REPEAT\0bob', 'same', 3, 1_000);
+  tracker.recordMessageAttempt('SHORT_RATE\0carol', 1, 100);
+  tracker.recordMessageAttempt('LONG_RATE\0dave', 1, 1_000);
+
+  currentTime = 200;
+  tracker.prune(100);
+
+  assert.equal(tracker.hasKey('SHORT_REPEAT\0alice'), false);
+  assert.equal(tracker.hasKey('SHORT_RATE\0carol'), false);
+  assert.equal(tracker.hasKey('LONG_REPEAT\0bob'), true);
+  assert.equal(tracker.hasKey('LONG_RATE\0dave'), true);
+});
+
 test('AutoMod message-rate policy is role agnostic and canonical-account scoped', () => {
   let currentTime = 0;
   const tracker = createAutoModTracker({ now: () => currentTime });

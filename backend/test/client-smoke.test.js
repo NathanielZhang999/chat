@@ -972,6 +972,81 @@ test('AutoMod save control resets on invalidation and stale acknowledgements can
   assert.deepEqual(applied, ['new']);
 });
 
+test('AutoMod save supersedes an older pending fetch without releasing the save control', () => {
+  const client = loadHelpers();
+  const socket = createDeferredSocket();
+  const controls = { automodSave: { disabled: false } };
+  const pendingChanges = [];
+  const center = client.createModeratorCenterCoordinator({
+    onPendingChange(key, pending) {
+      pendingChanges.push([key, pending]);
+      client.applyModeratorPendingState(controls, key, pending);
+    }
+  });
+  const applied = [];
+
+  center.open('ABC123', 'automod');
+  client.dispatchModeratorCenterRequest({
+    coordinator: center,
+    socket,
+    request: client.moderatorCenterRequestFor({ tab: 'automod', roomCode: 'ABC123' }),
+    apply: () => applied.push('old-fetch')
+  });
+  const saveRequest = client.moderatorCenterMutationRequestFor('automod', {
+    serverCode: 'ABC123', blockedKeywords: ['new'], mentionLimit: 4,
+    repeatLimit: 3, repeatWindowSeconds: 30, messageLimit: 7, messageWindowSeconds: 12
+  });
+  assert.deepEqual(saveRequest.supersedes, ['automod:get']);
+  client.dispatchModeratorCenterRequest({
+    coordinator: center,
+    socket,
+    request: saveRequest,
+    apply: () => applied.push('save')
+  });
+
+  assert.equal(center.isPending('automod:get'), false);
+  assert.equal(center.isPending('automod:save'), true);
+  assert.equal(controls.automodSave.disabled, true);
+  socket.calls[0].callback({ autoMod: { blockedKeywords: ['old-fetch'] } });
+  assert.deepEqual(applied, []);
+  assert.equal(controls.automodSave.disabled, true, 'stale fetch cannot release the pending save');
+  assert.equal(pendingChanges.filter(([key, pending]) => key === 'automod:get' && !pending).length, 1);
+
+  socket.calls[1].callback({ autoMod: { blockedKeywords: ['new'] } });
+  assert.deepEqual(applied, ['save']);
+  assert.equal(controls.automodSave.disabled, false);
+});
+
+test('wrong-room AutoMod save does not supersede the current room fetch', () => {
+  const client = loadHelpers();
+  const socket = createDeferredSocket();
+  const center = client.createModeratorCenterCoordinator();
+  const applied = [];
+
+  center.open('ABC123', 'automod');
+  client.dispatchModeratorCenterRequest({
+    coordinator: center,
+    socket,
+    request: client.moderatorCenterRequestFor({ tab: 'automod', roomCode: 'ABC123' }),
+    apply: () => applied.push('current-fetch')
+  });
+  const wrongRoomToken = client.dispatchModeratorCenterRequest({
+    coordinator: center,
+    socket,
+    request: client.moderatorCenterMutationRequestFor('automod', {
+      serverCode: 'XYZ789', blockedKeywords: [], mentionLimit: 4,
+      repeatLimit: 3, repeatWindowSeconds: 30, messageLimit: 7, messageWindowSeconds: 12
+    }),
+    apply: () => applied.push('wrong-room-save')
+  });
+
+  assert.equal(wrongRoomToken, null);
+  assert.equal(center.isPending('automod:get'), true);
+  assert.equal(socket.calls.length, 1);
+  socket.calls[0].callback({ autoMod: { blockedKeywords: [] } });
+  assert.deepEqual(applied, ['current-fetch']);
+});
+
 test('resolve and dismiss controls reset across same-room reopen and view invalidation', () => {
   const client = loadHelpers();
   const socket = createDeferredSocket();
