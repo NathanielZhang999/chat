@@ -1,6 +1,9 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { createConnectionHandler, seedSystem, withAccountTransitionLock } = require('../server');
+const {
+  createConnectionHandler, seedSystem, withAccountTransitionLock,
+  UserSchema, MessageSchema, resolvePings
+} = require('../server');
 const { FakeSocket, FakeIo, queryResult, acknowledge, deferred } = require('./support/fakes');
 
 function register(overrides = {}) {
@@ -91,6 +94,43 @@ test('account transition locks serialize one normalized account and release afte
 
   await assert.rejects(withAccountTransitionLock('alice', async () => { throw new Error('expected'); }));
   await assert.doesNotReject(withAccountTransitionLock('ALICE', async () => {}));
+});
+
+test('room membership and private history schemas declare query-matching indexes once', () => {
+  const userIndexes = UserSchema.indexes().filter(([keys]) => keys.servers === 1);
+  const messageIndexes = MessageSchema.indexes().filter(([keys]) =>
+    keys.serverCode === 1 && keys.timestamp === -1 && keys._id === -1
+  );
+  assert.equal(userIndexes.length, 1);
+  assert.equal(messageIndexes.length, 1);
+  assert.deepEqual(userIndexes[0][0], { servers: 1 });
+  assert.deepEqual(messageIndexes[0][0], { serverCode: 1, timestamp: -1, _id: -1 });
+});
+
+test('mention resolution uses the exact membership projection and a lean query', async () => {
+  const calls = [];
+  const UserModel = {
+    find(query, projection) {
+      calls.push({ query, projection });
+      return {
+        async lean() {
+          calls.push({ lean: true });
+          return [
+            { username: 'alice', displayName: 'Alice Smith' },
+            { username: 'ali', displayName: 'Ali' }
+          ];
+        }
+      };
+    }
+  };
+  const result = await resolvePings(
+    'Hi @ALICE SMITH and @ali', 'ABC123', 'user', 'user', 'bob', UserModel
+  );
+  assert.deepEqual(calls, [
+    { query: { servers: 'ABC123' }, projection: 'username displayName' },
+    { lean: true }
+  ]);
+  assert.equal(result, 'Hi {{PING:alice|Alice Smith}} and {{PING:ali|Ali}}');
 });
 
 test('login rejects replacing an authenticated socket identity', async () => {
@@ -1016,40 +1056,38 @@ test('failed target join cannot restore a concurrently deleted source room', asy
   assert.equal(switcher.joinedRooms.has('OLD123'), false);
 });
 
-test('room switch acknowledges success before broadcasting target presence', async () => {
-  const events = [];
-  const onlineUsersMap = new Map([['socket-1', {
-    username: 'alice', serverCode: 'OLD123', joinedServers: ['global', 'OLD123', 'ABC123']
-  }]]);
-  const ChatServerModel = { findOne: () => queryResult({ code: 'ABC123', moderators: [] }) };
-  const MessageModel = { find: () => queryResult([]) };
-  const { socket } = register({
-    ChatServerModel,
-    MessageModel,
-    onlineUsersMap,
-    broadcastOnlineUsersFn: code => events.push(`broadcast:${code}`)
-  });
-  socket.username = 'alice';
-  socket.role = 'user';
-  socket.joinedServers = ['global', 'OLD123', 'ABC123'];
-  socket.serverCode = 'OLD123';
-  socket.joinedRooms.add('OLD123');
+test('room switching acknowledges first and publishes only affected private presence', async () => {
+  const scenarios = [
+    { oldCode: 'OLD123', targetCode: 'ABC123', expected: ['OLD123', 'ABC123'] },
+    { oldCode: 'global', targetCode: 'ABC123', expected: ['ABC123'] },
+    { oldCode: 'OLD123', targetCode: 'global', expected: ['OLD123'] },
+    { oldCode: 'ABC123', targetCode: 'ABC123', expected: ['ABC123'] },
+    { oldCode: 'global', targetCode: 'global', expected: [] }
+  ];
 
-  await socket.trigger('switch_server', 'ABC123', result => {
-    events.push('ack');
-    assert.deepEqual(result, {
-      history: [], roomRole: 'user',
-      restriction: { banned: false, timedOut: false, timeoutUntil: null }
+  for (const scenario of scenarios) {
+    const events = [];
+    const onlineUsersMap = new Map([['socket-1', {
+      username: 'alice', serverCode: scenario.oldCode,
+      joinedServers: ['global', 'OLD123', 'ABC123']
+    }]]);
+    const ChatServerModel = {
+      findOne: query => queryResult({ code: query.code, moderators: [] })
+    };
+    const MessageModel = { find: () => queryResult([]) };
+    const { socket } = register({
+      ChatServerModel, MessageModel, onlineUsersMap,
+      broadcastOnlineUsersFn: code => events.push(`broadcast:${code}`)
     });
-  });
+    Object.assign(socket, {
+      username: 'alice', role: 'user', serverCode: scenario.oldCode,
+      joinedServers: ['global', 'OLD123', 'ABC123']
+    });
+    socket.joinedRooms.add(scenario.oldCode);
 
-  assert.equal(socket.serverCode, 'ABC123');
-  assert.equal(socket.joinedRooms.has('OLD123'), false);
-  assert.equal(socket.joinedRooms.has('ABC123'), true);
-  assert.equal(onlineUsersMap.get('socket-1').serverCode, 'ABC123');
-  assert.deepEqual(events, [
-    'ack', 'broadcast:OLD123', 'broadcast:ABC123', 'broadcast:global'
-  ]);
+    await socket.trigger('switch_server', scenario.targetCode, () => events.push('ack'));
+    assert.deepEqual(events, ['ack', ...scenario.expected.map(code => `broadcast:${code}`)]);
+  }
 });
 
 test('room switch finishes role lookup before history lookup begins', async () => {
