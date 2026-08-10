@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { createConnectionHandler } = require('../server');
-const { FakeSocket, FakeIo, createMemoryModel, acknowledge } = require('./support/fakes');
+const { FakeSocket, FakeIo, createMemoryModel, acknowledge, deferred } = require('./support/fakes');
 
 function objectId(index) {
   return Number(index).toString(16).padStart(24, '0');
@@ -124,6 +124,28 @@ async function listPins(socket, serverCode = socket.serverCode) {
   return ack.value();
 }
 
+function gateSwitchHistory(setup) {
+  const started = deferred();
+  const release = deferred();
+  const originalFind = setup.MessageModel.find.bind(setup.MessageModel);
+  setup.MessageModel.find = query => {
+    if (query && query.serverCode === 'XYZ789') {
+      const gated = {
+        sort() { return gated; },
+        limit() { return gated; },
+        async lean() {
+          started.resolve();
+          await release.promise;
+          return [];
+        }
+      };
+      return gated;
+    }
+    return originalFind(query);
+  };
+  return { started, release };
+}
+
 test('private pin policy allows owner exact moderator and global admin only', async () => {
   const setup = fixture({ messages: [message(1), message(2), message(3)] });
   const owner = authenticate(setup, { id: 'owner', username: 'Owner' });
@@ -209,7 +231,7 @@ test('duplicate pin and unpin requests are idempotent without version churn', as
 });
 
 test('pin array and pinVersion change in the same compare-and-set room update', async () => {
-  const setup = fixture();
+  const setup = fixture({ messages: [message(1), message(2)] });
   const calls = [];
   const original = setup.ChatServerModel.findOneAndUpdate.bind(setup.ChatServerModel);
   let loseFirstRace = true;
@@ -217,6 +239,11 @@ test('pin array and pinVersion change in the same compare-and-set room update', 
     calls.push({ query: structuredClone(query), update: structuredClone(update) });
     if (loseFirstRace) {
       loseFirstRace = false;
+      const storedRoom = setup.ChatServerModel.rows.find(row => row.code === 'ABC123');
+      storedRoom.pinnedMessages.push({
+        messageId: objectId(2), pinnedAt: new Date(2), pinnedBy: 'Owner'
+      });
+      storedRoom.pinVersion = 1;
       return null;
     }
     return original(query, update, options);
@@ -225,13 +252,93 @@ test('pin array and pinVersion change in the same compare-and-set room update', 
 
   const result = await setPin(mod, objectId(1), true);
   assert.equal(result.success, true);
+  assert.equal(result.pin.pinVersion, 2);
   assert.equal(calls.length, 2);
-  for (const call of calls) {
-    assert.deepEqual(call.update.$inc, { pinVersion: 1 });
-    assert.equal(call.update.$push.pinnedMessages.messageId, objectId(1));
-    assert.equal(call.query.code, 'ABC123');
-    assert.deepEqual(call.query.$or, [{ pinVersion: 0 }, { pinVersion: { $exists: false } }]);
-  }
+  assert.deepEqual(calls[0].query.$or, [{ pinVersion: 0 }, { pinVersion: { $exists: false } }]);
+  assert.equal(calls[1].query.pinVersion, 1);
+  assert.equal(Object.hasOwn(calls[1].query, '$or'), false);
+  assert.deepEqual(calls.map(call => call.update.$inc), [{ pinVersion: 1 }, { pinVersion: 1 }]);
+  assert.deepEqual(setup.ChatServerModel.rows.find(row => row.code === 'ABC123').pinnedMessages
+    .map(pin => String(pin.messageId)), [objectId(2), objectId(1)]);
+  assert.equal(setup.ModerationAuditModel.rows.length, 1);
+  assert.equal(mod.outbound.filter(item => item.event === 'message_pin_updated').length, 1);
+});
+
+test('pin compare-and-set loss is idempotent when the winner applied the desired state', async () => {
+  const setup = fixture();
+  const original = setup.ChatServerModel.findOneAndUpdate.bind(setup.ChatServerModel);
+  let attempts = 0;
+  setup.ChatServerModel.findOneAndUpdate = (query, update, options) => {
+    attempts += 1;
+    if (attempts === 1) {
+      const storedRoom = setup.ChatServerModel.rows.find(row => row.code === 'ABC123');
+      storedRoom.pinnedMessages.push({
+        messageId: objectId(1), pinnedAt: new Date(1), pinnedBy: 'Owner'
+      });
+      storedRoom.pinVersion = 1;
+      return null;
+    }
+    return original(query, update, options);
+  };
+  const mod = authenticate(setup, { id: 'mod', username: 'ExactMod' });
+
+  const result = await setPin(mod, objectId(1), true);
+
+  assert.deepEqual(result.pin, {
+    serverCode: 'ABC123', pinCount: 1, pinVersion: 1, blockVersion: 0
+  });
+  assert.equal(attempts, 1);
+  assert.equal(setup.ModerationAuditModel.rows.length, 0);
+  assert.equal(mod.outbound.some(item => item.event === 'message_pin_updated'), false);
+});
+
+test('queued pin list cannot read the old room after a switch wins the account lock', async () => {
+  const pin = { messageId: objectId(1), pinnedAt: new Date(1), pinnedBy: 'ExactMod' };
+  const setup = fixture({
+    rooms: [room('global'), room('ABC123', {
+      moderators: ['ExactMod'], pinnedMessages: [pin], pinVersion: 1
+    }), room('XYZ789')]
+  });
+  setup.UserModel.rows.find(row => row.username === 'ExactMod').servers.push('XYZ789');
+  const mod = authenticate(setup, {
+    id: 'mod', username: 'ExactMod', joinedServers: ['global', 'ABC123', 'XYZ789']
+  });
+  const gate = gateSwitchHistory(setup);
+  const switchAck = acknowledge();
+  const switchPending = mod.trigger('switch_server', 'XYZ789', switchAck.callback);
+  await gate.started.promise;
+  const listPending = listPins(mod, 'ABC123');
+  gate.release.resolve();
+
+  const [, listResult] = await Promise.all([switchPending, listPending]);
+
+  assert.equal(switchAck.value().serverCode, 'XYZ789');
+  assert.deepEqual(listResult, { error: 'Permission denied.' });
+});
+
+test('queued pin mutation cannot change the old room after a switch wins the account lock', async () => {
+  const setup = fixture();
+  setup.UserModel.rows.find(row => row.username === 'ExactMod').servers.push('XYZ789');
+  const mod = authenticate(setup, {
+    id: 'mod', username: 'ExactMod', joinedServers: ['global', 'ABC123', 'XYZ789']
+  });
+  const gate = gateSwitchHistory(setup);
+  const switchAck = acknowledge();
+  const switchPending = mod.trigger('switch_server', 'XYZ789', switchAck.callback);
+  await gate.started.promise;
+  const mutationPending = setPin(mod, objectId(1), true, 'ABC123');
+  gate.release.resolve();
+
+  const [, mutationResult] = await Promise.all([switchPending, mutationPending]);
+
+  assert.equal(switchAck.value().serverCode, 'XYZ789');
+  assert.deepEqual(mutationResult, { error: 'Permission denied.' });
+  const oldRoom = setup.ChatServerModel.rows.find(row => row.code === 'ABC123');
+  assert.deepEqual(oldRoom.pinnedMessages, []);
+  assert.equal(oldRoom.pinVersion, 0);
+  assert.deepEqual(setup.ModerationAuditModel.rows, []);
+  assert.equal(setup.ioInstance.sockets.flatMap(live => live.outbound)
+    .some(item => item.event === 'message_pin_updated'), false);
 });
 
 test('legacy missing pinVersion compares as zero and first pin mutation persists one', async () => {

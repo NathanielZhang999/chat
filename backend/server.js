@@ -2462,7 +2462,8 @@ function createConnectionHandler({
           const access = await loadRoomAccessState({
             UserModel, ChatServerModel, RoomRestrictionModel, username: socket.username, serverCode
           });
-          if (!access.allowed || access.restriction.banned || !access.user || !access.room) {
+          if (socket.serverCode !== serverCode || !access.allowed || access.restriction.banned ||
+              !access.user || !access.room) {
             return { error: 'Permission denied.' };
           }
           const { snapshot: blockState, blockedUserKeys } = await loadDurableBlockState(access.user.username);
@@ -2499,7 +2500,9 @@ function createConnectionHandler({
           const access = await loadRoomAccessState({
             UserModel, ChatServerModel, RoomRestrictionModel, username: socket.username, serverCode
           });
-          if (!canManagePins({ serverCode, access })) return { error: 'Permission denied.' };
+          if (socket.serverCode !== serverCode || !canManagePins({ serverCode, access })) {
+            return { error: 'Permission denied.' };
+          }
           const target = await MessageModel.findById(messageId);
           const targetAuthorKey = authorKeyForMessage(target);
           if (!target || target.deleted || target.serverCode !== serverCode || !targetAuthorKey) {
