@@ -338,6 +338,30 @@ test('room switch queue advances after an error acknowledgement', () => {
   ]);
 });
 
+test('room switch coordinator cancels replaced and coalesced queued requests', () => {
+  const helpers = loadHelpers();
+  const acknowledgements = [];
+  const cancellations = [];
+  const coordinator = helpers.createSwitchCoordinator(
+    (_target, callback) => acknowledgements.push(callback),
+    () => {}
+  );
+
+  coordinator.request('AAAAAA');
+  coordinator.request('BBBBBB', {
+    onCancel: reason => cancellations.push(`BBBBBB:${reason}`)
+  });
+  coordinator.request('AAAAAA', {
+    onCancel: reason => cancellations.push(`AAAAAA:${reason}`)
+  });
+
+  assert.deepEqual(cancellations, ['BBBBBB:replaced']);
+  acknowledgements[0]({ history: [] });
+  assert.deepEqual(cancellations, ['BBBBBB:replaced', 'AAAAAA:coalesced']);
+  assert.equal(acknowledgements.length, 1);
+  assert.equal(coordinator.isPending(), false);
+});
+
 test('room switch coordinator reports pending state', () => {
   const helpers = loadHelpers();
   let acknowledgeSwitch;
@@ -2341,6 +2365,132 @@ function createSetupSocketRuntime(overrides = {}, extraFunctions = []) {
   );
   return { client, context, setupSocket: context.__setupSocket };
 }
+
+function createQueuedRefreshRuntime() {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  const client = loadHelpers();
+  const socket = {};
+  const emissions = [];
+  let coordinator;
+  let context;
+  context = vm.createContext({
+    ChatClientHelpers: client,
+    socket,
+    currentServerCode: 'ABC123',
+    acceptedBlockVersion: 5,
+    currentRoomGeneration: 7,
+    readSuppressionToken: null,
+    requestServerSwitch(target, options) {
+      return coordinator.request(target, options);
+    }
+  });
+  coordinator = client.createSwitchCoordinator(
+    (target, callback) => emissions.push({ target, callback }),
+    (target, response, _token, options) => {
+      if (!response || response.error) return;
+      context.currentServerCode = target;
+      context.currentRoomGeneration += 1;
+      if (context.readSuppressionToken?.roomCode === target) {
+        context.readSuppressionToken = client.rebindSuppressionToken(
+          context.readSuppressionToken,
+          target,
+          context.currentRoomGeneration
+        );
+      }
+      if (options.suppressAutoRead === true && client.sameSuppressionOwner(
+        context.readSuppressionToken,
+        options.suppressionToken
+      )) {
+        context.readSuppressionToken = client.releaseExactToken(
+          context.readSuppressionToken,
+          context.readSuppressionToken
+        );
+      }
+    }
+  );
+  const refreshStart = source.indexOf('function handleRoomRefreshRequired(');
+  const refreshEnd = source.indexOf('\n    const authModal', refreshStart);
+  assert.notEqual(refreshStart, -1, 'refresh handler exists');
+  assert.notEqual(refreshEnd, -1, 'refresh handler boundary exists');
+  vm.runInContext(
+    `${clientFunctionSource(source, 'disarmReadSuppression')}\n` +
+      `${source.slice(refreshStart, refreshEnd)}\n` +
+      'globalThis.__handleRoomRefreshRequired = handleRoomRefreshRequired;',
+    context,
+    { filename: 'chat-refresh-queue-runtime.js' }
+  );
+  return { client, context, coordinator, emissions, socket };
+}
+
+test('superseding a queued refresh releases only its suppression owner for later reads', () => {
+  const sameRoom = createQueuedRefreshRuntime();
+  sameRoom.context.__handleRoomRefreshRequired({ serverCode: 'ABC123', blockVersion: 5 }, sameRoom.socket);
+  sameRoom.context.__handleRoomRefreshRequired({ serverCode: 'ABC123', blockVersion: 5 }, sameRoom.socket);
+  const userCancellations = [];
+
+  sameRoom.coordinator.request('ABC123', {
+    origin: 'user',
+    onCancel: reason => userCancellations.push(reason)
+  });
+
+  assert.equal(sameRoom.context.readSuppressionToken, null, 'displaced refresh B releases its owner');
+  sameRoom.emissions[0].callback({ history: [] });
+  assert.deepEqual(userCancellations, ['coalesced'], 'the redundant same-room user request is cleaned up');
+  assert.equal(sameRoom.emissions.length, 1, 'same-room user intent remains coalesced after A succeeds');
+  assert.equal(sameRoom.coordinator.isPending(), false);
+  assert.equal(sameRoom.client.isMarkReadEligible({
+    currentRoom: 'ABC123',
+    roomCode: 'ABC123',
+    visibilityState: 'visible',
+    nearBottom: true,
+    roomGeneration: sameRoom.context.currentRoomGeneration,
+    suppressionToken: sameRoom.context.readSuppressionToken
+  }), true, 'a later ordinary read is eligible');
+
+  const unrelatedOwner = createQueuedRefreshRuntime();
+  unrelatedOwner.context.__handleRoomRefreshRequired(
+    { serverCode: 'ABC123', blockVersion: 5 },
+    unrelatedOwner.socket
+  );
+  unrelatedOwner.context.__handleRoomRefreshRequired(
+    { serverCode: 'ABC123', blockVersion: 5 },
+    unrelatedOwner.socket
+  );
+  const otherToken = Object.freeze({ roomCode: 'XYZ789', roomGeneration: 3 });
+  unrelatedOwner.context.readSuppressionToken = otherToken;
+  unrelatedOwner.coordinator.request('ABC123', { origin: 'user' });
+  assert.equal(
+    unrelatedOwner.context.readSuppressionToken,
+    otherToken,
+    'cancelling refresh B cannot release an unrelated current owner'
+  );
+
+  const differentRoom = createQueuedRefreshRuntime();
+  differentRoom.context.__handleRoomRefreshRequired(
+    { serverCode: 'ABC123', blockVersion: 5 },
+    differentRoom.socket
+  );
+  differentRoom.context.__handleRoomRefreshRequired(
+    { serverCode: 'ABC123', blockVersion: 5 },
+    differentRoom.socket
+  );
+  differentRoom.coordinator.request('XYZ789', { origin: 'user' });
+  assert.equal(differentRoom.context.readSuppressionToken, null);
+  differentRoom.emissions[0].callback({ history: [] });
+  assert.equal(differentRoom.emissions[1].target, 'XYZ789');
+  differentRoom.emissions[1].callback({ history: [] });
+  differentRoom.coordinator.request('ABC123', { origin: 'user' });
+  differentRoom.emissions[2].callback({ history: [] });
+  assert.equal(differentRoom.context.currentServerCode, 'ABC123');
+  assert.equal(differentRoom.client.isMarkReadEligible({
+    currentRoom: 'ABC123',
+    roomCode: 'ABC123',
+    visibilityState: 'visible',
+    nearBottom: true,
+    roomGeneration: differentRoom.context.currentRoomGeneration,
+    suppressionToken: differentRoom.context.readSuppressionToken
+  }), true, 'returning after a different-room superseder does not revive B suppression');
+});
 
 test('replaced socket chat listener ignores old and wrong-room payloads before effects', () => {
   const oldSocket = createRuntimeSocket();

@@ -1902,6 +1902,11 @@
             let nextRequestId = 0;
             let epoch = 0;
 
+            const cancelRequest = (request, reason) => {
+                if (!request || typeof request.options.onCancel !== 'function') return;
+                request.options.onCancel(reason, request.token);
+            };
+
             const start = request => {
                 inFlightRequest = request;
                 emitSwitch(request.target, result => {
@@ -1914,10 +1919,13 @@
                         const nextRequest = queuedRequest;
                         inFlightRequest = null;
                         queuedRequest = null;
-                        if (nextRequest !== null &&
-                            !(completedSuccessfully && nextRequest.target === completedRequest.target &&
-                              nextRequest.options.forceRefresh !== true)) {
-                            start(nextRequest);
+                        if (nextRequest !== null) {
+                            if (completedSuccessfully && nextRequest.target === completedRequest.target &&
+                                nextRequest.options.forceRefresh !== true) {
+                                cancelRequest(nextRequest, 'coalesced');
+                            } else {
+                                start(nextRequest);
+                            }
                         }
                     }
                 });
@@ -1931,7 +1939,9 @@
                     const token = Object.freeze({ epoch, requestId: ++nextRequestId, target });
                     const request = { target, token, options: { ...options }, epoch };
                     if (inFlightRequest !== null) {
+                        const displacedRequest = queuedRequest;
                         queuedRequest = request;
+                        cancelRequest(displacedRequest, 'replaced');
                         return token;
                     }
                     start(request);
@@ -2378,10 +2388,18 @@
             roomGeneration: currentRoomGeneration
         });
         readSuppressionToken = suppressionToken;
+        const releaseSuppressionOwner = () => {
+            const ownedToken = ChatClientHelpers.sameSuppressionOwner(
+                readSuppressionToken,
+                suppressionToken
+            ) ? readSuppressionToken : null;
+            if (ownedToken) disarmReadSuppression(ownedToken);
+        };
         requestServerSwitch(data.serverCode, {
             forceRefresh: true,
             suppressAutoRead: true,
-            suppressionToken
+            suppressionToken,
+            onCancel: releaseSuppressionOwner
         });
     }
 
