@@ -722,6 +722,13 @@ function isCurrentRoomModerator(room, username) {
     room.moderators.some(candidate => normalizeAccountKey(candidate) === key));
 }
 
+function canEditRoomDetails({ serverCode, access }) {
+  if (!access || !access.allowed || access.restriction?.banned || access.restriction?.timedOut ||
+    !access.user || !access.room) return false;
+  if (access.user.role === 'admin') return true;
+  return serverCode !== 'global' && normalizeAccountKey(access.room.owner) === normalizeAccountKey(access.user.username);
+}
+
 function canModerateTarget({ serverCode, action, actorUser, targetUser, room }) {
   if (!actorUser || !targetUser || !room || room.code !== serverCode) return false;
   const normalizedAction = normalizeModerationAction(action);
@@ -1635,6 +1642,51 @@ function createConnectionHandler({
     }
   }
 
+  async function emitRoomDetailsUpdated(serverCode, room) {
+    let liveSockets;
+    try {
+      liveSockets = await fetchLiveSockets();
+    } catch (err) {
+      logUnexpectedError(logger, 'room_details_socket_discovery', err);
+      return;
+    }
+    const byAccount = new Map();
+    for (const live of liveSockets) {
+      const session = onlineUsersMap.get(live.id);
+      const username = live.username || session?.username;
+      const accountKey = normalizeAccountKey(username);
+      if (!normalizeUsername(username) || !accountKey) continue;
+      if (!byAccount.has(accountKey)) byAccount.set(accountKey, { username, sockets: [] });
+      byAccount.get(accountKey).sockets.push(live);
+    }
+    const event = safeRoomDetails(room, false);
+    const payload = {
+      serverCode: event.serverCode,
+      description: event.description,
+      rules: event.rules,
+      metadataVersion: event.metadataVersion
+    };
+    for (const { username, sockets } of byAccount.values()) {
+      try {
+        const access = await loadRoomAccessState({
+          UserModel, ChatServerModel, RoomRestrictionModel, username, serverCode
+        });
+        if (!access.allowed || access.restriction.banned || !access.user) continue;
+        const actualMember = serverCode === 'global' ||
+          (Array.isArray(access.user.servers) && access.user.servers.includes(serverCode));
+        for (const live of sockets) {
+          const session = onlineUsersMap.get(live.id);
+          const liveUsername = live.username || session?.username;
+          if (normalizeAccountKey(liveUsername) !== normalizeAccountKey(access.user.username)) continue;
+          const adminInspecting = access.user.role === 'admin' && live.serverCode === serverCode;
+          if (actualMember || adminInspecting) live.emit('room_details_updated', payload);
+        }
+      } catch (err) {
+        logUnexpectedError(logger, 'room_details_notification', err);
+      }
+    }
+  }
+
   function paginationCursor(data) {
     if (data.before === undefined || data.before === null) return { cursor: null };
     const cursor = decodeCursor(data.before);
@@ -2017,6 +2069,87 @@ function createConnectionHandler({
           logUnexpectedError(logger, 'update_profile', err);
           callback({ error: 'Failed to update profile.' });
       }
+  });
+
+  socket.on('get_room_details', async (data, callback) => {
+    callback = safeAck(callback);
+    if (!socket.username) return callback({ error: 'Not authenticated.' });
+    if (!data || typeof data !== 'object' || Array.isArray(data)) return callback({ error: 'Invalid input format.' });
+    const serverCode = normalizeServerCode(data.serverCode);
+    if (!serverCode) return callback({ error: 'Invalid input format.' });
+    try {
+      const result = await withAccountTransitionLock(socket.username, () =>
+        withRoomMutationLock(serverCode, async () => {
+          const access = await loadRoomAccessState({
+            UserModel, ChatServerModel, RoomRestrictionModel, username: socket.username, serverCode
+          });
+          if (!access.allowed || access.restriction.banned) return { error: 'Permission denied.' };
+          return { success: true, ...safeRoomDetails(access.room, canEditRoomDetails({ serverCode, access })) };
+        })
+      );
+      callback(result);
+    } catch (err) {
+      logUnexpectedError(logger, 'get_room_details', err);
+      callback({ error: 'Failed to load room details.' });
+    }
+  });
+
+  socket.on('update_room_details', async (data, callback) => {
+    callback = safeAck(callback);
+    if (!socket.username) return callback({ error: 'Not authenticated.' });
+    if (!data || typeof data !== 'object' || Array.isArray(data)) return callback({ error: 'Invalid input format.' });
+    const serverCode = normalizeServerCode(data.serverCode);
+    const description = normalizeRoomText(data.description, 500);
+    const rules = normalizeRoomText(data.rules, 2000);
+    if (!serverCode || description === null || rules === null) return callback({ error: 'Invalid input format.' });
+    try {
+      const result = await withAccountTransitionLock(socket.username, () =>
+        withRoomMutationLock(serverCode, async () => {
+          const access = await loadRoomAccessState({
+            UserModel, ChatServerModel, RoomRestrictionModel, username: socket.username, serverCode
+          });
+          if (!access.allowed || access.restriction.banned || !canEditRoomDetails({ serverCode, access })) {
+            return { error: 'Permission denied.' };
+          }
+          const storedVersion = access.room.metadataVersion;
+          const currentVersion = storedVersion === undefined ? 0 :
+            (Number.isInteger(storedVersion) && storedVersion >= 0 ? storedVersion : null);
+          if (currentVersion === null) return { error: 'Room details changed. Reload and try again.' };
+          const currentDescription = typeof access.room.description === 'string' ? access.room.description : '';
+          const currentRules = typeof access.room.rules === 'string' ? access.room.rules : '';
+          if (description === currentDescription && rules === currentRules) {
+            return { success: true, ...safeRoomDetails(access.room, true) };
+          }
+          const versionPredicate = currentVersion === 0
+            ? { $or: [{ metadataVersion: 0 }, { metadataVersion: { $exists: false } }] }
+            : { metadataVersion: currentVersion };
+          const updated = await ChatServerModel.findOneAndUpdate(
+            { code: serverCode, ...versionPredicate },
+            { $set: { description, rules }, $inc: { metadataVersion: 1 } },
+            { new: true }
+          );
+          if (!updated) return { error: 'Room details changed. Reload and try again.' };
+          const descriptionChanged = description !== currentDescription;
+          const rulesChanged = rules !== currentRules;
+          await appendAuditReliably({
+            correlationId: new mongoose.Types.ObjectId().toString(),
+            action: 'room_details_update',
+            serverCode,
+            actorUsername: access.user.username,
+            actorRole: access.user.role || 'user',
+            actorRoomRole: currentRoomRole(access.room, access.user.username),
+            reason: 'Updated room details',
+            metadata: { descriptionChanged, rulesChanged, descriptionLength: description.length, rulesLength: rules.length }
+          });
+          await emitRoomDetailsUpdated(serverCode, updated);
+          return { success: true, ...safeRoomDetails(updated, true) };
+        })
+      );
+      callback(result);
+    } catch (err) {
+      logUnexpectedError(logger, 'update_room_details', err);
+      callback({ error: 'Failed to update room details.' });
+    }
   });
 
   socket.on('manage_role', async (data, callback) => {
@@ -3775,6 +3908,7 @@ module.exports = {
   chooseAccessibleRoom,
   applySessionAccessSnapshot,
   loadRoomAccessState,
+  canEditRoomDetails,
   rejectAuditMutation,
   MODERATION_DURATIONS,
   RoomRestriction,

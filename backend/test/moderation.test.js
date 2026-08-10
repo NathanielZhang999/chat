@@ -1781,6 +1781,10 @@ test('global-banned lobby user can join an unbanned private room without joining
 
 test('timeout blocks send edit reaction and typing but allows own delete', async () => {
   const setup = timedOutAuthenticatedSocket('ABC123', 'Alice');
+  const metadataAck = acknowledge();
+  await setup.socket.trigger('update_room_details', {
+    serverCode: 'ABC123', description: 'timeout metadata', rules: ''
+  }, metadataAck.callback);
   await setup.socket.trigger('chat_message', { text: 'blocked message' });
   await setup.socket.trigger('edit_message', { id: VALID_MESSAGE_ID, text: 'blocked edit' });
   await setup.socket.trigger('toggle_reaction', { id: VALID_MESSAGE_ID, emoji: '👍' });
@@ -1791,6 +1795,7 @@ test('timeout blocks send edit reaction and typing but allows own delete', async
   assert.deepEqual(setup.message.reactions, {});
   assert.equal(setup.socket.outbound.some(item => item.event === 'typing'), false);
   assert.equal(setup.message.deleted, true);
+  assert.deepEqual(metadataAck.value(), { error: 'Permission denied.' });
 });
 
 test('timed-out room moderator cannot delete another user message', async () => {
