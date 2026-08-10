@@ -2839,6 +2839,152 @@ test('replaced socket chat listener ignores old and wrong-room payloads before e
   assert.deepEqual(effects, { dom: 1, typing: 1, read: 1, sound: 1 });
 });
 
+test('connected attention listeners count a committed message once in either snapshot delivery order', () => {
+  const messageId = '507f1f77bcf86cd799439123';
+  const messageAt = '2026-08-10T12:01:00.000Z';
+  const cursorId = '507f1f77bcf86cd799439122';
+  const cursorAt = '2026-08-10T12:00:00.000Z';
+
+  function run(order) {
+    const socket = createRuntimeSocket();
+    const initial = {
+      serverCode: 'ABC123', usernameKey: 'alice', notificationLevel: 'all',
+      lastReadAt: cursorAt, lastReadMessageId: cursorId,
+      countedThroughAt: cursorAt, countedThroughMessageId: cursorId,
+      unreadCount: 0, mentionCount: 0, version: 0, blockVersion: 5
+    };
+    const exact = {
+      ...initial,
+      countedThroughAt: messageAt,
+      countedThroughMessageId: messageId,
+      unreadCount: 1,
+      version: 1
+    };
+    const activity = {
+      serverCode: 'ABC123', messageId, timestamp: messageAt,
+      authorKey: 'bob', mentioned: false, blockVersion: 5
+    };
+    const roomStateByCode = new Map([['ABC123', initial]]);
+    const runtime = createSetupSocketRuntime({
+      socket,
+      acceptedBlockVersion: 5,
+      roomStateByCode,
+      attentionByRoom: new Map([['ABC123', initial]]),
+      recentActivityIdsByRoom: new Map(),
+      document: { getElementById() { return null; } }
+    }, [
+      'recentIdsForRoom', 'renderRoomAttention',
+      'acceptRoomStateSnapshot', 'applyRoomActivitySnapshot'
+    ]);
+    runtime.setupSocket(socket);
+
+    for (const item of order) {
+      socket.trigger(item === 'exact' ? 'room_attention_updated' : 'room_activity',
+        item === 'exact' ? exact : activity);
+    }
+    return roomStateByCode.get('ABC123').unreadCount;
+  }
+
+  assert.equal(run(['exact', 'activity']), 1, 'delayed activity is covered by exact watermark');
+  assert.equal(run(['activity', 'exact']), 1, 'later exact snapshot authoritatively replaces speculation');
+});
+
+test('connected deletion listener consumes the real scoped server payload only for the active room', () => {
+  const socket = createRuntimeSocket();
+  const messageId = '507f1f77bcf86cd799439133';
+  const row = {
+    className: 'msg',
+    textContent: 'visible',
+    style: {},
+    offsetHeight: 10,
+    children: [],
+    getAttribute(name) {
+      return name === 'data-display' ? 'Bob' : (name === 'data-author' ? 'bob' : null);
+    },
+    appendChild(child) { this.children.push(child); }
+  };
+  const document = {
+    querySelectorAll(selector) {
+      return selector === `.msg[data-id="${messageId}"]` ? [row] : [];
+    },
+    createElement(tagName) {
+      return { tagName, className: '', textContent: '', style: {}, appendChild() {} };
+    }
+  };
+  const runtime = createSetupSocketRuntime({
+    socket,
+    document,
+    myRole: 'user',
+    myRoomRole: 'user'
+  });
+  runtime.setupSocket(socket);
+
+  socket.trigger('message_deleted', { id: messageId, serverCode: 'XYZ789' });
+  assert.equal(row.className, 'msg', 'wrong-room deletion is inert');
+
+  socket.trigger('message_deleted', { id: messageId, serverCode: 'ABC123' });
+  assert.equal(row.className, 'msg deleted-compact is-deleted');
+  assert.equal(row.textContent, '');
+});
+
+test('replaced socket content access typing and logout listeners have zero effect', () => {
+  const oldSocket = createRuntimeSocket();
+  const effects = { content: 0, access: 0, typing: 0, logout: 0 };
+  const runtime = createSetupSocketRuntime({
+    socket: oldSocket,
+    myJoinedServers: ['global', 'ABC123'],
+    myBannedRooms: new Set(),
+    document: {
+      querySelectorAll() { effects.content += 1; return []; },
+      getElementById() { return { classList: { contains: () => false } }; }
+    },
+    closeModerationPrompt() { effects.access += 1; },
+    closeReportPrompt() {},
+    closeResolutionPrompt() {},
+    invalidateRevokedRoomState() {},
+    roomAccessCoordinator: { handleAccessUpdate() {} },
+    updateTypingUI() { effects.typing += 1; },
+    localStorage: { removeItem() { effects.logout += 1; } },
+    alert() {},
+    location: { reload() { effects.logout += 1; } }
+  });
+  runtime.setupSocket(oldSocket);
+  runtime.context.socket = createRuntimeSocket();
+
+  oldSocket.trigger('message_edited', {
+    id: '507f1f77bcf86cd799439134', serverCode: 'ABC123',
+    username: 'bob', text: 'stale content'
+  });
+  oldSocket.trigger('room_access_updated', {
+    username: 'alice', joinedServers: ['global'], serverCode: 'global', bannedRooms: []
+  });
+  oldSocket.trigger('typing', {
+    serverCode: 'ABC123', username: 'bob', displayName: 'Bob', isTyping: true
+  });
+  oldSocket.trigger('force_logout', 'stale logout');
+
+  assert.deepEqual(effects, { content: 0, access: 0, typing: 0, logout: 0 });
+});
+
+test('every setupSocket event listener starts by rejecting a replaced socket', () => {
+  const block = setupSocketSource(fs.readFileSync(chatPath, 'utf8'));
+  for (const event of [
+    'room_details_updated', 'message_pin_updated', 'room_notification_updated',
+    'room_read_updated', 'room_activity', 'room_attention_updated', 'user_block_updated',
+    'room_refresh_required', 'force_logout', 'chat_message', 'system_message',
+    'global_role_updated', 'room_role_updated', 'room_access_updated',
+    'room_restriction_updated', 'moderation_queue_updated', 'message_blocked',
+    'profile_updated', 'message_edited', 'message_deleted', 'reaction_updated',
+    'admin_new_server', 'server_deleted', 'online_users', 'typing'
+  ]) {
+    assert.match(
+      block,
+      new RegExp(`activeSocket\\.on\\(['"]${event}['"][\\s\\S]{0,100}=>\\s*\\{\\s*if \\(activeSocket !== socket\\) return;`),
+      `${event} rejects an old socket before inspecting its payload`
+    );
+  }
+});
+
 test('overlapping refresh acknowledgements keep newest suppression aligned through both scroll frames', () => {
   const source = fs.readFileSync(chatPath, 'utf8');
   const client = loadHelpers();
@@ -3058,4 +3204,89 @@ test('stale metadata and pin events cannot settle pending controls but authorita
   });
   assert.equal(roomInfoSave.disabled, false, 'newer accepted metadata settles');
   assert.equal(pinControl.disabled, false, 'newer accepted pin settles');
+});
+
+test('metadata content events preserve permission and equal-version fresh snapshots update authority', () => {
+  const socket = createRuntimeSocket();
+  const roomDetailsByCode = new Map([['ABC123', {
+    serverCode: 'ABC123', description: 'before', rules: 'rules',
+    metadataVersion: 4, canEdit: true
+  }]]);
+  const runtime = createSetupSocketRuntime({
+    socket,
+    roomDetailsByCode,
+    renderRoomInfo() {},
+    settleMetadataControlFromEvent() {}
+  }, ['acceptRoomDetailsSnapshot']);
+  runtime.setupSocket(socket);
+
+  socket.trigger('room_details_updated', {
+    serverCode: 'ABC123', description: 'event first', rules: 'new rules', metadataVersion: 5
+  });
+  assert.equal(
+    roomDetailsByCode.get('ABC123').canEdit,
+    true,
+    'a higher content event without authority cannot erase known permission before its ack'
+  );
+
+  assert.equal(runtime.context.acceptRoomDetailsSnapshot({
+    serverCode: 'ABC123', description: 'event first', rules: 'new rules',
+    metadataVersion: 5, canEdit: false
+  }), true);
+  assert.equal(
+    roomDetailsByCode.get('ABC123').canEdit,
+    false,
+    'an equal-version fresh timeout or role read can revoke permission'
+  );
+
+  assert.equal(runtime.context.acceptRoomDetailsSnapshot({
+    serverCode: 'ABC123', description: 'event first', rules: 'new rules',
+    metadataVersion: 5, canEdit: true
+  }), true);
+  assert.equal(
+    roomDetailsByCode.get('ABC123').canEdit,
+    true,
+    'an equal-version fresh role read can restore permission'
+  );
+});
+
+test('content-free blocked-author pin events advance versions and permit panel hydration after pin and unpin', () => {
+  const socket = createRuntimeSocket();
+  const client = loadHelpers();
+  const pinsByRoom = new Map([['ABC123', {
+    serverCode: 'ABC123', pinCount: 0, pinVersion: 4, blockVersion: 9,
+    pinsLoaded: true, pins: []
+  }]]);
+  let panelRefreshes = 0;
+  const runtime = createSetupSocketRuntime({
+    socket,
+    pinsByRoom,
+    acceptedBlockVersion: 9,
+    updatePinsButton() {},
+    updateMessagePinControlState() {},
+    settlePinControlFromEvent() {},
+    pinsDialogController: { isOpen: () => true },
+    featureGenerations: { invalidate() {} },
+    openPins() { panelRefreshes += 1; },
+    document: { getElementById() { return {}; } }
+  }, ['acceptPinSnapshot']);
+  runtime.setupSocket(socket);
+
+  for (const pinVersion of [5, 6]) {
+    socket.trigger('message_pin_updated', {
+      pin: { serverCode: 'ABC123', pinCount: 0, pinVersion, blockVersion: 9 }
+    });
+    const versionOnly = pinsByRoom.get('ABC123');
+    assert.equal(versionOnly.pinVersion, pinVersion);
+    assert.equal(versionOnly.pinsLoaded, false);
+
+    const hydrated = client.acceptPinBodies(versionOnly, {
+      serverCode: 'ABC123', pinCount: 0, pinVersion, blockVersion: 9,
+      pins: [], requestTokenCurrent: true
+    });
+    assert.notEqual(hydrated, versionOnly, 'the authoritative list at the new version is accepted');
+    assert.equal(hydrated.pinsLoaded, true);
+    pinsByRoom.set('ABC123', hydrated);
+  }
+  assert.equal(panelRefreshes, 2);
 });

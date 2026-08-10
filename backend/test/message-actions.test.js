@@ -1381,3 +1381,71 @@ for (const action of [
     assert.equal(ioInstance.outbound.some(item => item.event === 'server_deleted'), true);
   });
 }
+
+for (const mutation of [
+  {
+    name: 'edit',
+    event: 'edit_message',
+    payload: { id: '507f1f77bcf86cd799439011', text: 'must not resurrect' },
+    emittedEvent: 'message_edited'
+  },
+  {
+    name: 'reaction',
+    event: 'toggle_reaction',
+    payload: { id: '507f1f77bcf86cd799439011', emoji: '👍' },
+    emittedEvent: 'reaction_updated'
+  }
+]) {
+  test(`a committed delete cannot be overwritten by a stale preloaded ${mutation.name}`, async () => {
+    const messageId = '507f1f77bcf86cd799439011';
+    const deleteSaveStarted = deferred();
+    const releaseDeleteSave = deferred();
+    const MessageModel = createMemoryModel([{
+      _id: messageId, serverCode: 'ABC123', username: 'alice', displayName: 'Alice',
+      authorKey: 'alice', role: 'user', roomRole: 'user', text: 'before', attachment: null,
+      history: [], reactions: {}, edited: false, deleted: false, timestamp: new Date()
+    }]);
+    let gatedDelete = false;
+    MessageModel.saveHook = async ({ document }) => {
+      if (!document.deleted || gatedDelete) return;
+      gatedDelete = true;
+      deleteSaveStarted.resolve();
+      await releaseDeleteSave.promise;
+    };
+    const ChatServerModel = createMemoryModel([{
+      code: 'ABC123', name: 'Room', owner: 'alice', moderators: [],
+      pinnedMessages: [], pinVersion: 0,
+      autoMod: {
+        blockedKeywords: [], mentionLimit: 8, repeatLimit: 3, repeatWindowSeconds: 30,
+        messageLimit: 20, messageWindowSeconds: 60
+      }
+    }]);
+    const { socket } = registerMessages({
+      MessageModel,
+      ChatServerModel,
+      UserModel: createMemoryModel([{
+        username: 'alice', displayName: 'Alice', role: 'user', servers: ['global', 'ABC123']
+      }]),
+      RoomRestrictionModel: createMemoryModel([])
+    });
+    authenticate(socket, { serverCode: 'ABC123', joinedServers: ['global', 'ABC123'] });
+    const deleteAck = acknowledge();
+
+    const deletePending = socket.trigger('delete_message', {
+      id: messageId, serverCode: 'ABC123', clientContextId: 1
+    }, deleteAck.callback);
+    await deleteSaveStarted.promise;
+    const mutationPending = socket.trigger(mutation.event, {
+      ...mutation.payload, serverCode: 'ABC123', clientContextId: 1
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    releaseDeleteSave.resolve();
+    await Promise.all([deletePending, mutationPending]);
+
+    assert.equal(deleteAck.value().success, true);
+    assert.equal(MessageModel.rows[0].deleted, true);
+    assert.equal(MessageModel.rows[0].text, 'before');
+    assert.deepEqual(MessageModel.rows[0].reactions, {});
+    assert.equal(socket.outbound.some(item => item.event === mutation.emittedEvent), false);
+  });
+}

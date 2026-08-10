@@ -173,6 +173,102 @@ function preserveAttentionProjection(MessageModel) {
   };
 }
 
+test('create join and admin room discovery payloads expose only exact safe summaries', async () => {
+  const autoModSentinel = 'ROOM_AUTOMOD_SENTINEL';
+  const pinSentinel = '507f1f77bcf86cd799439099';
+  const ioInstance = new FakeIo();
+  const onlineUsersMap = new Map();
+  const UserModel = createMemoryModel([
+    { username: 'Creator', displayName: 'Creator', role: 'user', servers: ['global'] },
+    { username: 'Joiner', displayName: 'Joiner', role: 'user', servers: ['global'] },
+    { username: 'Admin', displayName: 'Admin', role: 'admin', servers: ['global'] }
+  ]);
+  const ChatServerModel = createMemoryModel([{
+    code: 'ABC123', name: 'Existing Room', owner: 'Creator', moderators: ['Creator'],
+    description: 'private description', rules: 'private rules', metadataVersion: 4,
+    pinnedMessages: [{ messageId: pinSentinel, pinnedAt: new Date(), pinnedBy: 'Creator' }],
+    pinVersion: 9, autoMod: { blockedKeywords: [autoModSentinel], mentionLimit: 8,
+      repeatLimit: 3, repeatWindowSeconds: 30, messageLimit: 5, messageWindowSeconds: 5 },
+    __v: 7, internalSentinel: 'ROOM_INTERNAL_SENTINEL'
+  }]);
+  const createRoom = ChatServerModel.create.bind(ChatServerModel);
+  ChatServerModel.create = value => createRoom({
+    ...value,
+    description: 'created private description',
+    rules: 'created private rules',
+    metadataVersion: 0,
+    pinnedMessages: [{ messageId: pinSentinel, pinnedAt: new Date(), pinnedBy: 'Creator' }],
+    pinVersion: 3,
+    autoMod: { blockedKeywords: [autoModSentinel], mentionLimit: 8,
+      repeatLimit: 3, repeatWindowSeconds: 30, messageLimit: 5, messageWindowSeconds: 5 },
+    moderators: ['Creator', 'HiddenModerator'],
+    __v: 11,
+    internalSentinel: 'ROOM_INTERNAL_SENTINEL'
+  });
+  const dependencies = {
+    ioInstance,
+    onlineUsersMap,
+    UserModel,
+    ChatServerModel,
+    MessageModel: createMemoryModel([]),
+    RoomRestrictionModel: createMemoryModel([]),
+    RoomMemberStateModel: createMemoryModel([]),
+    UserExperienceStateModel: createMemoryModel([]),
+    broadcastOnlineUsersFn: async () => {},
+    getRoomRoleFn: async () => 'user',
+    resolvePingsFn: async text => text,
+    logger: { error() {} }
+  };
+  function connect(id, username, role = 'user') {
+    const live = new FakeSocket();
+    live.id = id;
+    createConnectionHandler(dependencies)(live);
+    Object.assign(live, {
+      username, displayName: username, role, serverCode: 'global',
+      joinedServers: ['global'], bannedRooms: [], blockedUserKeys: new Set(), blockVersion: 0
+    });
+    live.joinedRooms.add('global');
+    onlineUsersMap.set(id, {
+      username, displayName: username, role, serverCode: 'global', joinedServers: ['global'],
+      bannedRooms: [], blockedUsers: [], blockVersion: 0
+    });
+    ioInstance.sockets.push(live);
+    return live;
+  }
+  const creator = connect('creator', 'Creator');
+  const joiner = connect('joiner', 'Joiner');
+  const admin = connect('admin', 'Admin', 'admin');
+
+  const createAck = acknowledge();
+  await creator.trigger('create_server', 'Created Room', createAck.callback);
+  const createdSummary = createAck.value().server;
+  const adminSummary = admin.outbound.find(item =>
+    item.event === 'admin_new_server' && item.payload.code === createdSummary.code
+  ).payload;
+  const joinAck = acknowledge();
+  await joiner.trigger('join_server', 'ABC123', joinAck.callback);
+  const joinedSummary = joinAck.value().server;
+
+  const expectedKeys = ['code', 'metadataVersion', 'name', 'owner', 'pin'];
+  for (const [label, summary] of [
+    ['create acknowledgement', createdSummary],
+    ['administrator discovery event', adminSummary],
+    ['join acknowledgement', joinedSummary]
+  ]) {
+    assert.deepEqual(Object.keys(summary).sort(), expectedKeys, label);
+    assert.deepEqual(Object.keys(summary.pin).sort(), [
+      'blockVersion', 'pinCount', 'pinVersion', 'serverCode'
+    ], `${label} pin summary`);
+  }
+  const serialized = JSON.stringify({ createdSummary, adminSummary, joinedSummary });
+  for (const sentinel of [
+    autoModSentinel, pinSentinel, 'HiddenModerator', 'ROOM_INTERNAL_SENTINEL',
+    'private description', 'private rules'
+  ]) {
+    assert.equal(serialized.includes(sentinel), false, sentinel);
+  }
+});
+
 test('room activity reaches inactive actual members but not admin ghost viewers nonmembers or banned users', async () => {
   const setup = roomActivityFixture();
   const author = setup.add({ id: 'author', username: 'Author', serverCode: 'ABC123' });
@@ -2117,7 +2213,13 @@ test('join grant cannot resurrect a detached membership removed by a concurrent 
   await Promise.all([joinPending, leavePending]);
 
   assert.equal(leaveCompletedBeforeGrant, false);
-  assert.deepEqual(joinAck.value(), { success: true, server: joinedRoom });
+  assert.deepEqual(joinAck.value(), {
+    success: true,
+    server: {
+      code: 'OTHER1', name: '', owner: 'owner', metadataVersion: 0,
+      pin: { serverCode: 'OTHER1', pinCount: 0, pinVersion: 0, blockVersion: 0 }
+    }
+  });
   assert.deepEqual(leaveAck.value(), { success: true });
   assert.deepEqual(persisted.servers, ['global', 'OTHER1']);
   for (const live of [joiner, leaver, arriving]) {
@@ -2204,7 +2306,13 @@ test('create grant cannot resurrect a detached membership removed by a concurren
   await Promise.all([createPending, leavePending]);
 
   assert.equal(leaveCompletedBeforeGrant, false);
-  assert.deepEqual(createAck.value(), { success: true, server: createdRoom });
+  assert.deepEqual(createAck.value(), {
+    success: true,
+    server: {
+      code: 'NEW123', name: 'Team', owner: 'alice', metadataVersion: 0,
+      pin: { serverCode: 'NEW123', pinCount: 0, pinVersion: 0, blockVersion: 0 }
+    }
+  });
   assert.deepEqual(leaveAck.value(), { success: true });
   assert.deepEqual(persisted.servers, ['global', 'NEW123']);
   for (const live of [creator, leaver, arriving]) {
@@ -2735,7 +2843,10 @@ test('a failed best-effort admin notification acknowledges server creation only 
   await assert.doesNotReject(socket.trigger('create_server', 'Team', value => acknowledgements.push(value)));
   assert.deepEqual(acknowledgements, [{
     success: true,
-    server: { code: 'ABC123', name: 'Team', owner: 'alice' }
+    server: {
+      code: 'ABC123', name: 'Team', owner: 'alice', metadataVersion: 0,
+      pin: { serverCode: 'ABC123', pinCount: 0, pinVersion: 0, blockVersion: 0 }
+    }
   }]);
   assert.equal(logged.some(args => JSON.stringify(args).includes('create_server_admin_notification')), true);
   assert.equal(JSON.stringify(logged).includes('notification unavailable'), false);

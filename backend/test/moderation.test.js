@@ -4108,6 +4108,146 @@ test('complete room experience backend policy matrix has no stale authority or c
   assert.equal(cases, 72);
 });
 
+function sendTransitionFixture(kind, { gateCreate = false, gateTransitionWrite = false } = {}) {
+  const sendCreateStarted = deferred();
+  const releaseSendCreate = deferred();
+  const transitionWriteStarted = deferred();
+  const releaseTransitionWrite = deferred();
+  const senderIsAdmin = kind === 'global demotion';
+  const senderMemberships = senderIsAdmin ? ['global'] : ['global', 'ABC123'];
+  const MessageModel = createMemoryModel([]);
+  const persistMessage = MessageModel.create.bind(MessageModel);
+  let reachedCreate = false;
+  MessageModel.create = async value => {
+    reachedCreate = true;
+    sendCreateStarted.resolve();
+    if (gateCreate) await releaseSendCreate.promise;
+    return persistMessage({
+      _id: '507f1f77bcf86cd799439088',
+      timestamp: new Date('2026-08-10T14:00:00.000Z'),
+      deleted: false,
+      ...value
+    });
+  };
+
+  const UserModel = createMemoryModel([
+    userDocument({
+      username: 'Alice', displayName: 'Alice', role: senderIsAdmin ? 'admin' : 'user',
+      servers: senderMemberships
+    }),
+    userDocument({
+      username: 'RootAdmin', displayName: 'Root Admin', role: 'admin',
+      servers: ['global', 'ABC123']
+    })
+  ]);
+  let transitionWriteGated = false;
+  UserModel.saveHook = async ({ document }) => {
+    const isTransitionWrite = document.username === 'Alice' &&
+      ((kind === 'leave' && !document.servers.includes('ABC123')) ||
+       (kind === 'global demotion' && document.role === 'user'));
+    if (!gateTransitionWrite || transitionWriteGated || !isTransitionWrite) return;
+    transitionWriteGated = true;
+    transitionWriteStarted.resolve();
+    await releaseTransitionWrite.promise;
+  };
+
+  const setup = registerWithModels({
+    UserModel,
+    MessageModel,
+    rooms: [roomDocument('global', { owner: 'System' }), roomDocument('ABC123')]
+  });
+  Object.assign(setup.socket, {
+    username: 'Alice',
+    displayName: 'Alice',
+    role: senderIsAdmin ? 'admin' : 'user',
+    serverCode: 'ABC123',
+    joinedServers: [...senderMemberships],
+    bannedRooms: [],
+    blockedUserKeys: new Set(),
+    blockVersion: 0
+  });
+  setup.socket.joinedRooms.add('ABC123');
+  setup.onlineUsersMap.set(setup.socket.id, {
+    username: 'Alice',
+    displayName: 'Alice',
+    role: setup.socket.role,
+    serverCode: 'ABC123',
+    joinedServers: [...senderMemberships],
+    bannedRooms: [],
+    blockedUsers: [],
+    blockVersion: 0
+  });
+  const administrator = connectAdditionalSocket(setup, {
+    id: `root-${kind.replace(/\s+/g, '-')}`,
+    username: 'RootAdmin',
+    role: 'admin',
+    serverCode: 'global',
+    joinedServers: ['global', 'ABC123']
+  });
+
+  function startTransition(ack) {
+    return kind === 'leave'
+      ? setup.socket.trigger('leave_server', 'ABC123', ack.callback)
+      : administrator.trigger('manage_role', {
+        targetUser: 'Alice', action: 'demote_global_admin'
+      }, ack.callback);
+  }
+
+  return {
+    ...setup,
+    administrator,
+    sendCreateStarted,
+    releaseSendCreate,
+    transitionWriteStarted,
+    releaseTransitionWrite,
+    startTransition,
+    reachedCreate: () => reachedCreate
+  };
+}
+
+for (const kind of ['leave', 'global demotion']) {
+  test(`chat message mutation wins before a concurrent ${kind} and commits before the transition`, async () => {
+    const setup = sendTransitionFixture(kind, { gateCreate: true });
+    const sendPending = setup.socket.trigger('chat_message', {
+      serverCode: 'ABC123', clientContextId: 1, text: `message before ${kind}`
+    });
+    await setup.sendCreateStarted.promise;
+
+    const transitionAck = acknowledge();
+    const transitionPending = setup.startTransition(transitionAck);
+    await new Promise(resolve => setImmediate(resolve));
+    const transitionBeforeSendCommit = transitionAck.value();
+
+    setup.releaseSendCreate.resolve();
+    await Promise.all([sendPending, transitionPending]);
+
+    assert.equal(transitionBeforeSendCommit, undefined);
+    assert.deepEqual(transitionAck.value(), { success: true });
+    assert.equal(setup.MessageModel.rows.length, 1);
+  });
+
+  test(`a ${kind} holding the actor account lock wins before a queued chat message`, async () => {
+    const setup = sendTransitionFixture(kind, { gateTransitionWrite: true });
+    const transitionAck = acknowledge();
+    const transitionPending = setup.startTransition(transitionAck);
+    await setup.transitionWriteStarted.promise;
+
+    const sendPending = setup.socket.trigger('chat_message', {
+      serverCode: 'ABC123', clientContextId: 1, text: `message after ${kind}`
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    await new Promise(resolve => setImmediate(resolve));
+    const reachedCreateBeforeTransitionCommit = setup.reachedCreate();
+
+    setup.releaseTransitionWrite.resolve();
+    await Promise.all([transitionPending, sendPending]);
+
+    assert.deepEqual(transitionAck.value(), { success: true });
+    assert.equal(reachedCreateBeforeTransitionCommit, false);
+    assert.equal(setup.MessageModel.rows.length, 0);
+  });
+}
+
 module.exports = {
   VALID_MESSAGE_ID,
   userDocument,

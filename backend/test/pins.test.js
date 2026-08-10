@@ -212,6 +212,67 @@ test('transactional pinned deletion marks deleted and pulls pin with one committ
   assert.equal(author.outbound.filter(item => item.event === 'message_deleted').length, 1);
 });
 
+test('standalone Mongo unsupported transaction falls back to compensating pinned deletion once', async () => {
+  const priorPin = { messageId: objectId(1), pinnedAt: new Date(10), pinnedBy: 'ExactMod' };
+  const setup = fixture({
+    rooms: [room('global'), room('ABC123', {
+      moderators: ['ExactMod'], pinnedMessages: [priorPin], pinVersion: 7
+    })]
+  });
+  let transactionCalls = 0;
+  const standaloneConnection = {
+    async transaction() {
+      transactionCalls += 1;
+      throw Object.assign(
+        new Error('Transaction numbers are only allowed on a replica set member or mongos'),
+        { name: 'MongoServerError', code: 20, codeName: 'IllegalOperation' }
+      );
+    }
+  };
+  setup.MessageModel.db = standaloneConnection;
+  setup.ChatServerModel.db = standaloneConnection;
+  const author = authenticate(setup, { id: 'standalone-author', username: 'Author' });
+
+  const result = await deleteMessage(author, objectId(1));
+
+  assert.equal(transactionCalls, 1);
+  assert.equal(setup.MessageModel.rows[0].deleted, true);
+  const storedRoom = setup.ChatServerModel.rows.find(row => row.code === 'ABC123');
+  assert.deepEqual(storedRoom.pinnedMessages, []);
+  assert.equal(storedRoom.pinVersion, 8);
+  assert.deepEqual(result, {
+    success: true, messageId: objectId(1),
+    pin: { serverCode: 'ABC123', pinCount: 0, pinVersion: 8, blockVersion: 0 }
+  });
+});
+
+test('unclassified transaction failures never replay pinned deletion through compensation', async () => {
+  const priorPin = { messageId: objectId(1), pinnedAt: new Date(10), pinnedBy: 'ExactMod' };
+  const setup = fixture({
+    rooms: [room('global'), room('ABC123', {
+      moderators: ['ExactMod'], pinnedMessages: [priorPin], pinVersion: 7
+    })]
+  });
+  const sharedConnection = {
+    async transaction() {
+      throw Object.assign(new Error('transaction outcome is unknown'), {
+        name: 'MongoServerError', code: 91, codeName: 'ShutdownInProgress'
+      });
+    }
+  };
+  setup.MessageModel.db = sharedConnection;
+  setup.ChatServerModel.db = sharedConnection;
+  const author = authenticate(setup, { id: 'uncertain-author', username: 'Author' });
+
+  const result = await deleteMessage(author, objectId(1));
+
+  assert.deepEqual(result, { error: 'Failed to delete message.' });
+  assert.equal(setup.MessageModel.rows[0].deleted, false);
+  const storedRoom = setup.ChatServerModel.rows.find(row => row.code === 'ABC123');
+  assert.deepEqual(storedRoom.pinnedMessages, [priorPin]);
+  assert.equal(storedRoom.pinVersion, 7);
+});
+
 test('fallback deletion pulls and versions the pin before saving the message', async () => {
   const priorPin = { messageId: objectId(1), pinnedAt: new Date(10), pinnedBy: 'ExactMod' };
   const setup = fixture({
@@ -745,7 +806,13 @@ test('pin events are fresh-access checked recipient-aware and monotonically vers
   assert.equal(memberEvents.length, 0);
   assert.deepEqual(inspectingAdmin.outbound.filter(item => item.event === 'message_pin_updated')
     .map(item => item.payload.pin.pinVersion), [1, 2]);
-  assert.equal(blocked.outbound.some(item => item.event === 'message_pin_updated'), false);
+  const blockedEvents = blocked.outbound.filter(item => item.event === 'message_pin_updated');
+  assert.deepEqual(blockedEvents.map(item => item.payload), [
+    { pin: { serverCode: 'ABC123', pinCount: 0, pinVersion: 1, blockVersion: 3 } },
+    { pin: { serverCode: 'ABC123', pinCount: 0, pinVersion: 2, blockVersion: 3 } }
+  ]);
+  assert.equal(JSON.stringify(blockedEvents).includes(objectId(1)), false);
+  assert.equal(JSON.stringify(blockedEvents).includes('Author'), false);
   assert.equal(ghostAdmin.outbound.some(item => item.event === 'message_pin_updated'), false);
   assert.equal(JSON.stringify(inspectingAdmin.outbound).includes('message 1'), false);
   assert.equal(JSON.stringify(inspectingAdmin.outbound).includes('pins'), false);

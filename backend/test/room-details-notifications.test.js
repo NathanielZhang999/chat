@@ -160,6 +160,21 @@ test('metadata events omit stale banned sessions and acknowledgements use canoni
   assert.equal(setup.bannedAdmin.outbound.filter(item => item.event === 'room_details_updated').length, 0);
   assert.equal(unrelatedAdmin.outbound.filter(item => item.event === 'room_details_updated').length, 0);
   assert.equal(setup.admin.outbound.filter(item => item.event === 'room_details_updated').length, 1);
+  assert.deepEqual(
+    setup.member.outbound.find(item => item.event === 'room_details_updated').payload,
+    {
+      serverCode: 'ABC123', description: 'changed', rules: 'rules',
+      metadataVersion: 1, canEdit: false
+    }
+  );
+  assert.equal(
+    setup.owner.outbound.find(item => item.event === 'room_details_updated').payload.canEdit,
+    true
+  );
+  assert.equal(
+    setup.admin.outbound.find(item => item.event === 'room_details_updated').payload.canEdit,
+    true
+  );
 });
 
 test('a lost metadata compare-and-set returns a reload error without audit or event', async () => {

@@ -778,8 +778,21 @@
                 if (!sameRoom || !integer(incoming.metadataVersion)) return current;
                 const currentVersion = current && integer(current.metadataVersion)
                     ? current.metadataVersion : -1;
-                if (incoming.metadataVersion <= currentVersion) return current;
-                return clone(incoming);
+                if (incoming.metadataVersion < currentVersion) return current;
+                if (incoming.metadataVersion === currentVersion) {
+                    if (!current || !same(current, incoming, [
+                        'serverCode', 'description', 'rules', 'metadataVersion'
+                    ])) return current;
+                    if (typeof incoming.canEdit !== 'boolean' || incoming.canEdit === current.canEdit) {
+                        return current;
+                    }
+                    return { ...current, canEdit: incoming.canEdit };
+                }
+                const next = clone(incoming);
+                if (typeof incoming.canEdit !== 'boolean' && typeof current?.canEdit === 'boolean') {
+                    next.canEdit = current.canEdit;
+                }
+                return next;
             }
 
             if (kind === 'blocks' || kind === 'block') {
@@ -831,7 +844,8 @@
                 if (incoming.version < current.version) return current;
                 const identical = same(current, incoming, [
                     'serverCode', 'usernameKey', 'notificationLevel', 'lastReadAt',
-                    'lastReadMessageId', 'unreadCount', 'mentionCount', 'version', 'blockVersion'
+                    'lastReadMessageId', 'countedThroughAt', 'countedThroughMessageId',
+                    'unreadCount', 'mentionCount', 'version', 'blockVersion'
                 ]);
                 return identical ? current : current;
             }
@@ -964,6 +978,13 @@
             const cursorId = state.lastReadMessageId == null ? '' : String(state.lastReadMessageId);
             if (!Number.isFinite(cursorTimestamp) && cursorTimestamp !== -Infinity) return state;
             if (timestamp < cursorTimestamp || (timestamp === cursorTimestamp && messageId <= cursorId)) return state;
+            const countedThroughTimestamp = state.countedThroughAt == null
+                ? -Infinity : new Date(state.countedThroughAt).getTime();
+            const countedThroughId = state.countedThroughMessageId == null
+                ? '' : String(state.countedThroughMessageId);
+            if (!Number.isFinite(countedThroughTimestamp) && countedThroughTimestamp !== -Infinity) return state;
+            if (timestamp < countedThroughTimestamp ||
+                (timestamp === countedThroughTimestamp && messageId <= countedThroughId)) return state;
             if (!recentIds.add(messageId, { timestamp: activity.timestamp, messageId })) return state;
             return {
                 ...state,
@@ -2325,8 +2346,8 @@
             roomStateByCode.set(next.serverCode, next);
             attentionByRoom.set(next.serverCode, next);
             recentIdsForRoom(next.serverCode).clearAtOrBefore({
-                timestamp: next.lastReadAt,
-                messageId: next.lastReadMessageId
+                timestamp: next.countedThroughAt ?? next.lastReadAt,
+                messageId: next.countedThroughMessageId ?? next.lastReadMessageId
             });
         }
         renderRoomAttention(next.serverCode);
@@ -3935,6 +3956,7 @@
         });
         
         activeSocket.on('force_logout', (msg) => {
+            if (activeSocket !== socket) return;
             localStorage.removeItem('pro_chat_user'); alert(msg || "You have been logged out remotely."); location.reload(); 
         });
 
@@ -3957,10 +3979,12 @@
         });
         
         activeSocket.on('system_message', (txt) => {
+            if (activeSocket !== socket) return;
             ChatClientHelpers.dispatchRoomEvent(currentServerCode, appendSystemMessage, txt);
         });
 
         activeSocket.on('global_role_updated', (data) => {
+            if (activeSocket !== socket) return;
             if (data.username === myUsername) {
                 myRole = data.role;
                 if (data.role !== 'admin') invalidatePrivilegedAccess();
@@ -3972,6 +3996,7 @@
         });
         
         activeSocket.on('room_role_updated', (data) => {
+            if (activeSocket !== socket) return;
             if (data.username === myUsername && data.targetServer === currentServerCode) {
                 myRoomRole = 'user';
                 invalidatePrivilegedAccess();
@@ -3980,6 +4005,7 @@
         });
 
         activeSocket.on('room_access_updated', (data) => {
+            if (activeSocket !== socket) return;
             if (!data || data.username !== myUsername) return;
             closeModerationPrompt();
             closeReportPrompt();
@@ -3990,11 +4016,13 @@
         });
 
         activeSocket.on('room_restriction_updated', (data) => {
+            if (activeSocket !== socket) return;
             if (data && data.serverCode === currentServerCode && data.banned) enterLobby();
             roomAccessCoordinator.handleRestrictionUpdate(data);
         });
 
         activeSocket.on('moderation_queue_updated', (data) => {
+            if (activeSocket !== socket) return;
             if (!data || data.serverCode !== moderatorCenterRoom ||
                 currentServerCode !== moderatorCenterRoom ||
                 !document.getElementById('moderator-center-modal').classList.contains('active')) return;
@@ -4002,6 +4030,7 @@
         });
 
         activeSocket.on('message_blocked', (data) => {
+            if (activeSocket !== socket) return;
             const context = compositionContextCoordinator.current();
             if (!ChatClientHelpers.shouldDisplayMessageBlocked({
                 data,
@@ -4012,6 +4041,7 @@
         });
         
         activeSocket.on('profile_updated', (data) => {
+            if (activeSocket !== socket) return;
             if (data.username === myUsername) { myColor = data.color; myAvatarUrl = data.avatarUrl; myDisplayName = data.displayName || data.username; }
             document.querySelectorAll(`.msg[data-author="${data.username}"]`).forEach(el => {
                 if (el.classList.contains('deleted-compact')) return;
@@ -4039,6 +4069,7 @@
         });
 
         activeSocket.on('message_edited', (data) => {
+            if (activeSocket !== socket) return;
             document.querySelectorAll(`.msg[data-id="${data.id}"]`).forEach(el => {
                 el.setAttribute('data-raw-text', data.text); 
                 el.classList.remove('pinged'); 
@@ -4075,7 +4106,12 @@
             });
         });
 
-        activeSocket.on('message_deleted', (id) => {
+        activeSocket.on('message_deleted', (data) => {
+            if (activeSocket !== socket) return;
+            if (!data || typeof data !== 'object' || Array.isArray(data) ||
+                data.serverCode !== currentServerCode ||
+                typeof data.id !== 'string' || !/^[a-f0-9]{24}$/i.test(data.id)) return;
+            const id = data.id;
             document.querySelectorAll(`.msg[data-id="${id}"]`).forEach(el => {
                 const authorName = el.getAttribute('data-display') || el.getAttribute('data-author') || 'Someone';
                 const isMe = el.getAttribute('data-author') === myUsername;
@@ -4102,6 +4138,7 @@
         });
 
         activeSocket.on('reaction_updated', (data) => {
+            if (activeSocket !== socket) return;
             const msgEl = document.querySelector(`.msg[data-id="${data.id}"]`);
             if (msgEl && !msgEl.classList.contains('deleted-compact')) {
                 let container = msgEl.querySelector('.msg-reactions');
@@ -4115,9 +4152,13 @@
             }
         });
         
-        activeSocket.on('admin_new_server', (srv) => { if (myRole === 'admin') addServerToList(srv.code, srv.name, srv.owner); });
+        activeSocket.on('admin_new_server', (srv) => {
+            if (activeSocket !== socket) return;
+            if (myRole === 'admin') addServerToList(srv.code, srv.name, srv.owner);
+        });
 
         activeSocket.on('server_deleted', (code) => {
+            if (activeSocket !== socket) return;
             myJoinedServers = myJoinedServers.filter(c => c !== code);
             const icon = document.getElementById(`srv-${code}`);
             if (icon) icon.remove();
@@ -4131,6 +4172,7 @@
 
         // --- ONLINE USERS RENDERER & ROLE SYNC ---
         activeSocket.on('online_users', (users) => {
+            if (activeSocket !== socket) return;
             ChatClientHelpers.dispatchRoomEvent(currentServerCode, roomUsers => {
             const list = document.getElementById('online-list');
             list.innerHTML = '';
@@ -4227,6 +4269,7 @@
         });
 
         activeSocket.on('typing', (data) => {
+            if (activeSocket !== socket) return;
             ChatClientHelpers.dispatchRoomEvent(currentServerCode, typing => {
                 if (typing.isTyping) typingUsers.set(typing.username, ChatClientHelpers.typingDisplayName(typing));
                 else typingUsers.delete(typing.username);

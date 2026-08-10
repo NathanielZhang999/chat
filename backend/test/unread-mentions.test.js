@@ -198,6 +198,37 @@ test('exact unread counts include only newer messages from another unblocked aut
   assert.equal(snapshot.blockVersion, 4);
 });
 
+test('exact room attention snapshots identify the newest committed message they already counted through', async () => {
+  const cursorAt = new Date('2026-08-10T12:00:00.000Z');
+  const countedThroughAt = new Date('2026-08-10T12:02:00.000Z');
+  const countedThroughMessageId = objectId(19);
+  const setup = createFixture({
+    users: [user('Reader'), user('Other')],
+    messages: [
+      message(17, { username: 'Other', authorKey: 'other', timestamp: cursorAt }),
+      message(18, {
+        username: 'Other', authorKey: 'other', timestamp: new Date('2026-08-10T12:01:00.000Z')
+      }),
+      message(19, {
+        username: 'Other', authorKey: 'other', timestamp: countedThroughAt
+      })
+    ],
+    roomStates: [roomState('reader', 'ABC123', cursorAt, objectId(17), { version: 2 })]
+  });
+  const reader = setup.connect({ id: 'reader-counted-through', username: 'Reader' });
+
+  const snapshot = await updateNotification(reader, 'ABC123', 'mentions');
+
+  assert.equal(snapshot.unreadCount, 2);
+  assert.equal(snapshot.countedThroughAt instanceof Date, true);
+  assert.equal(snapshot.countedThroughAt.getTime(), countedThroughAt.getTime());
+  assert.equal(snapshot.countedThroughMessageId, countedThroughMessageId);
+  const event = events(reader, 'room_notification_updated').at(-1);
+  assert.equal(event.countedThroughAt instanceof Date, true);
+  assert.equal(event.countedThroughAt.getTime(), countedThroughAt.getTime());
+  assert.equal(event.countedThroughMessageId, countedThroughMessageId);
+});
+
 test('exact mention counts use immutable usernames and everyone while deleted rows still count', async () => {
   const cursorAt = new Date('2026-08-10T12:00:00.000Z');
   const setup = createFixture({
