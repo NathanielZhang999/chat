@@ -96,6 +96,182 @@ function emptySwitchSuccess(usernameKey = 'alice', { canEdit = false } = {}) {
   };
 }
 
+function roomActivityFixture({ mentioned = false, recipientBlockVersion = 0 } = {}) {
+  const ioInstance = new FakeIo();
+  const onlineUsersMap = new Map();
+  const UserModel = createMemoryModel([
+    { username: 'Author', displayName: 'Author', role: 'user', servers: ['global', 'ABC123'] },
+    { username: 'Member', displayName: 'Member', role: 'user', servers: ['global', 'ABC123'] },
+    { username: 'Timed', displayName: 'Timed', role: 'user', servers: ['global', 'ABC123'] },
+    { username: 'Banned', displayName: 'Banned', role: 'user', servers: ['global', 'ABC123'] },
+    { username: 'Nonmember', displayName: 'Nonmember', role: 'user', servers: ['global'] },
+    { username: 'GhostAdmin', displayName: 'GhostAdmin', role: 'admin', servers: ['global'] }
+  ]);
+  const ChatServerModel = createMemoryModel([{
+    code: 'ABC123', name: 'Private', owner: 'Author', moderators: [],
+    autoMod: { blockedKeywords: [], mentionLimit: 8, repeatLimit: 3, repeatWindowSeconds: 30 }
+  }]);
+  const MessageModel = createMemoryModel([]);
+  const baseCreate = MessageModel.create.bind(MessageModel);
+  const timestamp = new Date('2026-08-10T15:00:00.000Z');
+  MessageModel.create = value => baseCreate({
+    _id: '507f1f77bcf86cd799439101', timestamp, deleted: false, ...value
+  });
+  const RoomRestrictionModel = createMemoryModel([
+    { serverCode: 'ABC123', username: 'timed', bannedAt: null, timeoutUntil: new Date(Date.now() + 60_000) },
+    { serverCode: 'ABC123', username: 'banned', bannedAt: new Date(), timeoutUntil: null }
+  ]);
+  const RoomMemberStateModel = createMemoryModel([]);
+  const UserExperienceStateModel = createMemoryModel([{
+    usernameKey: 'member', blockedUsers: [], blockVersion: recipientBlockVersion
+  }]);
+  const shared = {
+    ioInstance, onlineUsersMap, UserModel, ChatServerModel, MessageModel,
+    RoomRestrictionModel, RoomMemberStateModel, UserExperienceStateModel,
+    resolvePingsFn: async text => mentioned ? '{{PING:Member|Member}}' : text,
+    logger: { error() {} }
+  };
+  function add({ id, username, role = 'user', serverCode = 'global', joinedServers }) {
+    const memberships = joinedServers || UserModel.rows.find(row => row.username === username)?.servers || [];
+    const socket = registerSharedSocket(shared, id);
+    Object.assign(socket, {
+      username, displayName: username, role, serverCode, joinedServers: [...memberships],
+      bannedRooms: [], blockedUserKeys: new Set(),
+      blockVersion: username.toLowerCase() === 'member' ? recipientBlockVersion : 0
+    });
+    if (serverCode) socket.joinedRooms.add(serverCode);
+    onlineUsersMap.set(id, {
+      username, displayName: username, role, serverCode, joinedServers: [...memberships],
+      bannedRooms: [], blockedUsers: [], blockVersion: socket.blockVersion
+    });
+    ioInstance.sockets.push(socket);
+    return socket;
+  }
+  return { ...shared, add, timestamp };
+}
+
+function eventPayloads(socket, event) {
+  return socket.outbound.filter(item => item.event === event).map(item => item.payload);
+}
+
+function preserveAttentionProjection(MessageModel) {
+  const find = MessageModel.find.bind(MessageModel);
+  MessageModel.find = (query = {}) => {
+    const result = find(query);
+    if (!Array.isArray(query.$and)) return result;
+    return {
+      async select() {
+        return (await result).map(row => ({
+          _id: row._id, serverCode: row.serverCode, timestamp: row.timestamp,
+          username: row.username, authorKey: row.authorKey,
+          notificationMentions: Array.isArray(row.notificationMentions)
+            ? [...row.notificationMentions] : row.notificationMentions,
+          deleted: row.deleted
+        }));
+      }
+    };
+  };
+}
+
+test('room activity reaches inactive actual members but not admin ghost viewers nonmembers or banned users', async () => {
+  const setup = roomActivityFixture();
+  const author = setup.add({ id: 'author', username: 'Author', serverCode: 'ABC123' });
+  const inactive = setup.add({ id: 'member-inactive', username: 'Member', serverCode: 'global' });
+  const secondSession = setup.add({ id: 'member-second', username: 'Member', serverCode: null });
+  const timed = setup.add({ id: 'timed', username: 'Timed', serverCode: 'global' });
+  const banned = setup.add({ id: 'banned', username: 'Banned', serverCode: 'global' });
+  const nonmember = setup.add({ id: 'nonmember', username: 'Nonmember', serverCode: 'global' });
+  const ghost = setup.add({
+    id: 'ghost', username: 'GhostAdmin', role: 'admin', serverCode: 'ABC123', joinedServers: ['global']
+  });
+
+  await author.trigger('chat_message', { text: 'activity for the room rail' });
+
+  assert.equal(eventPayloads(inactive, 'room_activity').length, 1);
+  assert.equal(eventPayloads(secondSession, 'room_activity').length, 1);
+  assert.equal(eventPayloads(timed, 'room_activity').length, 1);
+  for (const denied of [author, banned, nonmember, ghost]) {
+    assert.deepEqual(eventPayloads(denied, 'room_activity'), [], denied.id);
+  }
+});
+
+test('room activity carries the recipient current blockVersion and normalized message tuple', async () => {
+  const setup = roomActivityFixture({ mentioned: true, recipientBlockVersion: 7 });
+  const author = setup.add({ id: 'author', username: 'Author', serverCode: 'ABC123' });
+  const recipient = setup.add({ id: 'member', username: 'Member', serverCode: 'global' });
+
+  await author.trigger('chat_message', { text: '@Member' });
+
+  assert.deepEqual(eventPayloads(recipient, 'room_activity'), [{
+    serverCode: 'ABC123',
+    messageId: '507f1f77bcf86cd799439101',
+    timestamp: setup.timestamp,
+    authorKey: 'author',
+    mentioned: true,
+    blockVersion: 7
+  }]);
+});
+
+test('login reconnect and account events replace exact counts from MongoDB', async () => {
+  const cursorAt = new Date('2026-08-10T12:00:00.000Z');
+  const ioInstance = new FakeIo();
+  const onlineUsersMap = new Map();
+  const UserModel = createMemoryModel([{
+    username: 'Reader', displayName: 'Reader', password: 'hash', role: 'user', servers: ['global', 'ABC123']
+  }]);
+  const ChatServerModel = createMemoryModel([
+    { code: 'global', name: 'Global Chat', owner: 'System', moderators: [] },
+    { code: 'ABC123', name: 'Private', owner: 'Owner', moderators: [] }
+  ]);
+  const MessageModel = createMemoryModel([
+    {
+      _id: '507f1f77bcf86cd799439111', serverCode: 'ABC123', username: 'Other', authorKey: 'other',
+      notificationMentions: [], timestamp: cursorAt
+    },
+    {
+      _id: '507f1f77bcf86cd799439112', serverCode: 'ABC123', username: 'Other', authorKey: 'other',
+      notificationMentions: ['reader'], timestamp: new Date('2026-08-10T12:01:00.000Z')
+    },
+    {
+      _id: '507f1f77bcf86cd799439113', serverCode: 'ABC123', username: 'Other', authorKey: 'other',
+      notificationMentions: [], timestamp: new Date('2026-08-10T12:02:00.000Z')
+    }
+  ]);
+  preserveAttentionProjection(MessageModel);
+  const RoomMemberStateModel = createMemoryModel([{
+    usernameKey: 'reader', serverCode: 'ABC123', notificationLevel: 'all',
+    lastReadAt: cursorAt, lastReadMessageId: '507f1f77bcf86cd799439111', version: 2
+  }]);
+  const UserExperienceStateModel = createMemoryModel([]);
+  const shared = {
+    ioInstance, onlineUsersMap, UserModel, ChatServerModel, MessageModel,
+    RoomRestrictionModel: createMemoryModel([]), RoomMemberStateModel, UserExperienceStateModel,
+    bcryptImpl: { async compare() { return true; } }, logger: { error() {} }
+  };
+  const first = registerSharedSocket(shared, 'login-one');
+  ioInstance.sockets.push(first);
+  const firstAck = acknowledge();
+  await first.trigger('login', { username: 'Reader', password: '123456' }, firstAck.callback);
+  const second = registerSharedSocket(shared, 'login-two');
+  ioInstance.sockets.push(second);
+  const secondAck = acknowledge();
+  await second.trigger('login', { username: 'reader', password: '123456' }, secondAck.callback);
+
+  for (const result of [firstAck.value(), secondAck.value()]) {
+    const state = result.roomStates.find(row => row.serverCode === 'ABC123');
+    assert.deepEqual({ unreadCount: state.unreadCount, mentionCount: state.mentionCount }, {
+      unreadCount: 2, mentionCount: 1
+    });
+  }
+  const notificationAck = acknowledge();
+  await first.trigger('update_room_notification', {
+    serverCode: 'ABC123', level: 'mentions'
+  }, notificationAck.callback);
+  assert.equal(notificationAck.value().unreadCount, 2);
+  assert.equal(notificationAck.value().mentionCount, 1);
+  assert.deepEqual(eventPayloads(second, 'room_notification_updated').at(-1), notificationAck.value());
+});
+
 test('login returns safe room summaries and actual-member room attention without admin ghost counts', async () => {
   const cursorAt = new Date('2026-08-10T12:00:00.000Z');
   const UserModel = createMemoryModel([{
@@ -1402,6 +1578,7 @@ test('room switch finishes role lookup before history lookup begins', async () =
       return {
         sort() { return this; },
         limit() { return this; },
+        async select() { return []; },
         async lean() {
           events.push('history:lean');
           return [];
@@ -1430,7 +1607,7 @@ test('room switch finishes role lookup before history lookup begins', async () =
 
   assert.deepEqual(ack.value(), emptySwitchSuccess());
   assert.deepEqual(events, [
-    'role:start', 'role:end', 'history:find', 'history:lean', 'history:find'
+    'role:start', 'role:end', 'history:find', 'history:lean', 'history:find', 'history:find'
   ]);
 });
 
@@ -2115,6 +2292,7 @@ test('deletion preflights sockets then waits for a queued switch account commit'
       return {
         sort() { return this; },
         limit() { return this; },
+        async select() { return []; },
         lean() {
           historyEntered.resolve();
           return historyPrepared.promise;

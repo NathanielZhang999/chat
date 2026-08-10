@@ -42,6 +42,25 @@ function message(index, overrides = {}) {
   };
 }
 
+function preserveAttentionProjection(MessageModel) {
+  const find = MessageModel.find.bind(MessageModel);
+  MessageModel.find = (query = {}) => {
+    const result = find(query);
+    if (!Array.isArray(query.$and)) return result;
+    return {
+      async select() {
+        return (await result).map(row => ({
+          _id: row._id, serverCode: row.serverCode, timestamp: row.timestamp,
+          username: row.username, authorKey: row.authorKey,
+          notificationMentions: Array.isArray(row.notificationMentions)
+            ? [...row.notificationMentions] : row.notificationMentions,
+          deleted: row.deleted
+        }));
+      }
+    };
+  };
+}
+
 function fixture(overrides = {}) {
   const setup = {
     ioInstance: new FakeIo(),
@@ -734,27 +753,54 @@ test('block updates refresh room attention pin counts typing and active history 
   assert.equal(second.typingUsers.has('author'), false);
 });
 
-test('unblocking refetches active history without advancing unrelated room cursors', async () => {
+test('unblocking may expose newer unread messages without silently advancing any cursor', async () => {
   const cursorAt = new Date('2026-08-10T12:00:00.000Z');
   const setup = fixture({
-    roomStates: [{
-      usernameKey: 'blocker', serverCode: 'XYZ789', notificationLevel: 'all',
-      lastReadAt: cursorAt, lastReadMessageId: objectId(9), version: 7
-    }],
+    messages: [message(10, {
+      notificationMentions: ['blocker'], timestamp: new Date('2026-08-10T12:01:00.000Z')
+    })],
+    roomStates: [
+      {
+        usernameKey: 'blocker', serverCode: 'XYZ789', notificationLevel: 'all',
+        lastReadAt: cursorAt, lastReadMessageId: objectId(9), version: 7
+      },
+      {
+        usernameKey: 'blocker', serverCode: 'ABC123', notificationLevel: 'mentions',
+        lastReadAt: cursorAt, lastReadMessageId: objectId(9), version: 3
+      }
+    ],
     experienceStates: [{
       usernameKey: 'blocker', blockedUsers: [{ usernameKey: 'author', username: 'Author', createdAt: new Date() }],
       blockVersion: 4
     }]
   });
+  preserveAttentionProjection(setup.MessageModel);
   const blocker = authenticate(setup, {
     id: 'blocker', username: 'Blocker', blockedUsers: ['author'], blockVersion: 4
   });
-  const before = JSON.stringify(setup.RoomMemberStateModel.rows[0]);
+  const cursorRowsBefore = new Map(setup.RoomMemberStateModel.rows.map(row => [
+    row.serverCode,
+    JSON.stringify({
+      lastReadAt: row.lastReadAt, lastReadMessageId: row.lastReadMessageId, version: row.version
+    })
+  ]));
 
   await setBlock(blocker, 'Author', false);
 
   assert.deepEqual(events(blocker, 'room_refresh_required').at(-1), { serverCode: 'ABC123', blockVersion: 5 });
-  assert.equal(JSON.stringify(setup.RoomMemberStateModel.rows.find(row => row.serverCode === 'XYZ789')), before);
+  for (const serverCode of ['ABC123', 'XYZ789']) {
+    const row = setup.RoomMemberStateModel.rows.find(candidate => candidate.serverCode === serverCode);
+    assert.equal(JSON.stringify({
+      lastReadAt: row.lastReadAt, lastReadMessageId: row.lastReadMessageId, version: row.version
+    }), cursorRowsBefore.get(serverCode), serverCode);
+  }
+  const attention = events(blocker, 'room_attention_updated')
+    .find(snapshot => snapshot.serverCode === 'ABC123');
+  assert.deepEqual({
+    unreadCount: attention.unreadCount,
+    mentionCount: attention.mentionCount,
+    blockVersion: attention.blockVersion
+  }, { unreadCount: 1, mentionCount: 1, blockVersion: 5 });
 });
 
 test('blocked account receives no event acknowledgement or observable state change', async () => {

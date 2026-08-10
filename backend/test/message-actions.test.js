@@ -37,6 +37,64 @@ function authenticate(socket, { serverCode = 'global', joinedServers = ['global'
   socket.joinedServers = joinedServers;
 }
 
+test('new messages store immutable normalized author and canonical send-time mentions', async () => {
+  const MessageModel = createMemoryModel([]);
+  const { socket } = registerMessages({
+    MessageModel,
+    resolvePingsFn: async () =>
+      '{{PING:Bob|Bob}} {{PING:BOB|Bob}} {{PING:everyone|everyone}}'
+  });
+  authenticate(socket, { serverCode: 'ABC123', joinedServers: ['global', 'ABC123'] });
+
+  await socket.trigger('chat_message', { text: '@Bob @BOB @everyone' });
+
+  assert.equal(MessageModel.rows.length, 1);
+  assert.equal(MessageModel.rows[0].serverCode, 'ABC123');
+  assert.equal(MessageModel.rows[0].authorKey, 'alice');
+  assert.deepEqual(MessageModel.rows[0].notificationMentions, ['bob', '*']);
+});
+
+test('everyone mention stores the reserved star exactly once', async () => {
+  const MessageModel = createMemoryModel([]);
+  const { socket } = registerMessages({
+    MessageModel,
+    resolvePingsFn: async () =>
+      '{{PING:everyone|everyone}} {{PING:everyone|everyone}}'
+  });
+  authenticate(socket, { serverCode: 'ABC123', joinedServers: ['global', 'ABC123'] });
+
+  await socket.trigger('chat_message', { text: '@everyone @everyone' });
+
+  assert.deepEqual(MessageModel.rows[0].notificationMentions, ['*']);
+});
+
+test('edits do not change mention metadata or create activity', async () => {
+  const MessageModel = createMemoryModel([]);
+  const { socket } = registerMessages({
+    MessageModel,
+    resolvePingsFn: async text => text === 'original'
+      ? '{{PING:bob|Bob}}'
+      : '{{PING:carol|Carol}}'
+  });
+  authenticate(socket, { serverCode: 'ABC123', joinedServers: ['global', 'ABC123'] });
+  await socket.trigger('chat_message', { text: 'original' });
+  const stored = MessageModel.rows[0];
+  assert.deepEqual(stored.notificationMentions, ['bob']);
+  const immutableBefore = {
+    authorKey: stored.authorKey,
+    notificationMentions: [...stored.notificationMentions]
+  };
+  socket.outbound.length = 0;
+
+  await socket.trigger('edit_message', { id: stored._id, text: 'edited' });
+
+  assert.deepEqual({
+    authorKey: MessageModel.rows[0].authorKey,
+    notificationMentions: MessageModel.rows[0].notificationMentions
+  }, immutableBefore);
+  assert.deepEqual(socket.outbound.filter(item => item.event === 'room_activity'), []);
+});
+
 test('pin mutation binds the live target to the requested room without exposing message content', async () => {
   const messageId = '507f1f77bcf86cd799439011';
   const secret = 'PIN_ACTION_SECRET';
@@ -833,6 +891,13 @@ test('room history strips unsafe legacy attachments before acknowledgement', asy
         return {
           sort() { return this; },
           limit() { return this; },
+          async select() {
+            return history.map(row => ({
+              _id: row._id, serverCode: row.serverCode, timestamp: row.timestamp,
+              username: row.username, authorKey: row.authorKey,
+              notificationMentions: row.notificationMentions, deleted: row.deleted
+            }));
+          },
           async lean() { return history; },
           then(resolve, reject) { return Promise.resolve(history).then(resolve, reject); }
         };

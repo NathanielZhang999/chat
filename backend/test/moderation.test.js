@@ -65,6 +65,25 @@ function saveableDocument(value) {
   return document;
 }
 
+function preserveAttentionProjection(MessageModel) {
+  const find = MessageModel.find.bind(MessageModel);
+  MessageModel.find = (query = {}) => {
+    const result = find(query);
+    if (!Array.isArray(query.$and)) return result;
+    return {
+      async select() {
+        return (await result).map(row => ({
+          _id: row._id, serverCode: row.serverCode, timestamp: row.timestamp,
+          username: row.username, authorKey: row.authorKey,
+          notificationMentions: Array.isArray(row.notificationMentions)
+            ? [...row.notificationMentions] : row.notificationMentions,
+          deleted: row.deleted
+        }));
+      }
+    };
+  };
+}
+
 function userDocument(overrides = {}) {
   return saveableDocument({
     username: 'Alice', displayName: 'Alice', password: 'hash', role: 'user', servers: ['global'],
@@ -3684,14 +3703,14 @@ for (const transition of ['demotion', 'promotion']) {
   });
 }
 
-test('join rejoin and restored access advance the cursor before publishing access', async () => {
+test('absence-period messages never become unread after leave kick ban rejoin or restored Global access', async () => {
   const newestAt = new Date('2026-08-10T13:00:00.000Z');
   const newestId = '507f1f77bcf86cd799439071';
 
   for (const scenario of [
     { name: 'join', initialState: [], expectedVersion: 0 },
     {
-      name: 'rejoin after an initially empty room',
+      name: 'rejoin after leave from an initially empty room',
       initialState: [{
         usernameKey: 'alice', serverCode: 'ABC123', notificationLevel: 'none',
         lastReadAt: null, lastReadMessageId: null, version: 0
@@ -3699,13 +3718,22 @@ test('join rejoin and restored access advance the cursor before publishing acces
       expectedVersion: 1
     },
     {
-      name: 'rejoin',
+      name: 'rejoin after kick',
       initialState: [{
         usernameKey: 'alice', serverCode: 'ABC123', notificationLevel: 'none',
         lastReadAt: new Date('2026-08-10T12:00:00.000Z'),
         lastReadMessageId: '507f1f77bcf86cd799439070', version: 4
       }],
       expectedVersion: 5
+    },
+    {
+      name: 'rejoin after ban and later unban',
+      initialState: [{
+        usernameKey: 'alice', serverCode: 'ABC123', notificationLevel: 'mentions',
+        lastReadAt: new Date('2026-08-10T12:00:00.000Z'),
+        lastReadMessageId: '507f1f77bcf86cd799439070', version: 6
+      }],
+      expectedVersion: 7
     }
   ]) {
     const RoomMemberStateModel = createMemoryModel(scenario.initialState);
@@ -3725,14 +3753,17 @@ test('join rejoin and restored access advance the cursor before publishing acces
         return document;
       }
     };
+    const MessageModel = createMemoryModel([{
+      _id: newestId, serverCode: 'ABC123', username: 'Other', authorKey: 'other',
+      notificationMentions: ['alice'], timestamp: newestAt
+    }]);
+    preserveAttentionProjection(MessageModel);
     const setup = registerWithModels({
       UserModel,
       ChatServerModel: createMemoryModel([
         roomDocument('global'), roomDocument('ABC123')
       ]),
-      MessageModel: createMemoryModel([{
-        _id: newestId, serverCode: 'ABC123', timestamp: newestAt
-      }]),
+      MessageModel,
       RoomMemberStateModel
     });
     Object.assign(setup.socket, {
@@ -3746,6 +3777,16 @@ test('join rejoin and restored access advance the cursor before publishing acces
     const ack = acknowledge();
     await setup.socket.trigger('join_server', 'ABC123', ack.callback);
     assert.equal(ack.value().success, true, scenario.name);
+    MessageModel.rows.push({
+      _id: '507f1f77bcf86cd799439073', serverCode: 'ABC123', username: 'Other', authorKey: 'other',
+      notificationMentions: ['alice'], timestamp: new Date('2026-08-10T13:01:00.000Z')
+    });
+    const notificationAck = acknowledge();
+    await setup.socket.trigger('update_room_notification', {
+      serverCode: 'ABC123', level: scenario.initialState[0]?.notificationLevel || 'all'
+    }, notificationAck.callback);
+    assert.equal(notificationAck.value().unreadCount, 1, `${scenario.name} post-grant unread`);
+    assert.equal(notificationAck.value().mentionCount, 1, `${scenario.name} post-grant mention`);
   }
 
   const RoomMemberStateModel = createMemoryModel([{
@@ -3869,6 +3910,108 @@ test('a failed membership or access grant leaves only a harmless early cursor ad
   assert.deepEqual(cursorMutationSessions, [null], 'early cursor write is outside the failed grant transaction');
   assert.notEqual(failedRestrictions.rows[0].bannedAt, null);
   assert.equal(failedRestore.ModerationAuditModel.rows.length, 0);
+});
+
+test('complete attention policy matrix covers levels blocks memberships restrictions sessions and reconnects', async () => {
+  const cursorAt = new Date('2026-08-10T12:00:00.000Z');
+  const cursorId = '507f1f77bcf86cd799439091';
+  const newerId = '507f1f77bcf86cd799439092';
+  const names = ['AllUser', 'MentionsUser', 'NoneUser', 'BlockedUser', 'TimedUser', 'BannedUser'];
+  const RoomMemberStateModel = createMemoryModel(names.map((username, index) => ({
+    _id: (200 + index).toString(16).padStart(24, '0'),
+    usernameKey: username.toLowerCase(), serverCode: 'ABC123',
+    notificationLevel: username === 'MentionsUser' ? 'mentions' : (username === 'NoneUser' ? 'none' : 'all'),
+    lastReadAt: cursorAt, lastReadMessageId: cursorId, version: 0
+  })));
+  const setup = registerWithModels({
+    users: [
+      ...names.map(username => userDocument({ username, displayName: username, password: 'hash', servers: ['global', 'ABC123'] })),
+      userDocument({ username: 'GhostAdmin', displayName: 'GhostAdmin', password: 'hash', role: 'admin', servers: ['global'] })
+    ],
+    rooms: [roomDocument('global'), roomDocument('ABC123')],
+    messages: [
+      {
+        _id: cursorId, serverCode: 'ABC123', username: 'Author', authorKey: 'author',
+        notificationMentions: [], timestamp: cursorAt
+      },
+      {
+        _id: newerId, serverCode: 'ABC123', username: 'Author', authorKey: 'author',
+        notificationMentions: ['*'], timestamp: new Date('2026-08-10T12:01:00.000Z')
+      }
+    ],
+    restrictions: [
+      restrictionDocument('ABC123', 'TimedUser', { timeoutUntil: new Date(Date.now() + 60_000) }),
+      restrictionDocument('ABC123', 'BannedUser', { bannedAt: new Date() })
+    ],
+    roomStates: RoomMemberStateModel.rows,
+    experienceStates: [{
+      usernameKey: 'blockeduser',
+      blockedUsers: [{ usernameKey: 'author', username: 'Author', createdAt: new Date() }],
+      blockVersion: 3
+    }]
+  });
+  preserveAttentionProjection(setup.MessageModel);
+  const sockets = new Map();
+  function attach(id, username, role = 'user', joinedServers = ['global', 'ABC123']) {
+    const live = connectAdditionalSocket(setup, {
+      id, username, role, serverCode: 'global', joinedServers
+    });
+    sockets.set(username, live);
+    return live;
+  }
+  for (const username of names) attach(username.toLowerCase(), username);
+  const secondAll = attach('all-second', 'AllUser');
+  const ghost = attach('ghost', 'GhostAdmin', 'admin', ['global']);
+
+  async function notification(live, level) {
+    const ack = acknowledge();
+    await live.trigger('update_room_notification', { serverCode: 'ABC123', level }, ack.callback);
+    return ack.value();
+  }
+
+  for (const [username, level] of [
+    ['MentionsUser', 'mentions'], ['NoneUser', 'none'], ['TimedUser', 'all']
+  ]) {
+    const state = await notification(sockets.get(username), level);
+    assert.deepEqual({ unreadCount: state.unreadCount, mentionCount: state.mentionCount }, {
+      unreadCount: 1, mentionCount: 1
+    }, username);
+  }
+  const blocked = await notification(sockets.get('BlockedUser'), 'all');
+  assert.deepEqual({
+    unreadCount: blocked.unreadCount, mentionCount: blocked.mentionCount, blockVersion: blocked.blockVersion
+  }, { unreadCount: 0, mentionCount: 0, blockVersion: 3 });
+  assert.deepEqual(await notification(sockets.get('BannedUser'), 'all'), { error: 'Permission denied.' });
+  assert.deepEqual(await notification(ghost, 'all'), { error: 'Permission denied.' });
+
+  const synchronized = await notification(sockets.get('AllUser'), 'mentions');
+  assert.deepEqual(secondAll.outbound.filter(item => item.event === 'room_notification_updated').at(-1).payload, synchronized);
+
+  const reconnect = new FakeSocket();
+  reconnect.id = 'all-reconnect';
+  createConnectionHandler({
+    ioInstance: setup.ioInstance,
+    onlineUsersMap: setup.onlineUsersMap,
+    UserModel: setup.UserModel,
+    ChatServerModel: setup.ChatServerModel,
+    MessageModel: setup.MessageModel,
+    RoomRestrictionModel: setup.RoomRestrictionModel,
+    ModerationAuditModel: setup.ModerationAuditModel,
+    ModerationReportModel: setup.ModerationReportModel,
+    RoomMemberStateModel: setup.RoomMemberStateModel,
+    UserExperienceStateModel: setup.UserExperienceStateModel,
+    bcryptImpl: { async compare() { return true; } },
+    broadcastOnlineUsersFn: async () => {}, getRoomRoleFn: async () => 'user',
+    resolvePingsFn: async text => text, logger: { error() {} }
+  })(reconnect);
+  setup.ioInstance.sockets.push(reconnect);
+  const loginAck = acknowledge();
+  await reconnect.trigger('login', { username: 'AllUser', password: '123456' }, loginAck.callback);
+  const reconnectState = loginAck.value().roomStates.find(state => state.serverCode === 'ABC123');
+  assert.equal(reconnectState.notificationLevel, 'mentions');
+  assert.deepEqual({ unreadCount: reconnectState.unreadCount, mentionCount: reconnectState.mentionCount }, {
+    unreadCount: 1, mentionCount: 1
+  });
 });
 
 module.exports = {

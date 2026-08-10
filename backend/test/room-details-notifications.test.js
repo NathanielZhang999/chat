@@ -95,6 +95,13 @@ async function updateNotification(socket, payload) {
   return ack.value();
 }
 
+async function markRoomRead(socket, payload) {
+  assert.equal(typeof socket.handlers.get('mark_room_read'), 'function', 'mark_room_read handler is registered');
+  const ack = acknowledge();
+  await socket.trigger('mark_room_read', payload, ack.callback);
+  return ack.value();
+}
+
 test('room details are readable by fresh authorized readers and denied after a ban', async () => {
   const setup = createFixture();
   assert.deepEqual(await details(setup.member, { serverCode: ' abc123 ' }), {
@@ -343,4 +350,51 @@ test('duplicate notification writes are idempotent and synchronize every account
     }]);
   }
   assert.deepEqual(bob.outbound.filter(item => item.event === 'room_notification_updated'), []);
+});
+
+test('mark read allows active timeout denies active ban and synchronizes all account sessions', async () => {
+  const setup = createFixture();
+  const cursorAt = new Date('2026-08-10T12:00:00.000Z');
+  const targetAt = new Date('2026-08-10T12:01:00.000Z');
+  setup.MessageModel.rows.push(
+    {
+      _id: '507f1f77bcf86cd799439041', serverCode: 'ABC123', username: 'Member',
+      authorKey: 'member', notificationMentions: [], timestamp: cursorAt
+    },
+    {
+      _id: '507f1f77bcf86cd799439042', serverCode: 'ABC123', username: 'Member',
+      authorKey: 'member', notificationMentions: ['timedoutowner'], timestamp: targetAt
+    }
+  );
+  setup.RoomMemberStateModel.rows.push({
+    _id: '507f1f77bcf86cd799439043', usernameKey: 'timedoutowner', serverCode: 'ABC123',
+    notificationLevel: 'mentions', lastReadAt: cursorAt,
+    lastReadMessageId: '507f1f77bcf86cd799439041', version: 4
+  });
+  const secondSession = installSession(setup, {
+    id: 'timeout-second', username: 'TIMEDOUTOWNER', serverCode: 'global',
+    joinedServers: ['global', 'ABC123']
+  });
+  assert.equal(typeof setup.timedOutOwner.handlers.get('mark_room_read'), 'function', 'mark_room_read handler is registered');
+  let observed;
+  await setup.timedOutOwner.trigger('mark_room_read', {
+    serverCode: 'ABC123', messageId: '507f1f77bcf86cd799439042'
+  }, result => {
+    observed = {
+      result,
+      first: setup.timedOutOwner.outbound.filter(item => item.event === 'room_read_updated'),
+      second: secondSession.outbound.filter(item => item.event === 'room_read_updated')
+    };
+  });
+
+  assert.equal(observed.result.version, 5);
+  assert.equal(observed.result.lastReadAt.getTime(), targetAt.getTime());
+  assert.equal(observed.result.lastReadMessageId, '507f1f77bcf86cd799439042');
+  assert.equal(observed.result.unreadCount, 0);
+  assert.equal(observed.result.mentionCount, 0);
+  assert.deepEqual(observed.first[0].payload, observed.result);
+  assert.deepEqual(observed.second[0].payload, observed.result);
+  assert.deepEqual(await markRoomRead(setup.bannedAdmin, {
+    serverCode: 'ABC123', messageId: '507f1f77bcf86cd799439042'
+  }), { error: 'Permission denied.' });
 });
