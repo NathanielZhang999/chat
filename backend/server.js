@@ -80,6 +80,213 @@ function normalizeAccountKey(value) {
   return String(value || '').normalize('NFKC').trim().toLowerCase();
 }
 
+function normalizeRoomText(value, maxLength) {
+  if (typeof value !== 'string') return null;
+  const normalized = value.normalize('NFKC').trim();
+  return normalized.length <= maxLength ? normalized : null;
+}
+
+function normalizeNotificationLevel(value) {
+  return ['all', 'mentions', 'none'].includes(value) ? value : null;
+}
+
+function authorKeyForMessage(message) {
+  const direct = normalizeAccountKey(message && message.authorKey);
+  if (direct && normalizeUsername(direct)) return direct;
+  const legacy = normalizeUsername(message && message.username);
+  return legacy ? normalizeAccountKey(legacy) : null;
+}
+
+function extractNotificationMentions(text) {
+  if (typeof text !== 'string') return [];
+  const mentions = [];
+  const seen = new Set();
+  const tokenPattern = /\{\{PING:([^|{}]{1,20})\|([^|{}]{1,30})\}\}/g;
+  for (const match of text.matchAll(tokenPattern)) {
+    const [, usernameValue, displayValue] = match;
+    if (usernameValue === 'everyone' && displayValue === 'everyone') {
+      if (!seen.has('*')) {
+        seen.add('*');
+        mentions.push('*');
+      }
+      continue;
+    }
+    const username = normalizeUsername(usernameValue);
+    const displayName = normalizeDisplayName(displayValue);
+    if (!username || username !== usernameValue || !displayName || displayName !== displayValue) continue;
+    const key = normalizeAccountKey(username);
+    if (!seen.has(key)) {
+      seen.add(key);
+      mentions.push(key);
+    }
+  }
+  return mentions;
+}
+
+function roomMessageQuery(serverCode) {
+  return serverCode === 'global'
+    ? { $or: [{ serverCode: 'global' }, { serverCode: { $exists: false } }, { serverCode: null }] }
+    : { serverCode };
+}
+
+function cursorFromMessage(message) {
+  if (!message || !isValidObjectId(String(message._id))) return null;
+  const lastReadAt = new Date(message.timestamp);
+  if (Number.isNaN(lastReadAt.getTime())) return null;
+  return { lastReadAt, lastReadMessageId: String(message._id) };
+}
+
+function compareCursor(left, right) {
+  const leftTime = left && left.lastReadAt instanceof Date ? left.lastReadAt.getTime() : NaN;
+  const rightTime = right && right.lastReadAt instanceof Date ? right.lastReadAt.getTime() : NaN;
+  if (Number.isNaN(leftTime) || Number.isNaN(rightTime)) return 0;
+  if (leftTime < rightTime) return -1;
+  if (leftTime > rightTime) return 1;
+  const leftId = String(left.lastReadMessageId || '').toLowerCase();
+  const rightId = String(right.lastReadMessageId || '').toLowerCase();
+  if (leftId < rightId) return -1;
+  if (leftId > rightId) return 1;
+  return 0;
+}
+
+function normalizedBlockedUserKeys(blockedUserKeys) {
+  const values = blockedUserKeys instanceof Set || Array.isArray(blockedUserKeys) ? blockedUserKeys : [];
+  const normalized = new Set();
+  for (const value of values) {
+    const key = normalizeAccountKey(value);
+    if (key && normalizeUsername(key)) normalized.add(key);
+  }
+  return normalized;
+}
+
+function safeReplyForViewer(reply, blockedUserKeys = new Set()) {
+  if (!reply || typeof reply !== 'object' || Array.isArray(reply)) return null;
+  const blocked = normalizedBlockedUserKeys(blockedUserKeys);
+  const authorKey = normalizeAccountKey(reply.authorKey);
+  if (!authorKey || !normalizeUsername(authorKey)) return blocked.size === 0 ? {
+    id: String(reply.id || ''), displayname: typeof reply.displayname === 'string' ? reply.displayname : '',
+    text: typeof reply.text === 'string' ? reply.text : ''
+  } : null;
+  if (blocked.has(authorKey)) return null;
+  return {
+    id: String(reply.id || ''), authorKey,
+    displayname: typeof reply.displayname === 'string' ? reply.displayname : '',
+    text: typeof reply.text === 'string' ? reply.text : ''
+  };
+}
+
+function safeReactionsForViewer(reactions, blockedUserKeys = new Set()) {
+  const blocked = normalizedBlockedUserKeys(blockedUserKeys);
+  const safe = {};
+  if (!reactions || typeof reactions !== 'object' || Array.isArray(reactions)) return safe;
+  for (const [reaction, users] of Object.entries(reactions)) {
+    if (!Array.isArray(users)) continue;
+    const allowed = users.filter(username => {
+      const key = normalizeAccountKey(username);
+      return key && normalizeUsername(key) && !blocked.has(key);
+    });
+    if (allowed.length > 0) Object.defineProperty(safe, reaction, {
+      value: allowed, enumerable: true, configurable: true, writable: true
+    });
+  }
+  return safe;
+}
+
+function safeMessageForViewer(message, { blockedUserKeys = new Set() } = {}) {
+  if (!message || typeof message !== 'object' || Array.isArray(message)) return null;
+  const authorKey = authorKeyForMessage(message);
+  if (!authorKey) return null;
+  const blocked = normalizedBlockedUserKeys(blockedUserKeys);
+  const username = normalizeUsername(message.username) || authorKey;
+  if (blocked.has(authorKey)) {
+    return {
+      _id: message._id,
+      serverCode: message.serverCode,
+      username,
+      authorKey,
+      timestamp: message.timestamp,
+      blocked: true
+    };
+  }
+  const deleted = Boolean(message.deleted);
+  return {
+    _id: message._id,
+    serverCode: message.serverCode,
+    username,
+    displayName: typeof message.displayName === 'string' ? message.displayName : '',
+    authorKey,
+    role: typeof message.role === 'string' ? message.role : 'user',
+    roomRole: typeof message.roomRole === 'string' ? message.roomRole : 'user',
+    color: typeof message.color === 'string' ? message.color : '',
+    avatarUrl: typeof message.avatarUrl === 'string' ? message.avatarUrl : '',
+    text: deleted ? '' : (typeof message.text === 'string' ? message.text : ''),
+    attachment: deleted ? null : sanitizeAttachment(message.attachment),
+    replyTo: deleted ? null : safeReplyForViewer(message.replyTo, blocked),
+    reactions: deleted ? {} : safeReactionsForViewer(message.reactions, blocked),
+    edited: Boolean(message.edited),
+    deleted,
+    timestamp: message.timestamp
+  };
+}
+
+function safeBlockedMessageReveal(message) {
+  if (!message || typeof message !== 'object' || Array.isArray(message)) return null;
+  const authorKey = authorKeyForMessage(message);
+  if (!authorKey) return null;
+  return {
+    _id: message._id,
+    serverCode: message.serverCode,
+    username: normalizeUsername(message.username) || authorKey,
+    displayName: typeof message.displayName === 'string' ? message.displayName : '',
+    authorKey,
+    timestamp: message.timestamp,
+    text: typeof message.text === 'string' ? message.text : '',
+    attachment: sanitizeAttachment(message.attachment),
+    edited: Boolean(message.edited),
+    deleted: Boolean(message.deleted)
+  };
+}
+
+function safeRoomDetails(room, canEdit) {
+  return {
+    serverCode: room && room.code,
+    description: room && typeof room.description === 'string' ? room.description : '',
+    rules: room && typeof room.rules === 'string' ? room.rules : '',
+    metadataVersion: Number.isInteger(room && room.metadataVersion) ? room.metadataVersion : 0,
+    canEdit: Boolean(canEdit)
+  };
+}
+
+function safeRoomState(row, counts = {}) {
+  return {
+    serverCode: row && row.serverCode,
+    usernameKey: row && row.usernameKey,
+    notificationLevel: normalizeNotificationLevel(row && row.notificationLevel) || 'all',
+    lastReadAt: row && row.lastReadAt ? new Date(row.lastReadAt) : null,
+    lastReadMessageId: row && row.lastReadMessageId ? String(row.lastReadMessageId) : null,
+    unreadCount: Number.isInteger(counts.unreadCount) && counts.unreadCount >= 0 ? counts.unreadCount : 0,
+    mentionCount: Number.isInteger(counts.mentionCount) && counts.mentionCount >= 0 ? counts.mentionCount : 0,
+    version: Number.isInteger(row && row.version) && row.version >= 0 ? row.version : 0,
+    blockVersion: Number.isInteger(counts.blockVersion) && counts.blockVersion >= 0 ? counts.blockVersion : 0
+  };
+}
+
+function safeBlockState(row) {
+  const blockedUsers = Array.isArray(row && row.blockedUsers) ? row.blockedUsers.reduce((safe, entry) => {
+    const usernameKey = normalizeAccountKey(entry && entry.usernameKey);
+    if (!usernameKey || !normalizeUsername(usernameKey)) return safe;
+    safe.push({
+      usernameKey,
+      username: normalizeUsername(entry.username) || usernameKey
+    });
+    return safe;
+  }, []) : [];
+  return {
+    blockedUsers,
+    blockVersion: Number.isInteger(row && row.blockVersion) && row.blockVersion >= 0 ? row.blockVersion : 0
+  };
+}
+
 function normalizeAutoModSettings(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value) || !Array.isArray(value.blockedKeywords)) return null;
   const boundedIntegers = [
@@ -624,11 +831,25 @@ const UserSchema = new mongoose.Schema({
 });
 const User = mongoose.model('User', UserSchema);
 
+const PinnedMessageSchema = new mongoose.Schema({
+  messageId: { type: mongoose.Schema.Types.ObjectId, required: true },
+  pinnedAt: { type: Date, required: true },
+  pinnedBy: { type: String, required: true, maxLength: 20 }
+}, { _id: false });
+
 const ChatServerSchema = new mongoose.Schema({
   code: { type: String, required: true, unique: true },
   name: { type: String, required: true, maxLength: 30 },
   owner: { type: String, required: true },
   moderators: { type: [String], default: [] },
+  description: { type: String, default: '', maxLength: 500 },
+  rules: { type: String, default: '', maxLength: 2000 },
+  metadataVersion: { type: Number, default: 0, min: 0 },
+  pinnedMessages: {
+    type: [PinnedMessageSchema], default: [],
+    validate: { validator: value => Array.isArray(value) && value.length <= 20 }
+  },
+  pinVersion: { type: Number, default: 0, min: 0 },
   autoMod: {
     blockedKeywords: {
       type: [{ type: String, maxLength: 40 }],
@@ -725,24 +946,63 @@ ModerationReportSchema.index(
 );
 const ModerationReport = mongoose.model('ModerationReport', ModerationReportSchema);
 
+const ReplySnapshotSchema = new mongoose.Schema({
+  id: { type: String, required: true, maxLength: 24 },
+  authorKey: { type: String, default: '', maxLength: 20 },
+  displayname: { type: String, required: true, maxLength: 30 },
+  text: { type: String, required: true, maxLength: 100 }
+}, { _id: false });
+
 const MessageSchema = new mongoose.Schema({
   serverCode: { type: String, required: true, default: 'global' },
   username: String,
   displayName: { type: String, default: '' },
+  authorKey: { type: String, default: '', maxLength: 20, immutable: true },
+  notificationMentions: { type: [String], default: [], immutable: true },
   role: { type: String, default: 'user' }, 
   roomRole: { type: String, default: 'user' },
   color: { type: String, default: '' },      
   avatarUrl: { type: String, default: '' },  
   text: { type: String, default: '' },
   attachment: { type: String, default: null },
-  replyTo: { type: Object, default: null },
+  replyTo: { type: ReplySnapshotSchema, default: null },
   reactions: { type: Object, default: {} }, 
   edited: { type: Boolean, default: false },
   deleted: { type: Boolean, default: false },
   history: [{ text: String, timestamp: Date }], 
   timestamp: { type: Date, default: Date.now }
 });
+MessageSchema.index({ serverCode: 1, timestamp: -1, _id: -1 });
 const Message = mongoose.model('Message', MessageSchema);
+
+const RoomMemberStateSchema = new mongoose.Schema({
+  usernameKey: { type: String, required: true, maxLength: 20 },
+  serverCode: { type: String, required: true, maxLength: 6 },
+  notificationLevel: { type: String, enum: ['all', 'mentions', 'none'], default: 'all' },
+  lastReadAt: { type: Date, default: null },
+  lastReadMessageId: { type: String, default: null, maxLength: 24 },
+  version: { type: Number, default: 0, min: 0 }
+}, { timestamps: true });
+RoomMemberStateSchema.index({ usernameKey: 1, serverCode: 1 }, { unique: true });
+RoomMemberStateSchema.index({ serverCode: 1, usernameKey: 1 });
+const RoomMemberState = mongoose.model('RoomMemberState', RoomMemberStateSchema);
+
+const BlockedUserSchema = new mongoose.Schema({
+  usernameKey: { type: String, required: true, maxLength: 20 },
+  username: { type: String, required: true, maxLength: 20 },
+  createdAt: { type: Date, required: true }
+}, { _id: false });
+
+const UserExperienceStateSchema = new mongoose.Schema({
+  usernameKey: { type: String, required: true, maxLength: 20 },
+  blockedUsers: {
+    type: [BlockedUserSchema], default: [],
+    validate: { validator: value => Array.isArray(value) && value.length <= 500 }
+  },
+  blockVersion: { type: Number, default: 0, min: 0 }
+}, { timestamps: true });
+UserExperienceStateSchema.index({ usernameKey: 1 }, { unique: true });
+const UserExperienceState = mongoose.model('UserExperienceState', UserExperienceStateSchema);
 
 // --- AUTO-SETUP SYSTEM ---
 async function seedSystem({
@@ -894,6 +1154,8 @@ function createConnectionHandler({
   RoomRestrictionModel = RoomRestriction,
   ModerationAuditModel = ModerationAudit,
   ModerationReportModel = ModerationReport,
+  RoomMemberStateModel = RoomMemberState,
+  UserExperienceStateModel = UserExperienceState,
   bcryptImpl = bcrypt,
   onlineUsersMap = onlineUsers,
   broadcastOnlineUsersFn = broadcastOnlineUsers,
@@ -3487,6 +3749,20 @@ module.exports = {
   normalizeAutoModSettings,
   normalizeStoredAutoModSettings,
   normalizeAccountKey,
+  normalizeRoomText,
+  normalizeNotificationLevel,
+  authorKeyForMessage,
+  extractNotificationMentions,
+  roomMessageQuery,
+  cursorFromMessage,
+  compareCursor,
+  safeReplyForViewer,
+  safeReactionsForViewer,
+  safeMessageForViewer,
+  safeBlockedMessageReveal,
+  safeRoomDetails,
+  safeRoomState,
+  safeBlockState,
   createAutoModTracker,
   evaluateAutoMod,
   evaluateMessageRate,
@@ -3502,6 +3778,10 @@ module.exports = {
   RoomRestriction,
   ModerationAudit,
   ModerationReport,
+  ChatServer,
+  Message,
+  RoomMemberState,
+  UserExperienceState,
   isValidPassword,
   normalizeColor,
   normalizeAvatarUrl,
