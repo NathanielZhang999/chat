@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Pro Global Chat</title>
+    <title>Chat v1.3.2</title>
     <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
     <style>
         :root { --primary: #5865F2; --bg: #202225; --surface: #36393f; --surface-dark: #2f3136; --text: #dcddde; --text-muted: #8e9297; --border: #202225; --error: #ed4245; --warning: #faa61a; --success: #3ba55c; --motion-fast: 140ms; --motion-base: 220ms; --motion-slow: 280ms; --ease-standard: cubic-bezier(0.2, 0.8, 0.2, 1); }
@@ -536,10 +536,18 @@
                     <label for="automod-keywords">Blocked keywords (one per line, up to 50)</label>
                     <textarea id="automod-keywords" class="text-input" rows="8" maxlength="2050"></textarea>
                 </div>
-                <div style="display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:10px;">
+                <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(130px, 1fr)); gap:10px;">
                     <div class="input-group"><label for="automod-mention-limit">Mention limit (1–20)</label><input id="automod-mention-limit" class="text-input" type="number" min="1" max="20"></div>
                     <div class="input-group"><label for="automod-repeat-limit">Repeat limit (2–10)</label><input id="automod-repeat-limit" class="text-input" type="number" min="2" max="10"></div>
                     <div class="input-group"><label for="automod-repeat-window">Window seconds (5–300)</label><input id="automod-repeat-window" class="text-input" type="number" min="5" max="300"></div>
+                    <div class="input-group">
+                        <label for="automod-message-limit">Message limit (1–20)</label>
+                        <input id="automod-message-limit" class="text-input" type="number" min="1" max="20">
+                    </div>
+                    <div class="input-group">
+                        <label for="automod-message-window">Window seconds (1–60)</label>
+                        <input id="automod-message-window" class="text-input" type="number" min="1" max="60">
+                    </div>
                 </div>
                 <div id="automod-error" class="moderation-error"></div>
                 <button id="automod-save" class="btn-primary" type="button">Save AutoMod</button>
@@ -852,18 +860,44 @@
                 blockedKeywords,
                 mentionLimit: Number(input.mentionLimit),
                 repeatLimit: Number(input.repeatLimit),
-                repeatWindowSeconds: Number(input.repeatWindowSeconds)
+                repeatWindowSeconds: Number(input.repeatWindowSeconds),
+                messageLimit: Number(input.messageLimit),
+                messageWindowSeconds: Number(input.messageWindowSeconds)
             };
             const bounds = {
                 mentionLimit: [1, 20],
                 repeatLimit: [2, 10],
-                repeatWindowSeconds: [5, 300]
+                repeatWindowSeconds: [5, 300],
+                messageLimit: [1, 20],
+                messageWindowSeconds: [1, 60]
             };
             const invalidNumber = Object.entries(bounds).some(([key, [min, max]]) =>
                 !Number.isInteger(settings[key]) || settings[key] < min || settings[key] > max);
             const invalidKeywords = candidateKeywords.length > 50 ||
                 blockedKeywords.some(value => value.length < 1 || value.length > 40);
             return invalidNumber || invalidKeywords ? null : settings;
+        },
+
+        applyAutoModForm(elements, autoMod) {
+            elements.keywords.value = Array.isArray(autoMod.blockedKeywords)
+                ? autoMod.blockedKeywords.slice(0, 50).join('\n')
+                : '';
+            elements.mentionLimit.value = autoMod.mentionLimit;
+            elements.repeatLimit.value = autoMod.repeatLimit;
+            elements.repeatWindowSeconds.value = autoMod.repeatWindowSeconds;
+            elements.messageLimit.value = autoMod.messageLimit;
+            elements.messageWindowSeconds.value = autoMod.messageWindowSeconds;
+        },
+
+        readAutoModForm(elements) {
+            return {
+                keywordsText: elements.keywords.value,
+                mentionLimit: elements.mentionLimit.value,
+                repeatLimit: elements.repeatLimit.value,
+                repeatWindowSeconds: elements.repeatWindowSeconds.value,
+                messageLimit: elements.messageLimit.value,
+                messageWindowSeconds: elements.messageWindowSeconds.value
+            };
         },
 
         restrictionActionsFor(restriction) {
@@ -1775,6 +1809,8 @@
         document.getElementById('automod-mention-limit').value = '';
         document.getElementById('automod-repeat-limit').value = '';
         document.getElementById('automod-repeat-window').value = '';
+        document.getElementById('automod-message-limit').value = '';
+        document.getElementById('automod-message-window').value = '';
         document.getElementById('automod-error').textContent = '';
     }
 
@@ -1945,30 +1981,33 @@
         loadModeratorCenterTab('automod');
     }
 
+    function autoModFormElements() {
+        return {
+            keywords: document.getElementById('automod-keywords'),
+            mentionLimit: document.getElementById('automod-mention-limit'),
+            repeatLimit: document.getElementById('automod-repeat-limit'),
+            repeatWindowSeconds: document.getElementById('automod-repeat-window'),
+            messageLimit: document.getElementById('automod-message-limit'),
+            messageWindowSeconds: document.getElementById('automod-message-window')
+        };
+    }
+
     function renderAutoModSettings(result) {
         if (result.error || !result.autoMod) {
             document.getElementById('automod-error').textContent = result.error || 'Invalid AutoMod response.';
             return;
         }
         const autoMod = result.autoMod;
-        document.getElementById('automod-keywords').value = Array.isArray(autoMod.blockedKeywords)
-            ? autoMod.blockedKeywords.slice(0, 50).join('\n')
-            : '';
-        document.getElementById('automod-mention-limit').value = autoMod.mentionLimit;
-        document.getElementById('automod-repeat-limit').value = autoMod.repeatLimit;
-        document.getElementById('automod-repeat-window').value = autoMod.repeatWindowSeconds;
+        ChatClientHelpers.applyAutoModForm(autoModFormElements(), autoMod);
         document.getElementById('automod-error').textContent = '';
     }
 
     function saveAutoModSettings() {
         const requestedRoom = moderatorCenterRoom;
         if (!requestedRoom || currentServerCode !== requestedRoom) return;
-        const settings = ChatClientHelpers.normalizeAutoModPrompt({
-            keywordsText: document.getElementById('automod-keywords').value,
-            mentionLimit: document.getElementById('automod-mention-limit').value,
-            repeatLimit: document.getElementById('automod-repeat-limit').value,
-            repeatWindowSeconds: document.getElementById('automod-repeat-window').value
-        });
+        const settings = ChatClientHelpers.normalizeAutoModPrompt(
+            ChatClientHelpers.readAutoModForm(autoModFormElements())
+        );
         if (!settings) {
             document.getElementById('automod-error').textContent =
                 'Use up to 50 keywords (1–40 characters each) and values within the displayed bounds.';

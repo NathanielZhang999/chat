@@ -50,6 +50,13 @@ test('new users receive the deployed Render backend URL by default', () => {
   );
 });
 
+test('browser title and AutoMod message-rate controls are exact', () => {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  assert.match(source, /<title>Chat v1\.3\.2<\/title>/);
+  assert.match(source, /id="automod-message-limit"[^>]*min="1"[^>]*max="20"/);
+  assert.match(source, /id="automod-message-window"[^>]*min="1"[^>]*max="60"/);
+});
+
 test('client motion policy avoids broad transitions and respects reduced motion', () => {
   const source = fs.readFileSync(chatPath, 'utf8');
   assert.doesNotMatch(source, /transition:\s*all\b/);
@@ -574,13 +581,46 @@ test('behavioral moderation helpers build exact report, resolution, and AutoMod 
   }), null);
 
   assert.deepEqual(client.normalizeAutoModPrompt({
-    keywordsText: ' Spam\nspoilers ', mentionLimit: '4', repeatLimit: '5', repeatWindowSeconds: '60'
+    keywordsText: ' Spam\nspoilers ', mentionLimit: '4', repeatLimit: '5', repeatWindowSeconds: '60',
+    messageLimit: '5', messageWindowSeconds: '5'
   }), {
-    blockedKeywords: ['spam', 'spoilers'], mentionLimit: 4, repeatLimit: 5, repeatWindowSeconds: 60
+    blockedKeywords: ['spam', 'spoilers'], mentionLimit: 4, repeatLimit: 5, repeatWindowSeconds: 60,
+    messageLimit: 5, messageWindowSeconds: 5
   });
+  for (const input of [
+    { messageLimit: '0' }, { messageLimit: '21' },
+    { messageWindowSeconds: '0' }, { messageWindowSeconds: '61' },
+    { messageLimit: '1.5' }, { messageWindowSeconds: '2.5' },
+    { messageLimit: undefined }, { messageWindowSeconds: undefined },
+    { messageLimit: 'wat' }, { messageWindowSeconds: 'wat' }
+  ]) {
+    assert.equal(client.normalizeAutoModPrompt({
+      keywordsText: 'spam', mentionLimit: '4', repeatLimit: '5', repeatWindowSeconds: '60',
+      messageLimit: '5', messageWindowSeconds: '5', ...input
+    }), null);
+  }
   assert.equal(client.normalizeAutoModPrompt({
-    keywordsText: 'spam', mentionLimit: '21', repeatLimit: '5', repeatWindowSeconds: '60'
+    keywordsText: 'spam', mentionLimit: '21', repeatLimit: '5', repeatWindowSeconds: '60',
+    messageLimit: '5', messageWindowSeconds: '5'
   }), null);
+
+  const elements = {
+    keywords: { value: '' }, mentionLimit: { value: '' }, repeatLimit: { value: '' },
+    repeatWindowSeconds: { value: '' }, messageLimit: { value: '' }, messageWindowSeconds: { value: '' }
+  };
+  client.applyAutoModForm(elements, {
+    blockedKeywords: ['spam'], mentionLimit: 4, repeatLimit: 3, repeatWindowSeconds: 30,
+    messageLimit: 7, messageWindowSeconds: 12
+  });
+  assert.equal(elements.messageLimit.value, 7);
+  assert.equal(elements.messageWindowSeconds.value, 12);
+  elements.messageLimit.value = 5;
+  elements.messageWindowSeconds.value = 9;
+  const read = client.readAutoModForm(elements);
+  assert.deepEqual(client.normalizeAutoModPrompt(read), {
+    blockedKeywords: ['spam'], mentionLimit: 4, repeatLimit: 3, repeatWindowSeconds: 30,
+    messageLimit: 5, messageWindowSeconds: 9
+  });
 });
 
 test('behavioral moderation row renderer keeps hostile API text inert', () => {
@@ -794,6 +834,10 @@ test('moderator center rejects rapid report-filter and stale audit-cursor respon
 
 test('moderator center request builders cover restrictions, audit, resolve, and AutoMod safely', () => {
   const client = loadHelpers();
+  const source = fs.readFileSync(chatPath, 'utf8');
+  assert.match(source, /function renderAutoModSettings[\s\S]*ChatClientHelpers\.applyAutoModForm\(autoModFormElements\(\), autoMod\)/);
+  assert.match(source, /function saveAutoModSettings[\s\S]*ChatClientHelpers\.readAutoModForm\(autoModFormElements\(\)\)/);
+  assert.match(source, /function autoModFormElements\(\)[\s\S]*automod-message-limit[\s\S]*automod-message-window/);
   assert.deepEqual(client.restrictionActionsFor({
     targetUsername: 'absent-from-roster', banned: true, timedOut: false
   }), ['unban']);
@@ -826,11 +870,14 @@ test('moderator center request builders cover restrictions, audit, resolve, and 
 
   const autoModPayload = {
     serverCode: 'ABC123', blockedKeywords: ['spam'], mentionLimit: 4,
-    repeatLimit: 3, repeatWindowSeconds: 30
+    repeatLimit: 3, repeatWindowSeconds: 30, messageLimit: 7, messageWindowSeconds: 12
   };
   const autoModSave = client.moderatorCenterMutationRequestFor('automod', autoModPayload);
-  assert.equal(autoModSave.event, 'update_automod');
-  assert.deepEqual(autoModSave.payload, autoModPayload);
+  assert.deepEqual({
+    event: autoModSave.event, key: autoModSave.key, view: autoModSave.view, payload: autoModSave.payload
+  }, {
+    event: 'update_automod', key: 'automod:save', view: 'automod', payload: autoModPayload
+  });
   client.dispatchModeratorCenterRequest({
     coordinator: center, socket, request: autoModSave,
     apply: () => applied.push('stale-save')
@@ -889,7 +936,7 @@ test('AutoMod save control resets on invalidation and stale acknowledgements can
   const applied = [];
   const request = value => client.moderatorCenterMutationRequestFor('automod', {
     serverCode: 'ABC123', blockedKeywords: [value], mentionLimit: 4,
-    repeatLimit: 3, repeatWindowSeconds: 30
+    repeatLimit: 3, repeatWindowSeconds: 30, messageLimit: 7, messageWindowSeconds: 12
   });
 
   center.open('ABC123', 'automod');
