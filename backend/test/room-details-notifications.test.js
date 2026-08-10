@@ -262,6 +262,46 @@ test('notification updates allow timed-out readers deny banned readers and valid
   assert.equal(setup.RoomMemberStateModel.rows.length, rowsBefore);
 });
 
+test('nonmember global admin cannot persist notification state or receive notification events', async () => {
+  const setup = createFixture();
+  setup.UserModel.rows.find(row => row.username === 'Admin').servers = ['global'];
+  setup.admin.joinedServers = ['global'];
+  setup.onlineUsersMap.get(setup.admin.id).joinedServers = ['global'];
+
+  assert.deepEqual(await updateNotification(setup.admin, {
+    serverCode: 'ABC123', level: 'none'
+  }), { error: 'Permission denied.' });
+  assert.deepEqual(setup.RoomMemberStateModel.rows, []);
+  assert.deepEqual(setup.admin.outbound.filter(item => item.event === 'room_notification_updated'), []);
+});
+
+test('nonmember global admin switch returns null personal state and attention without persistence', async () => {
+  const setup = createFixture();
+  setup.UserModel.rows.find(row => row.username === 'Admin').servers = ['global'];
+  Object.assign(setup.admin, {
+    serverCode: 'global', joinedServers: ['global'], bannedRooms: []
+  });
+  setup.admin.joinedRooms.delete('ABC123');
+  setup.admin.joinedRooms.add('global');
+  Object.assign(setup.onlineUsersMap.get(setup.admin.id), {
+    serverCode: 'global', joinedServers: ['global'], bannedRooms: []
+  });
+  const ack = acknowledge();
+
+  await setup.admin.trigger('switch_server', 'ABC123', ack.callback);
+
+  assert.deepEqual(ack.value(), {
+    serverCode: 'ABC123', history: [], roomRole: 'user',
+    restriction: { banned: false, timedOut: false, timeoutUntil: null },
+    details: { description: '', rules: '', metadataVersion: 0, canEdit: true },
+    notification: null,
+    pin: { serverCode: 'ABC123', pinCount: 0, pinVersion: 0, blockVersion: 0 },
+    attention: null
+  });
+  assert.deepEqual(setup.RoomMemberStateModel.rows, []);
+  assert.deepEqual(setup.admin.outbound.filter(item => item.event === 'room_notification_updated'), []);
+});
+
 test('notification and cursor mutations share one version and events carry complete state', async () => {
   const setup = createFixture();
   const cursorAt = new Date('2026-08-10T12:00:00.000Z');

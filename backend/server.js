@@ -2024,30 +2024,55 @@ function createConnectionHandler({
         }));
         const bannedRooms = restrictions.filter(item => item.banned).map(item => item.serverCode);
         const blockedRooms = new Set(bannedRooms);
-        const existingRoomCodes = new Set((rooms || []).map(room => room.code));
-        const joinedServers = user.servers.filter(code =>
-          (code === 'global' || existingRoomCodes.has(code)) && !blockedRooms.has(code)
-        );
-        const visibleRooms = (rooms || []).filter(room => !blockedRooms.has(room.code));
-        const defaultServerCode = chooseAccessibleRoom({ user, rooms, restrictions });
+        const { snapshot: blockState, blockedUserKeys } = durableBlockState;
+        const validatedRooms = [];
+        const actualMemberships = new Set();
+        const roomStateByCode = new Map();
+        for (const candidateRoom of (rooms || []).filter(room => !blockedRooms.has(room.code))) {
+          const validated = await withRoomMutationLock(candidateRoom.code, async () => {
+            const [freshRoom, freshUser] = await Promise.all([
+              ChatServerModel.findOne({ code: candidateRoom.code }),
+              findUserByUsername(UserModel, user.username)
+            ]);
+            if (!freshRoom || !freshUser) return null;
+            const actualMember = Array.isArray(freshUser.servers) &&
+              freshUser.servers.includes(candidateRoom.code);
+            if (!actualMember && role !== 'admin') return null;
+            return {
+              room: freshRoom,
+              actualMember,
+              state: actualMember ? await loadRoomStateSnapshot({
+                usernameKey: freshUser.username,
+                serverCode: candidateRoom.code,
+                blockedUserKeys
+              }) : null
+            };
+          });
+          if (!validated) continue;
+          validatedRooms.push(validated.room);
+          if (validated.actualMember) {
+            actualMemberships.add(candidateRoom.code);
+            roomStateByCode.set(candidateRoom.code, validated.state);
+          }
+        }
+        const joinedServers = user.servers.filter(code => actualMemberships.has(code));
+        const roomStates = joinedServers.map(code => roomStateByCode.get(code));
+        const visibleRoomCodes = new Set(validatedRooms.map(room => room.code));
+        const chosenServerCode = chooseAccessibleRoom({
+          user: { servers: joinedServers }, rooms: validatedRooms, restrictions
+        });
+        const defaultServerCode = visibleRoomCodes.has(chosenServerCode)
+          ? chosenServerCode
+          : (joinedServers.find(code => code !== 'global' && visibleRoomCodes.has(code)) || null);
         const restriction = defaultServerCode
           ? (restrictions.find(item => item.serverCode === defaultServerCode) || activeRestrictionState(null))
           : activeRestrictionState(null);
-        const { snapshot: blockState, blockedUserKeys } = durableBlockState;
-        const roomStates = [];
-        for (const serverCode of joinedServers) {
-          roomStates.push(await withRoomMutationLock(serverCode, () => loadRoomStateSnapshot({
-            usernameKey: user.username,
-            serverCode,
-            blockedUserKeys
-          })));
-        }
         const attentionSnapshots = roomStates.map(state => ({
           serverCode: state.serverCode,
           unreadCount: state.unreadCount,
           mentionCount: state.mentionCount
         }));
-        const roomSummaries = visibleRooms.map(room => safeRoomSummary(room, blockState.blockVersion));
+        const roomSummaries = validatedRooms.map(room => safeRoomSummary(room, blockState.blockVersion));
 
         socket.username = user.username;
         socket.displayName = user.displayName;
@@ -2314,7 +2339,9 @@ function createConnectionHandler({
           const access = await loadRoomAccessState({
             UserModel, ChatServerModel, RoomRestrictionModel, username: socket.username, serverCode
           });
-          if (!access.allowed || access.restriction.banned || !access.user) {
+          const actualMember = Array.isArray(access.user?.servers) &&
+            access.user.servers.includes(serverCode);
+          if (!access.allowed || access.restriction.banned || !access.user || !actualMember) {
             callback({ error: 'Permission denied.' });
             return;
           }
@@ -3637,10 +3664,7 @@ function createConnectionHandler({
         const actualMember = Array.isArray(access.user.servers) && access.user.servers.includes(serverCode);
         const notification = actualMember
           ? await loadRoomStateSnapshot({ usernameKey, serverCode, blockedUserKeys })
-          : safeRoomState({
-            serverCode, usernameKey, notificationLevel: 'all',
-            lastReadAt: null, lastReadMessageId: null, version: 0
-          }, { blockVersion: blockState.blockVersion });
+          : null;
         const detailSnapshot = safeRoomDetails(
           access.room,
           canEditRoomDetails({ serverCode, access })
@@ -3708,10 +3732,10 @@ function createConnectionHandler({
           details,
           notification,
           pin,
-          attention: {
+          attention: notification ? {
             unreadCount: notification.unreadCount,
             mentionCount: notification.mentionCount
-          }
+          } : null
         });
         return { success: true, oldCode };
       }));

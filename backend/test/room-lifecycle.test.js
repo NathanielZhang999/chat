@@ -158,6 +158,94 @@ test('login returns safe room summaries and actual-member room attention without
   assert.equal(setup.socket.blockVersion, 6);
 });
 
+test('login revalidates room existence and membership after a concurrent room deletion', async () => {
+  const roomQueryCaptured = deferred();
+  const releaseRoomQuery = deferred();
+  const UserModel = createMemoryModel([
+    { username: 'Alice', displayName: 'Alice', password: 'hash', role: 'user', servers: ['global', 'ABC123'] },
+    { username: 'Owner', displayName: 'Owner', password: 'hash', role: 'user', servers: ['global', 'ABC123'] }
+  ]);
+  const ChatServerModel = createMemoryModel([
+    { code: 'global', name: 'Global Chat', owner: 'System', moderators: [], metadataVersion: 1 },
+    { code: 'ABC123', name: 'Private', owner: 'Owner', moderators: [], metadataVersion: 2 }
+  ]);
+  const baseRoomFind = ChatServerModel.find.bind(ChatServerModel);
+  let holdLoginQuery = true;
+  ChatServerModel.find = query => {
+    const snapshot = baseRoomFind(query);
+    if (!holdLoginQuery || !query?.code?.$in?.includes('ABC123')) return snapshot;
+    holdLoginQuery = false;
+    return {
+      then(resolve, reject) {
+        roomQueryCaptured.resolve();
+        return releaseRoomQuery.promise.then(() => snapshot).then(resolve, reject);
+      }
+    };
+  };
+  const RoomMemberStateModel = createMemoryModel([]);
+  const onlineUsersMap = new Map();
+  const loginSocket = new FakeSocket();
+  loginSocket.id = 'login-race';
+  const ownerSocket = new FakeSocket();
+  ownerSocket.id = 'delete-race';
+  Object.assign(ownerSocket, {
+    username: 'Owner', displayName: 'Owner', role: 'user', serverCode: 'ABC123',
+    joinedServers: ['global', 'ABC123'], bannedRooms: []
+  });
+  ownerSocket.joinedRooms.add('ABC123');
+  onlineUsersMap.set(ownerSocket.id, {
+    username: 'Owner', displayName: 'Owner', role: 'user', serverCode: 'ABC123',
+    joinedServers: ['global', 'ABC123'], bannedRooms: []
+  });
+  const ioInstance = new FakeIo([loginSocket, ownerSocket]);
+  const dependencies = {
+    ioInstance, onlineUsersMap, UserModel, ChatServerModel,
+    MessageModel: createMemoryModel([]), RoomRestrictionModel: createMemoryModel([]),
+    ModerationReportModel: createMemoryModel([]), RoomMemberStateModel,
+    UserExperienceStateModel: createMemoryModel([]),
+    bcryptImpl: { async compare() { return true; } },
+    broadcastOnlineUsersFn: async () => {}, getRoomRoleFn: async () => 'user',
+    resolvePingsFn: async text => text, logger: { error() {} }
+  };
+  createConnectionHandler(dependencies)(loginSocket);
+  createConnectionHandler(dependencies)(ownerSocket);
+
+  const loginAck = acknowledge();
+  const loginPending = loginSocket.trigger(
+    'login', { username: 'Alice', password: '123456' }, loginAck.callback
+  );
+  await roomQueryCaptured.promise;
+  const deleteAck = acknowledge();
+  await ownerSocket.trigger('delete_server', 'ABC123', deleteAck.callback);
+  assert.deepEqual(deleteAck.value(), { success: true });
+  releaseRoomQuery.resolve();
+  await loginPending;
+
+  assert.deepEqual(loginAck.value(), {
+    success: true,
+    username: 'Alice', displayName: 'Alice', role: 'user', color: '', avatarUrl: '',
+    servers: [{
+      code: 'global', name: 'Global Chat', owner: 'System', metadataVersion: 1,
+      pin: { serverCode: 'global', pinCount: 0, pinVersion: 0, blockVersion: 0 }
+    }],
+    joinedServers: ['global'], defaultServerCode: 'global',
+    restriction: { banned: false, timedOut: false, timeoutUntil: null }, bannedRooms: [],
+    roomStates: [{
+      serverCode: 'global', usernameKey: 'alice', notificationLevel: 'all',
+      lastReadAt: null, lastReadMessageId: null,
+      unreadCount: 0, mentionCount: 0, version: 0, blockVersion: 0
+    }],
+    blockState: { blockedUsers: [], blockVersion: 0 },
+    attentionSnapshots: [{ serverCode: 'global', unreadCount: 0, mentionCount: 0 }]
+  });
+  assert.deepEqual(RoomMemberStateModel.rows.map(row => row.serverCode), ['global']);
+  assert.deepEqual(loginSocket.joinedServers, ['global']);
+  assert.equal(loginSocket.serverCode, 'global');
+  assert.equal(loginSocket.joinedRooms.has('global'), true);
+  assert.equal(loginSocket.joinedRooms.has('ABC123'), false);
+  assert.deepEqual(onlineUsersMap.get(loginSocket.id).joinedServers, ['global']);
+});
+
 test('switch returns details notification pin count attention and filtered history keys', async () => {
   const olderAt = new Date('2026-08-10T12:00:00.000Z');
   const newerAt = new Date('2026-08-10T12:01:00.000Z');
@@ -381,12 +469,23 @@ test('login cannot publish membership removed by a concurrent leave', async () =
   };
   const ioInstance = new FakeIo();
   const onlineUsersMap = new Map();
+  const rooms = [
+    { code: 'global', name: 'Global Chat', owner: 'System', moderators: [] },
+    { code: 'ABC123', name: 'Private', owner: 'Owner', moderators: [] }
+  ];
   const shared = {
     ioInstance,
     onlineUsersMap,
     UserModel,
     bcryptImpl,
-    ChatServerModel: { async find() { return []; }, async updateOne() {} }
+    ChatServerModel: {
+      async find(query = {}) {
+        const included = query.code?.$in;
+        return rooms.filter(room => !included || included.includes(room.code));
+      },
+      async findOne(query) { return rooms.find(room => room.code === query.code) || null; },
+      async updateOne() {}
+    }
   };
   const loginSocket = registerSharedSocket(shared, 'socket-login');
   const liveSocket = registerSharedSocket(shared, 'socket-live');
