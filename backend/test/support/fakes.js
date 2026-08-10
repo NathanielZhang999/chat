@@ -47,13 +47,8 @@ function queryResult(value) {
     limit() { return this; },
     skip() { return this; },
     select() { return this; },
-    maxTimeMS() { return this; },
     then(resolve, reject) { return Promise.resolve(value).then(resolve, reject); }
   };
-}
-
-function comparableValue(value) {
-  return value instanceof Date ? value.getTime() : value;
 }
 
 function valuesMatch(value, expected) {
@@ -61,22 +56,16 @@ function valuesMatch(value, expected) {
   if (expected instanceof RegExp) return expected.test(String(value || ''));
   if (expected && typeof expected === 'object' && !Array.isArray(expected)) {
     if ('$in' in expected) return expected.$in.some(candidate => valuesMatch(value, candidate));
-    if ('$ne' in expected) return !valuesMatch(value, expected.$ne);
-    if ('$lt' in expected) return comparableValue(value) < comparableValue(expected.$lt);
-    if ('$gt' in expected) return comparableValue(value) > comparableValue(expected.$gt);
+    if ('$lt' in expected) return value < expected.$lt;
+    if ('$gt' in expected) return value > expected.$gt;
     if ('$regex' in expected) return valuesMatch(value, expected.$regex);
   }
-  if (value instanceof Date && expected instanceof Date) return value.getTime() === expected.getTime();
   return value === expected;
 }
 
 function matchesQuery(row, query = {}) {
   return Object.entries(query).every(([key, expected]) => {
-    if (key === '$and') return Array.isArray(expected) && expected.every(clause => matchesQuery(row, clause));
     if (key === '$or') return Array.isArray(expected) && expected.some(clause => matchesQuery(row, clause));
-    if (expected && typeof expected === 'object' && '$exists' in expected) {
-      return Object.prototype.hasOwnProperty.call(row, key) === expected.$exists;
-    }
     return valuesMatch(row[key], expected);
   });
 }
@@ -105,43 +94,9 @@ function createMemoryModel(initialRows = []) {
     return queryResult(value);
   }
 
-  function findResult(matchedRows) {
-    let sortSpec = null;
-    let maximum = null;
-    let offset = 0;
-
-    function materialize() {
-      let values = [...matchedRows];
-      if (sortSpec) {
-        values.sort((left, right) => {
-          for (const [key, direction] of Object.entries(sortSpec)) {
-            const leftValue = comparableValue(left[key]);
-            const rightValue = comparableValue(right[key]);
-            if (leftValue === rightValue) continue;
-            return (leftValue < rightValue ? -1 : 1) * direction;
-          }
-          return 0;
-        });
-      }
-      if (offset > 0) values = values.slice(offset);
-      if (maximum !== null) values = values.slice(0, maximum);
-      return values.map(documentFor);
-    }
-
-    return {
-      lean: async () => materialize(),
-      sort(value) { sortSpec = value; return this; },
-      limit(value) { maximum = value; return this; },
-      skip(value) { offset = value; return this; },
-      select() { return this; },
-      maxTimeMS() { return this; },
-      then(resolve, reject) { return Promise.resolve(materialize()).then(resolve, reject); }
-    };
-  }
-
   return {
     rows,
-    find(query = {}) { return findResult(rows.filter(row => matchesQuery(row, query))); },
+    find(query = {}) { return result(rows.filter(row => matchesQuery(row, query)).map(documentFor)); },
     findOne(query = {}) { return result(documentFor(rows.find(row => matchesQuery(row, query)))); },
     findById(id) { return result(documentFor(rows.find(row => String(row._id) === String(id)))); },
     async create(value) {

@@ -31,13 +31,6 @@ const MAX_REACTION_KEYS = 20;
 const MAX_REACTION_USERS = 200;
 const MAX_REACTIONS_PER_USER = 20;
 const MAX_AUTOMOD_KEYS = 10_000;
-const SEARCH_QUERY_MAX_TIME_MS = 1_500;
-const HISTORY_RESPONSE_LIMITS = Object.freeze({
-  attachmentBytes: 256 * 1024,
-  attachmentsPerPage: 4,
-  messageBytes: 384 * 1024,
-  pageBytes: 1536 * 1024
-});
 const MODERATION_ACTIONS = new Set(['kick', 'timeout', 'clear_timeout', 'ban', 'unban']);
 const MODERATION_DURATIONS = Object.freeze({
   '10m': 10 * 60 * 1000,
@@ -48,18 +41,7 @@ const MODERATION_DURATIONS = Object.freeze({
 const PROTECTED_USERNAMES = new Set(['nyzhang1', 'system']);
 
 function safeAck(callback) {
-  const receiver = typeof callback === 'function' ? callback : () => {};
-  let sent = false;
-  return payload => {
-    if (sent) return false;
-    sent = true;
-    try {
-      receiver(payload);
-    } catch {
-      // A trusted acknowledgement callback cannot roll back committed server state.
-    }
-    return true;
-  };
+  return typeof callback === 'function' ? callback : () => {};
 }
 
 function normalizeWith(value, pattern) {
@@ -273,23 +255,16 @@ function normalizeClientContextId(value) {
 }
 
 function encodeCursor(date, id) {
-  return Buffer.from(
-    JSON.stringify([new Date(date).toISOString(), String(id).toLowerCase()]),
-    'utf8'
-  ).toString('base64url');
+  return Buffer.from(JSON.stringify([new Date(date).toISOString(), String(id)]), 'utf8').toString('base64url');
 }
 
 function decodeCursor(value) {
-  if (typeof value !== 'string' || value.length < 1 || value.length > 256 ||
-      !/^[A-Za-z0-9_-]+$/.test(value)) return null;
+  if (typeof value !== 'string' || value.length > 256) return null;
   try {
     const parsed = JSON.parse(Buffer.from(value, 'base64url').toString('utf8'));
-    if (!Array.isArray(parsed) || parsed.length !== 2 || typeof parsed[0] !== 'string' ||
-        typeof parsed[1] !== 'string' || !/^[0-9a-f]{24}$/.test(parsed[1])) return null;
+    if (!Array.isArray(parsed) || parsed.length !== 2 || !isValidObjectId(parsed[1])) return null;
     const date = new Date(parsed[0]);
-    if (Number.isNaN(date.getTime()) || date.toISOString() !== parsed[0] ||
-        encodeCursor(date, parsed[1]) !== value) return null;
-    return { date, id: parsed[1] };
+    return Number.isNaN(date.getTime()) ? null : { date, id: parsed[1] };
   } catch {
     return null;
   }
@@ -322,188 +297,6 @@ function createReplySnapshot(message) {
     id: String(message._id),
     displayname: message.displayName || message.username,
     text: text || (message.attachment ? 'Image Attachment' : '')
-  };
-}
-
-function messageRoomQuery(serverCode) {
-  return serverCode === 'global'
-    ? { $or: [
-        { serverCode: 'global' },
-        { serverCode: { $exists: false } },
-        { serverCode: null }
-      ] }
-    : { serverCode };
-}
-
-function messageCursorQuery(cursor) {
-  if (!cursor) return {};
-  return { $or: [
-    { timestamp: { $lt: cursor.date } },
-    { timestamp: cursor.date, _id: { $lt: cursor.id } }
-  ] };
-}
-
-function nextMessagePage(rows, limit) {
-  const hasMore = rows.length > limit;
-  const page = rows.slice(0, limit);
-  const last = page[page.length - 1];
-  return {
-    page,
-    nextCursor: hasMore && last ? encodeCursor(last.timestamp, last._id) : null
-  };
-}
-
-function normalizeMessageSearchQuery(value) {
-  if (typeof value !== 'string') return null;
-  const query = value.normalize('NFKC').trim();
-  return query.length >= 2 && query.length <= 80 ? query : null;
-}
-
-function normalizeStoredMessageSearchText(value) {
-  if (typeof value !== 'string') return '';
-  return value.slice(0, 2_000).normalize('NFKC').slice(0, 2_000);
-}
-
-function safeReplySnapshot(replyTo) {
-  if (!replyTo || typeof replyTo !== 'object' || Array.isArray(replyTo) || !isValidObjectId(replyTo.id)) {
-    return null;
-  }
-  return {
-    id: String(replyTo.id),
-    displayname: typeof replyTo.displayname === 'string' ? replyTo.displayname.slice(0, 30) : '',
-    text: typeof replyTo.text === 'string' ? replyTo.text.slice(0, 100) : ''
-  };
-}
-
-function safeReactions(reactions) {
-  if (!reactions || typeof reactions !== 'object' || Array.isArray(reactions)) return {};
-  const result = {};
-  for (const [emoji, users] of Object.entries(reactions)) {
-    if (Object.keys(result).length >= MAX_REACTION_KEYS || !isValidReaction(emoji) || !Array.isArray(users)) continue;
-    result[emoji] = users
-      .filter(username => typeof username === 'string' && username.length <= 20)
-      .slice(0, MAX_REACTION_USERS);
-  }
-  return result;
-}
-
-function safeMessageForViewer(message, viewer, options = {}) {
-  const serialized = {
-    _id: message && message._id !== undefined && message._id !== null ? String(message._id) : '',
-    serverCode: message && message.serverCode,
-    username: message && message.username,
-    displayName: message && message.displayName,
-    role: message && message.role,
-    roomRole: message && message.roomRole,
-    color: message && message.color,
-    avatarUrl: message && message.avatarUrl,
-    text: message && typeof message.text === 'string' ? message.text.slice(0, 2_000) : '',
-    attachment: sanitizeAttachment(message && message.attachment),
-    replyTo: safeReplySnapshot(message && message.replyTo),
-    reactions: safeReactions(message && message.reactions),
-    edited: Boolean(message && message.edited),
-    deleted: Boolean(message && message.deleted),
-    timestamp: message && message.timestamp
-  };
-  const storedUsername = normalizeUsername(message && message.username);
-  const viewerUsername = normalizeUsername(viewer && viewer.username);
-  const hasValidViewer = Boolean(viewerUsername);
-  const isAuthor = Boolean(storedUsername && hasValidViewer &&
-    normalizeAccountKey(storedUsername) === normalizeAccountKey(viewerUsername));
-  const mayViewDeletedContent = isAuthor || (hasValidViewer &&
-    (viewer.role === 'admin' || viewer.roomRole === 'mod'));
-
-  if (serialized.deleted && !mayViewDeletedContent) {
-    serialized.text = '';
-    serialized.attachment = null;
-    serialized.replyTo = null;
-    serialized.reactions = {};
-  }
-  if (options && options.search) {
-    delete serialized.attachment;
-    delete serialized.replyTo;
-    delete serialized.reactions;
-  }
-  return serialized;
-}
-
-function serializedByteLength(value) {
-  try {
-    return Buffer.byteLength(JSON.stringify(value), 'utf8');
-  } catch {
-    return Number.POSITIVE_INFINITY;
-  }
-}
-
-async function loadBoundedPageAttachments(MessageModel, rows) {
-  if (!MessageModel || typeof MessageModel.aggregate !== 'function' || !Array.isArray(rows) || rows.length === 0) {
-    return new Map();
-  }
-  const ids = rows
-    .map(row => row && row._id)
-    .filter(id => id !== undefined && id !== null);
-  if (ids.length === 0) return new Map();
-  const attachments = await MessageModel.aggregate([
-    { $match: {
-      _id: { $in: ids },
-      attachment: { $type: 'string', $ne: '' }
-    } },
-    { $sort: { timestamp: -1, _id: -1 } },
-    { $project: {
-      _id: 1,
-      attachment: {
-        $cond: [
-          { $lte: [{ $strLenBytes: '$attachment' }, HISTORY_RESPONSE_LIMITS.attachmentBytes] },
-          '$attachment',
-          null
-        ]
-      }
-    } },
-    { $match: { attachment: { $ne: null } } },
-    { $limit: HISTORY_RESPONSE_LIMITS.attachmentsPerPage }
-  ]);
-  return new Map((Array.isArray(attachments) ? attachments : [])
-    .map(row => [String(row._id), sanitizeAttachment(row.attachment)])
-    .filter(([, attachment]) => attachment));
-}
-
-async function loadBoundedMessagePage({ MessageModel, filter, limit, viewer }) {
-  let query = MessageModel.find(filter);
-  if (query && typeof query.select === 'function') {
-    query = query.select({ attachment: 0, history: 0, __v: 0, searchText: 0 });
-  }
-  const rows = await query
-    .sort({ timestamp: -1, _id: -1 })
-    .limit(limit + 1)
-    .lean();
-  const candidates = rows.slice(0, limit);
-  const attachments = await loadBoundedPageAttachments(MessageModel, candidates);
-  const messages = [];
-  const acceptedRows = [];
-  let totalBytes = 2;
-
-  for (const row of candidates) {
-    const attachment = attachments.get(String(row && row._id)) || null;
-    let serialized = safeMessageForViewer({ ...row, attachment }, viewer);
-    let rowBytes = serializedByteLength(serialized);
-    if (rowBytes > HISTORY_RESPONSE_LIMITS.messageBytes) {
-      serialized = { ...serialized, attachment: null, reactions: {} };
-      rowBytes = serializedByteLength(serialized);
-    }
-    const separatorBytes = messages.length === 0 ? 0 : 1;
-    if (messages.length > 0 &&
-        totalBytes + separatorBytes + rowBytes > HISTORY_RESPONSE_LIMITS.pageBytes) break;
-    if (rowBytes > HISTORY_RESPONSE_LIMITS.pageBytes - 2) continue;
-    messages.push(serialized);
-    acceptedRows.push(row);
-    totalBytes += separatorBytes + rowBytes;
-  }
-
-  const hasMore = rows.length > limit || acceptedRows.length < candidates.length;
-  const last = acceptedRows[acceptedRows.length - 1];
-  return {
-    messages,
-    nextCursor: hasMore && last ? encodeCursor(last.timestamp, last._id) : null
   };
 }
 
@@ -734,110 +527,7 @@ async function withRoomMutationLock(serverCode, operation) {
   }
 }
 
-function createRoomSearchGate({
-  maxPendingPerRoom = 2,
-  minStartIntervalMs = 100,
-  now = () => Date.now(),
-  schedule = setTimeout
-} = {}) {
-  const pendingLimit = Number.isInteger(maxPendingPerRoom) && maxPendingPerRoom >= 0
-    ? maxPendingPerRoom : 2;
-  const paceMs = Number.isFinite(minStartIntervalMs) && minStartIntervalMs >= 0
-    ? minStartIntervalMs : 100;
-  const states = new Map();
-
-  function status(serverCode) {
-    const state = states.get(serverCode);
-    return state
-      ? { inFlight: state.inFlight ? 1 : 0, pending: state.queue.length }
-      : { inFlight: 0, pending: 0 };
-  }
-
-  function armIdleCleanup(serverCode, state) {
-    if (states.get(serverCode) !== state || state.inFlight || state.queue.length > 0) return;
-    const generation = state.generation;
-    const waitMs = Math.max(0, state.nextStartAt - now());
-    if (waitMs === 0) {
-      states.delete(serverCode);
-      return;
-    }
-    try {
-      const timer = schedule(() => {
-        if (states.get(serverCode) !== state || state.generation !== generation ||
-            state.inFlight || state.queue.length > 0) return;
-        armIdleCleanup(serverCode, state);
-      }, waitMs);
-      if (timer && typeof timer.unref === 'function') timer.unref();
-    } catch {
-      if (states.get(serverCode) === state && !state.inFlight && state.queue.length === 0) {
-        states.delete(serverCode);
-      }
-    }
-  }
-
-  function pump(serverCode, state) {
-    if (state.inFlight || state.queue.length === 0) {
-      if (!state.inFlight && state.queue.length === 0) armIdleCleanup(serverCode, state);
-      return;
-    }
-    state.inFlight = true;
-    const entry = state.queue.shift();
-    (async () => {
-      const waitMs = Math.max(0, state.nextStartAt - now());
-      if (waitMs > 0) {
-        await new Promise(resolve => { schedule(resolve, waitMs); });
-      }
-      state.nextStartAt = now() + paceMs;
-      return entry.operation();
-    })().then(entry.resolve, entry.reject).finally(() => {
-      state.inFlight = false;
-      pump(serverCode, state);
-    });
-  }
-
-  return {
-    run(serverCode, operation) {
-      if (typeof operation !== 'function') return Promise.reject(new TypeError('Search operation is required.'));
-      let state = states.get(serverCode);
-      if (!state) {
-        state = { inFlight: false, queue: [], nextStartAt: 0, generation: 0 };
-        states.set(serverCode, state);
-      }
-      if (state.inFlight && state.queue.length >= pendingLimit) {
-        const error = new Error('Search queue is full.');
-        error.code = 'SEARCH_BUSY';
-        return Promise.reject(error);
-      }
-      state.generation += 1;
-      const result = new Promise((resolve, reject) => {
-        state.queue.push({ operation, resolve, reject });
-      });
-      pump(serverCode, state);
-      return result;
-    },
-    status,
-    size() { return states.size; }
-  };
-}
-
-function createMessageSearchRateLimiter({
-  now = () => Date.now(),
-  createLimiter = createRateLimiter,
-  schedule = setInterval
-} = {}) {
-  const limiter = createLimiter({
-    maxEntries: MAX_RATE_LIMIT_KEYS,
-    maxAttempts: 30,
-    windowMs: 60 * 1000,
-    now
-  });
-  schedule(() => limiter.prune(), 60 * 1000).unref();
-  return limiter;
-}
-
 const authRateLimiter = createRateLimiter();
-const messageSearchRateLimiter = createMessageSearchRateLimiter();
-const messageRoomSearchGate = createRoomSearchGate();
 setInterval(() => {
   authRateLimiter.prune();
 }, RATE_LIMIT_WINDOW_MS).unref();
@@ -962,7 +652,6 @@ const MessageSchema = new mongoose.Schema({
   color: { type: String, default: '' },      
   avatarUrl: { type: String, default: '' },  
   text: { type: String, default: '' },
-  searchText: { type: String, default: '', maxLength: 2000 },
   attachment: { type: String, default: null },
   replyTo: { type: Object, default: null },
   reactions: { type: Object, default: {} }, 
@@ -971,61 +660,7 @@ const MessageSchema = new mongoose.Schema({
   history: [{ text: String, timestamp: Date }], 
   timestamp: { type: Date, default: Date.now }
 });
-MessageSchema.index({ serverCode: 1, timestamp: -1, _id: -1 });
-MessageSchema.index({ timestamp: -1, _id: -1 });
 const Message = mongoose.model('Message', MessageSchema);
-
-async function backfillMessageSearchText({
-  MessageModel = Message,
-  batchSize = 50,
-  maxWriteAttempts = 3
-} = {}) {
-  const boundedBatchSize = Number.isInteger(batchSize) && batchSize >= 1 && batchSize <= 500
-    ? batchSize : 50;
-  const attempts = Number.isInteger(maxWriteAttempts) && maxWriteAttempts >= 1 && maxWriteAttempts <= 5
-    ? maxWriteAttempts : 3;
-  const missingSearchText = {
-    $or: [
-      { searchText: { $exists: false } },
-      { searchText: null }
-    ]
-  };
-  const cursor = MessageModel.find(missingSearchText)
-    .select({ _id: 1, text: 1 })
-    .lean()
-    .cursor({ batchSize: boundedBatchSize });
-  let operations = [];
-  let completed = 0;
-
-  async function flush() {
-    if (operations.length === 0) return;
-    const batch = operations;
-    operations = [];
-    let lastError;
-    for (let attempt = 0; attempt < attempts; attempt += 1) {
-      try {
-        await MessageModel.bulkWrite(batch, { ordered: false });
-        completed += batch.length;
-        return;
-      } catch (error) {
-        lastError = error;
-      }
-    }
-    throw lastError;
-  }
-
-  for await (const row of cursor) {
-    operations.push({
-      updateOne: {
-        filter: { _id: row._id, ...missingSearchText },
-        update: { $set: { searchText: normalizeStoredMessageSearchText(row.text) } }
-      }
-    });
-    if (operations.length >= boundedBatchSize) await flush();
-  }
-  await flush();
-  return completed;
-}
 
 // --- AUTO-SETUP SYSTEM ---
 async function seedSystem({
@@ -1183,8 +818,6 @@ function createConnectionHandler({
   getRoomRoleFn = getRoomRole,
   resolvePingsFn = resolvePings,
   rateLimiter = authRateLimiter,
-  searchRateLimiter = messageSearchRateLimiter,
-  searchGate = messageRoomSearchGate,
   autoModTracker = serverAutoModTracker,
   logger = console
 } = {}) {
@@ -1559,6 +1192,10 @@ function createConnectionHandler({
       session.color = profile.color;
       session.avatarUrl = profile.avatarUrl;
     }
+  }
+
+  async function roomExists(serverCode) {
+    return Boolean(await ChatServerModel.findOne({ code: serverCode }));
   }
 
   async function appendAuditReliably(entry) {
@@ -3238,34 +2875,40 @@ function createConnectionHandler({
     }
   });
 
-  async function deliverMessageReadWithinAccount({ serverCode, clientContextId, callback, operation }) {
-    return withRoomMutationLock(serverCode, async () => {
-      const access = await loadRoomAccessState({
-        UserModel, ChatServerModel, RoomRestrictionModel,
-        username: socket.username, serverCode
-      });
-      if (!access.room || !access.allowed || socket.serverCode !== serverCode ||
-          !canAccessRoom(socket, serverCode)) {
-        callback({ error: 'Permission denied.' });
-        return;
-      }
-      const roomRole = currentRoomRole(access.room, access.user.username);
-      callback(await operation({ access, roomRole, clientContextId }));
-    });
-  }
-
-  async function deliverMessageRead(options) {
-    return withAccountTransitionLock(
-      socket.username,
-      () => deliverMessageReadWithinAccount(options)
-    );
-  }
-
   socket.on('switch_server', async (code, callback) => {
     callback = safeAck(callback);
     if (!socket.username) return callback({ error: 'Not authenticated.' });
     const serverCode = normalizeServerCode(code);
     if (!serverCode) return callback({ error: 'Invalid input format.' });
+
+    let safeHistory;
+    let roomRole;
+    try {
+      const access = await loadRoomAccessState({
+        UserModel, ChatServerModel, RoomRestrictionModel,
+        username: socket.username, serverCode
+      });
+      if (!access.room) return callback({ error: 'Server not found.' });
+      if (!access.allowed || !canAccessRoom(socket, serverCode)) return callback({ error: 'Permission denied.' });
+
+      let query = { serverCode };
+      if (serverCode === 'global') query = { $or: [{ serverCode: 'global' }, { serverCode: { $exists: false } }, { serverCode: null }] };
+
+      roomRole = await getRoomRoleFn(serverCode, socket.username);
+      const history = await MessageModel.find(query).sort({ timestamp: -1 }).limit(100).lean();
+
+      safeHistory = history.map(storedMessage => {
+          const msg = { ...storedMessage, attachment: sanitizeAttachment(storedMessage.attachment) };
+          if (msg.deleted && msg.username !== socket.username && socket.role !== 'admin' && roomRole !== 'mod') {
+              msg.text = ''; msg.attachment = null; msg.reactions = {};
+          }
+          if (!msg.reactions) msg.reactions = {};
+          return msg;
+      }).reverse();
+    } catch (err) {
+      logUnexpectedError(logger, 'switch_server_history', err);
+      return callback({ error: 'Failed to switch server.' });
+    }
 
     let result;
     try {
@@ -3274,27 +2917,8 @@ function createConnectionHandler({
           UserModel, ChatServerModel, RoomRestrictionModel,
           username: socket.username, serverCode
         });
-        if (!access.room) {
-          callback({ error: 'Server not found.' });
-          return { success: false };
-        }
-        if (!access.allowed || !canAccessRoom(socket, serverCode)) {
-          callback({ error: 'Permission denied.' });
-          return { success: false };
-        }
-
-        const roomRole = currentRoomRole(access.room, access.user.username);
-        const page = await loadBoundedMessagePage({
-          MessageModel,
-          filter: messageRoomQuery(serverCode),
-          limit: 20,
-          viewer: {
-            username: access.user.username,
-            role: access.user.role,
-            roomRole
-          }
-        });
-        const history = [...page.messages].reverse();
+        if (!access.room) return { error: 'Server not found.' };
+        if (!access.allowed || !canAccessRoom(socket, serverCode)) return { error: 'Permission denied.' };
 
         const oldCode = socket.serverCode;
         const session = onlineUsersMap.get(socket.id);
@@ -3333,23 +2957,23 @@ function createConnectionHandler({
         }
         socket.serverCode = serverCode;
         if (session) session.serverCode = serverCode;
-        callback({
-          history,
-          nextCursor: page.nextCursor,
-          roomRole,
-          restriction: {
-            banned: access.restriction.banned,
-            timedOut: access.restriction.timedOut,
-            timeoutUntil: access.restriction.timeoutUntil
-          }
-        });
-        return { success: true, oldCode };
+        return { success: true, oldCode, restriction: access.restriction };
       }));
     } catch (err) {
       logUnexpectedError(logger, 'switch_server_recheck', err);
       return callback({ error: 'Failed to switch server.' });
     }
-    if (!result || !result.success) return;
+    if (result.error) return callback(result);
+
+    callback({
+      history: safeHistory,
+      roomRole,
+      restriction: {
+        banned: result.restriction.banned,
+        timedOut: result.restriction.timedOut,
+        timeoutUntil: result.restriction.timeoutUntil
+      }
+    });
 
     const broadcastCodes = [];
     if (result.oldCode && result.oldCode !== serverCode) broadcastCodes.push(result.oldCode);
@@ -3363,136 +2987,6 @@ function createConnectionHandler({
         logUnexpectedError(logger, 'switch_server_presence_broadcast', err);
       }
     });
-  });
-
-  socket.on('list_messages', async (data, callback) => {
-    callback = safeAck(callback);
-    if (!socket.username) return callback({ error: 'Not authenticated.' });
-    const serverCode = normalizeServerCode(data?.serverCode);
-    const clientContextId = normalizeClientContextId(data?.clientContextId);
-    const limit = normalizePageLimit(data?.limit);
-    const cursor = data?.cursor == null ? null : decodeCursor(data.cursor);
-    if (!serverCode || clientContextId === null || limit === null ||
-        (data?.cursor != null && !cursor) || serverCode !== socket.serverCode) {
-      return callback({ error: 'Invalid input format.' });
-    }
-
-    try {
-      await deliverMessageRead({
-        serverCode,
-        clientContextId,
-        callback,
-        operation: async ({ access, roomRole }) => {
-          const page = await loadBoundedMessagePage({
-            MessageModel,
-            filter: { $and: [messageRoomQuery(serverCode), messageCursorQuery(cursor)] },
-            limit,
-            viewer: {
-              username: access.user.username,
-              role: access.user.role,
-              roomRole
-            }
-          });
-          return {
-            messages: [...page.messages].reverse(),
-            nextCursor: page.nextCursor,
-            serverCode,
-            clientContextId
-          };
-        }
-      });
-    } catch (err) {
-      logUnexpectedError(logger, 'list_messages', err);
-      callback({ error: 'Failed to load messages.' });
-    }
-  });
-
-  socket.on('search_messages', async (data, callback) => {
-    callback = safeAck(callback);
-    if (!socket.username) return callback({ error: 'Not authenticated.' });
-    const isPlainObject = data && typeof data === 'object' && !Array.isArray(data) &&
-      (Object.getPrototypeOf(data) === Object.prototype || Object.getPrototypeOf(data) === null);
-    if (!isPlainObject) return callback({ error: 'Invalid input format.' });
-
-    const serverCode = normalizeServerCode(data.serverCode);
-    const clientContextId = normalizeClientContextId(data.clientContextId);
-    const query = normalizeMessageSearchQuery(data.query);
-    const requestId = normalizeClientContextId(data.requestId);
-    if (!serverCode || clientContextId === null || !query || requestId === null ||
-        serverCode !== socket.serverCode) {
-      return callback({ error: 'Invalid input format.' });
-    }
-
-    const key = authRateLimitKey(
-      socket,
-      'message_search',
-      normalizeAccountKey(socket.username)
-    );
-    if (!searchRateLimiter.check(key)) {
-      return callback({ error: 'Too many requests. Try again later.' });
-    }
-
-    try {
-      await searchGate.run(serverCode, () => withAccountTransitionLock(socket.username, () =>
-        deliverMessageReadWithinAccount({
-          serverCode,
-          clientContextId,
-          callback,
-          operation: async ({ access, roomRole }) => {
-            const textPattern = new RegExp(escapeRegExp(query), 'i');
-            const filter = {
-              $and: [
-                messageRoomQuery(serverCode),
-                { deleted: { $ne: true } },
-                { searchText: textPattern }
-              ]
-            };
-            let searchQuery = MessageModel.find(filter)
-              .select({
-                _id: 1,
-                serverCode: 1,
-                username: 1,
-                displayName: 1,
-                role: 1,
-                roomRole: 1,
-                color: 1,
-                avatarUrl: 1,
-                text: 1,
-                edited: 1,
-                timestamp: 1
-              })
-              .sort({ timestamp: -1, _id: -1 })
-              .limit(20);
-            if (searchQuery && typeof searchQuery.maxTimeMS === 'function') {
-              searchQuery = searchQuery.maxTimeMS(SEARCH_QUERY_MAX_TIME_MS);
-            }
-            const rows = await searchQuery.lean();
-            return {
-              results: rows.map(storedMessage => {
-                const roomScopedMessage = storedMessage && storedMessage.serverCode == null
-                  ? { ...storedMessage, serverCode }
-                  : storedMessage;
-                return safeMessageForViewer(roomScopedMessage, {
-                  username: access.user.username,
-                  role: access.user.role,
-                  roomRole
-                }, { search: true });
-              }),
-              serverCode,
-              clientContextId,
-              requestId
-            };
-          }
-        })
-      ));
-    } catch (err) {
-      if (err && err.code === 'SEARCH_BUSY') {
-        callback({ error: 'Search busy. Try again.' });
-        return;
-      }
-      logUnexpectedError(logger, 'search_messages', err);
-      callback({ error: 'Search failed.' });
-    }
   });
 
   socket.on('chat_message', async (payload) => {
@@ -3565,9 +3059,7 @@ function createConnectionHandler({
         const msg = await MessageModel.create({
             serverCode, username: socket.username, displayName: socket.displayName,
             role: socket.role, roomRole: roomRole, color: socket.color, avatarUrl: socket.avatarUrl,
-            text: cleanText,
-            searchText: normalizeStoredMessageSearchText(cleanText),
-            attachment, replyTo, reactions: {}
+            text: cleanText, attachment, replyTo, reactions: {}
         });
 
         ioInstance.to(msg.serverCode || serverCode).emit('chat_message', {
@@ -3689,9 +3181,7 @@ function createConnectionHandler({
 
             if (msg.text !== cleanText) {
                 msg.history = appendBoundedHistory(msg.history, { text: msg.text, timestamp: new Date() });
-                msg.text = cleanText;
-                msg.searchText = normalizeStoredMessageSearchText(cleanText);
-                msg.edited = true; msg.markModified('history');
+                msg.text = cleanText; msg.edited = true; msg.markModified('history');
                 await msg.save();
                 ioInstance.to(msg.serverCode).emit('message_edited', { id: msg._id, username: msg.username, role: msg.role, roomRole: msg.roomRole, text: cleanText });
             }
@@ -3737,62 +3227,24 @@ function createConnectionHandler({
     }
   });
 
-  async function deliverPrivilegedMessageRead(msgId, callback, operation) {
-    const roomReference = await MessageModel.findById(msgId, { _id: 1, serverCode: 1 });
-    if (!roomReference) {
-      callback({ error: 'Permission denied.' });
-      return;
-    }
-    const canonicalRoom = roomReference.serverCode == null
-      ? 'global'
-      : normalizeServerCode(roomReference.serverCode);
-    if (!canonicalRoom) {
-      callback({ error: 'Permission denied.' });
-      return;
-    }
-
-    return withAccountTransitionLock(socket.username, () =>
-      withRoomMutationLock(canonicalRoom, async () => {
-        const access = await loadRoomAccessState({
-          UserModel, ChatServerModel, RoomRestrictionModel,
-          username: socket.username, serverCode: canonicalRoom
-        });
-        if (!access.allowed || access.restriction.banned || socket.serverCode !== canonicalRoom) {
-          callback({ error: 'Permission denied.' });
-          return;
-        }
-        const message = await MessageModel.findById(msgId);
-        const freshMessageRoom = message && message.serverCode == null
-          ? 'global'
-          : normalizeServerCode(message && message.serverCode);
-        if (!message || freshMessageRoom !== canonicalRoom) {
-          callback({ error: 'Permission denied.' });
-          return;
-        }
-        const roomRole = currentRoomRole(access.room, access.user.username);
-        const isAuthor = normalizeAccountKey(message.username) === normalizeAccountKey(access.user.username);
-        if (!isAuthor && access.user.role !== 'admin' && roomRole !== 'mod') {
-          callback({ error: 'Permission denied.' });
-          return;
-        }
-        callback(await operation(message));
-      })
-    );
-  }
-
   socket.on('get_edit_history', async (msgId, callback) => {
     callback = safeAck(callback);
     if (!socket.username) return callback({ error: 'Not authenticated.' });
     try {
       if (!isValidObjectId(msgId)) return callback({ error: 'Invalid input format.' });
-      await deliverPrivilegedMessageRead(msgId, callback, async message => ({
-        success: true,
-        history: (Array.isArray(message.history) ? message.history : []).slice(-20).map(entry => {
-          const safeEntry = { text: typeof entry?.text === 'string' ? entry.text.slice(0, 2_000) : '' };
-          if (entry && entry.timestamp !== undefined) safeEntry.timestamp = entry.timestamp;
-          return safeEntry;
-        })
-      }));
+      const msg = await MessageModel.findById(msgId);
+      if (msg) {
+        const identity = { role: socket.role, joinedServers: socket.joinedServers || [] };
+        if (!canAccessRoom(identity, msg.serverCode)) return callback({ error: 'Permission denied.' });
+        const restriction = await getActiveRoomRestriction(RoomRestrictionModel, msg.serverCode, socket.username);
+        if (restriction.banned) return callback({ error: 'Permission denied.' });
+        if (!(await roomExists(msg.serverCode))) return callback({ error: 'Permission denied.' });
+        const roomRole = await getRoomRoleFn(msg.serverCode, socket.username);
+        if (msg.username === socket.username || socket.role === 'admin' || roomRole === 'mod') {
+            return callback({ success: true, history: (Array.isArray(msg.history) ? msg.history : []).slice(-20) });
+        }
+      }
+      callback({ error: 'Permission denied.' });
     } catch (err) {
       logUnexpectedError(logger, 'get_edit_history', err);
       callback({ error: 'Failed to load history.' });
@@ -3804,13 +3256,19 @@ function createConnectionHandler({
     if (!socket.username) return callback({ error: 'Not authenticated.' });
     try {
       if (!isValidObjectId(msgId)) return callback({ error: 'Invalid input format.' });
-      await deliverPrivilegedMessageRead(msgId, callback, async message => message.deleted
-        ? {
-            success: true,
-            text: typeof message.text === 'string' ? message.text.slice(0, 2_000) : '',
-            attachment: sanitizeAttachment(message.attachment)
-          }
-        : { error: 'Permission denied.' });
+      const msg = await MessageModel.findById(msgId);
+      if (msg && msg.deleted) {
+        const identity = { role: socket.role, joinedServers: socket.joinedServers || [] };
+        if (!canAccessRoom(identity, msg.serverCode)) return callback({ error: 'Permission denied.' });
+        const restriction = await getActiveRoomRestriction(RoomRestrictionModel, msg.serverCode, socket.username);
+        if (restriction.banned) return callback({ error: 'Permission denied.' });
+        if (!(await roomExists(msg.serverCode))) return callback({ error: 'Permission denied.' });
+        const roomRole = await getRoomRoleFn(msg.serverCode, socket.username);
+        if (msg.username === socket.username || socket.role === 'admin' || roomRole === 'mod') {
+            return callback({ success: true, text: msg.text, attachment: sanitizeAttachment(msg.attachment) });
+        }
+      }
+      callback({ error: 'Permission denied.' });
     } catch (err) {
       logUnexpectedError(logger, 'get_deleted_message', err);
       callback({ error: 'Failed to load deleted message.' });
@@ -3881,7 +3339,6 @@ const PORT = process.env.PORT || 3000;
 async function start({
   mongoUri = MONGO_URI,
   mongooseImpl = mongoose,
-  backfillMessageSearchFn = backfillMessageSearchText,
   seedSystemFn = seedSystem,
   serverInstance = server,
   port = PORT,
@@ -3889,7 +3346,6 @@ async function start({
 } = {}) {
   if (!mongoUri) throw new Error('MONGO_URI is required before server startup.');
   await mongooseImpl.connect(mongoUri);
-  await backfillMessageSearchFn();
   await seedSystemFn();
   return new Promise(resolve => {
     serverInstance.listen(port, () => {
@@ -3937,7 +3393,6 @@ module.exports = {
   RoomRestriction,
   ModerationAudit,
   ModerationReport,
-  MessageSchema,
   isValidPassword,
   normalizeColor,
   normalizeAvatarUrl,
@@ -3947,20 +3402,9 @@ module.exports = {
   isValidObjectId,
   encodeCursor,
   decodeCursor,
-  messageRoomQuery,
-  messageCursorQuery,
-  nextMessagePage,
-  normalizeMessageSearchQuery,
-  normalizeStoredMessageSearchText,
-  safeMessageForViewer,
-  loadBoundedMessagePage,
-  HISTORY_RESPONSE_LIMITS,
   neutralizePingTokens,
   normalizeTransportAddress,
   createRateLimiter,
-  createMessageSearchRateLimiter,
-  createRoomSearchGate,
-  backfillMessageSearchText,
   canAccessRoom,
   appendBoundedHistory,
   createReplySnapshot

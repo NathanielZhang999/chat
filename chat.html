@@ -97,13 +97,6 @@
         .header-btn.logout { display: block; }
 
         #chat-window { flex: 1; overflow-y: auto; padding: 1rem; display: flex; flex-direction: column; gap: 1rem; background: var(--surface); scroll-behavior: auto; }
-        .history-controls { display: flex; justify-content: center; flex: 0 0 auto; min-height: 0; }
-        .history-controls[hidden] { display: none; }
-        #load-older-messages { border: 1px solid var(--border); border-radius: 999px; padding: 5px 12px; background: var(--bg); color: var(--text); font: inherit; font-size: 0.78rem; font-weight: 600; cursor: pointer; }
-        #load-older-messages:hover:not(:disabled) { filter: brightness(1.12); }
-        #load-older-messages:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
-        #load-older-messages:disabled { cursor: wait; opacity: 0.6; }
-        .msg.search-highlight { background: rgba(88, 101, 242, 0.2); border-left-color: var(--primary); }
         
         /* --- SMOOTH MESSAGES & PING HIGHLIGHTS --- */
         @keyframes messageSlideIn {
@@ -265,16 +258,6 @@
         .hist-item { background: var(--surface-dark); padding: 1rem; border-radius: 4px; margin-bottom: 0.5rem; border-left: 3px solid var(--primary); }
         .hist-time { font-size: 0.75rem; color: var(--text-muted); margin-bottom: 0.5rem; font-weight: 600;}
         .hist-text { font-size: 0.95rem; white-space: pre-wrap; word-break: break-word; color: var(--text); }
-        .message-search-form { display: flex; gap: 8px; align-items: center; }
-        .message-search-form .text-input { flex: 1; min-width: 0; }
-        .message-search-form .btn-primary { width: auto; flex: 0 0 auto; }
-        #message-search-status { min-height: 1.2rem; margin: 0.75rem 0; color: var(--text-muted); font-size: 0.85rem; }
-        #message-search-results { display: flex; flex-direction: column; gap: 8px; max-height: 48vh; overflow-y: auto; }
-        .message-search-result { width: 100%; display: grid; grid-template-columns: 1fr auto; gap: 4px 10px; padding: 10px 12px; border: 1px solid var(--border); border-left: 3px solid var(--primary); border-radius: 4px; background: var(--surface-dark); color: var(--text); cursor: pointer; text-align: left; }
-        .message-search-result:hover { background: #40444b; }
-        .message-search-author { min-width: 0; overflow: hidden; text-overflow: ellipsis; color: white; font-size: 0.9rem; font-weight: 700; }
-        .message-search-time { color: var(--text-muted); font-size: 0.75rem; }
-        .message-search-snippet { grid-column: 1 / -1; color: var(--text); font-size: 0.88rem; line-height: 1.4; overflow-wrap: anywhere; white-space: pre-wrap; }
         
         /* --- DYNAMIC CONTEXT MENU --- */
         .context-menu {
@@ -330,35 +313,6 @@
         #sm-join-ui, #sm-create-ui { display: none; opacity: 0; }
         #sm-join-ui.active, #sm-create-ui.active { display: block; animation: fadePop var(--motion-base) var(--ease-standard) forwards; }
         .no-enter-animation { animation: none !important; }
-
-        @media (max-width: 480px) {
-          header {
-            height: auto;
-            min-height: 50px;
-            padding: 5px 8px;
-            flex-direction: column;
-            align-items: stretch;
-            justify-content: center;
-            gap: 4px;
-          }
-          #server-title {
-            min-width: 0;
-            overflow: hidden;
-            text-overflow: ellipsis;
-            white-space: nowrap;
-          }
-          .header-actions {
-            width: 100%;
-            min-width: 0;
-            flex-wrap: nowrap;
-            overflow-x: auto;
-            overflow-y: hidden;
-            padding-bottom: 2px;
-            scrollbar-width: thin;
-            overscroll-behavior-x: contain;
-          }
-          .header-btn { flex: 0 0 auto; padding: 6px 10px; }
-        }
 
         @media (prefers-reduced-motion: reduce) {
           *, *::before, *::after {
@@ -479,23 +433,9 @@
         </div>
     </div>
 
-    <div id="message-search-modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="message-search-title" aria-hidden="true">
-        <div class="modal-box" style="max-width: 560px;">
-            <button class="close-btn" id="message-search-x" type="button" aria-label="Close message search">&times;</button>
-            <h2 id="message-search-title">Search Messages</h2>
-            <form id="message-search-form" class="message-search-form">
-                <input type="text" id="message-search-input" class="text-input" maxlength="80" autocomplete="off" aria-label="Search the current room" placeholder="Search this room">
-                <button type="submit" id="message-search-submit" class="btn-primary">Search</button>
-            </form>
-            <div id="message-search-status" role="status" aria-live="polite"></div>
-            <div id="message-search-results"></div>
-            <button type="button" id="message-search-close" class="btn-primary btn-secondary" style="margin-top: 12px;">Close</button>
-        </div>
-    </div>
-
     <div id="history-modal" class="modal">
         <div class="modal-box" style="max-width: 500px;">
-            <button class="close-btn" id="history-modal-close" type="button" aria-label="Close message details">&times;</button>
+            <button class="close-btn" onclick="document.getElementById('history-modal').classList.remove('active')">&times;</button>
             <h2 id="history-modal-title">Message Edit History</h2>
             <div id="history-list"></div>
         </div>
@@ -623,17 +563,12 @@
                 <button class="header-btn delete" id="delete-server-btn" onclick="deleteServer()" style="display: none;">Delete</button>
                 <button class="header-btn success" id="join-server-btn" onclick="joinFromSnoop()" style="display: none;">Join (Visible)</button>
                 <button class="header-btn primary" id="moderator-center-btn" onclick="openModeratorCenter()" style="display: none;">Moderate</button>
-                <button class="header-btn primary" id="message-search-btn" type="button" style="display: none;">Search</button>
                 <button class="header-btn settings always-on" onclick="openSettings()">⚙️ Settings</button>
                 <button class="header-btn logout always-on" onclick="logoutApp()">Log Out</button>
             </div>
         </header>
         
-        <div id="chat-window">
-            <div id="history-controls" class="history-controls" hidden>
-                <button type="button" id="load-older-messages" hidden>Load older messages</button>
-            </div>
-        </div>
+        <div id="chat-window"></div>
         <div id="typing-indicator"></div>
         
         <div style="position: relative;">
@@ -700,473 +635,6 @@
                 socket: ioFactory(newUrl, { reconnectionAttempts: Infinity }),
                 socketUrl: newUrl
             };
-        },
-
-        createMessageReadCoordinator({
-            onOlderPendingChange = () => {},
-            onSearchPendingChange = () => {}
-        } = {}) {
-            let epoch = 0;
-            let roomCode = null;
-            let clientContextId = null;
-            let nextCursor = null;
-            let pendingOlderToken = null;
-            let nextOlderRequestId = 0;
-            let pendingSearchToken = null;
-            let nextSearchRequestId = 0;
-            let pendingDetailToken = null;
-            let nextDetailRequestId = 0;
-
-            const isCurrentOlder = token => Boolean(token && pendingOlderToken &&
-                token === pendingOlderToken && token.epoch === epoch &&
-                token.roomCode === roomCode && token.clientContextId === clientContextId);
-            const clearOlder = token => {
-                if (!isCurrentOlder(token)) return false;
-                pendingOlderToken = null;
-                onOlderPendingChange(false);
-                return true;
-            };
-            const isCurrentSearch = token => Boolean(token && pendingSearchToken &&
-                token === pendingSearchToken && token.epoch === epoch &&
-                token.roomCode === roomCode && token.clientContextId === clientContextId);
-            const clearSearch = token => {
-                if (!isCurrentSearch(token)) return false;
-                pendingSearchToken = null;
-                onSearchPendingChange(false);
-                return true;
-            };
-            const isCurrentDetail = token => Boolean(token && pendingDetailToken &&
-                token === pendingDetailToken && token.epoch === epoch &&
-                token.roomCode === roomCode && token.clientContextId === clientContextId &&
-                token.messageId === pendingDetailToken.messageId);
-
-            const resetPending = () => {
-                pendingOlderToken = null;
-                pendingSearchToken = null;
-                pendingDetailToken = null;
-                onOlderPendingChange(false);
-                onSearchPendingChange(false);
-            };
-
-            return {
-                activate(nextRoomCode, nextClientContextId, cursor = null) {
-                    epoch += 1;
-                    resetPending();
-                    roomCode = typeof nextRoomCode === 'string' && nextRoomCode
-                        ? nextRoomCode
-                        : null;
-                    clientContextId = Number.isSafeInteger(nextClientContextId) && nextClientContextId > 0
-                        ? nextClientContextId
-                        : null;
-                    nextCursor = typeof cursor === 'string' && cursor ? cursor : null;
-                    if (!roomCode || clientContextId === null) {
-                        roomCode = null;
-                        clientContextId = null;
-                        nextCursor = null;
-                    }
-                    return this.current();
-                },
-                invalidate() {
-                    epoch += 1;
-                    resetPending();
-                    roomCode = null;
-                    clientContextId = null;
-                    nextCursor = null;
-                    return epoch;
-                },
-                beginOlder() {
-                    if (!roomCode || clientContextId === null || !nextCursor || pendingOlderToken) {
-                        return null;
-                    }
-                    const token = Object.freeze({
-                        epoch,
-                        roomCode,
-                        clientContextId,
-                        cursor: nextCursor,
-                        requestId: ++nextOlderRequestId
-                    });
-                    pendingOlderToken = token;
-                    onOlderPendingChange(true);
-                    return token;
-                },
-                finishOlder(token, response) {
-                    if (!clearOlder(token)) return null;
-                    const accepted = Boolean(response && Array.isArray(response.messages) &&
-                        response.serverCode === roomCode &&
-                        response.clientContextId === clientContextId &&
-                        (response.nextCursor === null ||
-                            (typeof response.nextCursor === 'string' && response.nextCursor)));
-                    if (!accepted) return null;
-                    nextCursor = response.nextCursor;
-                    return response;
-                },
-                cancelOlder(token) {
-                    return clearOlder(token);
-                },
-                beginSearch({ supersede = false } = {}) {
-                    if (!roomCode || clientContextId === null) return null;
-                    if (pendingSearchToken && !supersede) return null;
-                    if (pendingSearchToken) clearSearch(pendingSearchToken);
-                    const token = Object.freeze({
-                        epoch,
-                        roomCode,
-                        clientContextId,
-                        requestId: ++nextSearchRequestId
-                    });
-                    pendingSearchToken = token;
-                    onSearchPendingChange(true);
-                    return token;
-                },
-                finishSearch(token, response) {
-                    if (!clearSearch(token)) return null;
-                    return response && Array.isArray(response.results) &&
-                        response.serverCode === token.roomCode &&
-                        response.clientContextId === token.clientContextId &&
-                        response.requestId === token.requestId
-                        ? response
-                        : null;
-                },
-                cancelSearch(token) {
-                    return clearSearch(token);
-                },
-                closeSearch() {
-                    pendingSearchToken = null;
-                    onSearchPendingChange(false);
-                },
-                beginDetail(roomOrMessageId, contextId, maybeMessageId) {
-                    const hasExplicitContext = arguments.length >= 3;
-                    const messageId = hasExplicitContext ? maybeMessageId : roomOrMessageId;
-                    if (!roomCode || clientContextId === null ||
-                        typeof messageId !== 'string' || !messageId ||
-                        (hasExplicitContext &&
-                            (roomOrMessageId !== roomCode || contextId !== clientContextId))) {
-                        return null;
-                    }
-                    const token = Object.freeze({
-                        epoch,
-                        roomCode,
-                        clientContextId,
-                        messageId,
-                        requestId: ++nextDetailRequestId
-                    });
-                    pendingDetailToken = token;
-                    return token;
-                },
-                finishDetail(token) {
-                    if (!isCurrentDetail(token)) return false;
-                    pendingDetailToken = null;
-                    return true;
-                },
-                closeDetail() {
-                    pendingDetailToken = null;
-                },
-                matches(token) {
-                    return Boolean(token && token.epoch === epoch &&
-                        token.roomCode === roomCode && token.clientContextId === clientContextId);
-                },
-                current() {
-                    return {
-                        epoch,
-                        roomCode,
-                        clientContextId,
-                        nextCursor,
-                        olderPending: Boolean(pendingOlderToken)
-                    };
-                }
-            };
-        },
-
-        requestOlderMessages({
-            coordinator,
-            socket,
-            onAccepted = () => {},
-            onTimeout = () => {},
-            scheduleTimeout = null,
-            cancelTimeout = null,
-            timeoutMs = 10000
-        } = {}) {
-            if (!coordinator || !socket || typeof socket.emit !== 'function') return false;
-            const token = coordinator.beginOlder();
-            if (!token) return false;
-            let timerId = null;
-            const clearTimer = () => {
-                if (timerId !== null && typeof cancelTimeout === 'function') cancelTimeout(timerId);
-                timerId = null;
-            };
-            if (typeof scheduleTimeout === 'function') {
-                timerId = scheduleTimeout(() => {
-                    timerId = null;
-                    if (!coordinator.cancelOlder(token)) return;
-                    onTimeout(token);
-                }, timeoutMs);
-            }
-            socket.emit('list_messages', {
-                serverCode: token.roomCode,
-                clientContextId: token.clientContextId,
-                cursor: token.cursor
-            }, response => {
-                clearTimer();
-                const accepted = coordinator.finishOlder(token, response);
-                if (!accepted) return;
-                onAccepted(accepted, token);
-            });
-            return Object.freeze({
-                token,
-                cancel() {
-                    clearTimer();
-                    return coordinator.cancelOlder(token);
-                }
-            });
-        },
-
-        normalizeMessageSearchQuery(value) {
-            if (typeof value !== 'string') return null;
-            const query = value.normalize('NFKC').trim();
-            return query.length >= 2 && query.length <= 80 ? query : null;
-        },
-
-        requestMessageSearch({
-            coordinator,
-            socket,
-            query,
-            onAccepted = () => {},
-            onTimeout = () => {},
-            scheduleTimeout = null,
-            cancelTimeout = null,
-            timeoutMs = 10000
-        } = {}) {
-            if (!coordinator || !socket || typeof socket.emit !== 'function') return false;
-            const normalizedQuery = this.normalizeMessageSearchQuery(query);
-            if (!normalizedQuery) return false;
-            const token = coordinator.beginSearch({ supersede: true });
-            if (!token) return false;
-            let timerId = null;
-            const clearTimer = () => {
-                if (timerId !== null && typeof cancelTimeout === 'function') cancelTimeout(timerId);
-                timerId = null;
-            };
-            if (typeof scheduleTimeout === 'function') {
-                timerId = scheduleTimeout(() => {
-                    timerId = null;
-                    if (!coordinator.cancelSearch(token)) return;
-                    onTimeout(token);
-                }, timeoutMs);
-            }
-            socket.emit('search_messages', {
-                serverCode: token.roomCode,
-                clientContextId: token.clientContextId,
-                query: normalizedQuery,
-                requestId: token.requestId
-            }, response => {
-                const accepted = coordinator.finishSearch(token, response);
-                clearTimer();
-                if (!accepted) return;
-                onAccepted(accepted, token);
-            });
-            return Object.freeze({
-                token,
-                cancel() {
-                    clearTimer();
-                    return coordinator.cancelSearch(token);
-                }
-            });
-        },
-
-        appendTrustedSearchText(doc, parent, value) {
-            const text = String(value || '');
-            const tokenPattern = /(?<!\{)\{\{PING:([A-Za-z0-9_-]{1,20})\|([A-Za-z0-9_ -]{1,30})\}\}(?!\})/g;
-            let lastIndex = 0;
-            let match;
-            while ((match = tokenPattern.exec(text)) !== null) {
-                if (match.index > lastIndex) {
-                    this.appendTextElement(doc, parent, 'span', '', text.slice(lastIndex, match.index));
-                }
-                const isEveryone = match[1] === 'everyone' && match[2] === 'everyone';
-                const mismatchedEveryone = (match[1] === 'everyone' || match[2] === 'everyone') && !isEveryone;
-                if (mismatchedEveryone) {
-                    this.appendTextElement(doc, parent, 'span', '', match[0]);
-                } else {
-                    this.appendTextElement(
-                        doc,
-                        parent,
-                        'span',
-                        isEveryone ? 'ping-tag everyone' : 'ping-tag',
-                        `@${isEveryone ? 'everyone' : match[2]}`
-                    );
-                }
-                lastIndex = tokenPattern.lastIndex;
-            }
-            if (lastIndex < text.length || !parent.children || parent.children.length === 0) {
-                this.appendTextElement(doc, parent, 'span', '', text.slice(lastIndex));
-            }
-            return parent;
-        },
-
-        appendSearchResultRow(doc, list, result, { formatDate, onSelect } = {}) {
-            if (!doc || !list || !result || result._id == null) return null;
-            const messageId = String(result._id);
-            if (!messageId) return null;
-            const row = doc.createElement('button');
-            row.type = 'button';
-            row.className = 'message-search-result';
-            const author = this.appendTextElement(
-                doc,
-                row,
-                'span',
-                'message-search-author',
-                result.displayName || result.username || 'Unknown'
-            );
-            const time = this.appendTextElement(
-                doc,
-                row,
-                'span',
-                'message-search-time',
-                typeof formatDate === 'function' ? formatDate(result.timestamp) : String(result.timestamp || '')
-            );
-            const snippet = doc.createElement('span');
-            snippet.className = 'message-search-snippet';
-            this.appendTrustedSearchText(doc, snippet, result.text);
-            row.appendChild(snippet);
-            row.onclick = () => {
-                if (typeof onSelect === 'function') onSelect(messageId);
-            };
-            list.appendChild(row);
-            return { row, author, time, snippet };
-        },
-
-        prependScrollTop({ oldScrollHeight, oldScrollTop, newScrollHeight } = {}) {
-            const beforeHeight = Number(oldScrollHeight) || 0;
-            const beforeTop = Number(oldScrollTop) || 0;
-            const afterHeight = Number(newScrollHeight) || 0;
-            return Math.max(0, beforeTop + afterHeight - beforeHeight);
-        },
-
-        uniqueMessages(existingIds, messages) {
-            const seen = new Set(existingIds && typeof existingIds[Symbol.iterator] === 'function'
-                ? existingIds
-                : []);
-            if (!Array.isArray(messages)) return [];
-            return messages.filter(message => {
-                if (!message || message._id == null) return false;
-                const id = String(message._id);
-                if (!id || seen.has(id)) return false;
-                seen.add(id);
-                return true;
-            });
-        },
-
-        prependMessagePage({
-            chatWindow,
-            historyControls,
-            messages,
-            renderMessage,
-            afterRender = () => {},
-            createResizeObserver = null,
-            isCurrent = () => true,
-            onAnchorCleanup = () => {}
-        } = {}) {
-            if (!chatWindow || !historyControls || typeof renderMessage !== 'function') return [];
-            const oldScrollHeight = chatWindow.scrollHeight;
-            const oldScrollTop = chatWindow.scrollTop;
-            const existingRows = [...chatWindow.querySelectorAll('.msg[data-id]')];
-            const existingIds = new Set(
-                existingRows
-                    .map(row => row.getAttribute('data-id'))
-                    .filter(Boolean)
-            );
-            const unique = this.uniqueMessages(existingIds, messages);
-            const anchor = historyControls.nextSibling;
-            const anchorElement = existingRows[0] || null;
-            const canMeasureAnchor = Boolean(anchorElement &&
-                typeof anchorElement.getBoundingClientRect === 'function' &&
-                typeof chatWindow.getBoundingClientRect === 'function');
-            const originalAnchorTop = canMeasureAnchor
-                ? anchorElement.getBoundingClientRect().top - chatWindow.getBoundingClientRect().top
-                : null;
-            const renderedRows = unique.map(message => renderMessage(message, anchor)).filter(Boolean);
-            afterRender();
-            const correctAnchor = () => {
-                if (!canMeasureAnchor) return false;
-                const currentTop = anchorElement.getBoundingClientRect().top -
-                    chatWindow.getBoundingClientRect().top;
-                const delta = currentTop - originalAnchorTop;
-                if (!delta) return true;
-                chatWindow.scrollTop += delta;
-                return true;
-            };
-            if (!correctAnchor()) {
-                chatWindow.scrollTop = this.prependScrollTop({
-                    oldScrollHeight,
-                    oldScrollTop,
-                    newScrollHeight: chatWindow.scrollHeight
-                });
-            }
-
-            let stopped = false;
-            let observer = null;
-            const onScroll = () => {
-                const currentTop = canMeasureAnchor
-                    ? anchorElement.getBoundingClientRect().top - chatWindow.getBoundingClientRect().top
-                    : null;
-                if (currentTop !== null && Math.abs(currentTop - originalAnchorTop) < 1) return;
-                cleanup();
-            };
-            const cleanup = () => {
-                if (stopped) return;
-                stopped = true;
-                if (observer) observer.disconnect();
-                if (typeof chatWindow.removeEventListener === 'function') {
-                    chatWindow.removeEventListener('scroll', onScroll);
-                }
-            };
-            if (canMeasureAnchor && renderedRows.length && typeof createResizeObserver === 'function') {
-                observer = createResizeObserver(() => {
-                    if (stopped) return;
-                    if (!isCurrent()) return cleanup();
-                    correctAnchor();
-                });
-                if (observer && typeof observer.observe === 'function') {
-                    renderedRows.forEach(row => observer.observe(row));
-                    if (typeof chatWindow.addEventListener === 'function') {
-                        chatWindow.addEventListener('scroll', onScroll, { passive: true });
-                    }
-                }
-            }
-            onAnchorCleanup(cleanup);
-            return unique;
-        },
-
-        renderInitialMessagePage({ messages, renderMessage, requestScroll } = {}) {
-            const history = Array.isArray(messages) ? messages : [];
-            if (typeof renderMessage === 'function') {
-                history.forEach(message => renderMessage(message, { history: true }));
-            }
-            if (typeof requestScroll === 'function') requestScroll('auto');
-        },
-
-        syncCurrentUserRoomAccess({
-            roomUsers,
-            username,
-            globalRole,
-            applyRole = () => {},
-            onAccessLoss = () => {}
-        } = {}) {
-            const users = Array.isArray(roomUsers) ? roomUsers : [];
-            const currentUser = users.find(user => user && user.username === username);
-            if (currentUser) {
-                applyRole(currentUser.roomRole || 'user');
-                return true;
-            }
-            if (globalRole === 'admin') return true;
-            onAccessLoss();
-            applyRole('user');
-            return false;
-        },
-
-        applyOlderControlState(control, { roomCode, nextCursor, olderPending } = {}) {
-            if (!control) return;
-            control.hidden = !(roomCode && nextCursor);
-            control.disabled = Boolean(olderPending);
         },
 
         createDialogRequestCoordinator({ onPendingChange = () => {} } = {}) {
@@ -1511,9 +979,9 @@
                 bannedRooms = new Set(Array.isArray(rooms) ? rooms : []);
                 renderAccess([...bannedRooms]);
             };
-            const requestRoom = (code, options) => {
+            const requestRoom = code => {
                 if (!code || bannedRooms.has(code)) return false;
-                requestSwitch(code, options);
+                requestSwitch(code);
                 return true;
             };
             return {
@@ -1941,38 +1409,6 @@
     const authBtn = document.getElementById('auth-btn');
     const authError = document.getElementById('auth-error');
     const chatWindow = document.getElementById('chat-window');
-    const historyControls = document.getElementById('history-controls');
-    const loadOlderButton = document.getElementById('load-older-messages');
-    const messageSearchButton = document.getElementById('message-search-btn');
-    const messageSearchModal = document.getElementById('message-search-modal');
-    const messageSearchInput = document.getElementById('message-search-input');
-    const messageSearchSubmit = document.getElementById('message-search-submit');
-    const messageSearchStatus = document.getElementById('message-search-status');
-    const messageSearchResults = document.getElementById('message-search-results');
-    const messageReadCoordinator = ChatClientHelpers.createMessageReadCoordinator({
-        onOlderPendingChange: pending => { loadOlderButton.disabled = pending; },
-        onSearchPendingChange: pending => {
-            messageSearchSubmit.disabled = pending;
-            messageSearchSubmit.textContent = pending ? 'Searching…' : 'Search';
-            if (pending) messageSearchStatus.textContent = 'Searching…';
-            else if (messageSearchStatus.textContent === 'Searching…') {
-                messageSearchStatus.textContent = 'Search unavailable. Please try again.';
-            }
-        }
-    });
-    let olderRequestHandle = null;
-    let searchRequestHandle = null;
-    let messageSearchReturnFocus = null;
-    let stopOlderAnchor = () => {};
-    const olderRequestTimeoutMs = 10000;
-    const searchRequestTimeoutMs = 10000;
-    const scheduleOlderAckTimeout = (callback, delay) => setTimeout(callback, delay);
-    const cancelOlderAckTimeout = timerId => clearTimeout(timerId);
-    const scheduleSearchAckTimeout = (callback, delay) => setTimeout(callback, delay);
-    const cancelSearchAckTimeout = timerId => clearTimeout(timerId);
-    const createOlderResizeObserver = typeof window.ResizeObserver === 'function'
-        ? callback => new window.ResizeObserver(callback)
-        : null;
     const scheduleAnimationFrame = window.requestAnimationFrame
         ? callback => window.requestAnimationFrame(callback)
         : callback => setTimeout(callback, 0);
@@ -2057,235 +1493,7 @@
         }
     }
 
-    function renderOlderControl() {
-        ChatClientHelpers.applyOlderControlState(
-            loadOlderButton,
-            messageReadCoordinator.current()
-        );
-        historyControls.hidden = loadOlderButton.hidden;
-    }
-
-    function renderSearchControl(forceHidden = false) {
-        const activeRead = messageReadCoordinator.current();
-        const hasActiveContext = activeRead.roomCode === currentServerCode &&
-            Number.isSafeInteger(activeRead.clientContextId) && activeRead.clientContextId > 0;
-        const accessible = !forceHidden && Boolean(currentServerCode) && hasActiveContext &&
-            ChatClientHelpers.isRoomRailAccessible({
-            serverCode: currentServerCode,
-            role: myRole,
-            joinedServers: myJoinedServers,
-            bannedRooms: [...myBannedRooms]
-        });
-        messageSearchButton.style.display = accessible ? 'block' : 'none';
-        if (!accessible && messageSearchModal.classList.contains('active')) {
-            closeMessageSearch({ restoreFocus: false });
-        }
-    }
-
-    function messageSearchFocusableElements() {
-        if (!messageSearchModal || typeof messageSearchModal.querySelectorAll !== 'function') return [];
-        return [...messageSearchModal.querySelectorAll(
-            'button:not([disabled]), input:not([disabled]), [href], [tabindex]:not([tabindex="-1"])'
-        )].filter(element => !element.hidden && element.getAttribute?.('aria-hidden') !== 'true');
-    }
-
-    function setMessageSearchBackgroundBlocked(blocked) {
-        if (typeof document === 'undefined') return;
-        for (const id of ['servers-sidebar', 'chat-area']) {
-            const element = document.getElementById(id);
-            if (!element) continue;
-            element.inert = Boolean(blocked);
-            if (blocked) element.setAttribute('aria-hidden', 'true');
-            else element.removeAttribute('aria-hidden');
-        }
-    }
-
-    function openMessageSearch() {
-        if (!currentServerCode || messageSearchButton.style.display === 'none') return false;
-        messageReadCoordinator.closeSearch();
-        messageSearchReturnFocus = messageSearchButton;
-        messageSearchInput.value = '';
-        messageSearchResults.textContent = '';
-        messageSearchStatus.textContent = 'Enter 2–80 characters to search this room.';
-        messageSearchModal.classList.add('active');
-        messageSearchModal.setAttribute?.('aria-hidden', 'false');
-        if (typeof setMessageSearchBackgroundBlocked === 'function') {
-            setMessageSearchBackgroundBlocked(true);
-        }
-        messageSearchInput.focus();
-        return true;
-    }
-
-    function closeMessageSearch({ restoreFocus = true } = {}) {
-        const wasActive = messageSearchModal.classList.contains('active');
-        const returnFocus = typeof messageSearchReturnFocus === 'undefined'
-            ? null
-            : messageSearchReturnFocus;
-        messageSearchReturnFocus = null;
-        if (searchRequestHandle) searchRequestHandle.cancel();
-        searchRequestHandle = null;
-        messageReadCoordinator.closeSearch();
-        messageSearchModal.classList.remove('active');
-        messageSearchModal.setAttribute?.('aria-hidden', 'true');
-        if (typeof setMessageSearchBackgroundBlocked === 'function') {
-            setMessageSearchBackgroundBlocked(false);
-        }
-        messageSearchInput.value = '';
-        messageSearchResults.textContent = '';
-        messageSearchStatus.textContent = '';
-        messageSearchSubmit.disabled = false;
-        messageSearchSubmit.textContent = 'Search';
-        if (wasActive && restoreFocus && returnFocus && typeof returnFocus.focus === 'function' &&
-            messageSearchButton.style.display !== 'none') {
-            returnFocus.focus();
-        }
-    }
-
-    function closeHistoryModal() {
-        messageReadCoordinator.closeDetail();
-        document.getElementById('history-modal').classList.remove('active');
-        document.getElementById('history-list').textContent = '';
-    }
-
-    function selectSearchResult(messageId) {
-        const loadedMessage = [...document.querySelectorAll('.msg[data-id]')]
-            .find(row => row.getAttribute('data-id') === String(messageId));
-        if (!loadedMessage) {
-            messageSearchStatus.textContent = 'This message is outside the loaded history.';
-            return false;
-        }
-        closeMessageSearch();
-        loadedMessage.scrollIntoView({
-            block: 'center',
-            behavior: prefersReducedMotion() ? 'auto' : 'smooth'
-        });
-        loadedMessage.classList.add('search-highlight');
-        setTimeout(() => loadedMessage.classList.remove('search-highlight'), 1800);
-        return true;
-    }
-
-    function renderSearchResults(results) {
-        messageSearchResults.textContent = '';
-        const values = Array.isArray(results) ? results : [];
-        const rendered = values.map(result => ChatClientHelpers.appendSearchResultRow(
-            document,
-            messageSearchResults,
-            result,
-            { formatDate: formatExactDate, onSelect: selectSearchResult }
-        )).filter(Boolean);
-        messageSearchStatus.textContent = rendered.length
-            ? `${rendered.length} ${rendered.length === 1 ? 'result' : 'results'}.`
-            : 'No messages found.';
-        return rendered;
-    }
-
-    function submitMessageSearch() {
-        const query = ChatClientHelpers.normalizeMessageSearchQuery(messageSearchInput.value);
-        if (!query) {
-            messageSearchStatus.textContent = 'Enter 2–80 characters.';
-            return false;
-        }
-        if (searchRequestHandle) searchRequestHandle.cancel();
-        searchRequestHandle = null;
-        messageSearchResults.textContent = '';
-        messageSearchStatus.textContent = 'Searching…';
-        const requestHandle = ChatClientHelpers.requestMessageSearch({
-            coordinator: messageReadCoordinator,
-            socket,
-            query,
-            scheduleTimeout: scheduleSearchAckTimeout,
-            cancelTimeout: cancelSearchAckTimeout,
-            timeoutMs: searchRequestTimeoutMs,
-            onTimeout() {
-                searchRequestHandle = null;
-                messageSearchStatus.textContent = 'Search timed out. Try again.';
-            },
-            onAccepted(response) {
-                searchRequestHandle = null;
-                renderSearchResults(response.results);
-            }
-        });
-        searchRequestHandle = requestHandle || null;
-        if (!requestHandle) {
-            messageSearchStatus.textContent = 'Search unavailable. Please try again.';
-            return false;
-        }
-        return true;
-    }
-
-    function handleMessageSearchKeydown(event) {
-        if (!event || event.key !== 'Enter') return false;
-        event.preventDefault();
-        return submitMessageSearch();
-    }
-
-    function handleMessageSearchModalKeydown(event) {
-        if (!event || !messageSearchModal.classList.contains('active')) return false;
-        if (event.key === 'Escape') {
-            event.preventDefault();
-            closeMessageSearch();
-            return true;
-        }
-        if (event.key !== 'Tab') return false;
-        const focusable = messageSearchFocusableElements();
-        if (focusable.length === 0) {
-            event.preventDefault();
-            return true;
-        }
-        const first = focusable[0];
-        const last = focusable[focusable.length - 1];
-        const active = typeof document === 'undefined' ? null : document.activeElement;
-        if (event.shiftKey && (active === first || !focusable.includes(active))) {
-            event.preventDefault();
-            last.focus();
-            return true;
-        }
-        if (!event.shiftKey && (active === last || !focusable.includes(active))) {
-            event.preventDefault();
-            first.focus();
-            return true;
-        }
-        return false;
-    }
-
-    function invalidateMessageReads() {
-        closeMessageSearch({ restoreFocus: false });
-        closeHistoryModal();
-        stopOlderAnchor();
-        stopOlderAnchor = () => {};
-        if (olderRequestHandle) olderRequestHandle.cancel();
-        olderRequestHandle = null;
-        messageReadCoordinator.invalidate();
-        renderOlderControl();
-        renderSearchControl(true);
-    }
-
-    function bindMessageSearchControls() {
-        messageSearchInput.maxLength = 80;
-        messageSearchButton.addEventListener('click', openMessageSearch);
-        document.getElementById('message-search-form').addEventListener('submit', event => {
-            event.preventDefault();
-            submitMessageSearch();
-        });
-        messageSearchInput.addEventListener('keydown', handleMessageSearchKeydown);
-        messageSearchModal.addEventListener('keydown', handleMessageSearchModalKeydown);
-        document.getElementById('message-search-x').addEventListener('click', closeMessageSearch);
-        document.getElementById('message-search-close').addEventListener('click', closeMessageSearch);
-        document.getElementById('history-modal-close').addEventListener('click', closeHistoryModal);
-    }
-
-    bindMessageSearchControls();
-
-    function clearRenderedMessages() {
-        stopOlderAnchor();
-        stopOlderAnchor = () => {};
-        [...chatWindow.children].forEach(child => {
-            if (child !== historyControls) child.remove();
-        });
-    }
-
     function enterLobby() {
-        invalidateMessageReads();
         compositionContextCoordinator.invalidate();
         currentServerCode = null;
         myRoomRole = 'user';
@@ -2293,7 +1501,7 @@
         clearTimeout(typingTimeout);
         typingUsers.clear();
         updateTypingUI();
-        clearRenderedMessages();
+        chatWindow.textContent = '';
         document.getElementById('online-list').textContent = '';
         document.getElementById('online-header').textContent = 'No active room';
         document.getElementById('server-title').textContent = 'Lobby';
@@ -2306,7 +1514,6 @@
         closeReportPrompt();
         closeResolutionPrompt();
         updateModeratorCenterAccess();
-        renderSearchControl();
         cancelAction();
         ChatClientHelpers.applyLobbyState({
             messageInput: msgInput,
@@ -2379,7 +1586,6 @@
                 icon.style.border = '';
             }
         });
-        renderSearchControl();
     }
 
     function canModerateCurrentRoom() {
@@ -3073,25 +2279,8 @@
 
     async function logoutApp() {
         if (await showAppConfirm("Log Out", "Are you sure you want to log out of your account?", "Log Out", true)) {
-            invalidateMessageReads();
             localStorage.removeItem('pro_chat_user'); location.reload(); 
         }
-    }
-
-    function replaceClientSocket(url) {
-        const previousSocket = socket;
-        const replacement = ChatClientHelpers.replaceSocket(socket, socketUrl, url, io);
-        socket = replacement.socket;
-        socketUrl = replacement.socketUrl;
-        if (socket !== previousSocket) {
-            invalidateMessageReads();
-            compositionContextCoordinator.invalidate();
-            closeModerationPrompt();
-            closeReportPrompt();
-            invalidatePrivilegedAccess();
-            setupSocket(socket);
-        }
-        return socket;
     }
 
     // --- AUTHENTICATION ---
@@ -3112,7 +2301,18 @@
         
         authError.style.color = "var(--text)"; authError.textContent = "Connecting to server..."; authBtn.disabled = true;
 
-        const authSocket = replaceClientSocket(url);
+        const previousSocket = socket;
+        const replacement = ChatClientHelpers.replaceSocket(socket, socketUrl, url, io);
+        socket = replacement.socket;
+        socketUrl = replacement.socketUrl;
+        if (socket !== previousSocket) {
+            compositionContextCoordinator.invalidate();
+            closeModerationPrompt();
+            closeReportPrompt();
+            invalidatePrivilegedAccess();
+            setupSocket(socket);
+        }
+        const authSocket = socket;
 
         const action = isLoginMode ? 'login' : 'register';
         const payload = isLoginMode ? { username: user, password: pass } : { username: user, password: pass, displayName: dName };
@@ -3170,21 +2370,6 @@
 
     function showError(msg, success) { authError.style.color = success ? "var(--success)" : "var(--error)"; authError.textContent = msg; }
 
-    function handleServerDeleted(code) {
-        myJoinedServers = myJoinedServers.filter(joinedCode => joinedCode !== code);
-        const icon = document.getElementById(`srv-${code}`);
-        if (icon) icon.remove();
-        if (currentServerCode !== code) return;
-        invalidateMessageReads();
-        renderSearchControl(true);
-        if (myBannedRooms.has('global')) enterLobby();
-        else switchServer('global');
-        showAppAlert(
-            "Server Deleted",
-            "The server you were viewing was permanently deleted by its Owner or a Global Admin."
-        );
-    }
-
     function setupSocket(activeSocket) {
         ChatClientHelpers.bindConnectErrorRecovery({
             activeSocket,
@@ -3195,8 +2380,6 @@
         });
         
         activeSocket.on('force_logout', (msg) => {
-            invalidateMessageReads();
-            compositionContextCoordinator.invalidate();
             localStorage.removeItem('pro_chat_user'); alert(msg || "You have been logged out remotely."); location.reload(); 
         });
 
@@ -3220,10 +2403,7 @@
         activeSocket.on('global_role_updated', (data) => {
             if (data.username === myUsername) {
                 myRole = data.role;
-                if (data.role !== 'admin') {
-                    invalidateMessageReads();
-                    invalidatePrivilegedAccess();
-                }
+                if (data.role !== 'admin') invalidatePrivilegedAccess();
                 renderServerAccess();
                 showAppAlert(data.role === 'admin' ? "Promoted!" : "Demoted", `You have been ${data.role === 'admin' ? 'promoted to' : 'demoted from'} Global Admin!`);
                 if (currentServerCode) roomSwitchCoordinator.request(currentServerCode);
@@ -3234,7 +2414,6 @@
         activeSocket.on('room_role_updated', (data) => {
             if (data.username === myUsername && data.targetServer === currentServerCode) {
                 myRoomRole = 'user';
-                invalidateMessageReads();
                 invalidatePrivilegedAccess();
                 roomSwitchCoordinator.request(currentServerCode);
             }
@@ -3378,7 +2557,17 @@
         
         activeSocket.on('admin_new_server', (srv) => { if (myRole === 'admin') addServerToList(srv.code, srv.name, srv.owner); });
 
-        activeSocket.on('server_deleted', handleServerDeleted);
+        activeSocket.on('server_deleted', (code) => {
+            myJoinedServers = myJoinedServers.filter(c => c !== code);
+            const icon = document.getElementById(`srv-${code}`);
+            if (icon) icon.remove();
+            
+            if (currentServerCode === code) {
+                if (myBannedRooms.has('global')) enterLobby();
+                else switchServer('global');
+                showAppAlert("Server Deleted", "The server you were viewing was permanently deleted by its Owner or a Global Admin.");
+            }
+        });
 
         // --- ONLINE USERS RENDERER & ROLE SYNC ---
         activeSocket.on('online_users', (users) => {
@@ -3388,19 +2577,14 @@
             
             usersCache = {}; // Rebuild local lookup
 
-            ChatClientHelpers.syncCurrentUserRoomAccess({
-                roomUsers,
-                username: myUsername,
-                globalRole: myRole,
-                applyRole(role) {
-                    myRoomRole = role;
-                    updateModeratorCenterAccess();
-                },
-                onAccessLoss() {
-                    invalidateMessageReads();
-                    invalidatePrivilegedAccess();
-                }
-            });
+            const me = roomUsers.find(u => u.username === myUsername);
+            if (me) {
+                myRoomRole = me.roomRole || 'user';
+                updateModeratorCenterAccess();
+            } else if (myRole !== 'admin') {
+                myRoomRole = 'user';
+                invalidatePrivilegedAccess();
+            }
 
             const isGlobal = currentServerCode === 'global';
             const roomType = isGlobal ? 'Global Online' : 'Room Members';
@@ -3690,20 +2874,20 @@
         renderServerAccess();
     }
 
-    function requestServerSwitch(code, { forceRefresh = false } = {}) {
-        if (!forceRefresh && currentServerCode === code && chatWindow.querySelector('.msg, .system-msg') &&
+    function requestServerSwitch(code) {
+        if (currentServerCode === code && chatWindow.innerHTML !== '' &&
             !roomSwitchCoordinator.isPending()) return;
         roomSwitchCoordinator.request(code);
     }
 
-    function switchServer(code, options) {
+    function switchServer(code) {
         if (!ChatClientHelpers.isRoomRailAccessible({
             serverCode: code,
             role: myRole,
             joinedServers: myJoinedServers,
             bannedRooms: [...myBannedRooms]
         })) return false;
-        return roomAccessCoordinator.requestRoom(code, options);
+        return roomAccessCoordinator.requestRoom(code);
     }
 
     function handleSwitchResult(code, res) {
@@ -3716,17 +2900,11 @@
                 const srv = serversCache[targetServerCode] || { name: 'Unknown', owner: '' };
                 const isStealth = myRole === 'admin' && !myJoinedServers.includes(targetServerCode) && targetServerCode !== 'global';
 
-                invalidateMessageReads();
                 closeModeratorCenter();
                 closeModerationPrompt();
                 closeReportPrompt();
                 currentServerCode = targetServerCode;
                 compositionContextCoordinator.activate(targetServerCode);
-                messageReadCoordinator.activate(
-                    targetServerCode,
-                    compositionContextCoordinator.current().clientContextId,
-                    response.nextCursor || null
-                );
                 myRoomRole = response.roomRole || 'user';
                 applyRestrictionState(response.restriction, targetServerCode);
                 renderServerAccess();
@@ -3759,6 +2937,7 @@
                     }
                 }
 
+                chatWindow.textContent = '';
                 cancelAction();
 
                 const serverTitle = document.getElementById('server-title');
@@ -3781,8 +2960,7 @@
                     ghost.style.fontStyle = 'italic';
                 }
 
-                loadHistory(response.history, { replace: true });
-                renderOlderControl();
+                if (response.history) loadHistory(response.history);
             }
         });
     }
@@ -3805,15 +2983,14 @@
             const icon = document.getElementById(`srv-${serverCode}`);
             if (myRole !== 'admin' && icon) {
                 icon.remove();
+                if (currentServerCode === serverCode) {
+                    if (myBannedRooms.has('global')) enterLobby();
+                    else switchServer('global');
+                }
             } else if (icon) {
                 icon.style.opacity = '0.4'; icon.style.border = '1px dashed #8e9297';
+                if (currentServerCode === serverCode) switchServer(serverCode);
             }
-            if (currentServerCode !== serverCode) return;
-            invalidateMessageReads();
-            renderSearchControl();
-            if (myRole === 'admin') switchServer(serverCode, { forceRefresh: true });
-            else if (myBannedRooms.has('global')) enterLobby();
-            else switchServer('global');
         });
     }
 
@@ -3883,7 +3060,7 @@
         let text = msgInput.value.trim();
         
         if (text === '/clear') {
-            clearRenderedMessages();
+            chatWindow.innerHTML = '';
             cancelAction();
             return;
         } else if (text.startsWith('/shrug')) {
@@ -3979,21 +3156,13 @@
     }
 
     function viewHistory(msgId) {
-        const token = messageReadCoordinator.beginDetail(msgId);
-        if (!token) return;
         socket.emit('get_edit_history', msgId, (res) => {
-            if (!messageReadCoordinator.finishDetail(token)) return;
             res = res || { error: 'No response from server.' };
             if (res.error) return showAppAlert("Error", res.error);
-            const list = document.getElementById('history-list'); list.textContent = '';
+            const list = document.getElementById('history-list'); list.innerHTML = '';
             document.getElementById('history-modal-title').textContent = "Message Edit History";
 
-            if (!res.history || res.history.length === 0) {
-                const empty = ChatClientHelpers.appendTextElement(
-                    document, list, 'div', 'hist-item', 'No previous edits.'
-                );
-                empty.style.borderLeftColor = 'var(--text-muted)';
-            }
+            if (!res.history || res.history.length === 0) { list.innerHTML = '<div class="hist-item" style="border-left-color: var(--text-muted);">No previous edits.</div>'; }
             else {
                 res.history.forEach((item, index) => {
                     const el = document.createElement('div'); el.className = 'hist-item';
@@ -4013,13 +3182,10 @@
     }
 
     function viewDeleted(msgId) {
-        const token = messageReadCoordinator.beginDetail(msgId);
-        if (!token) return;
         socket.emit('get_deleted_message', msgId, (res) => {
-            if (!messageReadCoordinator.finishDetail(token)) return;
             res = res || { error: 'No response from server.' };
             if (res.error) return showAppAlert("Error", res.error);
-            const list = document.getElementById('history-list'); list.textContent = '';
+            const list = document.getElementById('history-list'); list.innerHTML = '';
             document.getElementById('history-modal-title').textContent = "Deleted Message";
 
             const el = document.createElement('div'); el.className = 'hist-item';
@@ -4044,55 +3210,13 @@
         });
     }
 
-    function loadHistory(msgs, { replace = false } = {}) {
-        if (replace) clearRenderedMessages();
-        ChatClientHelpers.renderInitialMessagePage({
-            messages: msgs,
-            renderMessage(message, options) {
-                appendMessage(message, message.username === myUsername, options);
-            },
-            requestScroll: behavior => chatScrollCoordinator.request(behavior)
-        });
+    function loadHistory(msgs) {
+        if (!msgs || !Array.isArray(msgs)) return; 
+        msgs.forEach(message => appendMessage(message, message.username === myUsername, { history: true }));
+        chatScrollCoordinator.request('auto');
     }
 
-    function loadOlderMessages() {
-        const requestHandle = ChatClientHelpers.requestOlderMessages({
-            coordinator: messageReadCoordinator,
-            socket,
-            scheduleTimeout: scheduleOlderAckTimeout,
-            cancelTimeout: cancelOlderAckTimeout,
-            timeoutMs: olderRequestTimeoutMs,
-            onTimeout() {
-                olderRequestHandle = null;
-                renderOlderControl();
-            },
-            onAccepted(response, token) {
-                olderRequestHandle = null;
-                stopOlderAnchor();
-                ChatClientHelpers.prependMessagePage({
-                    chatWindow,
-                    historyControls,
-                    messages: response.messages,
-                    renderMessage(message, before) {
-                        return appendMessage(message, message.username === myUsername, {
-                            history: true,
-                            before
-                        });
-                    },
-                    afterRender: renderOlderControl,
-                    createResizeObserver: createOlderResizeObserver,
-                    isCurrent: () => messageReadCoordinator.matches(token),
-                    onAnchorCleanup(cleanup) { stopOlderAnchor = cleanup; }
-                });
-            }
-        });
-        olderRequestHandle = requestHandle || null;
-        if (!messageReadCoordinator.current().olderPending) olderRequestHandle = null;
-    }
-
-    loadOlderButton.addEventListener('click', loadOlderMessages);
-
-    function appendMessage(data, isMe, { history = false, before = null } = {}) {
+    function appendMessage(data, isMe, { history = false } = {}) {
         const renderPolicy = ChatClientHelpers.messageRenderPolicy({
             history,
             wasNearBottom: ChatClientHelpers.isNearScrollEnd(chatWindow)
@@ -4122,9 +3246,9 @@
                 viewTag.onclick = () => viewDeleted(data._id); 
                 wrapper.appendChild(viewTag);
             }
-            chatWindow.insertBefore(wrapper, before);
+            chatWindow.appendChild(wrapper);
             if (renderPolicy.shouldScroll) chatScrollCoordinator.request(renderPolicy.behavior);
-            return wrapper;
+            return;
         }
 
         wrapper.className = `msg`; 
@@ -4274,9 +3398,8 @@
         bodyDiv.appendChild(reactionsContainer);
 
         wrapper.appendChild(avatarDiv); wrapper.appendChild(bodyDiv);
-        chatWindow.insertBefore(wrapper, before);
+        chatWindow.appendChild(wrapper); 
         if (renderPolicy.shouldScroll) chatScrollCoordinator.request(renderPolicy.behavior);
-        return wrapper;
     }
 
     function appendSystemMessage(txt) {

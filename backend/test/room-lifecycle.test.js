@@ -1,12 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const mongoose = require('mongoose');
-const {
-  createConnectionHandler, seedSystem, withAccountTransitionLock, decodeCursor
-} = require('../server');
-const {
-  FakeSocket, FakeIo, queryResult, acknowledge, deferred, createMemoryModel
-} = require('./support/fakes');
+const { createConnectionHandler, seedSystem, withAccountTransitionLock } = require('../server');
+const { FakeSocket, FakeIo, queryResult, acknowledge, deferred } = require('./support/fakes');
 
 function register(overrides = {}) {
   const socket = new FakeSocket();
@@ -550,7 +545,7 @@ test('authorized room switch leaves old room only after access succeeds', async 
   assert.deepEqual(socket.leftRooms, ['global']);
   assert.equal(socket.joinedRooms.has('ABC123'), true);
   assert.deepEqual(ack.value(), {
-    history: [], nextCursor: null, roomRole: 'user',
+    history: [], roomRole: 'user',
     restriction: { banned: false, timedOut: false, timeoutUntil: null }
   });
 });
@@ -1043,7 +1038,7 @@ test('room switch acknowledges success before broadcasting target presence', asy
   await socket.trigger('switch_server', 'ABC123', result => {
     events.push('ack');
     assert.deepEqual(result, {
-      history: [], nextCursor: null, roomRole: 'user',
+      history: [], roomRole: 'user',
       restriction: { banned: false, timedOut: false, timeoutUntil: null }
     });
   });
@@ -1057,14 +1052,9 @@ test('room switch acknowledges success before broadcasting target presence', asy
   ]);
 });
 
-test('room switch derives a fresh room role before serializing history', async () => {
+test('room switch finishes role lookup before history lookup begins', async () => {
   const events = [];
-  const ChatServerModel = {
-    findOne() {
-      events.push('room:find');
-      return queryResult({ code: 'ABC123', moderators: ['alice'] });
-    }
-  };
+  const ChatServerModel = { findOne: () => queryResult({ code: 'ABC123', moderators: [] }) };
   const MessageModel = {
     find() {
       events.push('history:find');
@@ -1082,7 +1072,9 @@ test('room switch derives a fresh room role before serializing history', async (
     ChatServerModel,
     MessageModel,
     async getRoomRoleFn() {
-      events.push('stale-role-lookup');
+      events.push('role:start');
+      await Promise.resolve();
+      events.push('role:end');
       return 'user';
     }
   });
@@ -1096,953 +1088,12 @@ test('room switch derives a fresh room role before serializing history', async (
   await socket.trigger('switch_server', 'ABC123', ack.callback);
 
   assert.deepEqual(ack.value(), {
-    history: [], nextCursor: null, roomRole: 'mod',
+    history: [], roomRole: 'user',
     restriction: { banned: false, timedOut: false, timeoutUntil: null }
   });
-  assert.equal(events.includes('stale-role-lookup'), false);
-  assert.ok(events.indexOf('room:find') < events.indexOf('history:find'));
-  assert.ok(events.indexOf('history:find') < events.indexOf('history:lean'));
-});
-
-function messageFixture({ count, serverCode = 'ABC123', timestampFor } = {}) {
-  return Array.from({ length: count }, (_, index) => {
-    const sequence = index + 1;
-    return {
-      _id: sequence.toString(16).padStart(24, '0'),
-      serverCode,
-      username: sequence === count ? 'bob' : 'alice',
-      displayName: sequence === count ? 'Bob' : 'Alice',
-      role: 'user',
-      roomRole: 'user',
-      color: '',
-      avatarUrl: '',
-      text: `message ${sequence}`,
-      searchText: `message ${sequence}`,
-      attachment: null,
-      replyTo: null,
-      reactions: { '👍': ['alice'] },
-      edited: sequence === count,
-      deleted: sequence === count,
-      history: [{ text: 'internal edit history' }],
-      __v: 7,
-      timestamp: timestampFor
-        ? timestampFor(sequence)
-        : new Date(Date.UTC(2026, 7, 9, 12, 0, sequence))
-    };
-  });
-}
-
-function trackedMessageModel(messages) {
-  const memory = createMemoryModel(messages);
-  const queries = [];
-  return {
-    ...memory,
-    queries,
-    find(filter) {
-      const query = memory.find(filter);
-      const recorded = { filter, sort: null, limit: null };
-      queries.push(recorded);
-      return {
-        select(value) { query.select(value); return this; },
-        sort(value) { recorded.sort = value; query.sort(value); return this; },
-        limit(value) { recorded.limit = value; query.limit(value); return this; },
-        maxTimeMS(value) { query.maxTimeMS(value); return this; },
-        lean() { return query.lean(); },
-        then(resolve, reject) { return query.then(resolve, reject); }
-      };
-    }
-  };
-}
-
-function registerMessageReader({ messages, serverCode = 'ABC123', overrides = {} }) {
-  const MessageModel = trackedMessageModel(messages);
-  const UserModel = createMemoryModel([{
-    username: 'alice', role: 'user', servers: ['global', 'ABC123']
-  }]);
-  const ChatServerModel = createMemoryModel([
-    { code: 'global', owner: 'System', moderators: [] },
-    { code: 'ABC123', owner: 'owner', moderators: [] }
+  assert.deepEqual(events, [
+    'role:start', 'role:end', 'history:find', 'history:lean'
   ]);
-  const RoomRestrictionModel = createMemoryModel([]);
-  const registered = register({
-    MessageModel, UserModel, ChatServerModel, RoomRestrictionModel, ...overrides
-  });
-  Object.assign(registered.socket, {
-    username: 'alice', role: 'admin', roomRole: 'mod',
-    joinedServers: ['global', 'ABC123'], serverCode
-  });
-  registered.socket.joinedRooms.add(serverCode);
-  return { ...registered, MessageModel, UserModel, ChatServerModel, RoomRestrictionModel };
-}
-
-test('switch, list, and search commit once when a success acknowledgement throws', async t => {
-  for (const event of ['switch_server', 'list_messages', 'search_messages']) {
-    await t.test(event, async () => {
-      const broadcasts = [];
-      const { socket } = registerMessageReader({
-        messages: messageFixture({ count: 2 }),
-        serverCode: event === 'switch_server' ? 'global' : 'ABC123',
-        overrides: {
-          broadcastOnlineUsersFn: code => { broadcasts.push(code); },
-          searchRateLimiter: { check() { return true; } },
-          searchGate: { run(_serverCode, operation) { return operation(); } }
-        }
-      });
-      let attempts = 0;
-      let deliveredResponse;
-      const throwingAck = response => {
-        attempts += 1;
-        deliveredResponse = response;
-        throw new Error('trusted success callback failed');
-      };
-
-      if (event === 'switch_server') {
-        await assert.doesNotReject(socket.trigger(event, 'ABC123', throwingAck));
-        assert.equal(socket.serverCode, 'ABC123');
-        assert.deepEqual(broadcasts, ['global', 'ABC123']);
-      } else if (event === 'list_messages') {
-        await assert.doesNotReject(socket.trigger(event, {
-          serverCode: 'ABC123', clientContextId: 4, limit: 20
-        }, throwingAck));
-      } else {
-        await assert.doesNotReject(socket.trigger(event, {
-          serverCode: 'ABC123', clientContextId: 4, query: 'message', requestId: 1
-        }, throwingAck));
-      }
-      assert.equal(attempts, 1);
-      assert.equal(Boolean(deliveredResponse && !deliveredResponse.error), true);
-    });
-  }
-});
-
-function readPolicyMessageModel(messages) {
-  const memory = createMemoryModel(messages);
-  const queries = [];
-  return {
-    ...memory,
-    queries,
-    find(filter) {
-      const clauses = Array.isArray(filter?.$and) ? filter.$and : [];
-      const searchClause = clauses.find(clause => clause?.searchText instanceof RegExp);
-      const matchedSearchRows = searchClause
-        ? messages.filter(message => clauses.every(clause => {
-            if (Array.isArray(clause?.$or)) {
-              return clause.$or.some(roomClause => {
-                if (roomClause.serverCode === 'global') return message.serverCode === 'global';
-                if (roomClause.serverCode === null) return message.serverCode == null;
-                if (roomClause.serverCode?.$exists === false) {
-                  return !Object.prototype.hasOwnProperty.call(message, 'serverCode');
-                }
-                return false;
-              });
-            }
-            if (typeof clause?.serverCode === 'string') return message.serverCode === clause.serverCode;
-            if (clause?.deleted?.$ne === true) return message.deleted !== true;
-            if (clause?.searchText instanceof RegExp) {
-              return clause.searchText.test(String(message.searchText || ''));
-            }
-            return true;
-          }))
-        : null;
-      const query = searchClause
-        ? createMemoryModel(matchedSearchRows).find({})
-        : memory.find(filter);
-      const recorded = { filter, select: null, sort: null, limit: null };
-      queries.push(recorded);
-      return {
-        select(value) { recorded.select = value; query.select(value); return this; },
-        sort(value) { recorded.sort = value; query.sort(value); return this; },
-        limit(value) { recorded.limit = value; query.limit(value); return this; },
-        lean() { return query.lean(); },
-        then(resolve, reject) { return query.then(resolve, reject); }
-      };
-    }
-  };
-}
-
-function readPolicyMessages(serverCode) {
-  const messages = Array.from({ length: 21 }, (_, index) => {
-    const sequence = index + 1;
-    const message = {
-      _id: `1000000000000000000000${sequence.toString(16).padStart(2, '0')}`,
-      serverCode,
-      username: 'bob',
-      displayName: 'Bob',
-      role: 'user',
-      roomRole: 'user',
-      color: '#123456',
-      avatarUrl: '',
-      text: sequence === 21 ? 'matrix deleted canary' : `matrix visible ${sequence}`,
-      searchText: sequence === 21 ? 'matrix deleted canary' : `matrix visible ${sequence}`,
-      attachment: 'data:image/png;base64,AAAA',
-      replyTo: {
-        id: '507f1f77bcf86cd799439012', displayname: 'Reply', text: 'private reply'
-      },
-      reactions: { '👍': ['bob'] },
-      edited: true,
-      deleted: sequence === 21,
-      history: [{ text: 'private edit history' }],
-      __v: 7,
-      internal: 'private database field',
-      timestamp: new Date(Date.UTC(2026, 7, 9, 12, 0, sequence))
-    };
-    if (serverCode === 'global' && sequence % 3 === 1) delete message.serverCode;
-    if (serverCode === 'global' && sequence % 3 === 2) message.serverCode = null;
-    return message;
-  });
-  messages.push({
-    ...messages[0],
-    _id: 'f00000000000000000000001',
-    serverCode: serverCode === 'global' ? 'ABC123' : 'BBB222',
-    text: 'matrix other room canary',
-    deleted: false,
-    timestamp: new Date(Date.UTC(2026, 7, 9, 13))
-  });
-  return messages;
-}
-
-test('in-memory query adapter compares equal-timestamp ObjectIds for list_messages cursors', async () => {
-  const timestamp = new Date(Date.UTC(2026, 7, 9, 12));
-  const model = createMemoryModel([
-    { _id: new mongoose.Types.ObjectId('000000000000000000000001'), timestamp, serverCode: 'global' },
-    { _id: new mongoose.Types.ObjectId('000000000000000000000003'), timestamp, serverCode: null },
-    { _id: new mongoose.Types.ObjectId('000000000000000000000002'), timestamp },
-    { _id: new mongoose.Types.ObjectId('000000000000000000000004'), timestamp, serverCode: 'ABC123' }
-  ]);
-
-  const rows = await model.find({
-    $and: [
-      { $or: [
-        { serverCode: 'global' },
-        { serverCode: { $exists: false } },
-        { serverCode: null }
-      ] },
-      { $or: [
-        { timestamp: { $lt: timestamp } },
-        { timestamp, _id: { $lt: '000000000000000000000003' } }
-      ] }
-    ]
-  }).sort({ timestamp: -1, _id: -1 }).limit(10).lean();
-
-  assert.deepEqual(rows.map(row => String(row._id)), [
-    '000000000000000000000002',
-    '000000000000000000000001'
-  ]);
-});
-
-test('switch_server returns a safe initial page and cursor', async () => {
-  const messages = messageFixture({ count: 25 });
-  const { socket, MessageModel } = registerMessageReader({ messages, serverCode: 'global' });
-  const ack = acknowledge();
-
-  await socket.trigger('switch_server', 'ABC123', ack.callback);
-
-  const response = ack.value();
-  assert.equal(response.history.length, 20);
-  assert.ok(response.nextCursor);
-  assert.deepEqual(
-    response.history.map(row => row._id),
-    messages.slice(5).map(row => row._id)
-  );
-  assert.equal(response.history.some(row => 'history' in row || '__v' in row), false);
-  assert.deepEqual(MessageModel.queries, [{
-    filter: { serverCode: 'ABC123' },
-    sort: { timestamp: -1, _id: -1 },
-    limit: 21
-  }]);
-  assert.deepEqual(response.history.at(-1), {
-    _id: '000000000000000000000019',
-    serverCode: 'ABC123',
-    username: 'bob',
-    displayName: 'Bob',
-    role: 'user',
-    roomRole: 'user',
-    color: '',
-    avatarUrl: '',
-    text: '',
-    attachment: null,
-    replyTo: null,
-    reactions: {},
-    edited: true,
-    deleted: true,
-    timestamp: new Date(Date.UTC(2026, 7, 9, 12, 0, 25))
-  });
-});
-
-test('list_messages paginates across an equal-timestamp ObjectId boundary without gaps', async () => {
-  const tiedTimestamp = new Date(Date.UTC(2026, 7, 9, 12, 1));
-  const olderTimestamp = new Date(Date.UTC(2026, 7, 9, 12));
-  const messages = [
-    ...messageFixture({ count: 8, timestampFor: () => tiedTimestamp }),
-    ...messageFixture({ count: 2, timestampFor: () => olderTimestamp }).map((message, index) => ({
-      ...message,
-      _id: (index + 9).toString(16).padStart(24, '0'),
-      deleted: false,
-      edited: false,
-      username: 'alice',
-      displayName: 'Alice'
-    }))
-  ].map(message => ({ ...message, _id: new mongoose.Types.ObjectId(message._id) }));
-  const { socket, MessageModel } = registerMessageReader({ messages });
-  const firstAck = acknowledge();
-
-  await socket.trigger('list_messages', {
-    serverCode: 'ABC123', clientContextId: 4, limit: 5
-  }, firstAck.callback);
-  const first = firstAck.value();
-  assert.deepEqual(decodeCursor(first.nextCursor), {
-    date: tiedTimestamp,
-    id: '000000000000000000000004'
-  });
-  const secondAck = acknowledge();
-  await socket.trigger('list_messages', {
-    serverCode: 'ABC123', clientContextId: 4, cursor: first.nextCursor, limit: 5
-  }, secondAck.callback);
-  const second = secondAck.value();
-
-  const returnedIds = [...first.messages, ...second.messages].map(row => row._id);
-  assert.equal(new Set(returnedIds).size, 10);
-  assert.deepEqual([...returnedIds].sort(), [
-    '000000000000000000000001', '000000000000000000000002',
-    '000000000000000000000003', '000000000000000000000004',
-    '000000000000000000000005', '000000000000000000000006',
-    '000000000000000000000007', '000000000000000000000008',
-    '000000000000000000000009', '00000000000000000000000a'
-  ]);
-  assert.equal(second.nextCursor, null);
-  assert.deepEqual(MessageModel.queries.map(({ sort, limit }) => ({ sort, limit })), [
-    { sort: { timestamp: -1, _id: -1 }, limit: 6 },
-    { sort: { timestamp: -1, _id: -1 }, limit: 6 }
-  ]);
-  assert.deepEqual(
-    { serverCode: first.serverCode, clientContextId: first.clientContextId },
-    { serverCode: 'ABC123', clientContextId: 4 }
-  );
-});
-
-test('list_messages safely serializes with fresh roles despite stale cached privilege', async () => {
-  const messages = messageFixture({ count: 21 });
-  const { socket, MessageModel } = registerMessageReader({ messages });
-  const ack = acknowledge();
-
-  await socket.trigger('list_messages', {
-    serverCode: 'ABC123', clientContextId: 5, limit: 20
-  }, ack.callback);
-
-  const response = ack.value();
-  assert.equal(response.messages.some(row => 'history' in row || '__v' in row), false);
-  assert.deepEqual(response.messages.at(-1), {
-    _id: '000000000000000000000015',
-    serverCode: 'ABC123',
-    username: 'bob',
-    displayName: 'Bob',
-    role: 'user',
-    roomRole: 'user',
-    color: '',
-    avatarUrl: '',
-    text: '',
-    attachment: null,
-    replyTo: null,
-    reactions: {},
-    edited: true,
-    deleted: true,
-    timestamp: new Date(Date.UTC(2026, 7, 9, 12, 0, 21))
-  });
-  assert.deepEqual(MessageModel.queries.map(({ sort, limit }) => ({ sort, limit })), [{
-    sort: { timestamp: -1, _id: -1 },
-    limit: 21
-  }]);
-});
-
-test('list_messages validates pagination input and clamps the maximum page size', async () => {
-  const messages = messageFixture({ count: 55 });
-  const { socket } = registerMessageReader({ messages });
-  const cases = [
-    [{ serverCode: 'ABC123', clientContextId: 4, cursor: 'not-a-cursor' }, { error: 'Invalid input format.' }],
-    [{ serverCode: 'ABC123', clientContextId: 4, limit: 2.5 }, { error: 'Invalid input format.' }],
-    [{ serverCode: 'ABC123', clientContextId: 0 }, { error: 'Invalid input format.' }],
-    [{ serverCode: 'global', clientContextId: 4 }, { error: 'Invalid input format.' }]
-  ];
-  for (const [payload, expected] of cases) {
-    const ack = acknowledge();
-    await socket.trigger('list_messages', payload, ack.callback);
-    assert.deepEqual(ack.value(), expected);
-  }
-
-  const defaultAck = acknowledge();
-  await socket.trigger('list_messages', {
-    serverCode: 'ABC123', clientContextId: 7
-  }, defaultAck.callback);
-  assert.equal(defaultAck.value().messages.length, 20);
-
-  const clampedAck = acknowledge();
-  await socket.trigger('list_messages', {
-    serverCode: 'ABC123', clientContextId: 8, limit: 999
-  }, clampedAck.callback);
-  assert.equal(clampedAck.value().messages.length, 50);
-  assert.ok(clampedAck.value().nextCursor);
-});
-
-test('list_messages returns a terminal page and denies missing or inaccessible rooms', async () => {
-  const messages = messageFixture({ count: 3 });
-  const { socket, ChatServerModel, UserModel } = registerMessageReader({ messages });
-  const terminalAck = acknowledge();
-  await socket.trigger('list_messages', {
-    serverCode: 'ABC123', clientContextId: 9, limit: 20
-  }, terminalAck.callback);
-  assert.equal(terminalAck.value().nextCursor, null);
-  assert.equal(terminalAck.value().messages.length, 3);
-
-  ChatServerModel.rows.splice(ChatServerModel.rows.findIndex(row => row.code === 'ABC123'), 1);
-  const missingAck = acknowledge();
-  await socket.trigger('list_messages', {
-    serverCode: 'ABC123', clientContextId: 10, limit: 20
-  }, missingAck.callback);
-  assert.deepEqual(missingAck.value(), { error: 'Permission denied.' });
-
-  ChatServerModel.rows.push({ code: 'ABC123', owner: 'owner', moderators: [] });
-  socket.joinedServers = ['global'];
-  UserModel.rows[0].servers = ['global'];
-  const deniedAck = acknowledge();
-  await socket.trigger('list_messages', {
-    serverCode: 'ABC123', clientContextId: 11, limit: 20
-  }, deniedAck.callback);
-  assert.deepEqual(deniedAck.value(), { error: 'Permission denied.' });
-});
-
-test('legacy Global pagination includes missing and null serverCode rows only', async () => {
-  const missingServerCode = messageFixture({ count: 1 })[0];
-  delete missingServerCode.serverCode;
-  const messages = [
-    ...messageFixture({ count: 1, serverCode: 'global' }),
-    { ...missingServerCode, _id: '000000000000000000000002' },
-    { ...messageFixture({ count: 1, serverCode: null })[0], _id: '000000000000000000000003' },
-    { ...messageFixture({ count: 1, serverCode: 'ABC123' })[0], _id: '000000000000000000000004' }
-  ];
-  messages.forEach((message, index) => { message.timestamp = new Date(Date.UTC(2026, 7, 9, 12, 0, index)); });
-  const { socket } = registerMessageReader({ messages, serverCode: 'global' });
-  socket.joinedServers = ['global'];
-  const ack = acknowledge();
-
-  await socket.trigger('list_messages', {
-    serverCode: 'global', clientContextId: 12, limit: 20
-  }, ack.callback);
-
-  assert.deepEqual(ack.value().messages.map(row => row._id), [
-    '000000000000000000000001',
-    '000000000000000000000002',
-    '000000000000000000000003'
-  ]);
-  assert.equal(ack.value().nextCursor, null);
-});
-
-const readMatrix = [
-  ['member', 'private', 'active', 'initial', true],
-  ['member', 'private', 'timeout', 'page', true],
-  ['member', 'private', 'timeout', 'search', true],
-  ['member', 'private', 'ban', 'page', false],
-  ['room-mod', 'same-private', 'active', 'search', true],
-  ['room-mod', 'other-private', 'active', 'search', false],
-  ['admin', 'private-nonmember', 'active', 'page', true],
-  ['admin', 'private-nonmember', 'ban', 'search', false],
-  ['member', 'global', 'active', 'page', true],
-  ['member', 'global', 'ban', 'search', false]
-];
-
-test('complete message read policy matrix enforces fresh access and safe responses', async t => {
-  const historyFields = [
-    '_id', 'serverCode', 'username', 'displayName', 'role', 'roomRole', 'color',
-    'avatarUrl', 'text', 'attachment', 'replyTo', 'reactions', 'edited', 'deleted', 'timestamp'
-  ].sort();
-  const searchFields = historyFields
-    .filter(field => !['attachment', 'replyTo', 'reactions'].includes(field));
-
-  for (const [actor, roomKind, restrictionKind, operation, allowed] of readMatrix) {
-    await t.test(`${actor} ${roomKind} ${restrictionKind} ${operation}`, async () => {
-      const serverCode = roomKind === 'global' ? 'global' : 'ABC123';
-      const persistedRole = actor === 'admin' ? 'admin' : 'user';
-      const persistedServers = actor === 'admin'
-        ? ['global']
-        : (roomKind === 'other-private' ? ['global', 'BBB222'] : ['global', serverCode]);
-      const socketServers = roomKind === 'other-private'
-        ? ['global', 'ABC123', 'BBB222']
-        : [...persistedServers];
-      const messages = readPolicyMessages(serverCode);
-      const MessageModel = readPolicyMessageModel(messages);
-      const UserModel = createMemoryModel([{
-        username: 'alice', displayName: 'Alice', role: persistedRole, servers: persistedServers
-      }]);
-      const ChatServerModel = createMemoryModel([
-        { code: 'global', owner: 'System', moderators: [] },
-        {
-          code: 'ABC123', owner: 'owner',
-          moderators: roomKind === 'same-private' ? ['alice'] : []
-        },
-        {
-          code: 'BBB222', owner: 'other-owner',
-          moderators: roomKind === 'other-private' ? ['alice'] : []
-        }
-      ]);
-      const restriction = restrictionKind === 'active' ? [] : [{
-        serverCode,
-        username: 'alice',
-        bannedAt: restrictionKind === 'ban' ? new Date('2026-08-09T12:00:00.000Z') : null,
-        timeoutUntil: restrictionKind === 'timeout' ? new Date(Date.now() + 60_000) : null
-      }];
-      const { socket } = register({
-        MessageModel,
-        UserModel,
-        ChatServerModel,
-        RoomRestrictionModel: createMemoryModel(restriction),
-        searchRateLimiter: { check() { return true; } }
-      });
-      Object.assign(socket, {
-        username: 'alice', displayName: 'Alice', role: persistedRole,
-        joinedServers: socketServers,
-        serverCode: operation === 'initial' ? 'global' : serverCode
-      });
-      socket.joinedRooms.add(socket.serverCode);
-      const ack = acknowledge();
-
-      if (operation === 'initial') {
-        await socket.trigger('switch_server', serverCode, ack.callback);
-      } else if (operation === 'page') {
-        await socket.trigger('list_messages', {
-          serverCode, clientContextId: 41, limit: 20
-        }, ack.callback);
-      } else {
-        await socket.trigger('search_messages', {
-          serverCode, clientContextId: 41, query: 'matrix', requestId: 71
-        }, ack.callback);
-      }
-
-      const response = ack.value();
-      if (!allowed) {
-        assert.deepEqual(response, { error: 'Permission denied.' });
-        assert.equal(MessageModel.queries.length, 0, 'denial occurs before any Message query');
-        return;
-      }
-
-      const rows = operation === 'initial'
-        ? response.history
-        : (operation === 'page' ? response.messages : response.results);
-      assert.equal(rows.length, 20);
-      assert.equal(rows.some(row => row._id === 'f00000000000000000000001'), false);
-      if (serverCode === 'global') {
-        assert.equal(rows.every(row => ['global', null, undefined].includes(row.serverCode)), true);
-      } else {
-        assert.equal(rows.every(row => row.serverCode === serverCode), true);
-      }
-      const expectedFields = operation === 'search' ? searchFields : historyFields;
-      for (const row of rows) {
-        assert.deepEqual(Object.keys(row).sort(), expectedFields);
-        assert.equal('history' in row, false);
-        assert.equal('__v' in row, false);
-        assert.equal('internal' in row, false);
-      }
-
-      if (operation === 'search') {
-        assert.deepEqual(
-          {
-            serverCode: response.serverCode,
-            clientContextId: response.clientContextId,
-            requestId: response.requestId
-          },
-          { serverCode, clientContextId: 41, requestId: 71 }
-        );
-        assert.equal(rows.some(row => row.deleted), false);
-      } else {
-        assert.equal(typeof response.nextCursor, 'string');
-        assert.ok(decodeCursor(response.nextCursor));
-        const deletedRow = rows.find(row => row.deleted);
-        assert.ok(deletedRow);
-        assert.equal(
-          deletedRow.text,
-          actor === 'admin' ? 'matrix deleted canary' : ''
-        );
-        if (operation === 'page') {
-          assert.deepEqual(
-            { serverCode: response.serverCode, clientContextId: response.clientContextId },
-            { serverCode, clientContextId: 41 }
-          );
-        }
-      }
-    });
-  }
-});
-
-function registerModerationReadRace({ action, targetUser = 'alice' }) {
-  const persistenceStarted = deferred();
-  const releasePersistence = deferred();
-  const queryStarted = deferred();
-  const releaseQuery = deferred();
-  const events = [];
-  let messageQueries = 0;
-  let persistenceBegan = false;
-  const isGlobalDemotion = action === 'demotion';
-  const UserMemoryModel = createMemoryModel([
-    { username: 'admin', displayName: 'Admin', role: 'admin', servers: ['global', 'ABC123'] },
-    {
-      username: 'alice', displayName: 'Alice', role: isGlobalDemotion ? 'admin' : 'user',
-      servers: isGlobalDemotion ? ['global'] : ['global', 'ABC123']
-    },
-    { username: 'bob', displayName: 'Bob', role: 'user', servers: ['global', 'ABC123'] }
-  ]);
-  const UserModel = isGlobalDemotion ? {
-    ...UserMemoryModel,
-    async findOne(query) {
-      const found = await UserMemoryModel.findOne(query);
-      if (!found || String(found.username).toLowerCase() !== 'alice') return found;
-      const document = { ...found };
-      document.save = async () => {
-        persistenceBegan = true;
-        events.push(`${action}:persist`);
-        persistenceStarted.resolve();
-        await releasePersistence.promise;
-        const row = UserMemoryModel.rows.find(candidate =>
-          String(candidate.username).toLowerCase() === 'alice'
-        );
-        Object.assign(row, document);
-        delete row.save;
-        return document;
-      };
-      return document;
-    }
-  } : UserMemoryModel;
-  const ChatServerModel = createMemoryModel([
-    { code: 'global', owner: 'System', moderators: [] },
-    { code: 'ABC123', owner: 'owner', moderators: [] }
-  ]);
-  const RoomRestrictionModel = createMemoryModel([]);
-  const persistRestriction = RoomRestrictionModel.findOneAndUpdate.bind(RoomRestrictionModel);
-  RoomRestrictionModel.findOneAndUpdate = async (query, update, options) => {
-    if (update.$set && (update.$set.bannedAt || update.$set.timeoutUntil)) {
-      persistenceBegan = true;
-      events.push(`${action}:persist`);
-      persistenceStarted.resolve();
-      await releasePersistence.promise;
-    }
-    return persistRestriction(query, update, options);
-  };
-  const messages = messageFixture({ count: 1 });
-  const MessageModel = {
-    find() {
-      messageQueries += 1;
-      events.push('read:query');
-      queryStarted.resolve();
-      return {
-        select() { return this; },
-        sort() { return this; },
-        limit() { return this; },
-        async lean() {
-          await releaseQuery.promise;
-          return messages;
-        }
-      };
-    }
-  };
-  const shared = {
-    ioInstance: new FakeIo(),
-    onlineUsersMap: new Map(),
-    UserModel,
-    ChatServerModel,
-    RoomRestrictionModel,
-    MessageModel,
-    ModerationAuditModel: createMemoryModel([]),
-    broadcastOnlineUsersFn: async () => {},
-    searchRateLimiter: { check() { return true; } },
-    logger: { error() {} }
-  };
-  const moderator = registerSharedSocket(shared, `moderator-${action}`);
-  Object.assign(moderator, {
-    username: 'admin', displayName: 'Admin', role: 'admin',
-    joinedServers: ['global', 'ABC123'], serverCode: 'ABC123'
-  });
-  moderator.joinedRooms.add('ABC123');
-  const reader = registerSharedSocket(shared, `reader-${action}`);
-  Object.assign(reader, {
-    username: 'alice', displayName: 'Alice', role: isGlobalDemotion ? 'admin' : 'user',
-    joinedServers: isGlobalDemotion ? ['global'] : ['global', 'ABC123'], serverCode: 'ABC123'
-  });
-  reader.joinedRooms.add('ABC123');
-  shared.ioInstance.sockets = [moderator, reader];
-  return {
-    moderator,
-    reader,
-    persistenceStarted,
-    releasePersistence,
-    queryStarted,
-    releaseQuery,
-    events,
-    targetUser,
-    messageQueries: () => messageQueries,
-    persistenceBegan: () => persistenceBegan
-  };
-}
-
-test('complete message read policy matrix: list_messages queued behind a completed ban denies before querying messages', async () => {
-  const race = registerModerationReadRace({ action: 'ban' });
-  const moderationAck = acknowledge();
-  const moderationPending = race.moderator.trigger('moderate_user', {
-    serverCode: 'ABC123', targetUser: 'alice', action: 'ban', reason: 'test ban'
-  }, moderationAck.callback);
-  await race.persistenceStarted.promise;
-
-  const readAck = acknowledge();
-  const readPending = race.reader.trigger('list_messages', {
-    serverCode: 'ABC123', clientContextId: 13, limit: 20
-  }, readAck.callback);
-  await Promise.resolve();
-  assert.equal(race.messageQueries(), 0);
-
-  race.releasePersistence.resolve();
-  await Promise.all([moderationPending, readPending]);
-  assert.deepEqual(moderationAck.value(), { success: true });
-  assert.deepEqual(readAck.value(), { error: 'Permission denied.' });
-  assert.equal(race.messageQueries(), 0);
-});
-
-test('list_messages queued behind a completed timeout may finish its deferred query', async () => {
-  const race = registerModerationReadRace({ action: 'timeout' });
-  const moderationAck = acknowledge();
-  const moderationPending = race.moderator.trigger('moderate_user', {
-    serverCode: 'ABC123', targetUser: 'alice', action: 'timeout',
-    duration: '10m', reason: 'test timeout'
-  }, moderationAck.callback);
-  await race.persistenceStarted.promise;
-
-  const readAck = acknowledge();
-  const readPending = race.reader.trigger('list_messages', {
-    serverCode: 'ABC123', clientContextId: 14, limit: 20
-  }, readAck.callback);
-  race.releasePersistence.resolve();
-  await moderationPending;
-  await race.queryStarted.promise;
-  assert.equal(readAck.value(), undefined);
-
-  race.releaseQuery.resolve();
-  await readPending;
-  assert.deepEqual(moderationAck.value(), { success: true });
-  assert.deepEqual(
-    { count: readAck.value().messages.length, nextCursor: readAck.value().nextCursor },
-    { count: 1, nextCursor: null }
-  );
-});
-
-test('complete message read policy matrix: search_messages queued behind a completed ban denies before querying messages', async () => {
-  const race = registerModerationReadRace({ action: 'ban' });
-  const moderationAck = acknowledge();
-  const moderationPending = race.moderator.trigger('moderate_user', {
-    serverCode: 'ABC123', targetUser: 'alice', action: 'ban', reason: 'test ban'
-  }, moderationAck.callback);
-  await race.persistenceStarted.promise;
-
-  const searchAck = acknowledge();
-  const searchPending = race.reader.trigger('search_messages', {
-    serverCode: 'ABC123', clientContextId: 16, query: 'message', requestId: 1
-  }, searchAck.callback);
-  await Promise.resolve();
-  assert.equal(race.messageQueries(), 0);
-
-  race.releasePersistence.resolve();
-  await Promise.all([moderationPending, searchPending]);
-  assert.deepEqual(moderationAck.value(), { success: true });
-  assert.deepEqual(searchAck.value(), { error: 'Permission denied.' });
-  assert.equal(race.messageQueries(), 0);
-});
-
-for (const [event, payload] of [
-  ['list_messages', { serverCode: 'ABC123', clientContextId: 18, limit: 20 }],
-  ['search_messages', {
-    serverCode: 'ABC123', clientContextId: 19, query: 'message', requestId: 3
-  }]
-]) {
-  test(`complete message read policy matrix: ${event} queued behind a completed global-admin demotion denies before querying messages`, async () => {
-    const race = registerModerationReadRace({ action: 'demotion' });
-    const roleAck = acknowledge();
-    const rolePending = race.moderator.trigger('manage_role', {
-      targetUser: 'alice', action: 'demote_global_admin'
-    }, roleAck.callback);
-    await race.persistenceStarted.promise;
-
-    const readAck = acknowledge();
-    const readPending = race.reader.trigger(event, payload, readAck.callback);
-    await new Promise(resolve => setImmediate(resolve));
-    const queriesBeforeDemotion = race.messageQueries();
-
-    race.releaseQuery.resolve();
-    race.releasePersistence.resolve();
-    await Promise.all([rolePending, readPending]);
-    assert.equal(queriesBeforeDemotion, 0,
-      'the read remains behind the account transition until demotion commits');
-    assert.deepEqual(roleAck.value(), { success: true });
-    assert.deepEqual(readAck.value(), { error: 'Permission denied.' });
-    assert.equal(race.messageQueries(), 0);
-  });
-}
-
-test('search_messages queued behind a completed timeout may finish its deferred query', async () => {
-  const race = registerModerationReadRace({ action: 'timeout' });
-  const moderationAck = acknowledge();
-  const moderationPending = race.moderator.trigger('moderate_user', {
-    serverCode: 'ABC123', targetUser: 'alice', action: 'timeout',
-    duration: '10m', reason: 'test timeout'
-  }, moderationAck.callback);
-  await race.persistenceStarted.promise;
-
-  const searchAck = acknowledge();
-  const searchPending = race.reader.trigger('search_messages', {
-    serverCode: 'ABC123', clientContextId: 17, query: 'message', requestId: 2
-  }, searchAck.callback);
-  race.releasePersistence.resolve();
-  await moderationPending;
-  await race.queryStarted.promise;
-  assert.equal(searchAck.value(), undefined);
-
-  race.releaseQuery.resolve();
-  await searchPending;
-  assert.deepEqual(moderationAck.value(), { success: true });
-  assert.deepEqual(
-    {
-      ids: searchAck.value().results.map(message => message._id),
-      serverCode: searchAck.value().serverCode,
-      clientContextId: searchAck.value().clientContextId,
-      requestId: searchAck.value().requestId
-    },
-    {
-      ids: ['000000000000000000000001'],
-      serverCode: 'ABC123',
-      clientContextId: 17,
-      requestId: 2
-    }
-  );
-});
-
-test('search_messages acknowledges deferred results before a queued ban can complete', async () => {
-  const race = registerModerationReadRace({ action: 'ban', targetUser: 'bob' });
-  let searchResponse;
-  let moderationResponse;
-  let acknowledgementHeldAccountLock;
-  let accountLockProbe;
-  const searchPending = race.reader.trigger('search_messages', {
-    serverCode: 'ABC123', clientContextId: 18, query: 'message', requestId: 3
-  }, response => {
-    let probeEntered = false;
-    accountLockProbe = withAccountTransitionLock('alice', async () => { probeEntered = true; });
-    acknowledgementHeldAccountLock = !probeEntered;
-    race.events.push('read:ack');
-    searchResponse = response;
-  });
-  await race.queryStarted.promise;
-
-  const moderationPending = race.moderator.trigger('moderate_user', {
-    serverCode: 'ABC123', targetUser: race.targetUser, action: 'ban', reason: 'queued ban'
-  }, response => {
-    race.events.push('ban:ack');
-    moderationResponse = response;
-  });
-  await new Promise(resolve => setImmediate(resolve));
-  assert.equal(race.persistenceBegan(), false);
-  assert.equal(moderationResponse, undefined);
-
-  race.releaseQuery.resolve();
-  await searchPending;
-  await race.persistenceStarted.promise;
-  assert.deepEqual(searchResponse.results.map(message => message._id), [
-    '000000000000000000000001'
-  ]);
-  assert.equal(acknowledgementHeldAccountLock, true);
-  assert.ok(race.events.indexOf('read:ack') < race.events.indexOf('ban:persist'));
-
-  race.releasePersistence.resolve();
-  await Promise.all([moderationPending, accountLockProbe]);
-  assert.deepEqual(moderationResponse, { success: true });
-  assert.ok(race.events.indexOf('read:ack') < race.events.indexOf('ban:ack'));
-});
-
-test('list_messages acknowledges a deferred page before a queued ban can complete', async () => {
-  const race = registerModerationReadRace({ action: 'ban', targetUser: 'bob' });
-  let readResponse;
-  let moderationResponse;
-  let acknowledgementHeldAccountLock;
-  let accountLockProbe;
-  const readPending = race.reader.trigger('list_messages', {
-    serverCode: 'ABC123', clientContextId: 15, limit: 20
-  }, response => {
-    let probeEntered = false;
-    accountLockProbe = withAccountTransitionLock('alice', async () => { probeEntered = true; });
-    acknowledgementHeldAccountLock = !probeEntered;
-    race.events.push('read:ack');
-    readResponse = response;
-  });
-  await race.queryStarted.promise;
-
-  const moderationPending = race.moderator.trigger('moderate_user', {
-    serverCode: 'ABC123', targetUser: race.targetUser, action: 'ban', reason: 'queued ban'
-  }, response => {
-    race.events.push('ban:ack');
-    moderationResponse = response;
-  });
-  await new Promise(resolve => setImmediate(resolve));
-  assert.equal(race.persistenceBegan(), false);
-  assert.equal(moderationResponse, undefined);
-
-  race.releaseQuery.resolve();
-  await readPending;
-  await race.persistenceStarted.promise;
-  assert.deepEqual(readResponse.messages.map(message => message._id), [
-    '000000000000000000000001'
-  ]);
-  assert.equal(acknowledgementHeldAccountLock, true);
-  assert.ok(race.events.indexOf('read:ack') < race.events.indexOf('ban:persist'));
-
-  race.releasePersistence.resolve();
-  await Promise.all([moderationPending, accountLockProbe]);
-  assert.deepEqual(moderationResponse, { success: true });
-  assert.ok(race.events.indexOf('read:ack') < race.events.indexOf('ban:ack'));
-});
-
-test('switch_server acknowledges deferred history before a queued ban can complete', async () => {
-  const race = registerModerationReadRace({ action: 'ban', targetUser: 'bob' });
-  race.reader.serverCode = 'global';
-  race.reader.joinedRooms.delete('ABC123');
-  race.reader.joinedRooms.add('global');
-  let switchResponse;
-  let moderationResponse;
-  let acknowledgementHeldAccountLock;
-  let accountLockProbe;
-  const switchPending = race.reader.trigger('switch_server', 'ABC123', response => {
-    let probeEntered = false;
-    accountLockProbe = withAccountTransitionLock('alice', async () => { probeEntered = true; });
-    acknowledgementHeldAccountLock = !probeEntered;
-    race.events.push('read:ack');
-    switchResponse = response;
-  });
-  await race.queryStarted.promise;
-
-  const moderationPending = race.moderator.trigger('moderate_user', {
-    serverCode: 'ABC123', targetUser: race.targetUser, action: 'ban', reason: 'queued ban'
-  }, response => {
-    race.events.push('ban:ack');
-    moderationResponse = response;
-  });
-  await new Promise(resolve => setImmediate(resolve));
-  assert.equal(race.persistenceBegan(), false);
-  assert.equal(moderationResponse, undefined);
-
-  race.releaseQuery.resolve();
-  await switchPending;
-  await race.persistenceStarted.promise;
-  assert.deepEqual(switchResponse.history.map(message => message._id), [
-    '000000000000000000000001'
-  ]);
-  assert.equal(acknowledgementHeldAccountLock, true);
-  assert.ok(race.events.indexOf('read:ack') < race.events.indexOf('ban:persist'));
-
-  race.releasePersistence.resolve();
-  await Promise.all([moderationPending, accountLockProbe]);
-  assert.deepEqual(moderationResponse, { success: true });
-  assert.ok(race.events.indexOf('read:ack') < race.events.indexOf('ban:ack'));
 });
 
 test('leaving the active room removes transport and moderator access then moves to global', async () => {
@@ -2694,14 +1745,12 @@ test('deletion preflights sockets then waits for a queued switch account commit'
   const historyPrepared = deferred();
   const releaseMutation = deferred();
   const deletionFinished = deferred();
-  const deletionPreflight = deferred();
   const order = [];
   const state = { roomExists: true, mutationReleased: false, roomReads: 0 };
   const room = { code: 'ABC123', owner: 'alice', moderators: [] };
   const ioInstance = new FakeIo();
   ioInstance.fetchSockets = async () => {
     order.push('delete:fetchSockets');
-    deletionPreflight.resolve();
     return ioInstance.sockets;
   };
   const onlineUsersMap = new Map();
@@ -2788,14 +1837,17 @@ test('deletion preflights sockets then waits for a queued switch account commit'
   await mutationEntered.promise;
   const switchAck = acknowledge();
   const switchPending = late.trigger('switch_server', 'ABC123', switchAck.callback);
+  await historyEntered.promise;
+  historyPrepared.resolve([]);
+  await Promise.resolve();
+  await Promise.resolve();
   const deleteAck = acknowledge();
   const deletePending = deleter.trigger('delete_server', 'ABC123', deleteAck.callback);
-  await deletionPreflight.promise;
+  await Promise.resolve();
+  await Promise.resolve();
   state.mutationReleased = true;
   releaseMutation.resolve();
   await mutationPending;
-  await historyEntered.promise;
-  historyPrepared.resolve([]);
   await Promise.all([switchPending, deletePending]);
 
   const joinIndex = order.indexOf('late:join:ABC123');
@@ -2804,7 +1856,7 @@ test('deletion preflights sockets then waits for a queued switch account commit'
   assert.notEqual(fetchIndex, -1);
   assert.ok(fetchIndex < joinIndex);
   assert.deepEqual(switchAck.value(), {
-    history: [], nextCursor: null, roomRole: 'user',
+    history: [], roomRole: 'user',
     restriction: { banned: false, timedOut: false, timeoutUntil: null }
   });
   assert.deepEqual(deleteAck.value(), { success: true });
@@ -2818,9 +1870,10 @@ test('deletion preflights sockets then waits for a queued switch account commit'
 
 test('a switch waiting behind deletion cannot join the deleted room', async () => {
   const deleteEntered = deferred();
+  const historyEntered = deferred();
+  const historyPrepared = deferred();
   const releaseDelete = deferred();
   const state = { roomExists: true };
-  let messageQueries = 0;
   const room = { code: 'ABC123', owner: 'alice', moderators: [] };
   const ioInstance = new FakeIo();
   const onlineUsersMap = new Map();
@@ -2834,8 +1887,14 @@ test('a switch waiting behind deletion cannot join the deleted room', async () =
   };
   const MessageModel = {
     find() {
-      messageQueries += 1;
-      return queryResult([]);
+      return {
+        sort() { return this; },
+        limit() { return this; },
+        lean() {
+          historyEntered.resolve();
+          return historyPrepared.promise;
+        }
+      };
     },
     async deleteMany() {}
   };
@@ -2881,6 +1940,10 @@ test('a switch waiting behind deletion cannot join the deleted room', async () =
   await deleteEntered.promise;
   const switchAck = acknowledge();
   const switchPending = switcher.trigger('switch_server', 'ABC123', switchAck.callback);
+  await historyEntered.promise;
+  historyPrepared.resolve([]);
+  await Promise.resolve();
+  await Promise.resolve();
   releaseDelete.resolve();
   await Promise.all([deletePending, switchPending]);
 
@@ -2891,7 +1954,6 @@ test('a switch waiting behind deletion cannot join the deleted room', async () =
   assert.equal(switcher.joinedRooms.has('OLD123'), true);
   assert.equal(switcher.joinedRooms.has('ABC123'), false);
   assert.deepEqual(switcher.leftRooms, []);
-  assert.equal(messageQueries, 0);
 });
 
 test('room deletion clears every session cache before awaiting transport eviction', async () => {
@@ -3301,16 +2363,21 @@ for (const scenario of [
     expected: { error: 'Permission denied.' }
   }
 ]) {
-  test(`room switch rechecks ${scenario.name} after a pending account transition`, async () => {
-    const transitionStarted = deferred();
-    const releaseTransition = deferred();
-    let messageQueries = 0;
+  test(`room switch rechecks ${scenario.name} after pending history work`, async () => {
+    const history = deferred();
+    const historyStarted = deferred();
     const state = { room: { code: 'ABC123', moderators: [] } };
     const ChatServerModel = { async findOne() { return state.room; } };
     const MessageModel = {
       find() {
-        messageQueries += 1;
-        return queryResult([]);
+        return {
+          sort() { return this; },
+          limit() { return this; },
+          async lean() {
+            historyStarted.resolve();
+            return history.promise;
+          }
+        };
       }
     };
     const { socket } = register({ ChatServerModel, MessageModel });
@@ -3321,20 +2388,14 @@ for (const scenario of [
     socket.joinedRooms.add('global');
     if (scenario.configure) scenario.configure(socket);
 
-    const transition = withAccountTransitionLock('alice', async () => {
-      transitionStarted.resolve();
-      await releaseTransition.promise;
-    });
-    await transitionStarted.promise;
     const ack = acknowledge();
     const pending = socket.trigger('switch_server', 'ABC123', ack.callback);
-    await Promise.resolve();
+    await historyStarted.promise;
     scenario.mutate(state, socket);
-    releaseTransition.resolve();
-    await Promise.all([transition, pending]);
+    history.resolve([]);
+    await pending;
 
     assert.deepEqual(ack.value(), scenario.expected);
-    assert.equal(messageQueries, 0);
     assert.equal(socket.serverCode, 'global');
     assert.equal(socket.joinedRooms.has('ABC123'), false);
     assert.deepEqual(socket.leftRooms, []);
