@@ -1193,6 +1193,100 @@ test('composition context binds sends to the visible room and invalidates revoke
   assert.equal(context.payload({ text: 'new draft' }).clientContextId, 3);
 });
 
+test('typing coordinator emits one start and one idle stop for one hundred inputs', () => {
+  const helpers = loadHelpers();
+  let nextTimer = 0;
+  const timers = new Map();
+  const emitted = [];
+  const socket = {
+    connected: true,
+    emit(event, payload) { emitted.push({ event, payload: { ...payload } }); }
+  };
+  const context = { roomCode: 'ABC123', clientContextId: 7 };
+  const typing = helpers.createTypingCoordinator({
+    schedule(callback, delay) {
+      const id = ++nextTimer;
+      timers.set(id, { callback, delay });
+      return id;
+    },
+    cancel(id) { timers.delete(id); },
+    getSocket: () => socket,
+    getContext: () => ({ ...context }),
+    delay: 1_500
+  });
+
+  for (let index = 0; index < 100; index += 1) assert.equal(typing.input(), true);
+  assert.equal(emitted.length, 1);
+  assert.deepEqual(emitted[0], {
+    event: 'typing',
+    payload: { serverCode: 'ABC123', clientContextId: 7, isTyping: true }
+  });
+  assert.equal(timers.size, 1);
+  const idle = [...timers.values()][0];
+  assert.equal(idle.delay, 1_500);
+  idle.callback();
+  assert.equal(emitted.length, 2);
+  assert.equal(emitted[1].payload.isTyping, false);
+  assert.equal(typing.current().active, false);
+  typing.input();
+  assert.equal(emitted.filter(item => item.payload.isTyping).length, 2);
+});
+
+test('typing submit is ordered once and stale socket timers cannot emit', () => {
+  const helpers = loadHelpers();
+  const callbacks = [];
+  const canceled = [];
+  const events = [];
+  let context = { roomCode: 'ABC123', clientContextId: 2 };
+  const oldSocket = { connected: true, emit(event, payload) { events.push({ source: 'old', event, payload }); } };
+  const newSocket = { connected: true, emit(event, payload) { events.push({ source: 'new', event, payload }); } };
+  let socket = oldSocket;
+  const typing = helpers.createTypingCoordinator({
+    schedule(callback) { callbacks.push(callback); return callbacks.length; },
+    cancel(id) { canceled.push(id); },
+    getSocket: () => socket,
+    getContext: () => ({ ...context })
+  });
+
+  typing.input();
+  oldSocket.emit('chat_message', { text: 'sent' });
+  assert.equal(typing.submit(), true);
+  assert.deepEqual(events.map(item => `${item.event}:${item.payload.isTyping}`), [
+    'typing:true', 'chat_message:undefined', 'typing:false'
+  ]);
+  assert.equal(typing.submit(), false, 'no duplicate false without an active start');
+
+  typing.input();
+  const staleSameEpisodeTimer = callbacks.at(-1);
+  typing.input();
+  const currentSameEpisodeTimer = callbacks.at(-1);
+  staleSameEpisodeTimer();
+  assert.equal(typing.current().active, true);
+  assert.equal(typing.current().timerPending, true);
+  assert.equal(events.filter(item => item.payload.isTyping === false).length, 1);
+
+  const staleRoomTimer = currentSameEpisodeTimer;
+  typing.clear();
+  socket = newSocket;
+  context = { roomCode: 'BBB222', clientContextId: 3 };
+  typing.input();
+  staleRoomTimer();
+  assert.equal(typing.current().active, true);
+  assert.equal(typing.current().timerPending, true);
+  assert.equal(events.filter(item => item.source === 'new' && item.payload.isTyping === false).length, 0);
+  assert.equal(events.filter(item => item.source === 'old' && item.payload.isTyping === false).length, 1);
+  assert.ok(canceled.length >= 2);
+
+  typing.clear();
+  const eventCount = events.length;
+  newSocket.connected = false;
+  assert.equal(typing.input(), false);
+  newSocket.connected = true;
+  context = { roomCode: null, clientContextId: 4 };
+  assert.equal(typing.input(), false);
+  assert.equal(events.length, eventCount, 'invalid socket or room fails closed');
+});
+
 test('room rail disables kicked and unbanned nonmembers but preserves admin ghost rooms', () => {
   const client = loadHelpers();
   const ordinary = {
@@ -1240,9 +1334,27 @@ test('production client invalidates revoked access and sends every room mutation
   assert.match(source, /activeSocket\.on\(['"]room_access_updated['"][\s\S]{0,500}closeModerationPrompt\(\)[\s\S]{0,200}closeReportPrompt\(\)[\s\S]{0,200}closeResolutionPrompt\(\)/);
   assert.match(source, /activeSocket\.on\(['"]global_role_updated['"][\s\S]*invalidatePrivilegedAccess/);
   assert.match(source, /activeSocket\.on\(['"]room_role_updated['"][\s\S]*invalidatePrivilegedAccess/);
-  for (const event of ['chat_message', 'edit_message', 'toggle_reaction', 'delete_message', 'typing']) {
+  for (const event of ['chat_message', 'edit_message', 'toggle_reaction', 'delete_message']) {
     assert.match(source, new RegExp(`compositionContextCoordinator\\.payload\\([\\s\\S]{0,240}socket\\.emit\\(['"]${event}['"]`), event);
   }
+});
+
+test('production typing wiring uses the coordinator at every lifecycle boundary', () => {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  assert.match(source, /const typingCoordinator = ChatClientHelpers\.createTypingCoordinator\(/);
+  assert.match(source, /msgInput\.addEventListener\(['"]input['"],\s*\(\)\s*=>\s*\{[\s\S]{0,300}typingCoordinator\.input\(\)/);
+  assert.match(source, /document\.getElementById\(['"]compose['"]\)[\s\S]{0,1800}socket\.emit\(['"]chat_message['"][\s\S]{0,500}typingCoordinator\.submit\(\)/);
+  for (const boundary of ['enterLobby', 'requestServerSwitch', 'logoutApp']) {
+    const start = source.indexOf(`function ${boundary}`);
+    const end = source.indexOf('\n    function ', start + 1);
+    assert.notEqual(start, -1, boundary);
+    assert.match(source.slice(start, end === -1 ? source.length : end), /typingCoordinator\.clear\(\)/, boundary);
+  }
+  assert.match(source, /const previousSocket = socket;[\s\S]{0,300}replaceSocket[\s\S]{0,300}if \(socket !== previousSocket\)\s*\{[\s\S]{0,120}typingCoordinator\.clear\(\)/);
+  assert.match(source, /activeSocket\.on\(['"]force_logout['"][\s\S]{0,200}typingCoordinator\.clear\(\)/);
+  assert.match(source, /activeSocket\.on\(['"]global_role_updated['"][\s\S]{0,700}typingCoordinator\.clear\(\)[\s\S]{0,120}roomSwitchCoordinator\.request\(currentServerCode\)/);
+  assert.match(source, /activeSocket\.on\(['"]room_role_updated['"][\s\S]{0,500}typingCoordinator\.clear\(\)[\s\S]{0,120}roomSwitchCoordinator\.request\(currentServerCode\)/);
+  assert.doesNotMatch(source, /let typingTimeout|clearTimeout\(typingTimeout\)/);
 });
 
 test('production image uploads cannot complete into a replaced room composition context', () => {

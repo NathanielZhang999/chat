@@ -734,6 +734,84 @@
             };
         },
 
+        createTypingCoordinator({
+            schedule = (callback, wait) => setTimeout(callback, wait),
+            cancel = timerId => clearTimeout(timerId),
+            getSocket,
+            getContext,
+            delay = 1_500
+        } = {}) {
+            let timerId = null;
+            let timerGeneration = 0;
+            let active = null;
+            const clearTimer = () => {
+                if (timerId !== null) cancel(timerId);
+                timerId = null;
+                timerGeneration += 1;
+            };
+            const readToken = () => {
+                const activeSocket = typeof getSocket === 'function' ? getSocket() : null;
+                const context = typeof getContext === 'function' ? getContext() : null;
+                if (!activeSocket || !activeSocket.connected || !context || !context.roomCode ||
+                    !Number.isSafeInteger(context.clientContextId) || context.clientContextId <= 0) return null;
+                return Object.freeze({
+                    socket: activeSocket,
+                    serverCode: context.roomCode,
+                    clientContextId: context.clientContextId
+                });
+            };
+            const isCurrent = token => {
+                const current = readToken();
+                return Boolean(current && token && current.socket === token.socket &&
+                    current.serverCode === token.serverCode &&
+                    current.clientContextId === token.clientContextId);
+            };
+            const sameEpisode = (left, right) => Boolean(left && right &&
+                left.socket === right.socket && left.serverCode === right.serverCode &&
+                left.clientContextId === right.clientContextId);
+            const payload = (token, isTyping) => ({
+                serverCode: token.serverCode,
+                clientContextId: token.clientContextId,
+                isTyping
+            });
+            const clear = () => {
+                clearTimer();
+                active = null;
+            };
+            const stop = () => {
+                const token = active;
+                clear();
+                if (!token || !isCurrent(token)) return false;
+                token.socket.emit('typing', payload(token, false));
+                return true;
+            };
+            return {
+                input() {
+                    const token = readToken();
+                    if (!token) { clear(); return false; }
+                    if (!sameEpisode(active, token)) {
+                        clear();
+                        active = token;
+                        token.socket.emit('typing', payload(token, true));
+                    }
+                    clearTimer();
+                    const scheduledToken = active;
+                    const scheduledGeneration = timerGeneration;
+                    timerId = schedule(() => {
+                        if (scheduledGeneration !== timerGeneration || active !== scheduledToken) return;
+                        timerId = null;
+                        stop();
+                    }, delay);
+                    return true;
+                },
+                submit: stop,
+                clear,
+                current() {
+                    return { active: Boolean(active), timerPending: timerId !== null };
+                }
+            };
+        },
+
         isRoomRailAccessible({ serverCode, role, joinedServers, bannedRooms } = {}) {
             if (!serverCode || (Array.isArray(bannedRooms) && bannedRooms.includes(serverCode))) return false;
             if (serverCode === 'global' || role === 'admin') return true;
@@ -1461,9 +1539,12 @@
     let moderatorCenterTab = 'reports';
     const moderatorCenterCursors = { reports: null, restrictions: null, audit: null };
     const compositionContextCoordinator = ChatClientHelpers.createCompositionContextCoordinator();
+    const typingCoordinator = ChatClientHelpers.createTypingCoordinator({
+        getSocket: () => socket,
+        getContext: () => compositionContextCoordinator.current()
+    });
 
     let isLoginMode = true;
-    let typingTimeout;
     const typingUsers = new Map();
     
     let editingMsgId = null;
@@ -1558,11 +1639,11 @@
     }
 
     function enterLobby() {
+        typingCoordinator.clear();
         compositionContextCoordinator.invalidate();
         currentServerCode = null;
         myRoomRole = 'user';
         restrictionCoordinator.clear();
-        clearTimeout(typingTimeout);
         typingUsers.clear();
         updateTypingUI();
         chatWindow.textContent = '';
@@ -2348,6 +2429,7 @@
 
     async function logoutApp() {
         if (await showAppConfirm("Log Out", "Are you sure you want to log out of your account?", "Log Out", true)) {
+            typingCoordinator.clear();
             localStorage.removeItem('pro_chat_user'); location.reload(); 
         }
     }
@@ -2375,6 +2457,7 @@
         socket = replacement.socket;
         socketUrl = replacement.socketUrl;
         if (socket !== previousSocket) {
+            typingCoordinator.clear();
             compositionContextCoordinator.invalidate();
             closeModerationPrompt();
             closeReportPrompt();
@@ -2449,6 +2532,7 @@
         });
         
         activeSocket.on('force_logout', (msg) => {
+            typingCoordinator.clear();
             localStorage.removeItem('pro_chat_user'); alert(msg || "You have been logged out remotely."); location.reload(); 
         });
 
@@ -2475,7 +2559,10 @@
                 if (data.role !== 'admin') invalidatePrivilegedAccess();
                 renderServerAccess();
                 showAppAlert(data.role === 'admin' ? "Promoted!" : "Demoted", `You have been ${data.role === 'admin' ? 'promoted to' : 'demoted from'} Global Admin!`);
-                if (currentServerCode) roomSwitchCoordinator.request(currentServerCode);
+                if (currentServerCode) {
+                    typingCoordinator.clear();
+                    roomSwitchCoordinator.request(currentServerCode);
+                }
                 else updateModeratorCenterAccess();
             }
         });
@@ -2484,6 +2571,7 @@
             if (data.username === myUsername && data.targetServer === currentServerCode) {
                 myRoomRole = 'user';
                 invalidatePrivilegedAccess();
+                typingCoordinator.clear();
                 roomSwitchCoordinator.request(currentServerCode);
             }
         });
@@ -2946,6 +3034,7 @@
     function requestServerSwitch(code) {
         if (currentServerCode === code && chatWindow.innerHTML !== '' &&
             !roomSwitchCoordinator.isPending()) return;
+        typingCoordinator.clear();
         roomSwitchCoordinator.request(code);
     }
 
@@ -3150,6 +3239,7 @@
             const payload = compositionContextCoordinator.payload({ id: editingMsgId, text });
             if (!payload) return;
             socket.emit('edit_message', payload);
+            typingCoordinator.submit();
             cancelAction();
         } else {
             const payload = compositionContextCoordinator.payload({
@@ -3159,28 +3249,16 @@
             if (!payload) return;
             if (replyingToData) payload.replyTo = replyingToData;
             socket.emit('chat_message', payload);
+            typingCoordinator.submit();
             cancelAction();
         }
         
-        const stoppedTyping = compositionContextCoordinator.payload({ isTyping: false });
-        if (stoppedTyping) socket.emit('typing', stoppedTyping);
         msgInput.focus();
     });
 
     msgInput.addEventListener('input', () => {
         if (compositionDisabled || !currentServerCode) return;
-        const typingStarted = compositionContextCoordinator.payload({ isTyping: true });
-        if (!typingStarted) return;
-        socket.emit('typing', typingStarted);
-        clearTimeout(typingTimeout);
-        typingTimeout = setTimeout(() => {
-            if (!compositionContextCoordinator.matches(typingStarted)) return;
-            socket.emit('typing', {
-                serverCode: typingStarted.serverCode,
-                clientContextId: typingStarted.clientContextId,
-                isTyping: false
-            });
-        }, 1500);
+        typingCoordinator.input();
     });
 
     function initiateEdit(id, currentTextElement) {
