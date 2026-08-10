@@ -2691,6 +2691,120 @@ test('cancelled queued refresh keeps in-flight history scroll suppressed until A
   }), true, 'normal mark-read becomes eligible only after A owned release');
 });
 
+test('accepted refresh response rearms suppression for its newer block context without stealing owners', () => {
+  const responseForBlock = blockVersion => ({
+    serverCode: 'ABC123',
+    history: [{ _id: `message-${blockVersion}`, serverCode: 'ABC123' }],
+    roomRole: 'user',
+    restriction: { timedOut: false, timeoutUntil: null },
+    details: null,
+    notification: null,
+    pin: { serverCode: 'ABC123', pinCount: 0, pinVersion: 1, blockVersion }
+  });
+  const flushHistoryFrames = runtime => {
+    runtime.frames.splice(0).forEach(callback => callback());
+    runtime.frames.splice(0).forEach(callback => callback());
+  };
+  const queueMismatchedRefreshAndCancelB = (
+    runtime,
+    userOptions = { origin: 'user' }
+  ) => {
+    runtime.context.acceptedBlockVersion = 4;
+    runtime.context.__handleRoomRefreshRequired(
+      { serverCode: 'ABC123', blockVersion: 4 },
+      runtime.socket
+    );
+    const tokenA = runtime.context.readSuppressionToken;
+    runtime.context.acceptedBlockVersion = 5;
+    runtime.context.__handleRoomRefreshRequired(
+      { serverCode: 'ABC123', blockVersion: 5 },
+      runtime.socket
+    );
+    runtime.coordinator.request('ABC123', userOptions);
+    assert.equal(
+      runtime.context.readSuppressionToken,
+      null,
+      'B cancellation refuses cross-block transfer to A and releases B'
+    );
+    return tokenA;
+  };
+
+  const accepted = createRefreshHistoryRuntime();
+  const acceptedTokenA = queueMismatchedRefreshAndCancelB(accepted);
+  accepted.emissions[0].callback(responseForBlock(5));
+
+  assert.equal(
+    accepted.client.sameSuppressionOwner(
+      accepted.context.readSuppressionToken,
+      acceptedTokenA
+    ),
+    true,
+    'accepted A response reclaims only A ownership'
+  );
+  assert.equal(accepted.context.readSuppressionToken.blockVersion, 5);
+  assert.equal(accepted.context.readSuppressionToken.roomGeneration, 8);
+  flushHistoryFrames(accepted);
+  assert.deepEqual(
+    accepted.observedEligibility,
+    [false],
+    'A remains ineligible through its programmatic history scroll'
+  );
+  assert.equal(accepted.context.readSuppressionToken, null, 'A releases after its scroll mark frame');
+  assert.equal(accepted.client.isMarkReadEligible({
+    currentRoom: 'ABC123',
+    roomCode: 'ABC123',
+    visibilityState: 'visible',
+    nearBottom: true,
+    roomGeneration: accepted.context.currentRoomGeneration,
+    suppressionToken: accepted.context.readSuppressionToken
+  }), true, 'ordinary reads become eligible after accepted A releases');
+
+  const stale = createRefreshHistoryRuntime();
+  const staleUserCancellations = [];
+  queueMismatchedRefreshAndCancelB(stale, {
+    origin: 'user',
+    onCancel: reason => staleUserCancellations.push(reason)
+  });
+  stale.emissions[0].callback(responseForBlock(4));
+  assert.equal(stale.context.currentRoomGeneration, 7, 'stale A cannot activate a room generation');
+  assert.equal(stale.context.readSuppressionToken, null, 'stale A releases its own suppression');
+  assert.deepEqual(stale.observedEligibility, [], 'stale A never renders or schedules history work');
+  assert.deepEqual(staleUserCancellations, [], 'stale A cannot coalesce the queued user switch');
+  assert.equal(stale.emissions.length, 2, 'the queued user switch requests fresh block-v5 history');
+  assert.equal(stale.coordinator.isPending(), true);
+  stale.emissions[1].callback(responseForBlock(5));
+  assert.equal(stale.coordinator.isPending(), false);
+
+  const unrelated = createRefreshHistoryRuntime();
+  queueMismatchedRefreshAndCancelB(unrelated);
+  const newerUnrelatedOwner = Object.freeze({
+    refreshId: 'newer-unrelated',
+    roomCode: 'ABC123',
+    roomGeneration: 7,
+    blockVersion: 5
+  });
+  unrelated.context.readSuppressionToken = newerUnrelatedOwner;
+  unrelated.emissions[0].callback(responseForBlock(5));
+  assert.equal(
+    unrelated.client.sameSuppressionOwner(
+      unrelated.context.readSuppressionToken,
+      newerUnrelatedOwner
+    ),
+    true,
+    'accepted A cannot replace a newer unrelated owner'
+  );
+  flushHistoryFrames(unrelated);
+  assert.deepEqual(unrelated.observedEligibility, [false]);
+  assert.equal(
+    unrelated.client.sameSuppressionOwner(
+      unrelated.context.readSuppressionToken,
+      newerUnrelatedOwner
+    ),
+    true,
+    'A completion cannot release the unrelated owner'
+  );
+});
+
 test('replaced socket chat listener ignores old and wrong-room payloads before effects', () => {
   const oldSocket = createRuntimeSocket();
   const effects = { dom: 0, typing: 0, read: 0, sound: 0 };

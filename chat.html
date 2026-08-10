@@ -1026,15 +1026,19 @@
             return leftOwner === rightOwner;
         },
 
-        rebindSuppressionToken(token, roomCode, roomGeneration) {
+        rebindSuppressionToken(token, roomCode, roomGeneration, blockVersion = token?.blockVersion) {
             if (!token || token.roomCode !== roomCode ||
                 !Number.isInteger(roomGeneration) || roomGeneration <= 0) return token;
-            return Object.freeze({
+            const rebound = {
                 ...token,
                 ownerToken: token.ownerToken || token,
                 roomCode,
                 roomGeneration
-            });
+            };
+            if (Number.isInteger(blockVersion) && blockVersion >= 0) {
+                rebound.blockVersion = blockVersion;
+            }
+            return Object.freeze(rebound);
         },
 
         scheduleAfterScrollFrame(scheduleFrame, callback) {
@@ -1925,11 +1929,18 @@
                 inFlightRequest = request;
                 emitSwitch(request.target, result => {
                     if (request.epoch !== epoch || inFlightRequest !== request) return;
+                    let handledOutcome = null;
                     try {
-                        handleResult(request.target, result, request.token, request.options);
+                        handledOutcome = handleResult(
+                            request.target,
+                            result,
+                            request.token,
+                            request.options
+                        );
                     } finally {
                         const completedRequest = inFlightRequest;
-                        const completedSuccessfully = Boolean(result && !result.error);
+                        const completedSuccessfully = Boolean(result && !result.error) &&
+                            handledOutcome?.accepted !== false;
                         const nextRequest = queuedRequest;
                         inFlightRequest = null;
                         queuedRequest = null;
@@ -4570,13 +4581,19 @@
                         targetServerCode,
                         currentRoomGeneration
                     );
-                    if (options.suppressAutoRead === true &&
-                        ChatClientHelpers.sameSuppressionOwner(
-                            readSuppressionToken,
-                            options.suppressionToken
-                        )) {
-                        acceptedSuppressionToken = readSuppressionToken;
-                    }
+                }
+                if (options.suppressAutoRead === true && options.suppressionToken &&
+                    (!readSuppressionToken || ChatClientHelpers.sameSuppressionOwner(
+                        readSuppressionToken,
+                        options.suppressionToken
+                    ))) {
+                    readSuppressionToken = ChatClientHelpers.rebindSuppressionToken(
+                        options.suppressionToken,
+                        targetServerCode,
+                        currentRoomGeneration,
+                        response.pin?.blockVersion
+                    );
+                    acceptedSuppressionToken = readSuppressionToken;
                 }
                 myRoomRole = response.roomRole || 'user';
                 if (response.details) acceptRoomDetailsSnapshot({
