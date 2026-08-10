@@ -44,6 +44,12 @@
 
         .input-group { margin-bottom: 1rem; text-align: left; }
         .input-group label { display: block; font-size: 0.75rem; margin-bottom: 0.4rem; color: var(--text-muted); text-transform: uppercase; font-weight: 600; }
+        .automod-limits-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+            gap: 10px;
+            align-items: end;
+        }
         input.text-input { width: 100%; padding: 0.8rem; background: #202225; color: white; border: 1px solid var(--border); border-radius: 4px; outline: none; font-size: 1rem; transition: border-color 0.2s, box-shadow 0.2s;}
         input.text-input:focus { border-color: var(--primary); box-shadow: 0 0 0 3px rgba(88, 101, 242, 0.2); }
         
@@ -536,7 +542,7 @@
                     <label for="automod-keywords">Blocked keywords (one per line, up to 50)</label>
                     <textarea id="automod-keywords" class="text-input" rows="8" maxlength="2050"></textarea>
                 </div>
-                <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(130px, 1fr)); gap:10px;">
+                <div class="automod-limits-grid">
                     <div class="input-group"><label for="automod-mention-limit">Mention limit (1–20)</label><input id="automod-mention-limit" class="text-input" type="number" min="1" max="20"></div>
                     <div class="input-group"><label for="automod-repeat-limit">Repeat limit (2–10)</label><input id="automod-repeat-limit" class="text-input" type="number" min="2" max="10"></div>
                     <div class="input-group"><label for="automod-repeat-window">Window seconds (5–300)</label><input id="automod-repeat-window" class="text-input" type="number" min="5" max="300"></div>
@@ -1311,6 +1317,21 @@
                 shouldScroll: !history && wasNearBottom,
                 behavior: history ? 'auto' : 'smooth'
             };
+        },
+
+        messageRenderPolicyForElement(element, { history = false } = {}) {
+            return this.messageRenderPolicy({
+                history,
+                wasNearBottom: history ? false : this.isNearScrollEnd(element)
+            });
+        },
+
+        renderHistoryMessages(messages, { append, isMine, requestScroll } = {}) {
+            if (!Array.isArray(messages) || typeof append !== 'function' ||
+                typeof isMine !== 'function' || typeof requestScroll !== 'function') return 0;
+            messages.forEach(message => append(message, Boolean(isMine(message)), { history: true }));
+            requestScroll('auto');
+            return messages.length;
         },
 
         motionBaseDuration() {
@@ -3259,16 +3280,15 @@
     }
 
     function loadHistory(msgs) {
-        if (!msgs || !Array.isArray(msgs)) return; 
-        msgs.forEach(message => appendMessage(message, message.username === myUsername, { history: true }));
-        chatScrollCoordinator.request('auto');
+        ChatClientHelpers.renderHistoryMessages(msgs, {
+            append: appendMessage,
+            isMine: message => message.username === myUsername,
+            requestScroll: behavior => chatScrollCoordinator.request(behavior)
+        });
     }
 
     function appendMessage(data, isMe, { history = false } = {}) {
-        const renderPolicy = ChatClientHelpers.messageRenderPolicy({
-            history,
-            wasNearBottom: ChatClientHelpers.isNearScrollEnd(chatWindow)
-        });
+        const renderPolicy = ChatClientHelpers.messageRenderPolicyForElement(chatWindow, { history });
         const wrapper = document.createElement('div');
         wrapper.setAttribute('data-id', data._id); 
         wrapper.setAttribute('data-author', data.username);

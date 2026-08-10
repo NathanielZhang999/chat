@@ -50,11 +50,32 @@ test('new users receive the deployed Render backend URL by default', () => {
   );
 });
 
-test('browser title and AutoMod message-rate controls are exact', () => {
+test('browser title and AutoMod message-rate controls are exact and aligned', () => {
   const source = fs.readFileSync(chatPath, 'utf8');
   assert.match(source, /<title>Chat v1\.3\.2<\/title>/);
-  assert.match(source, /id="automod-message-limit"[^>]*min="1"[^>]*max="20"/);
-  assert.match(source, /id="automod-message-window"[^>]*min="1"[^>]*max="60"/);
+  assert.match(source, /\.automod-limits-grid\s*\{[^}]*display:\s*grid[^}]*grid-template-columns:\s*repeat\(auto-fit,\s*minmax\(170px,\s*1fr\)\)[^}]*gap:\s*10px[^}]*align-items:\s*end/s);
+  const panelStart = source.indexOf('<section id="moderator-panel-automod"');
+  const panelEnd = source.indexOf('</section>', panelStart);
+  assert.notEqual(panelStart, -1);
+  assert.ok(panelEnd > panelStart);
+  const panel = source.slice(panelStart, panelEnd);
+  assert.match(panel, /<div class="automod-limits-grid">/);
+  assert.doesNotMatch(panel, /minmax\(130px,\s*1fr\)/);
+  const controls = [
+    ['automod-mention-limit', 'Mention limit (1–20)', '1', '20'],
+    ['automod-repeat-limit', 'Repeat limit (2–10)', '2', '10'],
+    ['automod-repeat-window', 'Window seconds (5–300)', '5', '300'],
+    ['automod-message-limit', 'Message limit (1–20)', '1', '20'],
+    ['automod-message-window', 'Window seconds (1–60)', '1', '60']
+  ];
+  let previousIndex = -1;
+  for (const [id, label, min, max] of controls) {
+    const labelIndex = panel.indexOf(`<label for="${id}">${label}</label>`);
+    const inputPattern = new RegExp(`id="${id}"[^>]*min="${min}"[^>]*max="${max}"`);
+    assert.ok(labelIndex > previousIndex, `${id} label is present in order`);
+    assert.match(panel.slice(labelIndex), inputPattern);
+    previousIndex = labelIndex;
+  }
 });
 
 test('client motion policy avoids broad transitions and respects reduced motion', () => {
@@ -124,6 +145,44 @@ test('scroll policy preserves readers and separates history from live motion', (
     { ...helpers.messageRenderPolicy({ history: false, wasNearBottom: false }) },
     { animate: true, shouldScroll: false, behavior: 'smooth' }
   );
+});
+
+test('history rendering skips layout measurements and performs one final scroll', () => {
+  const helpers = loadHelpers();
+  let measurements = 0;
+  const scroller = {
+    get scrollHeight() { measurements += 1; return 1_000; },
+    get scrollTop() { measurements += 1; return 600; },
+    get clientHeight() { measurements += 1; return 320; }
+  };
+  const rows = Array.from({ length: 100 }, (_, index) => ({ _id: String(index), username: 'alice' }));
+  const appended = [];
+  const scrolls = [];
+
+  const count = helpers.renderHistoryMessages(rows, {
+    append(message, isMe, options) {
+      appended.push({ message, isMe, options: { ...options } });
+      helpers.messageRenderPolicyForElement(scroller, options);
+    },
+    isMine: message => message.username === 'alice',
+    requestScroll: behavior => scrolls.push(behavior)
+  });
+
+  assert.equal(count, 100);
+  assert.equal(appended.length, 100);
+  assert.equal(appended.every(item => item.isMe && item.options.history === true), true);
+  assert.equal(measurements, 0);
+  assert.deepEqual(scrolls, ['auto']);
+
+  const livePolicy = helpers.messageRenderPolicyForElement(scroller, { history: false });
+  assert.equal(measurements, 3);
+  assert.deepEqual({ ...livePolicy }, { animate: true, shouldScroll: true, behavior: 'smooth' });
+});
+
+test('production history path uses the measured helper boundary', () => {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  assert.match(source, /function loadHistory\(msgs\)[\s\S]{0,500}ChatClientHelpers\.renderHistoryMessages/);
+  assert.match(source, /function appendMessage\([\s\S]{0,500}ChatClientHelpers\.messageRenderPolicyForElement\(chatWindow,\s*\{ history \}\)/);
 });
 
 test('scroll coordinator coalesces requests and gives instant scroll priority', () => {
