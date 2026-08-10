@@ -33,6 +33,126 @@ function authenticate(socket, { serverCode = 'global', joinedServers = ['global'
   socket.joinedServers = joinedServers;
 }
 
+test('rate-limited messages skip reply lookup, ping resolution, persistence, and broadcast', async () => {
+  let currentTime = 1_000;
+  let replyLookups = 0;
+  let pingResolutions = 0;
+  let creates = 0;
+  const audits = [];
+  const { socket, ioInstance } = registerMessages({
+    autoModTracker: createAutoModTracker({ now: () => currentTime }),
+    ChatServerModel: { async findOne(query) {
+      return { code: query.code, moderators: [], autoMod: {
+        blockedKeywords: [], mentionLimit: 8, repeatLimit: 3, repeatWindowSeconds: 30,
+        messageLimit: 2, messageWindowSeconds: 5
+      } };
+    } },
+    MessageModel: {
+      async findById() { replyLookups += 1; return null; },
+      async create(value) {
+        creates += 1;
+        return { ...value, _id: String(creates).padStart(24, '0'), timestamp: new Date(currentTime) };
+      }
+    },
+    resolvePingsFn: async text => { pingResolutions += 1; return text; },
+    ModerationAuditModel: { async create(value) { audits.push(value); return value; } }
+  });
+  authenticate(socket, { serverCode: 'ABC123', joinedServers: ['global', 'ABC123'] });
+
+  await socket.trigger('chat_message', { serverCode: 'ABC123', clientContextId: 1, text: 'one' });
+  await socket.trigger('chat_message', { serverCode: 'ABC123', clientContextId: 1, text: 'two' });
+  replyLookups = 0;
+  pingResolutions = 0;
+  await socket.trigger('chat_message', {
+    serverCode: 'ABC123', clientContextId: 1, text: 'blocked secret',
+    replyTo: { id: '507f1f77bcf86cd799439011' }
+  });
+  await socket.trigger('chat_message', { serverCode: 'ABC123', clientContextId: 1, text: 'blocked again' });
+
+  assert.equal(creates, 2);
+  assert.equal(replyLookups, 0);
+  assert.equal(pingResolutions, 0);
+  assert.equal(ioInstance.outbound.filter(item => item.event === 'chat_message').length, 2);
+  assert.equal(socket.outbound.filter(item => item.event === 'message_blocked').length, 2);
+  assert.equal(audits.filter(item => item.metadata?.rule === 'message_rate').length, 1);
+  assert.equal(JSON.stringify(audits).includes('blocked secret'), false);
+  assert.equal(JSON.stringify(socket.outbound).includes('blocked secret'), false);
+});
+
+test('default AutoMod accepts five immediate distinct sends and blocks the sixth', async () => {
+  let currentTime = 0;
+  let creates = 0;
+  const { socket, ioInstance } = registerMessages({
+    autoModTracker: createAutoModTracker({ now: () => currentTime }),
+    ChatServerModel: { async findOne(query) {
+      return { code: query.code, moderators: [], autoMod: {
+        blockedKeywords: [], mentionLimit: 8, repeatLimit: 3, repeatWindowSeconds: 30
+      } };
+    } },
+    MessageModel: { async create(value) {
+      creates += 1;
+      return { ...value, _id: String(creates).padStart(24, '0'), timestamp: new Date(currentTime) };
+    } },
+    ModerationAuditModel: { async create(value) { return value; } }
+  });
+  authenticate(socket, { serverCode: 'ABC123', joinedServers: ['global', 'ABC123'] });
+  for (let index = 0; index < 5; index += 1) {
+    await socket.trigger('chat_message', { text: `distinct message ${index}` });
+  }
+  await socket.trigger('chat_message', { text: 'sixth distinct message' });
+  assert.equal(creates, 5);
+  assert.equal(ioInstance.outbound.filter(item => item.event === 'chat_message').length, 5);
+  assert.equal(socket.outbound.filter(item => item.event === 'message_blocked').length, 1);
+});
+
+test('strict one-per-second AutoMod expires at the exact rolling boundary', async () => {
+  let currentTime = 0;
+  let creates = 0;
+  const { socket } = registerMessages({
+    autoModTracker: createAutoModTracker({ now: () => currentTime }),
+    ChatServerModel: { async findOne(query) {
+      return { code: query.code, moderators: [], autoMod: {
+        blockedKeywords: [], mentionLimit: 8, repeatLimit: 3, repeatWindowSeconds: 30,
+        messageLimit: 1, messageWindowSeconds: 1
+      } };
+    } },
+    MessageModel: { async create(value) {
+      creates += 1;
+      return { ...value, _id: String(creates).padStart(24, '0'), timestamp: new Date(currentTime) };
+    } },
+    ModerationAuditModel: { async create(value) { return value; } }
+  });
+  authenticate(socket, { serverCode: 'ABC123', joinedServers: ['global', 'ABC123'] });
+  await socket.trigger('chat_message', { text: 'first' });
+  currentTime = 999;
+  await socket.trigger('chat_message', { text: 'blocked' });
+  currentTime = 1_000;
+  await socket.trigger('chat_message', { text: 'accepted at boundary' });
+  assert.equal(creates, 2);
+  assert.equal(socket.outbound.filter(item => item.event === 'message_blocked').length, 1);
+});
+
+test('malformed stored message-rate settings and tracker failures fail closed without raw content', async () => {
+  let creates = 0;
+  const logged = [];
+  const { socket, ioInstance } = registerMessages({
+    autoModTracker: { recordMessageAttempt() { throw new Error('tracker failure containing NeverLogRaw'); } },
+    ChatServerModel: { async findOne(query) {
+      return { code: query.code, moderators: [], autoMod: {
+        blockedKeywords: [], mentionLimit: 8, repeatLimit: 3, repeatWindowSeconds: 30,
+        messageLimit: 1, messageWindowSeconds: 1
+      } };
+    } },
+    MessageModel: { async create() { creates += 1; } },
+    logger: { error(...args) { logged.push(args); } }
+  });
+  authenticate(socket, { serverCode: 'ABC123', joinedServers: ['global', 'ABC123'] });
+  await socket.trigger('chat_message', { text: 'NeverLogRaw message' });
+  assert.equal(creates, 0);
+  assert.deepEqual(ioInstance.outbound, []);
+  assert.equal(JSON.stringify(logged).includes('NeverLogRaw'), false);
+});
+
 test('reaction in an inaccessible message room does not save or emit', async () => {
   let saved = false;
   const message = {

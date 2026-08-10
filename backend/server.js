@@ -31,6 +31,8 @@ const MAX_REACTION_KEYS = 20;
 const MAX_REACTION_USERS = 200;
 const MAX_REACTIONS_PER_USER = 20;
 const MAX_AUTOMOD_KEYS = 10_000;
+const DEFAULT_AUTOMOD_MESSAGE_LIMIT = 5;
+const DEFAULT_AUTOMOD_MESSAGE_WINDOW_SECONDS = 5;
 const MODERATION_ACTIONS = new Set(['kick', 'timeout', 'clear_timeout', 'ban', 'unban']);
 const MODERATION_DURATIONS = Object.freeze({
   '10m': 10 * 60 * 1000,
@@ -83,7 +85,9 @@ function normalizeAutoModSettings(value) {
   const boundedIntegers = [
     ['mentionLimit', 1, 20],
     ['repeatLimit', 2, 10],
-    ['repeatWindowSeconds', 5, 300]
+    ['repeatWindowSeconds', 5, 300],
+    ['messageLimit', 1, 20],
+    ['messageWindowSeconds', 1, 60]
   ];
   if (boundedIntegers.some(([key, min, max]) => !Number.isInteger(value[key]) || value[key] < min || value[key] > max)) return null;
 
@@ -103,8 +107,21 @@ function normalizeAutoModSettings(value) {
     blockedKeywords,
     mentionLimit: value.mentionLimit,
     repeatLimit: value.repeatLimit,
-    repeatWindowSeconds: value.repeatWindowSeconds
+    repeatWindowSeconds: value.repeatWindowSeconds,
+    messageLimit: value.messageLimit,
+    messageWindowSeconds: value.messageWindowSeconds
   };
+}
+
+function normalizeStoredAutoModSettings(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  return normalizeAutoModSettings({
+    ...value,
+    messageLimit: value.messageLimit === undefined ? DEFAULT_AUTOMOD_MESSAGE_LIMIT : value.messageLimit,
+    messageWindowSeconds: value.messageWindowSeconds === undefined
+      ? DEFAULT_AUTOMOD_MESSAGE_WINDOW_SECONDS
+      : value.messageWindowSeconds
+  });
 }
 
 function normalizeAutoModText(value) {
@@ -113,7 +130,7 @@ function normalizeAutoModText(value) {
 
 function createAutoModTracker({ maxKeys = MAX_AUTOMOD_KEYS, now = () => Date.now() } = {}) {
   const boundedMaxKeys = Number.isInteger(maxKeys) && maxKeys > 0 ? maxKeys : MAX_AUTOMOD_KEYS;
-  const messagesByAccountRoom = new Map();
+  const statesByAccountRoom = new Map();
 
   function pruneMessages(messages, currentTime, windowMs) {
     for (const [normalizedText, timestamps] of messages.entries()) {
@@ -123,42 +140,91 @@ function createAutoModTracker({ maxKeys = MAX_AUTOMOD_KEYS, now = () => Date.now
     }
   }
 
+  function pruneState(state, currentTime, fallbackWindowMs = 0) {
+    const repeatWindowMs = state.repeatWindowMs || fallbackWindowMs;
+    if (repeatWindowMs) pruneMessages(state.repeatedTextTimestamps, currentTime, repeatWindowMs);
+    const rateWindowMs = state.rateWindowMs || fallbackWindowMs;
+    if (rateWindowMs) {
+      state.acceptedMessageTimestamps = state.acceptedMessageTimestamps
+        .filter(timestamp => currentTime - timestamp < rateWindowMs);
+    }
+    return state.repeatedTextTimestamps.size === 0 && state.acceptedMessageTimestamps.length === 0;
+  }
+
   function prune(windowMs) {
     const currentTime = now();
-    for (const [key, messages] of messagesByAccountRoom.entries()) {
-      pruneMessages(messages, currentTime, windowMs);
-      if (messages.size === 0) messagesByAccountRoom.delete(key);
+    for (const [key, state] of statesByAccountRoom.entries()) {
+      if (pruneState(state, currentTime, windowMs)) statesByAccountRoom.delete(key);
     }
+  }
+
+  function makeState() {
+    return {
+      repeatedTextTimestamps: new Map(),
+      acceptedMessageTimestamps: [],
+      rateWindowMs: 0,
+      repeatWindowMs: 0,
+      rateAuditRecorded: false
+    };
+  }
+
+  function stateFor(key, currentTime, fallbackWindowMs) {
+    let state = statesByAccountRoom.get(key);
+    if (state && pruneState(state, currentTime, fallbackWindowMs)) {
+      statesByAccountRoom.delete(key);
+      state = null;
+    }
+    if (!state) {
+      if (statesByAccountRoom.size >= boundedMaxKeys) prune(fallbackWindowMs);
+      while (statesByAccountRoom.size >= boundedMaxKeys) {
+        statesByAccountRoom.delete(statesByAccountRoom.keys().next().value);
+      }
+      state = makeState();
+      statesByAccountRoom.set(key, state);
+    }
+    return state;
   }
 
   function recordAndCheck(key, normalizedText, limit, windowMs) {
     const currentTime = now();
-    let messages = messagesByAccountRoom.get(key);
-    if (messages) {
-      pruneMessages(messages, currentTime, windowMs);
-      if (messages.size === 0) {
-        messagesByAccountRoom.delete(key);
-        messages = null;
-      }
-    }
-    if (!messages) {
-      if (messagesByAccountRoom.size >= boundedMaxKeys) prune(windowMs);
-      messages = new Map();
-      messagesByAccountRoom.set(key, messages);
-      while (messagesByAccountRoom.size > boundedMaxKeys) {
-        messagesByAccountRoom.delete(messagesByAccountRoom.keys().next().value);
-      }
-    }
-    const timestamps = messages.get(normalizedText) || [];
+    const state = stateFor(key, currentTime, windowMs);
+    state.repeatWindowMs = windowMs;
+    pruneMessages(state.repeatedTextTimestamps, currentTime, windowMs);
+    const timestamps = state.repeatedTextTimestamps.get(normalizedText) || [];
     timestamps.push(currentTime);
-    messages.set(normalizedText, timestamps);
+    state.repeatedTextTimestamps.set(normalizedText, timestamps);
     return timestamps.length >= limit;
+  }
+
+  function recordMessageAttempt(key, limit, windowMs) {
+    const currentTime = now();
+    const state = stateFor(key, currentTime, windowMs);
+    state.rateWindowMs = windowMs;
+    state.acceptedMessageTimestamps = state.acceptedMessageTimestamps
+      .filter(timestamp => currentTime - timestamp < windowMs);
+    if (state.acceptedMessageTimestamps.length > limit) {
+      state.acceptedMessageTimestamps = state.acceptedMessageTimestamps.slice(-limit);
+    }
+    if (state.acceptedMessageTimestamps.length >= limit) {
+      const shouldAudit = !state.rateAuditRecorded;
+      state.rateAuditRecorded = true;
+      return { allowed: false, shouldAudit };
+    }
+    state.acceptedMessageTimestamps.push(currentTime);
+    state.rateAuditRecorded = false;
+    return { allowed: true, shouldAudit: false };
   }
 
   return {
     recordAndCheck,
+    recordMessageAttempt,
     prune,
-    size() { return messagesByAccountRoom.size; }
+    size() { return statesByAccountRoom.size; },
+    messageAttemptCount(key) {
+      const state = statesByAccountRoom.get(key);
+      return state ? state.acceptedMessageTimestamps.length : 0;
+    },
+    hasKey(key) { return statesByAccountRoom.has(key); }
   };
 }
 
@@ -190,16 +256,30 @@ function evaluateAutoMod({ text, resolvedText, username, serverCode, role, setti
   return { allowed: true };
 }
 
+function evaluateMessageRate({ username, serverCode, settings, tracker }) {
+  const key = `${serverCode}\0${normalizeAccountKey(username)}`;
+  const result = tracker.recordMessageAttempt(
+    key,
+    settings.messageLimit,
+    settings.messageWindowSeconds * 1000
+  );
+  return result.allowed
+    ? { allowed: true }
+    : { allowed: false, rule: 'message_rate', shouldAudit: result.shouldAudit };
+}
+
 const serverAutoModTracker = createAutoModTracker();
 const DEFAULT_AUTOMOD_SETTINGS = Object.freeze({
   blockedKeywords: Object.freeze([]),
   mentionLimit: 8,
   repeatLimit: 3,
-  repeatWindowSeconds: 30
+  repeatWindowSeconds: 30,
+  messageLimit: DEFAULT_AUTOMOD_MESSAGE_LIMIT,
+  messageWindowSeconds: DEFAULT_AUTOMOD_MESSAGE_WINDOW_SECONDS
 });
 
 function roomAutoModSettings(room) {
-  const normalized = normalizeAutoModSettings(room && room.autoMod);
+  const normalized = normalizeStoredAutoModSettings(room && room.autoMod);
   if (normalized) return normalized;
   return room && room.autoMod === undefined ? DEFAULT_AUTOMOD_SETTINGS : null;
 }
@@ -557,7 +637,9 @@ const ChatServerSchema = new mongoose.Schema({
     },
     mentionLimit: { type: Number, min: 1, max: 20, default: 8 },
     repeatLimit: { type: Number, min: 2, max: 10, default: 3 },
-    repeatWindowSeconds: { type: Number, min: 5, max: 300, default: 30 }
+    repeatWindowSeconds: { type: Number, min: 5, max: 300, default: 30 },
+    messageLimit: { type: Number, min: 1, max: 20, default: 5 },
+    messageWindowSeconds: { type: Number, min: 1, max: 60, default: 5 }
   }
 });
 const ChatServer = mongoose.model('ChatServer', ChatServerSchema);
@@ -825,7 +907,6 @@ function createConnectionHandler({
   socket.serverCode = null;
   socket.joinedServers = [];
   
-  let lastMessageTime = 0; 
   let suppressDisconnectPresence = false;
   let terminallyClosed = false;
 
@@ -1222,6 +1303,7 @@ function createConnectionHandler({
     result
   }) {
     socket.emit('message_blocked', { rule: 'content_policy', serverCode, clientContextId });
+    if (result.shouldAudit === false) return;
     await appendAuditReliably({
       correlationId: new mongoose.Types.ObjectId().toString(),
       action: 'automod_block',
@@ -2421,7 +2503,7 @@ function createConnectionHandler({
     if (!serverCode) return callback({ error: 'Invalid input format.' });
     try {
       await deliverModeratorRead(serverCode, callback, async access => {
-        const autoMod = normalizeAutoModSettings(access.room.autoMod);
+        const autoMod = normalizeStoredAutoModSettings(access.room.autoMod);
         if (!autoMod) throw new Error('Invalid stored AutoMod state.');
         return { autoMod };
       });
@@ -2442,7 +2524,9 @@ function createConnectionHandler({
       blockedKeywords: data.blockedKeywords,
       mentionLimit: data.mentionLimit,
       repeatLimit: data.repeatLimit,
-      repeatWindowSeconds: data.repeatWindowSeconds
+      repeatWindowSeconds: data.repeatWindowSeconds,
+      messageLimit: data.messageLimit,
+      messageWindowSeconds: data.messageWindowSeconds
     });
     if (!serverCode || !autoMod) return callback({ error: 'Invalid input format.' });
 
@@ -2477,7 +2561,9 @@ function createConnectionHandler({
               keywordCount: autoMod.blockedKeywords.length,
               mentionLimit: autoMod.mentionLimit,
               repeatLimit: autoMod.repeatLimit,
-              repeatWindowSeconds: autoMod.repeatWindowSeconds
+              repeatWindowSeconds: autoMod.repeatWindowSeconds,
+              messageLimit: autoMod.messageLimit,
+              messageWindowSeconds: autoMod.messageWindowSeconds
             }
           });
           return { success: true, autoMod };
@@ -3000,29 +3086,9 @@ function createConnectionHandler({
       if (intendedServerCode !== serverCode || clientContextId === null) return;
       if (!isValidAttachment(payload.attachment)) return;
 
-      const now = Date.now();
-      if (socket.role !== 'admin' && now - lastMessageTime < 500) {
-        return socket.emit('system_message', '⚠️ Slow down! You are sending messages too fast.');
-      }
-      lastMessageTime = now;
-
       const attachment = sanitizeAttachment(payload.attachment);
-      let cleanText = payload.text.trim().substring(0, 2000);
-      if (!cleanText && !attachment) return;
-
-      let replyTo = null;
-      if (payload.replyTo && typeof payload.replyTo === 'object' && isValidObjectId(payload.replyTo.id)) {
-        const referenced = await MessageModel.findById(payload.replyTo.id);
-        if (referenced && !referenced.deleted && referenced.serverCode === serverCode) {
-          replyTo = createReplySnapshot(referenced);
-        }
-      }
-
-      const roomRole = await getRoomRoleFn(serverCode, socket.username);
-      cleanText = neutralizePingTokens(cleanText);
-      const rawText = cleanText;
-      cleanText = await resolvePingsFn(cleanText, serverCode, socket.role, roomRole, socket.username);
-      if (typeof cleanText !== 'string' || cleanText.length > 2000) return;
+      const rawText = neutralizePingTokens(payload.text.trim().substring(0, 2000));
+      if (!rawText && !attachment) return;
 
       await withRoomMutationLock(serverCode, async () => {
         const access = await loadRoomAccessState({
@@ -3034,6 +3100,47 @@ function createConnectionHandler({
         const settings = roomAutoModSettings(access.room);
         if (!settings) return;
         const freshRoomRole = currentRoomRole(access.room, access.user.username);
+        let rateResult;
+        try {
+          rateResult = evaluateMessageRate({
+            username: access.user.username,
+            serverCode,
+            settings,
+            tracker: autoModTracker
+          });
+        } catch (err) {
+          logUnexpectedError(logger, 'automod_message_rate', err);
+          return;
+        }
+        if (!rateResult.allowed) {
+          await rejectAutoModContent({
+            serverCode,
+            clientContextId,
+            access,
+            roomRole: freshRoomRole,
+            rawText,
+            result: rateResult
+          });
+          return;
+        }
+
+        let replyTo = null;
+        if (payload.replyTo && typeof payload.replyTo === 'object' && isValidObjectId(payload.replyTo.id)) {
+          const referenced = await MessageModel.findById(payload.replyTo.id);
+          if (referenced && !referenced.deleted && referenced.serverCode === serverCode) {
+            replyTo = createReplySnapshot(referenced);
+          }
+        }
+
+        let cleanText = await resolvePingsFn(
+          rawText,
+          serverCode,
+          access.user.role,
+          freshRoomRole,
+          access.user.username
+        );
+        if (typeof cleanText !== 'string' || cleanText.length > 2000) return;
+        if (socket.serverCode !== intendedServerCode || !canAccessRoom(socket, serverCode)) return;
         const autoModResult = evaluateAutoMod({
           text: rawText,
           resolvedText: cleanText,
@@ -3058,7 +3165,7 @@ function createConnectionHandler({
 
         const msg = await MessageModel.create({
             serverCode, username: socket.username, displayName: socket.displayName,
-            role: socket.role, roomRole: roomRole, color: socket.color, avatarUrl: socket.avatarUrl,
+            role: socket.role, roomRole: freshRoomRole, color: socket.color, avatarUrl: socket.avatarUrl,
             text: cleanText, attachment, replyTo, reactions: {}
         });
 
@@ -3378,9 +3485,11 @@ module.exports = {
   normalizeModerationAction,
   normalizeModerationReason,
   normalizeAutoModSettings,
+  normalizeStoredAutoModSettings,
   normalizeAccountKey,
   createAutoModTracker,
   evaluateAutoMod,
+  evaluateMessageRate,
   findUserByUsername,
   canModerateTarget,
   activeRestrictionState,

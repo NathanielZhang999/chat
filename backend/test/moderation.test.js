@@ -5,9 +5,11 @@ const {
   normalizeModerationAction,
   normalizeModerationReason,
   normalizeAutoModSettings,
+  normalizeStoredAutoModSettings,
   normalizeAccountKey,
   createAutoModTracker,
   evaluateAutoMod,
+  evaluateMessageRate,
   findUserByUsername,
   withAccountTransitionLocks,
   withAccountTransitionLock,
@@ -745,7 +747,10 @@ test('exact-room moderator and global admin can read private report and AutoMod 
   const autoModAck = acknowledge();
   await setup.modSocket.trigger('get_automod', { serverCode: 'ABC123' }, autoModAck.callback);
   assert.deepEqual(autoModAck.value(), {
-    autoMod: { blockedKeywords: ['spam'], mentionLimit: 5, repeatLimit: 4, repeatWindowSeconds: 45 }
+    autoMod: {
+      blockedKeywords: ['spam'], mentionLimit: 5, repeatLimit: 4, repeatWindowSeconds: 45,
+      messageLimit: 5, messageWindowSeconds: 5
+    }
   });
 
   setup.UserModel.rows.push(userDocument({
@@ -762,13 +767,44 @@ test('exact-room moderator and global admin can read private report and AutoMod 
   assert.equal(adminAck.value().items[0].targetUsername, 'Bob');
 });
 
+test('legacy AutoMod rooms return message-rate defaults and socket writes require both fields', async () => {
+  const setup = reportingScenario();
+  const room = setup.ChatServerModel.rows.find(candidate => candidate.code === 'ABC123');
+  room.autoMod = { blockedKeywords: [], mentionLimit: 8, repeatLimit: 3, repeatWindowSeconds: 30 };
+
+  const legacyAck = acknowledge();
+  await setup.modSocket.trigger('get_automod', { serverCode: 'ABC123' }, legacyAck.callback);
+  assert.deepEqual(legacyAck.value(), {
+    autoMod: {
+      blockedKeywords: [], mentionLimit: 8, repeatLimit: 3, repeatWindowSeconds: 30,
+      messageLimit: 5, messageWindowSeconds: 5
+    }
+  });
+
+  const original = structuredClone(room.autoMod);
+  for (const omission of ['messageLimit', 'messageWindowSeconds']) {
+    const request = {
+      serverCode: 'ABC123', blockedKeywords: [], mentionLimit: 8, repeatLimit: 3,
+      repeatWindowSeconds: 30, messageLimit: 5, messageWindowSeconds: 5
+    };
+    delete request[omission];
+    const ack = acknowledge();
+    await setup.modSocket.trigger('update_automod', request, ack.callback);
+    assert.deepEqual(ack.value(), { error: 'Invalid input format.' });
+    assert.deepEqual(room.autoMod, original);
+    assert.equal(setup.ModerationAuditModel.rows.length, 0);
+  }
+});
+
 test('exact-room moderator and global admin can update room AutoMod settings without auditing keywords', async () => {
   const setup = reportingScenario();
   const moderatorSettings = {
     blockedKeywords: ['  ＳＰＡＭ  ', 'spam', 'Spoilers'],
     mentionLimit: 4,
     repeatLimit: 5,
-    repeatWindowSeconds: 60
+    repeatWindowSeconds: 60,
+    messageLimit: 6,
+    messageWindowSeconds: 20
   };
   const moderatorAck = acknowledge();
   await setup.modSocket.trigger('update_automod', {
@@ -780,7 +816,9 @@ test('exact-room moderator and global admin can update room AutoMod settings wit
     blockedKeywords: ['spam', 'spoilers'],
     mentionLimit: 4,
     repeatLimit: 5,
-    repeatWindowSeconds: 60
+    repeatWindowSeconds: 60,
+    messageLimit: 6,
+    messageWindowSeconds: 20
   };
   assert.deepEqual(moderatorAck.value(), { success: true, autoMod: normalizedModeratorSettings });
   assert.deepEqual(
@@ -793,7 +831,9 @@ test('exact-room moderator and global admin can update room AutoMod settings wit
     keywordCount: 2,
     mentionLimit: 4,
     repeatLimit: 5,
-    repeatWindowSeconds: 60
+    repeatWindowSeconds: 60,
+    messageLimit: 6,
+    messageWindowSeconds: 20
   });
   assert.equal(JSON.stringify(setup.ModerationAuditModel.rows).includes('spam'), false);
   assert.equal(JSON.stringify(setup.ModerationAuditModel.rows).includes('spoilers'), false);
@@ -810,12 +850,15 @@ test('exact-room moderator and global admin can update room AutoMod settings wit
     blockedKeywords: ['AdminRule'],
     mentionLimit: 3,
     repeatLimit: 4,
-    repeatWindowSeconds: 45
+    repeatWindowSeconds: 45,
+    messageLimit: 7,
+    messageWindowSeconds: 15
   }, adminAck.callback);
   assert.deepEqual(adminAck.value(), {
     success: true,
     autoMod: {
-      blockedKeywords: ['adminrule'], mentionLimit: 3, repeatLimit: 4, repeatWindowSeconds: 45
+      blockedKeywords: ['adminrule'], mentionLimit: 3, repeatLimit: 4, repeatWindowSeconds: 45,
+      messageLimit: 7, messageWindowSeconds: 15
     }
   });
 
@@ -825,23 +868,28 @@ test('exact-room moderator and global admin can update room AutoMod settings wit
     blockedKeywords: ['LobbyRule'],
     mentionLimit: 2,
     repeatLimit: 3,
-    repeatWindowSeconds: 30
+    repeatWindowSeconds: 30,
+    messageLimit: 8,
+    messageWindowSeconds: 10
   }, globalAck.callback);
   assert.deepEqual(globalAck.value(), {
     success: true,
     autoMod: {
-      blockedKeywords: ['lobbyrule'], mentionLimit: 2, repeatLimit: 3, repeatWindowSeconds: 30
+      blockedKeywords: ['lobbyrule'], mentionLimit: 2, repeatLimit: 3, repeatWindowSeconds: 30,
+      messageLimit: 8, messageWindowSeconds: 10
     }
   });
   assert.deepEqual(setup.ChatServerModel.rows.find(room => room.code === 'global').autoMod, {
-    blockedKeywords: ['lobbyrule'], mentionLimit: 2, repeatLimit: 3, repeatWindowSeconds: 30
+    blockedKeywords: ['lobbyrule'], mentionLimit: 2, repeatLimit: 3, repeatWindowSeconds: 30,
+    messageLimit: 8, messageWindowSeconds: 10
   });
 });
 
 test('update AutoMod settings denies other-room, stale, banned, and non-admin Global moderators', async () => {
   const setup = reportingScenario();
   const requestedSettings = {
-    blockedKeywords: ['private'], mentionLimit: 4, repeatLimit: 4, repeatWindowSeconds: 40
+    blockedKeywords: ['private'], mentionLimit: 4, repeatLimit: 4, repeatWindowSeconds: 40,
+    messageLimit: 5, messageWindowSeconds: 5
   };
   const originalPrivateSettings = structuredClone(
     setup.ChatServerModel.rows.find(room => room.code === 'ABC123').autoMod
@@ -1145,15 +1193,38 @@ test('moderation inputs accept only the supported actions, durations, reasons, a
   assert.equal(normalizeModerationReason(' '.repeat(3)), null);
   assert.equal(normalizeModerationReason('x'.repeat(201)), null);
   assert.deepEqual(Object.keys(MODERATION_DURATIONS).sort(), ['10m', '1h', '24h', '7d'].sort());
+  assert.equal(normalizeAutoModSettings({
+    blockedKeywords: ['spam'], mentionLimit: 5, repeatLimit: 3, repeatWindowSeconds: 30
+  }), null);
+  assert.deepEqual(normalizeStoredAutoModSettings({
+    blockedKeywords: ['spam'], mentionLimit: 5, repeatLimit: 3, repeatWindowSeconds: 30
+  }), {
+    blockedKeywords: ['spam'], mentionLimit: 5, repeatLimit: 3, repeatWindowSeconds: 30,
+    messageLimit: 5, messageWindowSeconds: 5
+  });
   assert.deepEqual(normalizeAutoModSettings({
     blockedKeywords: ['  SPAM  ', 'spam', 'ＢＡＤ'],
     mentionLimit: 5,
     repeatLimit: 3,
-    repeatWindowSeconds: 30
+    repeatWindowSeconds: 30,
+    messageLimit: 5,
+    messageWindowSeconds: 5
   }), {
-    blockedKeywords: ['spam', 'bad'], mentionLimit: 5, repeatLimit: 3, repeatWindowSeconds: 30
+    blockedKeywords: ['spam', 'bad'], mentionLimit: 5, repeatLimit: 3, repeatWindowSeconds: 30,
+    messageLimit: 5, messageWindowSeconds: 5
   });
-  assert.equal(normalizeAutoModSettings({ blockedKeywords: [], mentionLimit: 0, repeatLimit: 3, repeatWindowSeconds: 30 }), null);
+  for (const invalid of [
+    { messageLimit: 0, messageWindowSeconds: 5 },
+    { messageLimit: 21, messageWindowSeconds: 5 },
+    { messageLimit: 5, messageWindowSeconds: 0 },
+    { messageLimit: 5, messageWindowSeconds: 61 },
+    { messageLimit: 1.5, messageWindowSeconds: 5 }
+  ]) {
+    assert.equal(normalizeAutoModSettings({
+      blockedKeywords: [], mentionLimit: 8, repeatLimit: 3, repeatWindowSeconds: 30,
+      ...invalid
+    }), null);
+  }
 });
 
 test('moderation authority is exact-room and respects the global/private action matrix', () => {
@@ -1301,6 +1372,75 @@ test('AutoMod repeat tracker expires entries and remains bounded to ten thousand
   currentTime = 20_000;
   tracker.prune(5_000);
   assert.equal(tracker.size(), 0);
+});
+
+test('message-rate tracker uses accepted attempts, exact rolling boundaries, and bounded shared keys', () => {
+  let currentTime = 0;
+  const tracker = createAutoModTracker({ maxKeys: 10_000, now: () => currentTime });
+  assert.deepEqual(tracker.recordMessageAttempt('ABC123\0admin', 2, 1_000), { allowed: true, shouldAudit: false });
+  currentTime = 100;
+  assert.deepEqual(tracker.recordMessageAttempt('ABC123\0admin', 2, 1_000), { allowed: true, shouldAudit: false });
+  currentTime = 200;
+  assert.deepEqual(tracker.recordMessageAttempt('ABC123\0admin', 2, 1_000), { allowed: false, shouldAudit: true });
+  currentTime = 300;
+  assert.deepEqual(tracker.recordMessageAttempt('ABC123\0admin', 2, 1_000), { allowed: false, shouldAudit: false });
+  currentTime = 1_000;
+  assert.deepEqual(tracker.recordMessageAttempt('ABC123\0admin', 2, 1_000), { allowed: true, shouldAudit: false });
+  assert.equal(tracker.messageAttemptCount('ABC123\0admin'), 2);
+
+  assert.deepEqual(tracker.recordMessageAttempt('ABC123\0alice', 1, 1_000), { allowed: true, shouldAudit: false });
+  assert.deepEqual(tracker.recordMessageAttempt('XYZ789\0admin', 1, 1_000), { allowed: true, shouldAudit: false });
+  assert.equal(tracker.messageAttemptCount('ABC123\0alice'), 1);
+  assert.equal(tracker.messageAttemptCount('XYZ789\0admin'), 1);
+  for (let index = 0; index <= 10_000; index += 1) {
+    tracker.recordMessageAttempt(`ROOM${index}\0user${index}`, 20, 1_000);
+  }
+  assert.equal(tracker.size(), 10_000);
+  assert.equal(tracker.hasKey('ABC123\0admin'), false);
+  assert.equal(tracker.hasKey('ROOM10000\0user10000'), true);
+  assert.ok(tracker.messageAttemptCount('ROOM10000\0user10000') <= 20);
+});
+
+test('message-rate tracker trims immediately when a room lowers its configured limit', () => {
+  let currentTime = 0;
+  const tracker = createAutoModTracker({ now: () => currentTime });
+  for (let index = 0; index < 20; index += 1) {
+    currentTime = index;
+    assert.equal(tracker.recordMessageAttempt('ABC123\0alice', 20, 1_000).allowed, true);
+  }
+  currentTime = 20;
+  assert.deepEqual(tracker.recordMessageAttempt('ABC123\0alice', 1, 1_000), { allowed: false, shouldAudit: true });
+  assert.ok(tracker.messageAttemptCount('ABC123\0alice') <= 1);
+});
+
+test('message-rate tracker shares one bounded map with repeat tracker state', () => {
+  let currentTime = 0;
+  const tracker = createAutoModTracker({ maxKeys: 10_000, now: () => currentTime });
+  for (let index = 0; index < 5_000; index += 1) {
+    tracker.recordAndCheck(`REPEAT${index}\0user${index}`, 'same', 3, 1_000);
+  }
+  for (let index = 0; index < 5_001; index += 1) {
+    tracker.recordMessageAttempt(`RATE${index}\0user${index}`, 1, 1_000);
+  }
+  assert.equal(tracker.size(), 10_000);
+  assert.equal(tracker.hasKey('REPEAT0\0user0'), false);
+  assert.equal(tracker.hasKey('RATE5000\0user5000'), true);
+});
+
+test('AutoMod message-rate policy is role agnostic and canonical-account scoped', () => {
+  let currentTime = 0;
+  const tracker = createAutoModTracker({ now: () => currentTime });
+  const settings = {
+    blockedKeywords: [], mentionLimit: 8, repeatLimit: 3, repeatWindowSeconds: 30,
+    messageLimit: 1, messageWindowSeconds: 1
+  };
+  assert.deepEqual(evaluateMessageRate({ username: 'Alice', serverCode: 'ABC123', settings, tracker }), { allowed: true });
+  assert.deepEqual(evaluateMessageRate({ username: 'aLiCe', serverCode: 'ABC123', settings, tracker }), {
+    allowed: false, rule: 'message_rate', shouldAudit: true
+  });
+  assert.deepEqual(evaluateMessageRate({ username: 'Alice', serverCode: 'XYZ789', settings, tracker }), { allowed: true });
+  currentTime = 1_000;
+  assert.deepEqual(evaluateMessageRate({ username: 'Alice', serverCode: 'ABC123', settings, tracker }), { allowed: true });
 });
 
 test('identical normalized messages share repeat state across same-account sockets but not rooms or accounts', async () => {
