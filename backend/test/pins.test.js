@@ -347,6 +347,49 @@ test('exhausted restore leaves the message safely unpinned emits newer state and
   assert.equal(serialized.includes(attachmentSentinel), false);
 });
 
+test('conflicting same-id restore state is removed before publishing authoritative unpinned state', async () => {
+  const priorPin = { messageId: objectId(1), pinnedAt: new Date(10), pinnedBy: 'ExactMod' };
+  const conflictingPin = { messageId: objectId(1), pinnedAt: new Date(20), pinnedBy: 'Owner' };
+  const setup = fixture({
+    rooms: [room('global'), room('ABC123', {
+      moderators: ['ExactMod'], pinnedMessages: [priorPin], pinVersion: 7
+    })]
+  });
+  const saveStarted = deferred();
+  const releaseSave = deferred();
+  setup.MessageModel.saveHook = async () => {
+    saveStarted.resolve();
+    await releaseSave.promise;
+    throw new Error('delete persistence failed');
+  };
+  const author = authenticate(setup, { id: 'author', username: 'Author' });
+
+  const deletionPending = deleteMessage(author, objectId(1));
+  await saveStarted.promise;
+  const writerRoom = await setup.ChatServerModel.findOneAndUpdate(
+    {
+      code: 'ABC123', pinVersion: 8,
+      'pinnedMessages.messageId': { $ne: objectId(1) }
+    },
+    { $push: { pinnedMessages: conflictingPin }, $inc: { pinVersion: 1 } },
+    { new: true }
+  );
+  assert.equal(writerRoom.pinVersion, 9);
+  assert.deepEqual(writerRoom.pinnedMessages, [conflictingPin]);
+  releaseSave.resolve();
+  const result = await deletionPending;
+
+  const storedRoom = setup.ChatServerModel.rows.find(row => row.code === 'ABC123');
+  assert.deepEqual(result, { error: 'Failed to delete message.' });
+  assert.equal(setup.MessageModel.rows[0].deleted, false);
+  assert.deepEqual(storedRoom.pinnedMessages, []);
+  assert.equal(storedRoom.pinVersion, 10);
+  assert.deepEqual(pinEvents(setup).map(item => item.payload), [{
+    messageId: objectId(1), pinned: false,
+    pin: { serverCode: 'ABC123', pinCount: 0, pinVersion: 10, blockVersion: 0 }
+  }]);
+});
+
 test('pin and delete races serialize under one room lock with no dangling live pin', async () => {
   const priorPin = { messageId: objectId(1), pinnedAt: new Date(10), pinnedBy: 'ExactMod' };
   const setup = fixture({

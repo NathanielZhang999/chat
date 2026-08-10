@@ -1493,16 +1493,25 @@ function createConnectionHandler({
     return !Number.isNaN(pinTime) && pinTime === priorTime;
   }
 
+  function priorPinState(room, priorPin) {
+    const messageId = String(priorPin && priorPin.messageId || '').toLowerCase();
+    const sameMessagePins = (Array.isArray(room && room.pinnedMessages) ? room.pinnedMessages : [])
+      .filter(pin => String(pin && pin.messageId || '').toLowerCase() === messageId);
+    if (sameMessagePins.some(pin => pinsMatchExactPrior(pin, priorPin))) return 'exact';
+    return sameMessagePins.length > 0 ? 'conflict' : 'absent';
+  }
+
   async function restorePinAfterFailedDelete({ room, priorPin, blockVersion }) {
     let observedRoom = room;
     let lastError;
     for (let attempt = 0; attempt < 2; attempt += 1) {
+      let attemptedMutation = null;
       try {
         if (!observedRoom) throw new Error('Pinned message room disappeared.');
-        const alreadyRestored = (Array.isArray(observedRoom.pinnedMessages)
-          ? observedRoom.pinnedMessages : []).some(pin => pinsMatchExactPrior(pin, priorPin));
-        if (!alreadyRestored) {
-          const updatedRoom = await ChatServerModel.findOneAndUpdate(
+        const observedState = priorPinState(observedRoom, priorPin);
+        if (observedState === 'absent') {
+          attemptedMutation = 'restore';
+          const restoredRoom = await ChatServerModel.findOneAndUpdate(
             {
               code: observedRoom.code,
               ...roomPinVersionPredicate(observedRoom),
@@ -1511,8 +1520,22 @@ function createConnectionHandler({
             { $push: { pinnedMessages: priorPin }, $inc: { pinVersion: 1 } },
             { new: true }
           );
-          if (!updatedRoom) throw new Error('Pinned message restoration lost its version race.');
-          observedRoom = updatedRoom;
+          if (!restoredRoom) throw new Error('Pinned message restoration lost its version race.');
+          observedRoom = restoredRoom;
+        } else if (observedState === 'conflict') {
+          attemptedMutation = 'remove_conflict';
+          const messageId = String(priorPin.messageId).toLowerCase();
+          const unpinnedRoom = await ChatServerModel.findOneAndUpdate(
+            {
+              code: observedRoom.code,
+              ...roomPinVersionPredicate(observedRoom),
+              'pinnedMessages.messageId': messageId
+            },
+            { $pull: { pinnedMessages: { messageId } }, $inc: { pinVersion: 1 } },
+            { new: true }
+          );
+          if (!unpinnedRoom) throw new Error('Conflicting pin removal lost its version race.');
+          observedRoom = unpinnedRoom;
         }
       } catch (err) {
         lastError = err;
@@ -1521,15 +1544,29 @@ function createConnectionHandler({
       try {
         const verifiedRoom = await ChatServerModel.findOne({ code: room.code });
         observedRoom = verifiedRoom;
-        const restored = Boolean(verifiedRoom &&
-          (Array.isArray(verifiedRoom.pinnedMessages) ? verifiedRoom.pinnedMessages : [])
-            .some(pin => pinsMatchExactPrior(pin, priorPin)));
-        if (restored) return { restored: true, room: verifiedRoom, blockVersion };
+        if (!verifiedRoom) throw new Error('Pinned message room disappeared during verification.');
+        const verifiedState = priorPinState(verifiedRoom, priorPin);
+        if (verifiedState === 'exact') {
+          return { restored: true, pinned: true, verified: true, room: verifiedRoom, blockVersion };
+        }
+        if (verifiedState === 'absent' && (attemptedMutation === 'remove_conflict' || attempt === 1)) {
+          return { restored: false, pinned: false, verified: true, room: verifiedRoom, blockVersion, error: lastError };
+        }
+        if (verifiedState === 'conflict' && attempt === 1) {
+          return { restored: false, pinned: true, verified: true, room: verifiedRoom, blockVersion, error: lastError };
+        }
       } catch (err) {
         lastError = err;
       }
     }
-    return { restored: false, room: observedRoom, blockVersion, error: lastError };
+    return {
+      restored: false,
+      pinned: null,
+      verified: false,
+      room: observedRoom,
+      blockVersion,
+      error: lastError
+    };
   }
 
   async function quarantineLiveSocket(live, session, roomCodes) {
@@ -4430,20 +4467,14 @@ function createConnectionHandler({
                   room: persistedRoom, priorPin: removed.priorPin, blockVersion
                 });
                 persistedRoom = restored.room || persistedRoom;
-                if (restored.restored) {
-                  await emitMessagePinUpdated({
-                    serverCode: intendedServerCode,
-                    messageId: msgId,
-                    pinned: true,
-                    room: persistedRoom,
-                    targetAuthorKey
-                  });
-                } else {
+                if (!restored.restored) {
                   logUnexpectedError(logger, 'delete_message_pin_restore', restored.error || deleteError);
+                }
+                if (restored.verified) {
                   await emitMessagePinUpdated({
                     serverCode: intendedServerCode,
                     messageId: msgId,
-                    pinned: false,
+                    pinned: restored.pinned,
                     room: persistedRoom,
                     targetAuthorKey
                   });
