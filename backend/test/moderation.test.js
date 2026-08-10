@@ -257,6 +257,7 @@ function registerWithModels(seed = {}) {
     resolvePingsFn: seed.resolvePingsFn || (async text => text),
     logger: seed.logger || { error() {} }
   })(socket);
+  ioInstance.sockets.push(socket);
   return setup;
 }
 
@@ -1648,16 +1649,17 @@ test('identical normalized messages share repeat state across same-account socke
   await secondAlice.trigger('chat_message', { text: 'same  repeat' });
 
   assert.equal(setup.MessageModel.rows.length, 4);
-  assert.deepEqual(setup.ioInstance.outbound.map(item => item.payload.text), [
+  assert.deepEqual(setup.MessageModel.rows.map(item => item.text), [
     repeatText.trim(), 'same repeat', 'same repeat', 'same  repeat'
   ]);
+  assert.equal(setup.ioInstance.outbound.some(item => item.event === 'chat_message'), false);
 
   await new Promise(resolve => setTimeout(resolve, 510));
   await setup.socket.trigger('chat_message', { text: 'same repeat' });
 
   assert.equal(setup.MessageModel.rows.length, 4);
-  assert.equal(setup.ioInstance.outbound.length, 4);
-  assert.deepEqual(setup.socket.outbound, [{
+  assert.equal(setup.ioInstance.outbound.some(item => item.event === 'chat_message'), false);
+  assert.deepEqual(setup.socket.outbound.filter(item => item.event === 'message_blocked'), [{
     target: 'self', event: 'message_blocked',
     payload: { rule: 'content_policy', serverCode: 'ABC123', clientContextId: 1 }
   }]);
@@ -3355,7 +3357,7 @@ for (const action of ['timeout', 'ban']) {
     assert.equal(targetSocket.serverCode, 'ABC123');
     await targetSocket.trigger('typing', true);
     assert.equal(targetSocket.outbound.some(item =>
-      item.target === 'ABC123' && item.event === 'typing' && item.payload.isTyping === true
+      item.target === 'self' && item.event === 'typing' && item.payload.isTyping === true
     ), true);
   });
 }

@@ -185,15 +185,12 @@ test('transactional pinned deletion marks deleted and pulls pin with one committ
     roomUpdates.push({ query: structuredClone(query), update: structuredClone(update), options });
     return updateRoom(query, update, options);
   };
-  const toRoom = setup.ioInstance.to.bind(setup.ioInstance);
-  setup.ioInstance.to = serverCode => {
-    const channel = toRoom(serverCode);
-    return { emit(event, payload) {
-      if (event === 'message_deleted') assert.equal(committed, true);
-      channel.emit(event, payload);
-    } };
-  };
   const author = authenticate(setup, { id: 'author', username: 'Author' });
+  const originalEmit = author.emit.bind(author);
+  author.emit = (event, payload) => {
+    if (event === 'message_deleted') assert.equal(committed, true);
+    originalEmit(event, payload);
+  };
 
   const result = await deleteMessage(author, objectId(1));
 
@@ -212,7 +209,7 @@ test('transactional pinned deletion marks deleted and pulls pin with one committ
     pin: { serverCode: 'ABC123', pinCount: 0, pinVersion: 8, blockVersion: 0 }
   });
   assert.equal(pinEvents(setup).length, 1);
-  assert.equal(setup.ioInstance.outbound.filter(item => item.event === 'message_deleted').length, 1);
+  assert.equal(author.outbound.filter(item => item.event === 'message_deleted').length, 1);
 });
 
 test('fallback deletion pulls and versions the pin before saving the message', async () => {
@@ -701,6 +698,26 @@ test('pin summaries and counts omit authors blocked by each recipient not the pi
   assert.equal(Object.hasOwn(switchAck.value(), 'pins'), false);
 });
 
+test('recipient pin counts change after block without changing room pinVersion', async () => {
+  const pin = { messageId: objectId(1), pinnedAt: new Date(10), pinnedBy: 'ExactMod' };
+  const setup = fixture({
+    rooms: [room('global'), room('ABC123', { pinnedMessages: [pin], pinVersion: 11 }), room('XYZ789')]
+  });
+  const blocker = authenticate(setup, { id: 'blocker', username: 'Blocker' });
+  const before = setup.ChatServerModel.rows.find(candidate => candidate.code === 'ABC123').pinVersion;
+  const ack = acknowledge();
+
+  await blocker.trigger('set_user_block', { username: 'Author', blocked: true }, ack.callback);
+
+  assert.equal(ack.value().success, true);
+  assert.equal(setup.ChatServerModel.rows.find(candidate => candidate.code === 'ABC123').pinVersion, before);
+  const refresh = blocker.outbound.filter(item => item.event === 'message_pin_updated')
+    .find(item => item.payload.pin?.serverCode === 'ABC123');
+  assert.deepEqual(refresh.payload.pin, {
+    serverCode: 'ABC123', pinCount: 0, pinVersion: 11, blockVersion: 1
+  });
+});
+
 test('pin events are fresh-access checked recipient-aware and monotonically versioned', async () => {
   const setup = fixture();
   const mod = authenticate(setup, { id: 'mod', username: 'ExactMod' });
@@ -725,8 +742,7 @@ test('pin events are fresh-access checked recipient-aware and monotonically vers
   assert.equal((await setPin(mod, objectId(1), false)).pin.pinVersion, 2);
 
   const memberEvents = memberOtherSession.outbound.filter(item => item.event === 'message_pin_updated');
-  assert.equal(memberEvents.length, 1);
-  assert.equal(memberEvents[0].payload.pin.pinVersion, 1);
+  assert.equal(memberEvents.length, 0);
   assert.deepEqual(inspectingAdmin.outbound.filter(item => item.event === 'message_pin_updated')
     .map(item => item.payload.pin.pinVersion), [1, 2]);
   assert.equal(blocked.outbound.some(item => item.event === 'message_pin_updated'), false);

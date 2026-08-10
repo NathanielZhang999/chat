@@ -80,6 +80,12 @@ function normalizeAccountKey(value) {
   return String(value || '').normalize('NFKC').trim().toLowerCase();
 }
 
+function isPlainObject(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
 function normalizeRoomText(value, maxLength) {
   if (typeof value !== 'string') return null;
   const normalized = value.normalize('NFKC').trim();
@@ -299,6 +305,26 @@ function safeBlockState(row) {
     blockedUsers,
     blockVersion: Number.isInteger(row && row.blockVersion) && row.blockVersion >= 0 ? row.blockVersion : 0
   };
+}
+
+function blockSetFromState(row) {
+  return new Set(safeBlockState(row).blockedUsers.map(item => item.usernameKey));
+}
+
+function replaceAccountBlockCaches(sockets, usernameKey, state, onlineUsersMap = onlineUsers) {
+  const accountKey = normalizeAccountKey(usernameKey);
+  const safeState = safeBlockState(state);
+  const blockedUsers = safeState.blockedUsers.map(item => item.usernameKey);
+  for (const live of Array.isArray(sockets) ? sockets : []) {
+    const session = onlineUsersMap.get(live.id);
+    if (normalizeAccountKey(live.username || session?.username) !== accountKey) continue;
+    live.blockedUserKeys = new Set(blockedUsers);
+    live.blockVersion = safeState.blockVersion;
+    if (session) {
+      session.blockedUsers = [...blockedUsers];
+      session.blockVersion = safeState.blockVersion;
+    }
+  }
 }
 
 function normalizeAutoModSettings(value) {
@@ -593,9 +619,12 @@ function appendBoundedHistory(history, entry, limit = 20) {
 }
 
 function createReplySnapshot(message) {
+  const authorKey = authorKeyForMessage(message);
+  if (!authorKey) return null;
   const text = typeof message.text === 'string' ? message.text.slice(0, 100) : '';
   return {
     id: String(message._id),
+    authorKey,
     displayname: message.displayName || message.username,
     text: text || (message.attachment ? 'Image Attachment' : '')
   };
@@ -993,7 +1022,7 @@ const ModerationReport = mongoose.model('ModerationReport', ModerationReportSche
 
 const ReplySnapshotSchema = new mongoose.Schema({
   id: { type: String, required: true, maxLength: 24 },
-  authorKey: { type: String, default: '', maxLength: 20 },
+  authorKey: { type: String, default: '', maxLength: 20, immutable: true },
   displayname: { type: String, required: true, maxLength: 30 },
   text: { type: String, required: true, maxLength: 100 }
 }, { _id: false });
@@ -1224,13 +1253,28 @@ function createConnectionHandler({
     return [...byId.values()];
   }
 
+  async function ensureBlockState(usernameKey, { session = null } = {}) {
+    const key = normalizeAccountKey(usernameKey);
+    let row = await applyQuerySession(UserExperienceStateModel.findOne({ usernameKey: key }), session);
+    if (!row) {
+      try {
+        row = await UserExperienceStateModel.findOneAndUpdate(
+          { usernameKey: key },
+          { $setOnInsert: { usernameKey: key, blockedUsers: [], blockVersion: 0 } },
+          { upsert: true, new: true, setDefaultsOnInsert: true, ...(session ? { session } : {}) }
+        );
+      } catch (err) {
+        if (!err || err.code !== 11000) throw err;
+      }
+    }
+    if (!row) row = await applyQuerySession(UserExperienceStateModel.findOne({ usernameKey: key }), session);
+    if (!row) throw new Error('Block state initialization failed.');
+    return safeBlockState(row);
+  }
+
   async function loadDurableBlockState(usernameKey, { session = null } = {}) {
-    const row = await applyQuerySession(
-      UserExperienceStateModel.findOne({ usernameKey: normalizeAccountKey(usernameKey) }),
-      session
-    );
-    const snapshot = safeBlockState(row);
-    const blockedUserKeys = new Set(snapshot.blockedUsers.map(item => item.usernameKey));
+    const snapshot = await ensureBlockState(usernameKey, { session });
+    const blockedUserKeys = blockSetFromState(snapshot);
     blockedUserKeys.blockVersion = snapshot.blockVersion;
     return { snapshot, blockedUserKeys };
   }
@@ -1395,51 +1439,222 @@ function createConnectionHandler({
     return normalizedBlockedUserKeys(Array.isArray(session && session.blockedUsers) ? session.blockedUsers : []);
   }
 
-  async function emitMessagePinUpdated({ serverCode, messageId, pinned, room, targetAuthorKey }) {
+  function blockVersionForLiveSession(live, session) {
+    if (Number.isInteger(live?.blockVersion) && live.blockVersion >= 0) return live.blockVersion;
+    return Number.isInteger(session?.blockVersion) && session.blockVersion >= 0 ? session.blockVersion : 0;
+  }
+
+  async function emitPersonalizedRoomEvent({ serverCode, event, buildPayload }) {
+    const canonicalRoom = normalizeServerCode(serverCode);
+    if (!canonicalRoom || typeof event !== 'string' || typeof buildPayload !== 'function') return;
     let liveSockets;
     try {
       liveSockets = await fetchLiveSockets();
     } catch (err) {
-      logUnexpectedError(logger, 'pin_notification_socket_discovery', err);
+      logUnexpectedError(logger, 'personalized_socket_discovery', err);
       return;
     }
-    const candidates = await loadPinCandidates(room);
     const accounts = new Map();
     for (const live of liveSockets) {
+      if (normalizeServerCode(live.serverCode) !== canonicalRoom) continue;
       const session = onlineUsersMap.get(live.id);
-      const username = live.username || session?.username;
-      const accountKey = normalizeAccountKey(username);
-      if (!normalizeUsername(username) || !accountKey) continue;
-      if (!accounts.has(accountKey)) accounts.set(accountKey, { username, sockets: [] });
-      accounts.get(accountKey).sockets.push({ live, session });
+      const username = normalizeUsername(live.username || session?.username);
+      const usernameKey = normalizeAccountKey(username);
+      if (!username || !usernameKey) continue;
+      if (!accounts.has(usernameKey)) accounts.set(usernameKey, { username, sockets: [] });
+      accounts.get(usernameKey).sockets.push(live);
     }
     for (const { username, sockets } of accounts.values()) {
+      let access;
       try {
-        const access = await loadRoomAccessState({
-          UserModel, ChatServerModel, RoomRestrictionModel, username, serverCode
+        access = await loadRoomAccessState({
+          UserModel, ChatServerModel, RoomRestrictionModel, username, serverCode: canonicalRoom
         });
-        if (!access.allowed || access.restriction.banned || !access.user) continue;
-        const actualMember = Array.isArray(access.user.servers) && access.user.servers.includes(serverCode);
-        for (const { live, session } of sockets) {
-          const activeRoom = live.serverCode ?? session?.serverCode ?? null;
-          const adminInspecting = access.user.role === 'admin' && activeRoom === serverCode;
-          if (!actualMember && !adminInspecting) continue;
-          const blockedUserKeys = blockCacheForLiveSession(live, session);
-          if (blockedUserKeys.has(targetAuthorKey)) continue;
-          const pinCount = visiblePinsFromCandidates(candidates, blockedUserKeys).length;
-          const blockVersion = Number.isInteger(live.blockVersion) && live.blockVersion >= 0
-            ? live.blockVersion
-            : (Number.isInteger(session?.blockVersion) && session.blockVersion >= 0 ? session.blockVersion : 0);
-          live.emit('message_pin_updated', {
-            messageId,
-            pinned,
-            pin: { serverCode, pinCount, pinVersion: pinVersionForRoom(room), blockVersion }
-          });
-        }
       } catch (err) {
-        logUnexpectedError(logger, 'pin_notification', err);
+        logUnexpectedError(logger, 'personalized_room_access', err);
+        continue;
+      }
+      if (!access.allowed || access.restriction.banned || !access.user || !access.room) continue;
+      for (const live of sockets) {
+        if (normalizeServerCode(live.serverCode) !== canonicalRoom) continue;
+        const session = onlineUsersMap.get(live.id);
+        const blockedUserKeys = blockCacheForLiveSession(live, session);
+        const blockVersion = blockVersionForLiveSession(live, session);
+        let payload = buildPayload({ live, access, blockedUserKeys, blockVersion });
+        if (payload && typeof payload.then === 'function') {
+          payload = await payload;
+          if (blockVersionForLiveSession(live, onlineUsersMap.get(live.id)) !== blockVersion) {
+            const freshSession = onlineUsersMap.get(live.id);
+            payload = buildPayload({
+              live,
+              access,
+              blockedUserKeys: blockCacheForLiveSession(live, freshSession),
+              blockVersion: blockVersionForLiveSession(live, freshSession)
+            });
+            if (payload && typeof payload.then === 'function') payload = await payload;
+          }
+        }
+        if (payload === null || payload === undefined) continue;
+        if (normalizeServerCode(live.serverCode) !== canonicalRoom) continue;
+        const freshSession = onlineUsersMap.get(live.id);
+        const freshVersion = blockVersionForLiveSession(live, freshSession);
+        if (freshVersion !== blockVersion) {
+          payload = buildPayload({
+            live,
+            access,
+            blockedUserKeys: blockCacheForLiveSession(live, freshSession),
+            blockVersion: freshVersion
+          });
+          if (payload && typeof payload.then === 'function') payload = await payload;
+          if (payload === null || payload === undefined) continue;
+        }
+        live.emit(event, payload);
       }
     }
+  }
+
+  async function emitMessagePinUpdated({ serverCode, messageId, pinned, room, targetAuthorKey }) {
+    const candidates = await loadPinCandidates(room);
+    await emitPersonalizedRoomEvent({
+      serverCode,
+      event: 'message_pin_updated',
+      buildPayload: ({ blockedUserKeys, blockVersion }) => {
+        if (!targetAuthorKey || blockedUserKeys.has(targetAuthorKey)) return null;
+        return {
+          messageId,
+          pinned,
+          pin: {
+            serverCode,
+            pinCount: visiblePinsFromCandidates(candidates, blockedUserKeys).length,
+            pinVersion: pinVersionForRoom(room),
+            blockVersion
+          }
+        };
+      }
+    });
+  }
+
+  function clearBlockedTypingEntries(live, session, blockedUserKeys) {
+    for (const holder of [live, session]) {
+      const typing = holder?.typingUsers;
+      if (typing instanceof Set || typing instanceof Map) {
+        for (const username of [...typing.keys()]) {
+          if (blockedUserKeys.has(normalizeAccountKey(username))) typing.delete(username);
+        }
+      } else if (Array.isArray(typing)) {
+        holder.typingUsers = typing.filter(username => !blockedUserKeys.has(normalizeAccountKey(username)));
+      } else if (typing && typeof typing === 'object') {
+        for (const username of Object.keys(typing)) {
+          if (blockedUserKeys.has(normalizeAccountKey(username))) delete typing[username];
+        }
+      }
+    }
+  }
+
+  async function refreshBlockerSessions({ usernameKey, state, sockets }) {
+    const accountKey = normalizeAccountKey(usernameKey);
+    const safeState = safeBlockState(state);
+    const blockedUserKeys = blockSetFromState(safeState);
+    blockedUserKeys.blockVersion = safeState.blockVersion;
+    const actor = await findUserByUsername(UserModel, accountKey);
+    if (!actor) return;
+    const memberships = [...new Set(Array.isArray(actor.servers) ? actor.servers : [])];
+    const roomSnapshots = new Map();
+    for (const serverCode of memberships) {
+      const access = await loadRoomAccessState({
+        UserModel, ChatServerModel, RoomRestrictionModel, username: actor.username, serverCode
+      });
+      const actualMember = Array.isArray(access.user?.servers) && access.user.servers.includes(serverCode);
+      if (!access.allowed || access.restriction.banned || !access.room || !actualMember) continue;
+      roomSnapshots.set(serverCode, {
+        attention: await loadRoomStateSnapshot({
+          usernameKey: accountKey, serverCode, blockedUserKeys
+        }),
+        pin: await visiblePinCountSnapshot({
+          room: access.room, blockedUserKeys, blockVersion: safeState.blockVersion
+        })
+      });
+    }
+    for (const live of Array.isArray(sockets) ? sockets : []) {
+      const session = onlineUsersMap.get(live.id);
+      if (normalizeAccountKey(live.username || session?.username) !== accountKey) continue;
+      delete live.pinsCache;
+      delete live.pinCache;
+      if (session) {
+        delete session.pinsCache;
+        delete session.pinCache;
+      }
+      clearBlockedTypingEntries(live, session, blockedUserKeys);
+      for (const { attention, pin } of roomSnapshots.values()) {
+        live.emit('room_attention_updated', attention);
+        live.emit('message_pin_updated', { pin });
+      }
+      const activeRoom = normalizeServerCode(live.serverCode);
+      if (activeRoom && roomSnapshots.has(activeRoom)) {
+        live.emit('room_refresh_required', {
+          serverCode: activeRoom,
+          blockVersion: safeState.blockVersion
+        });
+      }
+    }
+  }
+
+  function publicBlockMutationState(target, state) {
+    const safeState = safeBlockState(state);
+    return {
+      success: true,
+      usernameKey: normalizeAccountKey(target.username),
+      username: normalizeUsername(target.username),
+      blockedUsers: safeState.blockedUsers,
+      blockVersion: safeState.blockVersion
+    };
+  }
+
+  async function applyBlockMutation({ usernameKey, target, blocked, sockets }) {
+    let observed = await ensureBlockState(usernameKey);
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const currentKeys = blockSetFromState(observed);
+      const targetKey = normalizeAccountKey(target.username);
+      const alreadyDesired = currentKeys.has(targetKey) === blocked;
+      if (alreadyDesired) break;
+      if (blocked && observed.blockedUsers.length >= 500) return { error: 'Block limit reached.' };
+      const version = observed.blockVersion;
+      const versionPredicate = version === 0
+        ? { $or: [{ blockVersion: 0 }, { blockVersion: { $exists: false } }] }
+        : { blockVersion: version };
+      const statePredicate = blocked
+        ? { 'blockedUsers.usernameKey': { $ne: targetKey } }
+        : { 'blockedUsers.usernameKey': targetKey };
+      const update = blocked
+        ? { $push: { blockedUsers: {
+          usernameKey: targetKey,
+          username: normalizeUsername(target.username),
+          createdAt: new Date()
+        } }, $inc: { blockVersion: 1 } }
+        : { $pull: { blockedUsers: { usernameKey: targetKey } }, $inc: { blockVersion: 1 } };
+      const updated = await UserExperienceStateModel.findOneAndUpdate(
+        { usernameKey, ...versionPredicate, ...statePredicate },
+        update,
+        { new: true }
+      );
+      if (updated) {
+        observed = safeBlockState(updated);
+        break;
+      }
+      observed = await ensureBlockState(usernameKey);
+    }
+    if (blockSetFromState(observed).has(normalizeAccountKey(target.username)) !== blocked) {
+      return { error: 'Block state changed. Reload and try again.' };
+    }
+    replaceAccountBlockCaches(sockets, usernameKey, observed, onlineUsersMap);
+    const publication = publicBlockMutationState(target, observed);
+    for (const live of Array.isArray(sockets) ? sockets : []) {
+      const session = onlineUsersMap.get(live.id);
+      if (normalizeAccountKey(live.username || session?.username) !== usernameKey) continue;
+      live.emit('user_block_updated', publication);
+    }
+    await refreshBlockerSessions({ usernameKey, state: observed, sockets });
+    return publication;
   }
 
   function exactStoredPin(room, messageId) {
@@ -2335,7 +2550,6 @@ function createConnectionHandler({
         socket.blockedUserKeys = new Set(blockedUserKeys);
         socket.blockVersion = blockState.blockVersion;
 
-        if (defaultServerCode) await Promise.resolve(socket.join(defaultServerCode));
         onlineUsersMap.set(socket.id, {
           username: user.username,
           displayName: socket.displayName,
@@ -2348,6 +2562,7 @@ function createConnectionHandler({
           blockedUsers: [...blockedUserKeys],
           blockVersion: blockState.blockVersion
         });
+        if (defaultServerCode) await Promise.resolve(socket.join(defaultServerCode));
 
         const serversToUpdate = new Set(joinedServers);
         serversToUpdate.forEach(c => broadcastOnlineUsersFn(c));
@@ -2383,6 +2598,91 @@ function createConnectionHandler({
     } catch (err) {
       logUnexpectedError(logger, 'login', err);
       callback({ error: 'Login failed.' });
+    }
+  });
+
+  socket.on('set_user_block', async (data, callback) => {
+    callback = safeAck(callback);
+    if (!socket.username) return callback({ error: 'Not authenticated.' });
+    if (!isPlainObject(data) || typeof data.blocked !== 'boolean') {
+      return callback({ error: 'Invalid input format.' });
+    }
+    const requestedUsername = normalizeUsername(data.username);
+    if (!requestedUsername) return callback({ error: 'Invalid input format.' });
+    const actorUsername = socket.username;
+    try {
+      const result = await withAccountTransitionLock(actorUsername, async () => {
+        if (normalizeAccountKey(socket.username) !== normalizeAccountKey(actorUsername)) {
+          return { error: 'Unable to update block.' };
+        }
+        const target = await findUserByUsername(UserModel, requestedUsername);
+        if (!target || normalizeAccountKey(target.username) === normalizeAccountKey(actorUsername)) {
+          return { error: 'Unable to update block.' };
+        }
+        const sockets = await fetchLiveSockets();
+        return applyBlockMutation({
+          usernameKey: normalizeAccountKey(actorUsername), target, blocked: data.blocked, sockets
+        });
+      });
+      callback(result);
+    } catch (err) {
+      logUnexpectedError(logger, 'set_user_block', err);
+      callback({ error: 'Failed to update block.' });
+    }
+  });
+
+  socket.on('get_blocked_message', async (data, callback) => {
+    callback = safeAck(callback);
+    if (!socket.username) return callback({ error: 'Not authenticated.' });
+    if (!isPlainObject(data)) return callback({ error: 'Invalid input format.' });
+    const serverCode = normalizeServerCode(data.serverCode);
+    const rawMessageId = typeof data.messageId === 'string' ? data.messageId : '';
+    const messageId = rawMessageId.toLowerCase();
+    const clientContextId = normalizeClientContextId(data.clientContextId);
+    if (!serverCode || !isValidObjectId(rawMessageId) || clientContextId === null) {
+      return callback({ error: 'Invalid input format.' });
+    }
+    if (normalizeServerCode(socket.serverCode) !== serverCode) {
+      return callback({ error: 'Permission denied.' });
+    }
+    const actorUsername = socket.username;
+    try {
+      const result = await withAccountTransitionLock(actorUsername, () =>
+        withRoomMutationLock(serverCode, async () => {
+          if (normalizeAccountKey(socket.username) !== normalizeAccountKey(actorUsername) ||
+              normalizeServerCode(socket.serverCode) !== serverCode) {
+            return { error: 'Permission denied.' };
+          }
+          const access = await loadRoomAccessState({
+            UserModel, ChatServerModel, RoomRestrictionModel, username: actorUsername, serverCode
+          });
+          if (!access.allowed || access.restriction.banned || !access.user || !access.room) {
+            return { error: 'Permission denied.' };
+          }
+          const target = await MessageModel.findById(messageId);
+          const targetServerCode = normalizeServerCode(target?.serverCode || 'global');
+          const authorKey = authorKeyForMessage(target);
+          if (!target || targetServerCode !== serverCode || !authorKey) {
+            return { error: 'Permission denied.' };
+          }
+          const blockState = await ensureBlockState(access.user.username);
+          if (!blockSetFromState(blockState).has(authorKey)) return { error: 'Permission denied.' };
+          const safeTarget = safeBlockedMessageReveal(target);
+          if (!safeTarget) return { error: 'Permission denied.' };
+          return {
+            success: true,
+            serverCode,
+            messageId,
+            clientContextId,
+            blockVersion: blockState.blockVersion,
+            message: { ...safeTarget, serverCode }
+          };
+        })
+      );
+      callback(result);
+    } catch (err) {
+      logUnexpectedError(logger, 'get_blocked_message', err);
+      callback({ error: 'Failed to load blocked message.' });
     }
   });
 
@@ -4039,7 +4339,10 @@ function createConnectionHandler({
           .limit(100)
           .lean();
         const safeHistory = history
-          .map(storedMessage => safeMessageForViewer(storedMessage, { blockedUserKeys }))
+          .map(storedMessage => {
+            const safeMessage = safeMessageForViewer(storedMessage, { blockedUserKeys });
+            return safeMessage ? { ...safeMessage, serverCode } : null;
+          })
           .filter(Boolean)
           .reverse();
         access = await loadRoomAccessState({
@@ -4210,7 +4513,8 @@ function createConnectionHandler({
         let replyTo = null;
         if (payload.replyTo && typeof payload.replyTo === 'object' && isValidObjectId(payload.replyTo.id)) {
           const referenced = await MessageModel.findById(payload.replyTo.id);
-          if (referenced && !referenced.deleted && referenced.serverCode === serverCode) {
+          if (referenced && !referenced.deleted &&
+              normalizeServerCode(referenced.serverCode || 'global') === serverCode) {
             replyTo = createReplySnapshot(referenced);
           }
         }
@@ -4248,13 +4552,15 @@ function createConnectionHandler({
 
         const msg = await MessageModel.create({
             serverCode, username: socket.username, displayName: socket.displayName,
+            authorKey: normalizeAccountKey(access.user.username),
             role: socket.role, roomRole: freshRoomRole, color: socket.color, avatarUrl: socket.avatarUrl,
             text: cleanText, attachment, replyTo, reactions: {}
         });
 
-        ioInstance.to(msg.serverCode || serverCode).emit('chat_message', {
-            _id: msg._id, username: msg.username, displayName: msg.displayName, role: msg.role, roomRole: msg.roomRole, color: msg.color, avatarUrl: msg.avatarUrl,
-            text: msg.text, attachment: sanitizeAttachment(msg.attachment), replyTo: msg.replyTo, reactions: {}, timestamp: msg.timestamp, edited: false, deleted: false
+        await emitPersonalizedRoomEvent({
+          serverCode: msg.serverCode || serverCode,
+          event: 'chat_message',
+          buildPayload: ({ blockedUserKeys }) => safeMessageForViewer(msg, { blockedUserKeys })
         });
       });
     } catch (err) {
@@ -4306,7 +4612,15 @@ function createConnectionHandler({
             msg.markModified('reactions');
             await msg.save();
 
-            ioInstance.to(msg.serverCode).emit('reaction_updated', { id: msg._id, reactions: msg.reactions });
+            const targetAuthorKey = authorKeyForMessage(msg);
+            await emitPersonalizedRoomEvent({
+              serverCode: msg.serverCode,
+              event: 'reaction_updated',
+              buildPayload: ({ blockedUserKeys }) => {
+                if (!targetAuthorKey || blockedUserKeys.has(targetAuthorKey)) return null;
+                return { id: msg._id, reactions: safeReactionsForViewer(msg.reactions, blockedUserKeys) };
+              }
+            });
           });
       } catch (err) {
           logUnexpectedError(logger, 'toggle_reaction', err);
@@ -4373,7 +4687,21 @@ function createConnectionHandler({
                 msg.history = appendBoundedHistory(msg.history, { text: msg.text, timestamp: new Date() });
                 msg.text = cleanText; msg.edited = true; msg.markModified('history');
                 await msg.save();
-                ioInstance.to(msg.serverCode).emit('message_edited', { id: msg._id, username: msg.username, role: msg.role, roomRole: msg.roomRole, text: cleanText });
+                const targetAuthorKey = authorKeyForMessage(msg);
+                await emitPersonalizedRoomEvent({
+                  serverCode: msg.serverCode,
+                  event: 'message_edited',
+                  buildPayload: ({ blockedUserKeys }) => {
+                    if (!targetAuthorKey || blockedUserKeys.has(targetAuthorKey)) return null;
+                    return {
+                      id: msg._id,
+                      username: normalizeUsername(msg.username) || targetAuthorKey,
+                      role: typeof msg.role === 'string' ? msg.role : 'user',
+                      roomRole: typeof msg.roomRole === 'string' ? msg.roomRole : 'user',
+                      text: typeof msg.text === 'string' ? msg.text : ''
+                    };
+                  }
+                });
             }
           });
         }
@@ -4497,7 +4825,14 @@ function createConnectionHandler({
               targetAuthorKey
             });
           }
-          ioInstance.to(intendedServerCode).emit('message_deleted', msgId);
+          await emitPersonalizedRoomEvent({
+            serverCode: intendedServerCode,
+            event: 'message_deleted',
+            buildPayload: ({ blockedUserKeys: recipientBlocks }) => {
+              if (!targetAuthorKey || recipientBlocks.has(targetAuthorKey)) return null;
+              return { id: msgId, serverCode: intendedServerCode };
+            }
+          });
           const pin = await visiblePinCountSnapshot({
             room: persistedRoom, blockedUserKeys, blockVersion
           });
@@ -4518,6 +4853,11 @@ function createConnectionHandler({
       if (!isValidObjectId(msgId)) return callback({ error: 'Invalid input format.' });
       const msg = await MessageModel.findById(msgId);
       if (msg) {
+        const authorKey = authorKeyForMessage(msg);
+        const blockState = await ensureBlockState(socket.username);
+        if (!authorKey || blockSetFromState(blockState).has(authorKey)) {
+          return callback({ error: 'Permission denied.' });
+        }
         const identity = { role: socket.role, joinedServers: socket.joinedServers || [] };
         if (!canAccessRoom(identity, msg.serverCode)) return callback({ error: 'Permission denied.' });
         const restriction = await getActiveRoomRestriction(RoomRestrictionModel, msg.serverCode, socket.username);
@@ -4542,6 +4882,11 @@ function createConnectionHandler({
       if (!isValidObjectId(msgId)) return callback({ error: 'Invalid input format.' });
       const msg = await MessageModel.findById(msgId);
       if (msg && msg.deleted) {
+        const authorKey = authorKeyForMessage(msg);
+        const blockState = await ensureBlockState(socket.username);
+        if (!authorKey || blockSetFromState(blockState).has(authorKey)) {
+          return callback({ error: 'Permission denied.' });
+        }
         const identity = { role: socket.role, joinedServers: socket.joinedServers || [] };
         if (!canAccessRoom(identity, msg.serverCode)) return callback({ error: 'Permission denied.' });
         const restriction = await getActiveRoomRestriction(RoomRestrictionModel, msg.serverCode, socket.username);
@@ -4576,10 +4921,18 @@ function createConnectionHandler({
         });
         if (socket.serverCode !== intendedServerCode || !access.allowed ||
             access.restriction.timedOut || !canAccessRoom(socket, serverCode)) return;
-        socket.to(serverCode).emit('typing', {
-          username: socket.username,
-          displayName: socket.displayName || socket.username,
-          isTyping
+        const typingAuthorKey = normalizeAccountKey(access.user.username);
+        await emitPersonalizedRoomEvent({
+          serverCode,
+          event: 'typing',
+          buildPayload: ({ blockedUserKeys }) => {
+            if (blockedUserKeys.has(typingAuthorKey)) return null;
+            return {
+              username: access.user.username,
+              displayName: socket.displayName || access.user.username,
+              isTyping
+            };
+          }
         });
       });
     } catch (err) {
@@ -4587,7 +4940,7 @@ function createConnectionHandler({
     }
   });
 
-  socket.on('disconnect', () => {
+  socket.on('disconnect', async () => {
     if (suppressDisconnectPresence) {
       onlineUsersMap.delete(socket.id);
       return;
@@ -4608,7 +4961,15 @@ function createConnectionHandler({
         const isVisible = socket.role !== 'admin' || (joinedServers && joinedServers.includes(serverCode)) || serverCode === 'global';
         if (isVisible) {
             ioInstance.to(serverCode).emit('system_message', `${dName} disconnected.`);
-            ioInstance.to(serverCode).emit('typing', { username: socket.username, isTyping: false });
+            const typingAuthorKey = normalizeAccountKey(socket.username);
+            await emitPersonalizedRoomEvent({
+              serverCode,
+              event: 'typing',
+              buildPayload: ({ blockedUserKeys }) => {
+                if (blockedUserKeys.has(typingAuthorKey)) return null;
+                return { username: socket.username, displayName: dName, isTyping: false };
+              }
+            });
         }
       }
     }
@@ -4681,6 +5042,8 @@ module.exports = {
   safeRoomDetails,
   safeRoomState,
   safeBlockState,
+  blockSetFromState,
+  replaceAccountBlockCaches,
   createAutoModTracker,
   evaluateAutoMod,
   evaluateMessageRate,

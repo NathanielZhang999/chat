@@ -194,7 +194,7 @@ test('rate-limited messages skip reply lookup, ping resolution, persistence, and
   assert.equal(creates, 2);
   assert.equal(replyLookups, 0);
   assert.equal(pingResolutions, 0);
-  assert.equal(ioInstance.outbound.filter(item => item.event === 'chat_message').length, 2);
+  assert.equal(socket.outbound.filter(item => item.event === 'chat_message').length, 2);
   assert.equal(socket.outbound.filter(item => item.event === 'message_blocked').length, 2);
   assert.equal(audits.filter(item => item.metadata?.rule === 'message_rate').length, 1);
   for (const [label, records] of [
@@ -231,7 +231,7 @@ test('default AutoMod accepts five immediate distinct sends and blocks the sixth
   }
   await socket.trigger('chat_message', { text: 'sixth distinct message' });
   assert.equal(creates, 5);
-  assert.equal(ioInstance.outbound.filter(item => item.event === 'chat_message').length, 5);
+  assert.equal(socket.outbound.filter(item => item.event === 'chat_message').length, 5);
   assert.equal(socket.outbound.filter(item => item.event === 'message_blocked').length, 1);
 });
 
@@ -424,8 +424,8 @@ test('editing emits only to the active stored message room', async () => {
   const { socket, ioInstance } = registerMessages({ MessageModel });
   authenticate(socket, { serverCode: 'ABC123', joinedServers: ['global', 'ABC123'] });
   await socket.trigger('edit_message', { id: message._id, text: 'after' });
-  assert.equal(ioInstance.outbound.at(-1).room, 'ABC123');
-  assert.equal(ioInstance.outbound.at(-1).event, 'message_edited');
+  assert.equal(socket.outbound.at(-1).target, 'self');
+  assert.equal(socket.outbound.at(-1).event, 'message_edited');
 });
 
 test('message reply snapshot comes from the stored same-room message', async () => {
@@ -449,8 +449,124 @@ test('message reply snapshot comes from the stored same-room message', async () 
   });
   assert.deepEqual(created.replyTo, {
     id: referenced._id,
+    authorKey: 'bob',
     displayname: 'Bob',
     text: 'trusted stored text'
+  });
+});
+
+test('new replies persist immutable authorKey from the exact-room source', async () => {
+  let created;
+  const referenced = {
+    _id: '507f1f77bcf86cd799439011', serverCode: 'ABC123', username: 'BoB', authorKey: 'bob',
+    displayName: 'Bob', text: 'trusted source', deleted: false
+  };
+  const { socket } = registerMessages({
+    MessageModel: {
+      async findById() { return referenced; },
+      async create(value) {
+        created = value;
+        return { ...value, _id: '507f191e810c19729de860ea', timestamp: new Date() };
+      }
+    }
+  });
+  authenticate(socket, { serverCode: 'ABC123', joinedServers: ['global', 'ABC123'] });
+
+  await socket.trigger('chat_message', {
+    text: 'reply', replyTo: {
+      id: referenced._id, authorKey: 'attacker', displayname: 'Attacker', text: 'forged'
+    }
+  });
+
+  assert.deepEqual(created.replyTo, {
+    id: referenced._id, authorKey: 'bob', displayname: 'Bob', text: 'trusted source'
+  });
+});
+
+test('reaction updates remove identities blocked by each recipient', async () => {
+  const message = {
+    _id: '507f1f77bcf86cd799439011', serverCode: 'ABC123', username: 'Carol', authorKey: 'carol',
+    deleted: false, reactions: { '👍': ['Bob'] }, markModified() {}, async save() {}
+  };
+  const sockets = ['alice', 'blocker', 'open'].map(id => {
+    const live = new FakeSocket();
+    live.id = id;
+    return live;
+  });
+  const ioInstance = new FakeIo(sockets);
+  const onlineUsersMap = new Map();
+  const users = createMemoryModel([
+    { username: 'Alice', role: 'user', servers: ['global', 'ABC123'] },
+    { username: 'Blocker', role: 'user', servers: ['global', 'ABC123'] },
+    { username: 'Open', role: 'user', servers: ['global', 'ABC123'] }
+  ]);
+  const deps = {
+    ioInstance, onlineUsersMap, UserModel: users,
+    ChatServerModel: createMemoryModel([{ code: 'ABC123', moderators: [] }]),
+    MessageModel: { async findById() { return message; } },
+    RoomRestrictionModel: createMemoryModel([]), UserExperienceStateModel: createMemoryModel([]),
+    broadcastOnlineUsersFn: async () => {}, getRoomRoleFn: async () => 'user',
+    resolvePingsFn: async text => text
+  };
+  for (const live of sockets) createConnectionHandler(deps)(live);
+  Object.assign(sockets[0], { username: 'Alice', displayName: 'Alice', role: 'user' });
+  Object.assign(sockets[1], { username: 'Blocker', displayName: 'Blocker', role: 'user', blockedUserKeys: new Set(['bob']), blockVersion: 2 });
+  Object.assign(sockets[2], { username: 'Open', displayName: 'Open', role: 'user', blockedUserKeys: new Set(), blockVersion: 0 });
+  for (const live of sockets) {
+    live.serverCode = 'ABC123';
+    live.joinedServers = ['global', 'ABC123'];
+    onlineUsersMap.set(live.id, {
+      username: live.username, serverCode: 'ABC123', joinedServers: [...live.joinedServers],
+      blockedUsers: [...(live.blockedUserKeys || [])], blockVersion: live.blockVersion || 0
+    });
+  }
+
+  await sockets[0].trigger('toggle_reaction', { id: message._id, emoji: '👍' });
+
+  assert.deepEqual(sockets[1].outbound.find(item => item.event === 'reaction_updated').payload.reactions, {
+    '👍': ['Alice']
+  });
+  assert.deepEqual(sockets[2].outbound.find(item => item.event === 'reaction_updated').payload.reactions, {
+    '👍': ['Bob', 'Alice']
+  });
+});
+
+test('typing from a blocked author is suppressed only for blocker sessions', async () => {
+  const author = new FakeSocket(); author.id = 'author';
+  const blocker = new FakeSocket(); blocker.id = 'blocker';
+  const open = new FakeSocket(); open.id = 'open';
+  const sockets = [author, blocker, open];
+  const ioInstance = new FakeIo(sockets);
+  const onlineUsersMap = new Map();
+  const deps = {
+    ioInstance, onlineUsersMap,
+    UserModel: createMemoryModel([
+      { username: 'Author', role: 'user', servers: ['global', 'ABC123'] },
+      { username: 'Blocker', role: 'user', servers: ['global', 'ABC123'] },
+      { username: 'Open', role: 'user', servers: ['global', 'ABC123'] }
+    ]),
+    ChatServerModel: createMemoryModel([{ code: 'ABC123', moderators: [] }]),
+    RoomRestrictionModel: createMemoryModel([]), UserExperienceStateModel: createMemoryModel([]),
+    broadcastOnlineUsersFn: async () => {}, getRoomRoleFn: async () => 'user',
+    resolvePingsFn: async text => text
+  };
+  for (const live of sockets) createConnectionHandler(deps)(live);
+  for (const [live, username] of [[author, 'Author'], [blocker, 'Blocker'], [open, 'Open']]) {
+    Object.assign(live, {
+      username, displayName: username, role: 'user', serverCode: 'ABC123',
+      joinedServers: ['global', 'ABC123'], blockedUserKeys: new Set(username === 'Blocker' ? ['author'] : [])
+    });
+    onlineUsersMap.set(live.id, {
+      username, serverCode: 'ABC123', joinedServers: ['global', 'ABC123'],
+      blockedUsers: [...live.blockedUserKeys], blockVersion: 1
+    });
+  }
+
+  await author.trigger('typing', true);
+
+  assert.equal(blocker.outbound.some(item => item.event === 'typing'), false);
+  assert.deepEqual(open.outbound.find(item => item.event === 'typing').payload, {
+    username: 'Author', displayName: 'Author', isTyping: true
   });
 });
 
@@ -482,7 +598,7 @@ test('chat message is rejected when its active room changes while mention resolu
   assert.deepEqual(ioInstance.outbound, []);
 });
 
-test('chat message emits to its stored room when persistence is pending', async () => {
+test('chat message stays bound to its stored room without leaking to a newly active room', async () => {
   const createStarted = deferred();
   const releaseCreate = deferred();
   let created;
@@ -505,7 +621,8 @@ test('chat message emits to its stored room when persistence is pending', async 
   await pending;
 
   assert.equal(created.serverCode, 'ABC123');
-  assert.equal(ioInstance.outbound.at(-1).room, 'ABC123');
+  assert.deepEqual(socket.outbound, []);
+  assert.deepEqual(ioInstance.outbound, []);
 });
 
 test('chat message rechecks membership immediately before persistence', async () => {
@@ -827,7 +944,7 @@ test('a persisted room ban blocks an administrator from deleting another user me
   assert.deepEqual(ioInstance.outbound, []);
 });
 
-test('typing emits a complete payload only for accessible active rooms and boolean states', async () => {
+test('typing validates accessible active rooms and boolean states with a complete personalized payload', async () => {
   const { socket } = registerMessages();
   authenticate(socket, { serverCode: 'ABC123', joinedServers: ['global'] });
   await socket.trigger('typing', true);
@@ -838,8 +955,7 @@ test('typing emits a complete payload only for accessible active rooms and boole
   await socket.trigger('typing', 'true');
   await socket.trigger('typing', true);
   assert.deepEqual(socket.outbound, [{
-    target: 'ABC123',
-    event: 'typing',
+    target: 'self', event: 'typing',
     payload: { username: 'alice', displayName: 'Alice', isTyping: true }
   }]);
 });
@@ -1090,7 +1206,8 @@ test('room deletion cannot overtake an in-flight reaction persistence', async ()
   const releaseSave = deferred();
   const state = { roomExists: true, savedAfterDeletion: false };
   const message = {
-    _id: '507f1f77bcf86cd799439011', serverCode: 'ABC123', deleted: false, reactions: {},
+    _id: '507f1f77bcf86cd799439011', serverCode: 'ABC123', username: 'alice', authorKey: 'alice',
+    deleted: false, reactions: {},
     markModified() {},
     async save() {
       saveStarted.resolve();
@@ -1130,10 +1247,8 @@ test('room deletion cannot overtake an in-flight reaction persistence', async ()
   await Promise.all([reactionPending, deletionPending]);
 
   assert.equal(state.savedAfterDeletion, false);
-  const reactionIndex = ioInstance.outbound.findIndex(item => item.event === 'reaction_updated');
-  const deletionIndex = ioInstance.outbound.findIndex(item => item.event === 'server_deleted');
-  assert.ok(reactionIndex >= 0);
-  assert.ok(deletionIndex > reactionIndex);
+  assert.equal(socket.outbound.some(item => item.event === 'reaction_updated'), true);
+  assert.equal(ioInstance.outbound.some(item => item.event === 'server_deleted'), true);
 });
 
 for (const action of [
@@ -1197,9 +1312,7 @@ for (const action of [
     await Promise.all([actionPending, deletionPending]);
 
     assert.equal(state.savedAfterDeletion, false);
-    const actionIndex = ioInstance.outbound.findIndex(item => item.event === action.emittedEvent);
-    const deletionIndex = ioInstance.outbound.findIndex(item => item.event === 'server_deleted');
-    assert.ok(actionIndex >= 0);
-    assert.ok(deletionIndex > actionIndex);
+    assert.equal(socket.outbound.some(item => item.event === action.emittedEvent), true);
+    assert.equal(ioInstance.outbound.some(item => item.event === 'server_deleted'), true);
   });
 }

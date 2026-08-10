@@ -317,6 +317,41 @@ test('switch returns details notification pin count attention and filtered histo
   });
 });
 
+test('switch history is blocker-filtered and preserves Global legacy compatibility', async () => {
+  const secret = 'BLOCKED_TEXT_SENTINEL';
+  const timestamp = new Date('2026-08-10T12:00:00.000Z');
+  const setup = register({
+    UserModel: createMemoryModel([{
+      username: 'Alice', displayName: 'Alice', role: 'user', servers: ['global']
+    }]),
+    ChatServerModel: createMemoryModel([{
+      code: 'global', name: 'Global Chat', owner: 'System', moderators: [], pinnedMessages: [], pinVersion: 0
+    }]),
+    MessageModel: createMemoryModel([{
+      _id: '507f1f77bcf86cd799439011', username: 'Bob', authorKey: 'bob', displayName: 'Bob',
+      role: 'user', roomRole: 'user', color: '', avatarUrl: '', text: secret,
+      attachment: null, replyTo: null, reactions: {}, edited: false, deleted: false, timestamp
+    }]),
+    UserExperienceStateModel: createMemoryModel([{
+      usernameKey: 'alice', blockedUsers: [{ usernameKey: 'bob', username: 'Bob', createdAt: new Date() }],
+      blockVersion: 2
+    }])
+  });
+  Object.assign(setup.socket, {
+    username: 'Alice', displayName: 'Alice', role: 'user', serverCode: 'global',
+    joinedServers: ['global'], blockedUserKeys: new Set(['bob']), blockVersion: 2
+  });
+  const ack = acknowledge();
+
+  await setup.socket.trigger('switch_server', 'Global', ack.callback);
+
+  assert.deepEqual(ack.value().history, [{
+    _id: '507f1f77bcf86cd799439011', serverCode: 'global', username: 'Bob', authorKey: 'bob',
+    timestamp, blocked: true
+  }]);
+  assert.equal(JSON.stringify(ack.value()).includes(secret), false);
+});
+
 test('leave retains room state while deletion removes every state row for that room', async () => {
   const retainedState = createMemoryModel([{
     usernameKey: 'alice', serverCode: 'ABC123', notificationLevel: 'none',

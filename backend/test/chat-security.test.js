@@ -123,6 +123,7 @@ test('history and reply snapshots derive bounded stored data', () => {
   });
   assert.deepEqual(snapshot, {
     id: '507f1f77bcf86cd799439011',
+    authorKey: 'alice',
     displayname: 'Alice',
     text: 'x'.repeat(100)
   });

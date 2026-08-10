@@ -12,7 +12,8 @@ class FakeSocket {
   async trigger(event, ...args) {
     const payloadEvents = new Set([
       'chat_message', 'edit_message', 'toggle_reaction', 'get_room_details', 'update_room_details',
-      'list_pinned_messages', 'set_message_pin', 'get_blocked_message', 'update_room_notification', 'mark_room_read'
+      'list_pinned_messages', 'set_message_pin', 'get_blocked_message',
+      'update_room_notification', 'mark_room_read'
     ]);
     if (payloadEvents.has(event) && args[0] && typeof args[0] === 'object' && !Array.isArray(args[0])) {
       args[0] = { ...args[0] };
@@ -135,7 +136,13 @@ function matchesQuery(row, query = {}) {
       const exists = values.length > 0;
       return Boolean(expected.$exists) === exists && (Object.keys(rest).length === 0 || values.some(value => valuesMatch(value, rest)));
     }
-    if (expected && typeof expected === 'object' && !Array.isArray(expected) && '$ne' in expected && values.length === 0) return true;
+    if (expected && typeof expected === 'object' && !Array.isArray(expected) && '$ne' in expected) {
+      if (values.length === 0) return true;
+      const rest = { ...expected };
+      delete rest.$ne;
+      const noneEqual = values.every(value => !valuesMatch(value, expected.$ne));
+      return noneEqual && (Object.keys(rest).length === 0 || values.some(value => valuesMatch(value, rest)));
+    }
     return values.some(value => valuesMatch(value, expected));
   });
 }
