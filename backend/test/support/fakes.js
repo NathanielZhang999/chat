@@ -216,8 +216,8 @@ function applyUpdate(row, update = {}, { isInsert = false } = {}) {
     const additions = value && typeof value === 'object' && Array.isArray(value.$each) ? value.$each : [value];
     updateArray(row, path, current => {
       let next = [...current, ...additions.map(cloneValue)];
-      if (value && typeof value === 'object' && Number.isInteger(value.$slice) && value.$slice !== 0) {
-        next = value.$slice > 0 ? next.slice(0, value.$slice) : next.slice(value.$slice);
+      if (value && typeof value === 'object' && Number.isInteger(value.$slice)) {
+        next = value.$slice >= 0 ? next.slice(0, value.$slice) : next.slice(value.$slice);
       }
       return next;
     });
@@ -267,7 +267,8 @@ function createMemoryModel(initialRows = []) {
       if (row._id === undefined) row._id = String(nextId++).padStart(24, '0');
       applyUpdate(row, update, { isInsert: true });
       rows.push(row);
-      return multi ? { matchedCount: 0, modifiedCount: 0, upsertedCount: 1, upsertedId: row._id } : documentFor(row);
+      if (multi) return { matchedCount: 0, modifiedCount: 0, upsertedCount: 1, upsertedId: row._id };
+      return returnNew ? documentFor(row) : null;
     }
     const selected = multi ? matches : matches.slice(0, 1);
     if (multi) {

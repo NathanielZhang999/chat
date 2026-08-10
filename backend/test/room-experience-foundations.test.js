@@ -111,6 +111,39 @@ test('legacy authors and replies fail closed when block filtering cannot prove s
   assert.equal(safeReplyForViewer({ id: 'x', authorKey: 'bob', displayname: 'Bob', text: 'secret' }, new Set(['bob'])), null);
 });
 
+test('blocked-message reveals redact deleted content after a message mutation', () => {
+  const deleted = {
+    _id: '000000000000000000000003', serverCode: 'ABC123', username: 'Alice', authorKey: 'alice',
+    displayName: 'Alice', timestamp: new Date(), text: 'deleted secret', attachment: 'data:image/png;base64,AA==',
+    edited: true, deleted: true, replyTo: { text: 'private' }, reactions: { '\ud83d\udc4d': ['Bob'] }, history: [{ text: 'old' }]
+  };
+  assert.deepEqual(safeBlockedMessageReveal(deleted), {
+    _id: '000000000000000000000003', serverCode: 'ABC123', username: 'Alice', displayName: 'Alice',
+    authorKey: 'alice', timestamp: deleted.timestamp, text: '', attachment: null, edited: true, deleted: true
+  });
+});
+
+test('room details fail closed for malformed metadata versions', () => {
+  assert.equal(safeRoomDetails({ code: 'ABC123' }, false).metadataVersion, 0);
+  assert.equal(safeRoomDetails({ code: 'ABC123', metadataVersion: -1 }, false).metadataVersion, 0);
+  assert.equal(safeRoomDetails({ code: 'ABC123', metadataVersion: 1.5 }, false).metadataVersion, 0);
+});
+
+test('memory push slices zero-length arrays to empty', async () => {
+  const model = createMemoryModel([{ _id: 'one', events: [1] }]);
+  await model.updateOne({ _id: 'one' }, { $push: { events: { $each: [2, 3], $slice: 0 } } });
+  assert.deepEqual((await model.findById('one')).events, []);
+});
+
+test('memory upserts return a null pre-image when new is false', async () => {
+  const model = createMemoryModel([]);
+  const upserted = await model.findOneAndUpdate(
+    { _id: 'two', kind: 'new' }, { $setOnInsert: { created: true }, $set: { value: 1 } }, { upsert: true, new: false }
+  );
+  assert.equal(upserted, null);
+  assert.deepEqual(await model.findById('two'), { _id: 'two', kind: 'new', created: true, value: 1 });
+});
+
 test('memory model supports atomic versioned array and cursor operations', async () => {
   const model = createMemoryModel([{ _id: 'one', nested: { value: 1 }, values: [{ usernameKey: 'bob' }], version: 0 }]);
   const session = { id: 'session-1' };

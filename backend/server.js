@@ -233,6 +233,7 @@ function safeBlockedMessageReveal(message) {
   if (!message || typeof message !== 'object' || Array.isArray(message)) return null;
   const authorKey = authorKeyForMessage(message);
   if (!authorKey) return null;
+  const deleted = Boolean(message.deleted);
   return {
     _id: message._id,
     serverCode: message.serverCode,
@@ -240,10 +241,10 @@ function safeBlockedMessageReveal(message) {
     displayName: typeof message.displayName === 'string' ? message.displayName : '',
     authorKey,
     timestamp: message.timestamp,
-    text: typeof message.text === 'string' ? message.text : '',
-    attachment: sanitizeAttachment(message.attachment),
+    text: deleted ? '' : (typeof message.text === 'string' ? message.text : ''),
+    attachment: deleted ? null : sanitizeAttachment(message.attachment),
     edited: Boolean(message.edited),
-    deleted: Boolean(message.deleted)
+    deleted
   };
 }
 
@@ -252,7 +253,8 @@ function safeRoomDetails(room, canEdit) {
     serverCode: room && room.code,
     description: room && typeof room.description === 'string' ? room.description : '',
     rules: room && typeof room.rules === 'string' ? room.rules : '',
-    metadataVersion: Number.isInteger(room && room.metadataVersion) ? room.metadataVersion : 0,
+    metadataVersion: Number.isInteger(room && room.metadataVersion) && room.metadataVersion >= 0
+      ? room.metadataVersion : 0,
     canEdit: Boolean(canEdit)
   };
 }
