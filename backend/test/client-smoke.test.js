@@ -1200,3 +1200,1079 @@ test('production image uploads cannot complete into a replaced room composition 
   assert.equal((uploadBlock.match(/if \(!isCurrentUpload\(\)\) return/g) || []).length, 2);
   assert.match(uploadBlock, /uploadEpoch === attachmentLoadEpoch/);
 });
+
+test('version acceptance is strict for metadata pins and blocks and identical-idempotent for room state', () => {
+  const client = loadHelpers();
+  const details = {
+    serverCode: 'ABC123', description: 'old', rules: 'old rules', metadataVersion: 2, canEdit: false
+  };
+  assert.equal(client.acceptVersionedState(details, { ...details, description: 'different' }, 'metadata'), details);
+  assert.equal(client.acceptVersionedState(details, { ...details, metadataVersion: 1 }, 'metadata'), details);
+  assert.equal(client.acceptVersionedState(details, { ...details, metadataVersion: -1 }, 'metadata'), details);
+  const newerDetails = client.acceptVersionedState(
+    details,
+    { ...details, description: 'new', metadataVersion: 3 },
+    'metadata'
+  );
+  assert.equal(newerDetails.description, 'new');
+  assert.equal(newerDetails.metadataVersion, 3);
+
+  const pin = { serverCode: 'ABC123', pinCount: 1, pinVersion: 5, blockVersion: 4 };
+  assert.equal(client.acceptVersionedState(pin, { ...pin, pinCount: 2 }, 'pins'), pin);
+  assert.equal(client.acceptVersionedState(pin, { ...pin, pinVersion: 4 }, 'pins'), pin);
+  assert.equal(client.acceptVersionedState(pin, { ...pin }, 'pins'), pin);
+
+  const blocks = { blockedUsers: [{ usernameKey: 'bob', username: 'Bob' }], blockVersion: 7 };
+  assert.equal(client.acceptVersionedState(blocks, { blockedUsers: [], blockVersion: 7 }, 'blocks'), blocks);
+  const newerBlocks = client.acceptVersionedState(
+    blocks,
+    { blockedUsers: [], blockVersion: 8 },
+    'blocks'
+  );
+  assert.equal(newerBlocks.blockVersion, 8);
+  assert.deepEqual([...newerBlocks.blockedUsers], []);
+
+  const roomState = {
+    serverCode: 'ABC123', usernameKey: 'alice', notificationLevel: 'all',
+    lastReadAt: '2026-08-10T10:00:00.000Z', lastReadMessageId: '000002',
+    unreadCount: 3, mentionCount: 1, version: 9, blockVersion: 7
+  };
+  assert.equal(client.acceptVersionedState(roomState, { ...roomState }, 'room-state'), roomState);
+  assert.equal(client.acceptVersionedState(
+    roomState,
+    { ...roomState, unreadCount: 4 },
+    'room-state'
+  ), roomState, 'equal-but-different state is rejected');
+});
+
+test('pin body hydration accepts only the current unloaded pin and block version', () => {
+  const client = loadHelpers();
+  const current = {
+    serverCode: 'ABC123', pinCount: 1, pinVersion: 5, blockVersion: 4,
+    pinsLoaded: false, pins: []
+  };
+  const pin = {
+    messageId: '507f1f77bcf86cd799439001', username: 'Alice', text: 'Safe body'
+  };
+  for (const stale of [
+    { ...current, pinVersion: 4, pins: [pin], requestTokenCurrent: true },
+    { ...current, blockVersion: 3, pins: [pin], requestTokenCurrent: true },
+    { ...current, pinCount: 2, pins: [pin], requestTokenCurrent: true },
+    { ...current, pins: [pin], requestTokenCurrent: false }
+  ]) {
+    assert.equal(client.acceptPinBodies(current, stale), current);
+  }
+  const hydrated = client.acceptPinBodies(current, {
+    ...current, pins: [pin], requestTokenCurrent: true
+  });
+  assert.notEqual(hydrated, current);
+  assert.equal(hydrated.pinsLoaded, true);
+  assert.equal(hydrated.pins[0].text, 'Safe body');
+  assert.equal(client.acceptPinBodies(hydrated, {
+    ...current, pins: [pin], requestTokenCurrent: true
+  }), hydrated, 'already-loaded bodies are not overwritten');
+});
+
+test('a greater accepted block version replaces an equal pin version visible count', () => {
+  const client = loadHelpers();
+  const current = { serverCode: 'ABC123', pinCount: 4, pinVersion: 8, blockVersion: 2 };
+  const replacement = client.acceptVersionedState(current, {
+    serverCode: 'ABC123', pinCount: 1, pinVersion: 8, blockVersion: 3
+  }, 'pins');
+  assert.notEqual(replacement, current);
+  assert.deepEqual({
+    pinCount: replacement.pinCount,
+    pinVersion: replacement.pinVersion,
+    blockVersion: replacement.blockVersion
+  }, { pinCount: 1, pinVersion: 8, blockVersion: 3 });
+  assert.equal(client.acceptVersionedState(current, {
+    serverCode: 'ABC123', pinCount: 1, pinVersion: 7, blockVersion: 3
+  }, 'pins'), current, 'a block replacement cannot roll the owning pin version back');
+});
+
+test('scoped feature generations reject late close reopen room switch and account callbacks before inspection', () => {
+  const client = loadHelpers();
+  const coordinator = client.createScopedGenerationCoordinator();
+  const firstOpen = coordinator.begin('room-info', 'ABC123');
+  assert.equal(Object.isFrozen(firstOpen), true);
+  assert.equal(coordinator.isCurrent(firstOpen, 'ABC123'), true);
+  coordinator.invalidate('room-info');
+  const reopened = coordinator.begin('room-info', 'ABC123');
+  assert.equal(coordinator.isCurrent(firstOpen, 'ABC123'), false);
+  assert.equal(coordinator.isCurrent(reopened, 'ABC123'), true);
+  assert.equal(coordinator.isCurrent(reopened, 'XYZ789'), false);
+
+  const roomSwitch = coordinator.begin('room-switch', 'ABC123');
+  coordinator.begin('room-switch', 'XYZ789');
+  assert.equal(coordinator.isCurrent(roomSwitch, 'ABC123'), false);
+  const account = coordinator.begin('account', 'alice');
+  coordinator.invalidateAll();
+  assert.equal(coordinator.isCurrent(account, 'alice'), false);
+});
+
+test('socket replacement clears every feature map and old-socket listeners are inert', () => {
+  const client = loadHelpers();
+  const coordinator = client.createScopedGenerationCoordinator();
+  const oldSocketWork = coordinator.begin('pins', 'ABC123');
+  coordinator.invalidateAll();
+  assert.equal(coordinator.isCurrent(oldSocketWork, 'ABC123'), false);
+
+  const source = fs.readFileSync(chatPath, 'utf8');
+  for (const mapName of [
+    'roomDetailsByCode', 'pinsByRoom', 'roomStateByCode', 'attentionByRoom',
+    'recentActivityIdsByRoom', 'blockedUsersByKey'
+  ]) {
+    assert.match(source, new RegExp(`const ${mapName} = new Map\\(\\)`), mapName);
+    assert.match(source, new RegExp(`${mapName}\\.clear\\(\\)`), `${mapName} clears on replacement`);
+  }
+  assert.match(source, /function clearFeatureStateForSocketReplacement\(\)[\s\S]*featureGenerations\.invalidateAll\(\)/);
+  for (const event of [
+    'room_details_updated', 'message_pin_updated', 'room_notification_updated',
+    'room_read_updated', 'room_activity', 'user_block_updated', 'room_refresh_required'
+  ]) {
+    assert.match(
+      source,
+      new RegExp(`activeSocket\\.on\\(['"]${event}['"][\\s\\S]{0,180}if \\(activeSocket !== socket\\) return`),
+      `${event} ignores an old socket`
+    );
+  }
+});
+
+test('room activity ignores old block versions cursor-covered tuples and bounded duplicate IDs', () => {
+  const client = loadHelpers();
+  const recentIds = client.createRecentIdSet();
+  let state = {
+    serverCode: 'ABC123', notificationLevel: 'all', unreadCount: 0, mentionCount: 0,
+    lastReadAt: '2026-08-10T10:00:00.000Z', lastReadMessageId: '000010',
+    version: 4, blockVersion: 4
+  };
+  const apply = activity => { state = client.applyRoomActivity(state, activity, recentIds); };
+  apply({
+    serverCode: 'ABC123', messageId: '000011', timestamp: '2026-08-10T10:00:01.000Z',
+    mentioned: true, blockVersion: 4
+  });
+  apply({
+    serverCode: 'ABC123', messageId: '000012', timestamp: '2026-08-10T10:00:02.000Z',
+    mentioned: true, blockVersion: 3
+  });
+  apply({
+    serverCode: 'ABC123', messageId: '000011', timestamp: '2026-08-10T10:00:01.000Z',
+    mentioned: true, blockVersion: 4
+  });
+  apply({
+    serverCode: 'ABC123', messageId: '000010', timestamp: '2026-08-10T10:00:00.000Z',
+    mentioned: true, blockVersion: 4
+  });
+  for (let index = 0; index < 300; index += 1) {
+    apply({
+      serverCode: 'ABC123', messageId: `message-${String(index).padStart(3, '0')}`,
+      timestamp: new Date(Date.UTC(2026, 7, 10, 10, 1, index)).toISOString(),
+      mentioned: index % 2 === 0, blockVersion: 4
+    });
+  }
+  assert.equal(state.unreadCount, 301);
+  assert.equal(state.mentionCount, 151);
+  assert.equal(recentIds.size, 256);
+  assert.equal(recentIds.has('000011'), false, 'FIFO eviction removes the oldest accepted ID');
+  assert.equal(recentIds.has('message-299'), true);
+});
+
+test('exact read snapshots replace speculative counts across tabs and devices', () => {
+  const client = loadHelpers();
+  const speculative = {
+    serverCode: 'ABC123', usernameKey: 'alice', notificationLevel: 'all',
+    lastReadAt: '2026-08-10T10:00:00.000Z', lastReadMessageId: '000010',
+    unreadCount: 8, mentionCount: 3, version: 4, blockVersion: 2
+  };
+  const exact = client.acceptVersionedState(speculative, {
+    ...speculative,
+    lastReadAt: '2026-08-10T10:05:00.000Z', lastReadMessageId: '000099',
+    unreadCount: 1, mentionCount: 0, version: 5
+  }, 'room-state');
+  assert.deepEqual({
+    unreadCount: exact.unreadCount,
+    mentionCount: exact.mentionCount,
+    version: exact.version,
+    lastReadMessageId: exact.lastReadMessageId
+  }, { unreadCount: 1, mentionCount: 0, version: 5, lastReadMessageId: '000099' });
+
+  const recentIds = client.createRecentIdSet();
+  recentIds.add('000050', { timestamp: '2026-08-10T10:02:00.000Z', messageId: '000050' });
+  recentIds.add('000100', { timestamp: '2026-08-10T10:06:00.000Z', messageId: '000100' });
+  recentIds.clearAtOrBefore({
+    timestamp: exact.lastReadAt,
+    messageId: exact.lastReadMessageId
+  });
+  assert.equal(recentIds.has('000050'), false);
+  assert.equal(recentIds.has('000100'), true);
+});
+
+test('a greater accepted block version authoritatively replaces equal-version room counts', () => {
+  const client = loadHelpers();
+  const current = {
+    serverCode: 'ABC123', usernameKey: 'alice', notificationLevel: 'mentions',
+    lastReadAt: null, lastReadMessageId: null,
+    unreadCount: 7, mentionCount: 2, version: 6, blockVersion: 3
+  };
+  const replacement = client.acceptVersionedState(current, {
+    ...current, unreadCount: 2, mentionCount: 0, blockVersion: 4
+  }, 'room-state');
+  assert.notEqual(replacement, current);
+  assert.deepEqual({
+    unreadCount: replacement.unreadCount,
+    mentionCount: replacement.mentionCount,
+    version: replacement.version,
+    blockVersion: replacement.blockVersion
+  }, { unreadCount: 2, mentionCount: 0, version: 6, blockVersion: 4 });
+  assert.equal(client.acceptVersionedState(current, {
+    ...current, version: 5, blockVersion: 4
+  }, 'room-state'), current);
+});
+
+test('attention presentation follows all mentions none and caps visible counts at 99+', () => {
+  const client = loadHelpers();
+  assert.deepEqual({ ...client.attentionPresentation({
+    notificationLevel: 'all', unreadCount: 42, mentionCount: 2
+  }) }, { badgeText: '@2', ariaLabel: '2 mentions', title: '2 mentions, 42 unread messages', visible: true });
+  assert.deepEqual({ ...client.attentionPresentation({
+    notificationLevel: 'all', unreadCount: 120, mentionCount: 0
+  }) }, { badgeText: '99+', ariaLabel: '120 unread messages', title: '120 unread messages', visible: true });
+  assert.deepEqual({ ...client.attentionPresentation({
+    notificationLevel: 'mentions', unreadCount: 120, mentionCount: 100
+  }) }, { badgeText: '@99+', ariaLabel: '100 mentions', title: '100 mentions', visible: true });
+  assert.deepEqual({ ...client.attentionPresentation({
+    notificationLevel: 'mentions', unreadCount: 8, mentionCount: 0
+  }) }, { badgeText: '', ariaLabel: '', title: '', visible: false });
+  assert.deepEqual({ ...client.attentionPresentation({
+    notificationLevel: 'none', unreadCount: 8, mentionCount: 4
+  }) }, { badgeText: '', ariaLabel: '', title: '', visible: false });
+});
+
+test('sound policy permits all traffic for all mentions only for mentions and none for none', () => {
+  const client = loadHelpers();
+  assert.equal(client.soundPolicy('all', false), 'msg');
+  assert.equal(client.soundPolicy('all', true), 'ping');
+  assert.equal(client.soundPolicy('mentions', true), 'ping');
+  assert.equal(client.soundPolicy('mentions', false), null);
+  assert.equal(client.soundPolicy('none', true), null);
+  assert.equal(client.soundPolicy('unknown', true), null);
+});
+
+test('blocked placeholders are silent at every notification level', () => {
+  const client = loadHelpers();
+  for (const level of ['all', 'mentions', 'none']) {
+    assert.equal(client.soundPolicy(level, false, true), null);
+    assert.equal(client.soundPolicy(level, true, true), null);
+  }
+});
+
+test('mark-read policy requires active room visible document and bottom scroll', () => {
+  const client = loadHelpers();
+  const eligible = {
+    currentRoom: 'ABC123', roomCode: 'ABC123', visibilityState: 'visible',
+    nearBottom: true, roomGeneration: 12, suppressionToken: null
+  };
+  assert.equal(client.isMarkReadEligible(eligible), true);
+  assert.equal(client.isMarkReadEligible({ ...eligible, currentRoom: 'XYZ789' }), false);
+  assert.equal(client.isMarkReadEligible({ ...eligible, visibilityState: 'hidden' }), false);
+  assert.equal(client.isMarkReadEligible({ ...eligible, nearBottom: false }), false);
+  assert.equal(client.isMarkReadEligible({
+    ...eligible,
+    suppressionToken: Object.freeze({ roomCode: 'ABC123', roomGeneration: 12 })
+  }), false);
+  assert.equal(client.isMarkReadEligible({
+    ...eligible,
+    suppressionToken: Object.freeze({ roomCode: 'ABC123', roomGeneration: 11 })
+  }), true, 'suppression is scoped to the exact room generation');
+});
+
+test('block update invalidates pin cache typing history replies and reactions before refetch', () => {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  const start = source.indexOf('function applyAcceptedBlockState(');
+  const end = source.indexOf('\n    function ', start + 1);
+  assert.notEqual(start, -1, 'block replacement handler exists');
+  const block = source.slice(start, end === -1 ? source.length : end);
+  assert.match(block, /pinsByRoom\.clear\(\)/);
+  assert.match(block, /recentActivityIdsByRoom\.clear\(\)/);
+  assert.match(block, /typingUsers\.clear\(\)/);
+  assert.match(block, /invalidateAllFeatureCallbacksExceptBlock/);
+  assert.match(block, /replaceActiveMessagesWithBlockRefreshState\(\)/);
+  assert.ok(
+    block.indexOf('replaceActiveMessagesWithBlockRefreshState()') < block.indexOf('renderBlockedUsers()'),
+    'message, reply, and reaction content is removed before subsequent UI work'
+  );
+});
+
+test('event before acknowledgement still settles the current metadata pin and block controls', () => {
+  const client = loadHelpers();
+  const receipts = client.createOperationReceiptCoordinator();
+  for (const kind of ['metadata', 'pin', 'block']) {
+    const identity = `${kind}:ABC123:1`;
+    const token = receipts.begin(kind, identity);
+    assert.equal(receipts.canFinish(token, identity), true);
+    assert.equal(receipts.settleFromEvent(token, identity), true);
+    assert.equal(receipts.canFinish(token, identity), true, `${kind} ack remains idempotently finishable`);
+    assert.equal(receipts.finish(token, identity), true);
+
+    const stale = receipts.begin(kind, `${identity}:stale`);
+    const current = receipts.begin(kind, `${identity}:new`);
+    assert.equal(receipts.settleFromEvent(stale, `${identity}:stale`), false);
+    assert.equal(receipts.canFinish(stale, `${identity}:stale`), false);
+    assert.equal(receipts.canFinish(current, `${identity}:new`), true);
+  }
+});
+
+test('block refresh suppresses only its programmatic mark-read and later live messages resume normal reads', () => {
+  const client = loadHelpers();
+  const context = {
+    currentRoom: 'ABC123', roomCode: 'ABC123', visibilityState: 'visible',
+    nearBottom: true, roomGeneration: 14,
+    suppressionToken: Object.freeze({ roomCode: 'ABC123', roomGeneration: 14 })
+  };
+  assert.equal(client.isMarkReadEligible(context), false);
+  assert.equal(client.isMarkReadEligible({ ...context, suppressionToken: null }), true);
+  assert.equal(client.isMarkReadEligible({
+    ...context,
+    currentRoom: 'XYZ789', roomCode: 'XYZ789', roomGeneration: 15
+  }), true, 'another room cannot inherit the active room suppression token');
+
+  const source = fs.readFileSync(chatPath, 'utf8');
+  assert.match(source, /function handleRoomRefreshRequired[\s\S]*suppressAutoRead:\s*true/);
+  assert.match(source, /function disarmReadSuppression[\s\S]*ChatClientHelpers\.releaseExactToken/);
+  assert.match(source, /function scheduleMaybeMarkCurrentRoomRead/);
+});
+
+function createFakeEventTarget() {
+  const listeners = new Map();
+  return {
+    activeElement: null,
+    addEventListener(type, listener) {
+      if (!listeners.has(type)) listeners.set(type, new Set());
+      listeners.get(type).add(listener);
+    },
+    removeEventListener(type, listener) {
+      listeners.get(type)?.delete(listener);
+    },
+    dispatch(type, event = {}) {
+      for (const listener of listeners.get(type) || []) listener({ type, ...event });
+    }
+  };
+}
+
+function createFakeElement(owner, { disabled = false, hidden = false } = {}) {
+  const attributes = new Map();
+  const classes = new Set();
+  return {
+    ownerDocument: owner,
+    disabled,
+    hidden,
+    isConnected: true,
+    children: [],
+    classList: {
+      add(...names) { names.forEach(name => classes.add(name)); },
+      remove(...names) { names.forEach(name => classes.delete(name)); },
+      contains(name) { return classes.has(name); }
+    },
+    setAttribute(name, value) { attributes.set(name, String(value)); },
+    getAttribute(name) { return attributes.get(name) ?? null; },
+    removeAttribute(name) { attributes.delete(name); },
+    appendChild(child) { this.children.push(child); return child; },
+    contains(candidate) { return candidate === this || this.children.includes(candidate); },
+    focus() { owner.activeElement = this; },
+    querySelectorAll() { return this.children; }
+  };
+}
+
+test('room rail entries are semantic buttons with notification-aware labels and silent badges', () => {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  assert.match(source, /<button[^>]*class="server-icon active"[^>]*id="srv-global"[^>]*type="button"/);
+  assert.match(source, /<button[^>]*class="server-icon add-btn"[^>]*type="button"/);
+  const addStart = source.indexOf('function addServerToList(');
+  const addEnd = source.indexOf('\n    function ', addStart + 1);
+  const addBlock = source.slice(addStart, addEnd);
+  assert.match(addBlock, /document\.createElement\('button'\)/);
+  assert.match(addBlock, /icon\.type\s*=\s*'button'/);
+  assert.match(addBlock, /aria-label/);
+  assert.match(source, /className\s*=\s*'room-attention-badge'/);
+  assert.doesNotMatch(source, /room-attention-badge[^>\n]*aria-live/);
+});
+
+test('Room Info and Pins dialogs have labelled modal semantics initial focus Escape and focus restoration', () => {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  for (const [id, label] of [
+    ['room-info-modal', 'room-info-title'],
+    ['pins-modal', 'pins-title']
+  ]) {
+    assert.match(
+      source,
+      new RegExp(`id="${id}"[^>]*role="dialog"[^>]*aria-modal="true"[^>]*aria-labelledby="${label}"`)
+    );
+  }
+
+  const client = loadHelpers();
+  const doc = createFakeEventTarget();
+  const dialog = createFakeElement(doc);
+  const trigger = createFakeElement(doc);
+  const initial = createFakeElement(doc);
+  const controller = client.createFocusDialogController({
+    dialog,
+    documentTarget: doc,
+    getInitialFocus: () => initial
+  });
+  controller.open(trigger);
+  assert.equal(dialog.hidden, false);
+  assert.equal(dialog.classList.contains('active'), true);
+  assert.equal(doc.activeElement, initial);
+  doc.dispatch('keydown', { key: 'Escape', preventDefault() {} });
+  assert.equal(dialog.hidden, true);
+  assert.equal(dialog.classList.contains('active'), false);
+  assert.equal(doc.activeElement, trigger);
+});
+
+test('Room Info exposes read content edit save and notification controls by exact policy', () => {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  for (const id of [
+    'room-info-btn', 'room-info-title', 'room-description', 'room-rules',
+    'room-notification-level', 'room-info-edit', 'room-info-save'
+  ]) assert.equal((source.match(new RegExp(`id="${id}"`, 'g')) || []).length, 1, id);
+  assert.match(source, /id="room-notification-level"[\s\S]*<option value="all">[\s\S]*<option value="mentions">[\s\S]*<option value="none">/);
+  const renderStart = source.indexOf('function renderRoomInfo(');
+  const renderEnd = source.indexOf('\n    function ', renderStart + 1);
+  const renderBlock = source.slice(renderStart, renderEnd);
+  assert.match(renderBlock, /details\.canEdit/);
+  assert.match(renderBlock, /roomInfoEdit\.hidden/);
+  assert.match(renderBlock, /roomInfoSave\.hidden/);
+  assert.match(renderBlock, /textContent/);
+});
+
+test('newly joined rooms open Room Info once after a successful join', () => {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  const joinCalls = source.match(/queueJoinedRoomInfoIntent\(res\.server\.code,[^)]+\)/g) || [];
+  assert.equal(joinCalls.length, 3, 'join, create, and admin-visible join share the exact intent path');
+  assert.match(source, /function consumeJoinedRoomInfoIntent[\s\S]*openRoomInfo\(intent\.trigger/);
+});
+
+test('pending joined Room Info intent is consumed only by the exact accepted room switch generation', () => {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  assert.match(source, /pendingJoinedRoomInfoIntent\s*=\s*Object\.freeze\(\{[\s\S]*roomCode[\s\S]*switchToken/);
+  assert.match(source, /function consumeJoinedRoomInfoIntent\(roomCode, switchToken\)[\s\S]*intent\.roomCode !== roomCode[\s\S]*intent\.switchToken !== switchToken/);
+  assert.match(source, /function handleSwitchResult\(code, res, switchToken[\s\S]*consumeJoinedRoomInfoIntent\(targetServerCode, switchToken\)/);
+});
+
+test('older in-flight switch completion cannot cancel a queued joined-room info intent', () => {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  const consumeStart = source.indexOf('function consumeJoinedRoomInfoIntent(');
+  const consumeEnd = source.indexOf('\n    function ', consumeStart + 1);
+  const consumeBlock = source.slice(consumeStart, consumeEnd);
+  assert.match(consumeBlock, /if \(!intent/);
+  assert.match(consumeBlock, /return false/);
+  assert.ok(
+    consumeBlock.indexOf('intent.switchToken !== switchToken') <
+      consumeBlock.indexOf('pendingJoinedRoomInfoIntent = null'),
+    'a mismatched completion returns before clearing the queued intent'
+  );
+  assert.match(source, /function supersedeJoinedRoomInfoIntent[\s\S]*origin === 'user'/);
+});
+
+test('Pins load bodies only when opened and stale room pin acknowledgements are ignored', () => {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  const openStart = source.indexOf('function openPins(');
+  const openEnd = source.indexOf('\n    function ', openStart + 1);
+  const openBlock = source.slice(openStart, openEnd);
+  assert.match(openBlock, /featureGenerations\.begin\('pins', roomCode\)/);
+  assert.match(openBlock, /socket\.emit\('list_pinned_messages'/);
+  assert.ok(openBlock.indexOf('featureGenerations.isCurrent') < openBlock.indexOf('response.error'));
+  assert.match(openBlock, /ChatClientHelpers\.acceptPinBodies/);
+
+  const loginStart = source.indexOf("authSocket.emit(action, payload");
+  const loginEnd = source.indexOf('function showError', loginStart);
+  assert.doesNotMatch(source.slice(loginStart, loginEnd), /list_pinned_messages/);
+  const switchStart = source.indexOf('function handleSwitchResult(');
+  const switchEnd = source.indexOf('function copyCode', switchStart);
+  assert.doesNotMatch(source.slice(switchStart, switchEnd), /list_pinned_messages/);
+});
+
+test('message and member menus expose exact pin block and unblock actions', () => {
+  const client = loadHelpers();
+  assert.deepEqual([...client.messageActionsFor({
+    canReply: true, canReact: true, canManagePins: true, pinned: false,
+    canReport: true, canDelete: false
+  })], ['reply', 'react', 'pin', 'report']);
+  assert.deepEqual([...client.messageActionsFor({
+    canReply: true, canReact: true, canManagePins: true, pinned: true,
+    canReport: false, canDelete: true
+  })], ['reply', 'react', 'unpin', 'delete']);
+  assert.deepEqual({ ...client.blockActionFor({ username: 'Bob', isSelf: false, blocked: false }) }, {
+    action: 'block', label: 'Block', blocked: true
+  });
+  assert.deepEqual({ ...client.blockActionFor({ username: 'Bob', isSelf: false, blocked: true }) }, {
+    action: 'unblock', label: 'Unblock', blocked: false
+  });
+  assert.equal(client.blockActionFor({ username: 'Alice', isSelf: true, blocked: false }), null);
+});
+
+test('blocked rows are collapsed content-free controls and Show is independently expanded', () => {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  const start = source.indexOf('function renderBlockedMessage(');
+  const end = source.indexOf('\n    function ', start + 1);
+  const block = source.slice(start, end);
+  assert.match(block, /textContent\s*=\s*'Blocked message — Show'/);
+  assert.match(block, /setAttribute\('aria-expanded', 'false'\)/);
+  assert.match(block, /get_blocked_message/);
+  assert.match(block, /featureGenerations\.isCurrent\(token, identity\)/);
+  assert.match(block, /setAttribute\('aria-expanded', 'true'\)/);
+  for (const leakedField of ['data.text', 'data.attachment', 'data.replyTo', 'data.reactions']) {
+    assert.doesNotMatch(block, new RegExp(leakedField.replace('.', '\\.')));
+  }
+});
+
+test('blocked user settings permit recovery and unblocking without target disclosure', () => {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  for (const id of ['blocked-users-list', 'blocked-users-empty']) {
+    assert.equal((source.match(new RegExp(`id="${id}"`, 'g')) || []).length, 1, id);
+  }
+  assert.match(source, /function renderBlockedUsers[\s\S]*button\.textContent|function renderBlockedUsers[\s\S]*'Unblock'/);
+  assert.match(source, /function setUserBlocked\(username, blocked, control\)[\s\S]*set_user_block/);
+  assert.match(source, /user_block_updated/);
+  assert.doesNotMatch(source, /(?:alert|showAppAlert)\([^\n]*blockedUsers/i);
+});
+
+test('author avatar member and menu triggers support Enter Space aria-haspopup and aria-expanded', () => {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  assert.match(source, /function createMemberMenuTrigger[\s\S]*document\.createElement\('button'\)[\s\S]*aria-haspopup[\s\S]*aria-expanded/);
+  assert.match(source, /function createAuthorMenuTrigger[\s\S]*document\.createElement\('button'\)[\s\S]*aria-haspopup[\s\S]*aria-expanded/);
+  assert.match(source, /function createMessageMenuTrigger[\s\S]*document\.createElement\('button'\)[\s\S]*aria-haspopup[\s\S]*aria-expanded/);
+  assert.match(source, /handleTriggerKeydown/);
+});
+
+test('menus focus the first item close on Escape or outside activation and restore trigger focus', () => {
+  const client = loadHelpers();
+  const doc = createFakeEventTarget();
+  const menu = createFakeElement(doc);
+  const firstDisabled = createFakeElement(doc, { disabled: true });
+  const firstEnabled = createFakeElement(doc);
+  menu.children.push(firstDisabled, firstEnabled);
+  const trigger = createFakeElement(doc);
+  const outside = createFakeElement(doc);
+  const controller = client.createMenuController({
+    menu,
+    documentTarget: doc,
+    getItems: () => menu.children
+  });
+
+  controller.handleTriggerKeydown({ key: 'Enter', preventDefault() {} }, trigger);
+  assert.equal(trigger.getAttribute('aria-expanded'), 'true');
+  assert.equal(doc.activeElement, firstEnabled);
+  doc.dispatch('keydown', { key: 'Escape', preventDefault() {} });
+  assert.equal(trigger.getAttribute('aria-expanded'), 'false');
+  assert.equal(doc.activeElement, trigger);
+
+  controller.handleTriggerKeydown({ key: ' ', preventDefault() {} }, trigger);
+  doc.dispatch('pointerdown', { target: outside });
+  assert.equal(trigger.getAttribute('aria-expanded'), 'false');
+  assert.equal(doc.activeElement, trigger);
+});
+
+test('message actions remain keyboard and coarse-pointer reachable without hover', () => {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  assert.match(source, /\.msg:focus-within\s+\.msg-actions\s*\{[^}]*opacity:\s*1[^}]*visibility:\s*visible/s);
+  assert.match(source, /@media\s*\(hover:\s*none\),\s*\(pointer:\s*coarse\)[\s\S]*\.msg-actions\s*\{[^}]*opacity:\s*1[^}]*visibility:\s*visible/s);
+  assert.match(source, /@media\s*\(hover:\s*none\),\s*\(pointer:\s*coarse\)[\s\S]*\.action-btn\s*\{[^}]*min-width:\s*44px[^}]*min-height:\s*44px/s);
+});
+
+test('mobile header keeps Room Info and Pins visible and moves every other action into one overflow menu', () => {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  for (const id of ['room-info-btn', 'pins-btn', 'header-overflow-btn', 'header-overflow-menu']) {
+    assert.equal((source.match(new RegExp(`id="${id}"`, 'g')) || []).length, 1, id);
+  }
+  const start = source.indexOf('@media (max-width: 700px)');
+  const end = source.indexOf('</style>', start);
+  const mobile = source.slice(start, end);
+  assert.notEqual(start, -1);
+  for (const id of ['room-info-btn', 'pins-btn']) {
+    assert.match(mobile, new RegExp(`#${id}\\s*\\{[^}]*display:\\s*(?:inline-)?flex[^}]*min-width:\\s*44px[^}]*min-height:\\s*44px`, 's'));
+  }
+  assert.match(mobile, /#header-overflow-btn\s*\{[^}]*display:\s*(?:inline-)?flex[^}]*min-width:\s*44px[^}]*min-height:\s*44px/s);
+  assert.match(mobile, /#header-overflow-menu\s*\.header-btn\s*\{[^}]*min-height:\s*44px[^}]*width:\s*100%/s);
+  for (const id of [
+    'invite-code-btn', 'leave-server-btn', 'delete-server-btn', 'join-server-btn',
+    'moderator-center-btn', 'settings-btn', 'logout-btn'
+  ]) assert.match(mobile, new RegExp(`#${id}\\s*\\{[^}]*display:\\s*none`, 's'), id);
+});
+
+test('responsive header contract maps 320px and 200 percent text scale to reachable 44px targets', () => {
+  const client = loadHelpers();
+  const layout = client.headerLayoutContract(320, 2);
+  assert.equal(layout.breakpoint, 700);
+  assert.equal(layout.targetSize, 44);
+  assert.equal(layout.mobile, true);
+  assert.deepEqual([...layout.visible], ['room-info-btn', 'pins-btn', 'header-overflow-btn']);
+  assert.equal(layout.slots.length, 3);
+  for (const slot of layout.slots) {
+    assert.equal(slot.width >= 44, true);
+    assert.equal(slot.height >= 44, true);
+    assert.equal(slot.left >= 0, true);
+    assert.equal(slot.right <= 320, true);
+  }
+  assert.equal(layout.slots[0].right <= layout.slots[1].left, true);
+  assert.equal(layout.slots[1].right <= layout.slots[2].left, true);
+});
+
+test('new UI preserves reduced motion and the exact Chat v1.3.2 title', () => {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  assert.equal((source.match(/<title>Chat v1\.3\.2<\/title>/g) || []).length, 1);
+  assert.doesNotMatch(source, /transition:\s*all\b/);
+  const reducedStart = source.indexOf('@media (prefers-reduced-motion: reduce)');
+  assert.notEqual(reducedStart, -1);
+  const reduced = source.slice(reducedStart, source.indexOf('</style>', reducedStart));
+  assert.match(reduced, /\.modal-box/);
+  assert.match(reduced, /animation-duration:\s*0\.01ms\s*!important/);
+});
+
+test('complete client race matrix rejects old socket room dialog pin block read and activity work', () => {
+  const client = loadHelpers();
+  const source = fs.readFileSync(chatPath, 'utf8');
+  const generations = client.createScopedGenerationCoordinator();
+  const oldSocket = { id: 'old' };
+  const newSocket = { id: 'new' };
+  let activeSocket = oldSocket;
+  let currentRoom = 'AAAAAA';
+  let blockState = null;
+  const details = new Map();
+  const pins = new Map();
+  const reads = new Map();
+  const activityIds = new Map();
+  const rendered = [];
+
+  const oldDialog = generations.begin('room-info', 'AAAAAA');
+  const oldPin = generations.begin('pin-action', 'AAAAAA');
+  const oldRead = generations.begin('mark-read', 'AAAAAA:1:old');
+  const oldReveal = generations.begin('reveal', 'AAAAAA:old');
+
+  generations.invalidateAll();
+  activeSocket = newSocket;
+  currentRoom = 'AAAAAA';
+  const roomA = generations.begin('active-room', currentRoom);
+  const roomADialog = generations.begin('room-info', currentRoom);
+  const roomAPin = generations.begin('pin-action', currentRoom);
+  const roomARead = generations.begin('mark-read', `${currentRoom}:${roomA.generation}:a`);
+  const closedReveal = generations.begin('reveal', `${currentRoom}:message-a`);
+  generations.invalidate('reveal');
+
+  currentRoom = 'BBBBBB';
+  const roomB = generations.begin('active-room', currentRoom);
+  for (const scope of [
+    'room-info', 'room-info-save', 'pins', 'pin-action', 'reveal', 'mark-read',
+    'room-notification'
+  ]) generations.invalidate(scope);
+  const roomBDialog = generations.begin('room-info', currentRoom);
+  const roomBReveal = generations.begin('reveal', `${currentRoom}:message-b`);
+
+  function acceptDetails(socketRef, token, incoming) {
+    if (socketRef !== activeSocket || incoming.serverCode !== currentRoom ||
+        !generations.isCurrent(token, incoming.serverCode)) return false;
+    const current = details.get(incoming.serverCode) || null;
+    const next = client.acceptVersionedState(current, incoming, 'metadata');
+    if (next === current) return false;
+    details.set(incoming.serverCode, next);
+    return true;
+  }
+
+  assert.equal(acceptDetails(oldSocket, oldDialog, {
+    serverCode: 'AAAAAA', metadataVersion: 99, description: 'old socket'
+  }), false);
+  assert.equal(acceptDetails(newSocket, roomADialog, {
+    serverCode: 'AAAAAA', metadataVersion: 99, description: 'old room'
+  }), false);
+  assert.equal(acceptDetails(newSocket, roomBDialog, {
+    serverCode: 'BBBBBB', metadataVersion: 4, description: 'current'
+  }), true);
+  assert.equal(acceptDetails(newSocket, roomBDialog, {
+    serverCode: 'BBBBBB', metadataVersion: 3, description: 'stale version'
+  }), false);
+
+  blockState = client.acceptVersionedState(blockState, {
+    accountKey: 'alice', blockVersion: 2, blockedUsers: []
+  }, 'blocks');
+  const staleBlock = client.acceptVersionedState(blockState, {
+    accountKey: 'alice', blockVersion: 1,
+    blockedUsers: [{ usernameKey: 'secret', username: 'Secret' }]
+  }, 'blocks');
+  assert.equal(staleBlock, blockState);
+
+  const currentPin = client.acceptVersionedState(null, {
+    serverCode: 'BBBBBB', pinCount: 1, pinVersion: 3, blockVersion: 2
+  }, 'pins');
+  pins.set('BBBBBB', currentPin);
+  assert.equal(client.acceptVersionedState(currentPin, {
+    serverCode: 'BBBBBB', pinCount: 8, pinVersion: 2, blockVersion: 2
+  }, 'pins'), currentPin);
+  assert.equal(generations.isCurrent(oldPin, 'AAAAAA'), false);
+  assert.equal(generations.isCurrent(roomAPin, 'AAAAAA'), false);
+
+  const exactRead = client.acceptVersionedState(null, {
+    serverCode: 'BBBBBB', usernameKey: 'alice', notificationLevel: 'all',
+    lastReadAt: '2026-08-10T12:00:00.000Z', lastReadMessageId: 'b',
+    unreadCount: 2, mentionCount: 1, version: 5, blockVersion: 2
+  }, 'room-state');
+  reads.set('BBBBBB', exactRead);
+  assert.equal(client.acceptVersionedState(exactRead, {
+    ...exactRead, unreadCount: 9, version: 4
+  }, 'room-state'), exactRead);
+  assert.equal(generations.isCurrent(oldRead, 'AAAAAA:1:old'), false);
+  assert.equal(generations.isCurrent(roomARead, `AAAAAA:${roomA.generation}:a`), false);
+
+  activityIds.set('BBBBBB', client.createRecentIdSet());
+  const activity = {
+    serverCode: 'BBBBBB', messageId: 'new-message', timestamp: '2026-08-10T12:01:00.000Z',
+    mentioned: true, blockVersion: 2
+  };
+  const afterActivity = client.applyRoomActivity(exactRead, activity, activityIds.get('BBBBBB'));
+  assert.notEqual(afterActivity, exactRead);
+  assert.equal(client.applyRoomActivity(afterActivity, activity, activityIds.get('BBBBBB')), afterActivity);
+
+  if (generations.isCurrent(oldReveal, 'AAAAAA:old')) rendered.push('old socket reveal');
+  if (generations.isCurrent(closedReveal, 'AAAAAA:message-a')) rendered.push('closed reveal');
+  if (generations.isCurrent(roomBReveal, 'BBBBBB:message-b')) rendered.push('current B reveal');
+  assert.deepEqual(rendered, ['current B reveal']);
+  assert.deepEqual([...details.keys()], ['BBBBBB']);
+  assert.deepEqual([...pins.keys()], ['BBBBBB']);
+  assert.deepEqual([...reads.keys()], ['BBBBBB']);
+  assert.equal(generations.isCurrent(roomA, 'AAAAAA'), false);
+  assert.equal(generations.isCurrent(roomB, 'BBBBBB'), true);
+
+  const pinStart = source.indexOf('function setMessagePinned(');
+  const pinEnd = source.indexOf('\n    function ', pinStart + 1);
+  const pinBlock = source.slice(pinStart, pinEnd);
+  assert.match(pinBlock, /featureGenerations\.begin\('pin-action', context\.roomCode\)/);
+  assert.ok(pinBlock.indexOf('featureGenerations.isCurrent') < pinBlock.indexOf('response.error'));
+  const switchStart = source.indexOf('function handleSwitchResult(');
+  const switchEnd = source.indexOf('function copyCode', switchStart);
+  assert.match(source.slice(switchStart, switchEnd), /invalidateRoomScopedFeatureCallbacks\(\)/);
+});
+
+test('complete mobile keyboard matrix keeps every authorized action reachable', () => {
+  const client = loadHelpers();
+  const source = fs.readFileSync(chatPath, 'utf8');
+  const actionPairs = [
+    ['invite-code-btn', 'overflow-invite-btn'],
+    ['leave-server-btn', 'overflow-leave-btn'],
+    ['delete-server-btn', 'overflow-delete-btn'],
+    ['join-server-btn', 'overflow-join-btn'],
+    ['moderator-center-btn', 'overflow-moderate-btn'],
+    ['settings-btn', 'overflow-settings-btn'],
+    ['logout-btn', 'overflow-logout-btn']
+  ];
+
+  for (const [directId, overflowId] of actionPairs) {
+    assert.match(source, new RegExp(`<button[^>]*id="${directId}"[^>]*type="button"`, 'i'), directId);
+    assert.match(source, new RegExp(`<button[^>]*id="${overflowId}"[^>]*type="button"[^>]*role="menuitem"`, 'i'), overflowId);
+  }
+  assert.doesNotMatch(source, /<meta\s+name="viewport"[^>]*(?:user-scalable\s*=\s*no|maximum-scale\s*=\s*1)/i);
+
+  const roleCases = [
+    [{ canReply: true, canReact: true, canManagePins: true, pinned: false, canReport: true },
+      ['reply', 'react', 'pin', 'report']],
+    [{ canReply: true, canReact: true, canManagePins: true, pinned: true, canDelete: true },
+      ['reply', 'react', 'unpin', 'delete']],
+    [{ canReply: true, canReact: true, canManagePins: false, canReport: true },
+      ['reply', 'react', 'report']]
+  ];
+  for (const [context, expected] of roleCases) {
+    assert.deepEqual([...client.messageActionsFor(context)], expected);
+  }
+  assert.deepEqual({ ...client.blockActionFor({ username: 'Bob', blocked: false }) }, {
+    action: 'block', label: 'Block', blocked: true
+  });
+  assert.deepEqual({ ...client.blockActionFor({ username: 'Bob', blocked: true }) }, {
+    action: 'unblock', label: 'Unblock', blocked: false
+  });
+
+  for (const [width, scale, expectedMobile] of [[320, 2, true], [700, 1, true], [701, 2, false]]) {
+    const layout = client.headerLayoutContract(width, scale);
+    assert.equal(layout.mobile, expectedMobile, `${width}px at ${scale}x`);
+    assert.equal(layout.targetSize, 44);
+    if (!expectedMobile) continue;
+    assert.deepEqual([...layout.visible], ['room-info-btn', 'pins-btn', 'header-overflow-btn']);
+    for (const slot of layout.slots) {
+      assert.equal(slot.width >= 44 && slot.height >= 44, true);
+      assert.equal(slot.left >= 0 && slot.right <= width, true);
+    }
+  }
+});
+
+test('closing feature dialogs resets pending mutation controls before reopen', () => {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  const infoStart = source.indexOf('const roomInfoDialogController =');
+  const infoEnd = source.indexOf('const pinsDialogController =', infoStart);
+  const info = source.slice(infoStart, infoEnd);
+  assert.match(info, /onClose\(\)[\s\S]*operationReceipts\.invalidate\('metadata'\)/);
+  assert.match(info, /onClose\(\)[\s\S]*pendingMetadataOperation\s*=\s*null/);
+  assert.match(info, /onClose\(\)[\s\S]*roomInfoSave\.disabled\s*=\s*false/);
+
+  const pinsStart = source.indexOf('const pinsDialogController =');
+  const pinsEnd = source.indexOf('const headerOverflowController =', pinsStart);
+  const pins = source.slice(pinsStart, pinsEnd);
+  assert.match(pins, /onClose\(\)[\s\S]*featureGenerations\.invalidate\('pin-action'\)/);
+  assert.match(pins, /onClose\(\)[\s\S]*operationReceipts\.invalidate\('pin'\)/);
+  assert.match(pins, /onClose\(\)[\s\S]*pendingPinOperation\s*=\s*null/);
+});
+
+test('block replacement synchronously removes compose reply and rendered pin bodies', () => {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  const replaceStart = source.indexOf('function replaceActiveMessagesWithBlockRefreshState(');
+  const replaceEnd = source.indexOf('\n    function ', replaceStart + 1);
+  const replace = source.slice(replaceStart, replaceEnd);
+  assert.match(replace, /cancelAction\(\)/);
+  assert.ok(replace.indexOf('cancelAction()') < replace.indexOf("'Refreshing messages…'"));
+
+  const blockStart = source.indexOf('function applyAcceptedBlockState(');
+  const blockEnd = source.indexOf('\n    function ', blockStart + 1);
+  const block = source.slice(blockStart, blockEnd);
+  assert.match(block, /document\.getElementById\('pins-list'\)\.textContent\s*=\s*''/);
+  assert.match(block, /closePins\(\)/);
+  assert.ok(block.indexOf("document.getElementById('pins-list').textContent = ''") <
+    block.indexOf('renderBlockedUsers()'));
+});
+
+test('block refresh suppression follows the accepted room generation and clears after switch failure', () => {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  const start = source.indexOf('function handleSwitchResult(');
+  const end = source.indexOf('\n    function copyCode', start);
+  const block = source.slice(start, end);
+  assert.match(block, /readSuppressionToken\s*=\s*Object\.freeze\(\{[\s\S]*roomGeneration:\s*currentRoomGeneration/);
+  assert.ok(block.indexOf('roomGeneration: currentRoomGeneration') < block.indexOf('loadHistory(response.history)'));
+  assert.match(block, /if\s*\(!outcome\.accepted\s*&&\s*options\.suppressAutoRead\s*===\s*true\)[\s\S]*disarmReadSuppression\(options\.suppressionToken\)/);
+  assert.match(block, /return outcome/);
+});
+
+test('joined-room intent owns a forced current-socket switch and same-room user intent supersedes it', () => {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  const forcedJoinSwitches = source.match(
+    /switchServer\(res\.server\.code,\s*\{\s*origin:\s*'join',\s*forceRefresh:\s*true\s*\}\)/g
+  ) || [];
+  assert.equal(forcedJoinSwitches.length, 3, 'visible join, invite join, and create all own a real switch token');
+
+  for (const socketName of ['joinSocket', 'createSocket', 'inviteSocket']) {
+    assert.match(source, new RegExp(`const ${socketName} = socket;[\\s\\S]*${socketName}\\.emit`));
+    assert.match(source, new RegExp(`${socketName}\\.emit[\\s\\S]*if \\(${socketName} !== socket\\) return`));
+  }
+
+  const supersedeStart = source.indexOf('function supersedeJoinedRoomInfoIntent(');
+  const supersedeEnd = source.indexOf('\n    function ', supersedeStart + 1);
+  const supersede = source.slice(supersedeStart, supersedeEnd);
+  assert.match(supersede, /origin === 'user'\s*&&\s*pendingJoinedRoomInfoIntent/);
+  assert.doesNotMatch(supersede, /pendingJoinedRoomInfoIntent\.roomCode\s*!==\s*roomCode/);
+});
+
+test('hydrated and event pin state updates existing message actions without stale closures', () => {
+  const client = loadHelpers();
+  const pin = id => ({ dataset: { messageId: id, pinned: 'false' }, textContent: 'Pin' });
+  const first = pin('first');
+  const second = pin('second');
+  assert.equal(client.syncPinActionControls([first, second], {
+    pinsLoaded: true,
+    pins: [{ messageId: 'second' }]
+  }), 2);
+  assert.deepEqual(
+    [first, second].map(control => [control.dataset.pinned, control.textContent]),
+    [['false', 'Pin'], ['true', 'Unpin']]
+  );
+  assert.equal(client.syncPinActionControls([first, second], null, {
+    messageId: 'first', pinned: true
+  }), 1);
+  assert.deepEqual([first.dataset.pinned, first.textContent], ['true', 'Unpin']);
+
+  const source = fs.readFileSync(chatPath, 'utf8');
+  const syncStart = source.indexOf('function syncMessagePinControls(');
+  const syncEnd = source.indexOf('\n    function ', syncStart + 1);
+  const sync = source.slice(syncStart, syncEnd);
+  assert.match(sync, /pinsByRoom\.get\(serverCode\)/);
+  assert.match(sync, /\.message-pin-action\[data-message-id\]/);
+  assert.match(sync, /ChatClientHelpers\.syncPinActionControls/);
+
+  const openStart = source.indexOf('function openPins(');
+  const openEnd = source.indexOf('\n    function ', openStart + 1);
+  assert.match(source.slice(openStart, openEnd), /pinsByRoom\.set\(roomCode, hydrated\)[\s\S]*syncMessagePinControls\(roomCode\)/);
+
+  const eventStart = source.indexOf("activeSocket.on('message_pin_updated'");
+  const eventEnd = source.indexOf("activeSocket.on('room_notification_updated'", eventStart);
+  assert.match(source.slice(eventStart, eventEnd), /if \(accepted[\s\S]*updateMessagePinControlState\(/);
+
+  const appendStart = source.indexOf('function appendMessage(');
+  const appendEnd = source.indexOf('\n    function ', appendStart + 1);
+  const append = source.slice(appendStart, appendEnd);
+  assert.match(append, /pinBtn\.className\s*=\s*'action-btn message-pin-action'/);
+  assert.match(append, /pinBtn\.dataset\.messageId\s*=/);
+  assert.match(append, /setMessagePinned\([\s\S]*pinBtn\.dataset\.pinned !== 'true'/);
+  assert.doesNotMatch(append, /setMessagePinned\([^\n]*!isPinned/);
+});
+
+test('overlapping block refreshes retain the newest suppression through the scroll mark frame', () => {
+  const client = loadHelpers();
+  const tokenA = Object.freeze({ id: 'A' });
+  const tokenB = Object.freeze({ id: 'B' });
+  assert.equal(client.releaseExactToken(tokenB, tokenA), tokenB, 'older A cannot release newer B');
+  assert.equal(client.releaseExactToken(tokenB, tokenB), null, 'the exact owner can release B');
+
+  const frames = [];
+  const observedDuringMark = [];
+  let active = tokenA;
+  const schedule = callback => frames.push(callback);
+  schedule(() => schedule(() => observedDuringMark.push(active)));
+  client.scheduleAfterScrollFrame(schedule, () => { active = client.releaseExactToken(active, tokenA); });
+  const firstFrame = frames.splice(0);
+  firstFrame.forEach(callback => callback());
+  assert.equal(active, tokenA);
+  const secondFrame = frames.splice(0);
+  secondFrame.forEach(callback => callback());
+  assert.deepEqual(observedDuringMark, [tokenA], 'scroll-triggered mark check sees suppression');
+  assert.equal(active, null, 'release follows the mark-check frame');
+
+  const source = fs.readFileSync(chatPath, 'utf8');
+  const refreshStart = source.indexOf('function handleRoomRefreshRequired(');
+  const refreshEnd = source.indexOf('\n    const authModal', refreshStart);
+  const refresh = source.slice(refreshStart, refreshEnd);
+  assert.match(refresh, /const suppressionToken\s*=\s*Object\.freeze/);
+  assert.match(refresh, /readSuppressionToken\s*=\s*suppressionToken/);
+  assert.match(refresh, /requestServerSwitch\([\s\S]*suppressionToken/);
+
+  const switchStart = source.indexOf('function handleSwitchResult(');
+  const switchEnd = source.indexOf('\n    function copyCode', switchStart);
+  const switchBlock = source.slice(switchStart, switchEnd);
+  assert.match(switchBlock, /readSuppressionToken\s*===\s*options\.suppressionToken/);
+  assert.match(switchBlock, /disarmReadSuppression\(options\.suppressionToken\)/);
+  assert.doesNotMatch(switchBlock, /disarmReadSuppression\(\)/);
+  assert.match(
+    switchBlock,
+    /ChatClientHelpers\.scheduleAfterScrollFrame\([\s\S]*disarmReadSuppression\(acceptedSuppressionToken\)/
+  );
+});
+
+test('timed-out message policy hides mutations except own delete and restores them on expiry', () => {
+  const client = loadHelpers();
+  assert.deepEqual([...client.messageActionsFor({
+    timedOut: true,
+    isOwn: true,
+    canReply: true,
+    canReact: true,
+    canManagePins: true,
+    pinned: true,
+    canEdit: true,
+    canReport: false,
+    canDelete: true
+  })], ['delete']);
+  assert.deepEqual([...client.messageActionsFor({
+    timedOut: true,
+    isOwn: false,
+    canReply: true,
+    canReact: true,
+    canManagePins: false,
+    canEdit: false,
+    canReport: true,
+    canDelete: false
+  })], ['report']);
+  assert.deepEqual([...client.messageActionsFor({
+    timedOut: true,
+    isOwn: false,
+    canReply: true,
+    canReact: true,
+    canManagePins: true,
+    pinned: false,
+    canEdit: true,
+    canReport: true,
+    canDelete: true
+  })], ['report']);
+  assert.deepEqual([...client.messageActionsFor({
+    timedOut: false,
+    isOwn: false,
+    canReply: true,
+    canReact: true,
+    canManagePins: true,
+    pinned: false,
+    canEdit: true,
+    canReport: true,
+    canDelete: true
+  })], ['reply', 'react', 'pin', 'edit', 'report', 'delete']);
+
+  const source = fs.readFileSync(chatPath, 'utf8');
+  assert.match(source, /let currentRestrictionState\s*=\s*Object\.freeze/);
+  assert.match(source, /function isCurrentRoomTimedOut\(\)/);
+  assert.match(source, /function canManagePinsInCurrentRoom\(\)[\s\S]*!isCurrentRoomTimedOut\(\)/);
+  assert.match(source, /function syncMessageActionAvailability\(\)[\s\S]*data-active-room-required/);
+  const restrictionStart = source.indexOf('const restrictionCoordinator =');
+  const restrictionEnd = source.indexOf('const roomAccessCoordinator =', restrictionStart);
+  const restriction = source.slice(restrictionStart, restrictionEnd);
+  assert.match(restriction, /currentRestrictionState\s*=\s*Object\.freeze/);
+  assert.match(restriction, /syncMessageActionAvailability\(\)/);
+  assert.match(restriction, /pinsDialogController\.isOpen\(\)[\s\S]*renderPins\(\)/);
+
+  const appendStart = source.indexOf('function appendMessage(');
+  const appendEnd = source.indexOf('\n    function ', appendStart + 1);
+  const append = source.slice(appendStart, appendEnd);
+  assert.match(append, /ChatClientHelpers\.messageActionsFor\(\{[\s\S]*timedOut:\s*isCurrentRoomTimedOut\(\)/);
+  assert.match(append, /data-active-room-required/);
+  assert.match(append, /isMe\s*\|\|\s*!isCurrentRoomTimedOut\(\)/);
+  assert.doesNotMatch(append, /const canManagePins\s*=\s*myRole/);
+
+  for (const functionName of ['setMessagePinned', 'initiateEdit', 'initiateReply']) {
+    const start = source.indexOf(`function ${functionName}(`);
+    const end = source.indexOf('\n    function ', start + 1);
+    assert.match(source.slice(start, end), /isCurrentRoomTimedOut\(\)/, functionName);
+  }
+  const reactionsStart = source.indexOf('function renderReactions(');
+  const reactionsEnd = source.indexOf('\n    function ', reactionsStart + 1);
+  assert.match(source.slice(reactionsStart, reactionsEnd), /isCurrentRoomTimedOut\(\)/);
+});
+
+test('a stale switch acknowledgement cannot restore history scrubbed by a newer block version', () => {
+  const client = loadHelpers();
+  const callbacks = [];
+  const renderedHistory = ['visible-before-block'];
+  let acceptedBlockVersion = 4;
+  let currentServerCode = 'global';
+
+  const coordinator = client.createSwitchCoordinator(
+    (target, callback) => callbacks.push({ target, callback }),
+    (targetServerCode, response) => {
+      const outcome = client.applySwitchResult({
+        currentServerCode,
+        targetServerCode,
+        response,
+        acceptedBlockVersion,
+        showAlert() {},
+        applySuccess(nextRoom, accepted) {
+          currentServerCode = nextRoom;
+          for (const message of accepted.history || []) renderedHistory.push(message.text);
+        }
+      });
+      currentServerCode = outcome.currentServerCode;
+    }
+  );
+
+  coordinator.request('ABC123', { origin: 'user' });
+  acceptedBlockVersion = 5;
+  renderedHistory.length = 0;
+  coordinator.request('ABC123', { forceRefresh: true, origin: 'block-refresh' });
+
+  callbacks[0].callback({
+    serverCode: 'ABC123',
+    history: [{ _id: 'secret', text: 'BLOCKED CONTENT SENTINEL' }],
+    pin: { serverCode: 'ABC123', pinCount: 0, pinVersion: 1, blockVersion: 4 },
+    notification: { serverCode: 'ABC123', version: 1, blockVersion: 4 }
+  });
+
+  assert.deepEqual(renderedHistory, [], 'older serialized history never reaches the fake DOM');
+  assert.equal(currentServerCode, 'global', 'the stale acknowledgement cannot change visible room state');
+  assert.equal(callbacks.length, 2, 'the queued content-free refresh starts immediately');
+
+  const source = fs.readFileSync(chatPath, 'utf8');
+  const switchStart = source.indexOf('function handleSwitchResult(');
+  const switchEnd = source.indexOf('\n    function copyCode', switchStart);
+  const switchBlock = source.slice(switchStart, switchEnd);
+  assert.match(switchBlock, /acceptedBlockVersion/);
+  assert.ok(
+    switchBlock.indexOf('acceptedBlockVersion') < switchBlock.indexOf('invalidateRoomScopedFeatureCallbacks()'),
+    'block authority is checked before any room or DOM mutation'
+  );
+});

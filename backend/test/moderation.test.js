@@ -14,7 +14,9 @@ const {
   withAccountTransitionLocks,
   withAccountTransitionLock,
   canModerateTarget,
+  canEditRoomDetails,
   canManagePins,
+  safeMessageForViewer,
   activeRestrictionState,
   applySessionAccessSnapshot,
   rejectAuditMutation,
@@ -4012,6 +4014,98 @@ test('complete attention policy matrix covers levels blocks memberships restrict
   assert.deepEqual({ unreadCount: reconnectState.unreadCount, mentionCount: reconnectState.mentionCount }, {
     unreadCount: 1, mentionCount: 1
   });
+});
+
+test('complete room experience backend policy matrix has no stale authority or content leak', async () => {
+  const rooms = ['global', 'ABC123'];
+  const actors = [
+    { label: 'admin', username: 'Admin', role: 'admin', member: true },
+    { label: 'owner', username: 'Owner', role: 'user', member: true },
+    { label: 'exact-mod', username: 'ExactMod', role: 'user', member: true },
+    { label: 'other-mod', username: 'OtherMod', role: 'user', member: true },
+    { label: 'member', username: 'Member', role: 'user', member: true },
+    { label: 'nonmember', username: 'Nonmember', role: 'user', member: false }
+  ];
+  const restrictions = [
+    { label: 'active', banned: false, timedOut: false },
+    { label: 'timeout', banned: false, timedOut: true },
+    { label: 'banned', banned: true, timedOut: false }
+  ];
+  let cases = 0;
+
+  for (const serverCode of rooms) {
+    for (const actor of actors) {
+      for (const restriction of restrictions) {
+        for (const blocked of [false, true]) {
+          const room = {
+            code: serverCode,
+            owner: 'Owner',
+            moderators: serverCode === 'global' ? [] : ['ExactMod']
+          };
+          const active = restriction.label === 'active';
+          const allowed = actor.member || actor.role === 'admin';
+          const access = {
+            allowed,
+            user: { username: actor.username, role: actor.role },
+            room,
+            restriction: { banned: restriction.banned, timedOut: restriction.timedOut }
+          };
+          const privileged = actor.role === 'admin';
+          const privateOwner = serverCode !== 'global' && actor.label === 'owner';
+          const exactModerator = serverCode !== 'global' && actor.label === 'exact-mod';
+          const prefix = `${serverCode}/${actor.label}/${restriction.label}/${blocked ? 'blocked' : 'unblocked'}`;
+
+          assert.equal(
+            canEditRoomDetails({ serverCode, access }),
+            active && allowed && (privileged || privateOwner),
+            `${prefix}: details`
+          );
+          assert.equal(
+            canManagePins({ serverCode, access }),
+            active && allowed && (privileged || privateOwner || exactModerator),
+            `${prefix}: pins`
+          );
+          const canModerate = active && allowed && canModerateTarget({
+            serverCode,
+            action: 'ban',
+            actorUser: access.user,
+            targetUser: { username: 'Target', role: 'user' },
+            room
+          });
+          assert.equal(
+            canModerate,
+            active && allowed && (privileged || exactModerator),
+            `${prefix}: moderation`
+          );
+
+          const secret = `secret-${prefix}`;
+          const safe = safeMessageForViewer({
+            _id: VALID_MESSAGE_ID,
+            serverCode,
+            username: 'Author',
+            authorKey: 'author',
+            displayName: 'Secret Author',
+            text: secret,
+            attachment: `data:image/png;base64,${secret}`,
+            replyTo: { id: VALID_MESSAGE_ID, text: secret },
+            reactions: { 'eyes': ['Author'] },
+            timestamp: new Date('2026-08-10T12:00:00.000Z')
+          }, { blockedUserKeys: blocked ? new Set(['author']) : new Set() });
+          if (blocked) {
+            assert.deepEqual(Object.keys(safe).sort(), [
+              '_id', 'authorKey', 'blocked', 'serverCode', 'timestamp', 'username'
+            ]);
+            assert.equal(JSON.stringify(safe).includes(secret), false, `${prefix}: blocked content`);
+          } else {
+            assert.equal(safe.text, secret, `${prefix}: visible content`);
+            assert.notEqual(safe.blocked, true, `${prefix}: visible marker`);
+          }
+          cases += 1;
+        }
+      }
+    }
+  }
+  assert.equal(cases, 72);
 });
 
 module.exports = {
