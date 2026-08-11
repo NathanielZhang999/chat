@@ -611,7 +611,6 @@ test('complete appearance preference policy matrix uses registered handlers', as
       writes += 1;
       if (row.outcome === 'CAS loser') {
         Object.assign(UserModel.rows[0], { preferences: winner, preferencesVersion: 5 });
-        return null;
       }
       if (row.outcome === 'database rejection') throw new Error('DATABASE_SECRET_SENTINEL');
       return originalUpdate(...args);

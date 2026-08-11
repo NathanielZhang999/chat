@@ -42,6 +42,32 @@ function loadHelpers() {
   });
 }
 
+function loadProductionFunction(name, globals = {}) {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  const declarationStart = source.indexOf(`function ${name}(`);
+  assert.notEqual(declarationStart, -1, `missing production function ${name}`);
+  const bodyStart = source.indexOf('{', declarationStart);
+  assert.notEqual(bodyStart, -1, `missing body for production function ${name}`);
+  let depth = 0;
+  let declarationEnd = -1;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    if (source[index] === '{') depth += 1;
+    if (source[index] === '}') depth -= 1;
+    if (depth === 0) {
+      declarationEnd = index + 1;
+      break;
+    }
+  }
+  assert.notEqual(declarationEnd, -1, `unterminated production function ${name}`);
+  const context = vm.createContext({ ...globals });
+  vm.runInContext(
+    `${source.slice(declarationStart, declarationEnd)}\nthis.productionFunction = ${name};`,
+    context,
+    { filename: `chat-${name}.js` }
+  );
+  return { context, invoke: (...args) => context.productionFunction(...args) };
+}
+
 test('new users receive the deployed Render backend URL by default', () => {
   const source = fs.readFileSync(chatPath, 'utf8');
   assert.match(
@@ -3308,6 +3334,7 @@ test('complete usability race matrix preserves the newest account room socket an
   const assertNoAliceRoomLeak = label => {
     assert.doesNotMatch(JSON.stringify(state),
       /ALICE_PRIVATE|SECRET1|Alice|alice draft|alice tone|alice status/, label);
+    assert.equal(state.role, 'user', `${label}: Alice's admin role is reset`);
   };
 
   session.replace(aliceSocket);
@@ -3376,7 +3403,11 @@ test('complete usability race matrix preserves the newest account room socket an
   const oldChatHandler = aliceSocket.listeners.get('chat_message').at(-1);
   const oldMemberHandler = aliceSocket.listeners.get('online_users').at(-1);
   const acknowledgementHandlers = helpers.createAcknowledgementHandlerMap({
-    switchHistorySuccess: response => { state.dom = response.history; state.navigation.push(response.serverCode); },
+    switchHistorySuccess: response => {
+      state.dom = response.history;
+      state.room = response.serverCode;
+      state.navigation.push(response.serverCode);
+    },
     switchHistoryError: response => { state.alerts.push(response.error); },
     editHistorySuccess: response => { state.dialogs.push(response.history); state.cache.edit = response.history; },
     editHistoryError: response => { state.alerts.push(response.error); state.statuses.push(response.error); },
@@ -3477,6 +3508,30 @@ test('complete usability race matrix preserves the newest account room socket an
   assert.equal(ackFirstSave.payload.expectedVersion, 3);
   assert.deepEqual(structuredClone(appearance.current()), { preferences: bobAckFirst, preferencesVersion: 4 });
 
+  Object.assign(state, {
+    dom: ['BOB_GENERATION_A_DOM'], historyDetail: ['BOB_GENERATION_A_HISTORY'], members: ['Bob'],
+    room: 'ROOMC3', contextId: 23, cache: { ROOMC3: 'BOB_GENERATION_A_CACHE' }, role: 'admin',
+    typing: ['Bob'], composition: 'Bob generation A draft', attachment: 'BOB_GENERATION_A_ATTACHMENT',
+    dialogs: ['BOB_GENERATION_A_DIALOG'], alerts: ['BOB_GENERATION_A_ALERT'],
+    audio: ['Bob generation A tone'], navigation: ['ROOMC3'], statuses: ['Bob generation A status'],
+    authSurface: 'room', account: 'Bob'
+  });
+  const sameObjectContext = { serverCode: 'ROOMC3', clientContextId: 23 };
+  const sameObjectBindingToken = guard.capture(bobSocket, sameObjectContext);
+  assert.ok(sameObjectBindingToken, 'generation-A Bob traffic is captured while authenticated');
+  authenticatedBinding = helpers.createAuthenticatedSocketBinder({
+    socket: bobSocket,
+    bindingToken: sameObjectBindingToken,
+    dispatchGuard: guard,
+    listenerTable
+  });
+  const retiredSameObjectChat = bobSocket.listeners.get('chat_message').at(-1);
+  const retiredSameObjectMembers = bobSocket.listeners.get('online_users').at(-1);
+  const retiredSameObjectSwitch = acknowledgements.capture('switchHistory', bobSocket, sameObjectContext);
+  const retiredSameObjectEdit = acknowledgements.capture('editHistory', bobSocket,
+    { ...sameObjectContext, messageId: 'bob-generation-a-message' });
+  const retiredSameObjectDeleted = acknowledgements.capture('deletedMessage', bobSocket,
+    { ...sameObjectContext, messageId: 'bob-generation-a-message' });
   const sameObjectSave = appearance.beginSave(bobEventFirst);
   const sameObjectRequest = preferenceRequests.at(-1);
   const retiredSameObjectPreference = bobSocket.listeners.get('preferences_updated').at(-1);
@@ -3489,8 +3544,57 @@ test('complete usability race matrix preserves the newest account room socket an
   bridge.finishAuth(sameObjectLogin, backendUrl, 'Bob', {
     username: 'Bob', preferences: bobAckFirst, preferencesVersion: 4
   });
+  assert.equal(state.role, 'user', 'same-object reconnect resets the retired admin role');
+  Object.assign(state, {
+    dom: ['BOB_GENERATION_B_DOM'], members: ['Bob generation B'], room: 'ROOMC3', contextId: 23,
+    dialogs: ['BOB_GENERATION_B_DIALOG'], alerts: ['BOB_GENERATION_B_ALERT'],
+    cache: { ROOMC3: 'BOB_GENERATION_B_CACHE' }, audio: ['Bob generation B tone'],
+    navigation: ['ROOMC3'], statuses: ['Bob generation B status'], authSurface: 'room', account: 'Bob'
+  });
+  const beforeSameObjectRetiredTraffic = structuredClone({
+    dom: state.dom,
+    members: state.members,
+    room: state.room,
+    dialogs: state.dialogs,
+    alerts: state.alerts,
+    cache: state.cache,
+    audio: state.audio,
+    navigation: state.navigation,
+    statuses: state.statuses
+  });
+  const beforeSameObjectAppearanceStatuses = appearanceStatuses.length;
+  const beforeSameObjectStorageWrites = storageWrites.length;
+  retiredSameObjectChat({ ...sameObjectContext, text: 'RETIRED_BOB_CHAT' });
+  retiredSameObjectMembers([{ username: 'Retired Bob member' }]);
+  for (const callback of [retiredSameObjectSwitch, retiredSameObjectEdit, retiredSameObjectDeleted]) {
+    callback({
+      ...sameObjectContext,
+      messageId: 'bob-generation-a-message',
+      history: ['RETIRED_BOB_HISTORY'],
+      text: 'RETIRED_BOB_DELETED_MESSAGE'
+    });
+    callback({
+      ...sameObjectContext,
+      messageId: 'bob-generation-a-message',
+      error: 'RETIRED_BOB_ERROR'
+    });
+  }
   sameObjectRequest.callback({ success: true, preferences: aliceAppearance, preferencesVersion: 99 });
   retiredSameObjectPreference({ preferences: aliceAppearance, preferencesVersion: 99 });
+  assert.deepEqual({
+    dom: state.dom,
+    members: state.members,
+    room: state.room,
+    dialogs: state.dialogs,
+    alerts: state.alerts,
+    cache: state.cache,
+    audio: state.audio,
+    navigation: state.navigation,
+    statuses: state.statuses
+  }, beforeSameObjectRetiredTraffic,
+  'retired same-object events and success/error callbacks cannot mutate any authenticated surface');
+  assert.equal(appearanceStatuses.length, beforeSameObjectAppearanceStatuses);
+  assert.equal(storageWrites.length, beforeSameObjectStorageWrites);
   assert.equal(sameObjectSave.payload.expectedVersion, 4);
   assert.deepEqual(structuredClone(appearance.current()), { preferences: bobAckFirst, preferencesVersion: 4 });
 
@@ -3822,20 +3926,40 @@ test('light compact large-text state keeps composer controls present enabled and
     'data-density': 'compact', 'data-motion': 'system'
   });
 
-  const controls = Object.fromEntries(['msg-input', 'send-btn', 'attachment-btn', 'emoji-btn', 'file-upload']
-    .map(id => [id, { disabled: true }]));
+  const controls = {
+    msgInput: { disabled: true },
+    sendBtn: { disabled: true },
+    attachmentButton: { disabled: true },
+    emojiButton: { disabled: true },
+    fileUpload: { disabled: true }
+  };
+  const productionComposition = loadProductionFunction('setCompositionDisabled', {
+    compositionDisabled: true,
+    ...controls,
+    restrictionNotice: { textContent: '' },
+    activeReactMessageId: null,
+    document: { getElementById: () => ({ classList: { remove() {} } }) }
+  });
   const restriction = helpers.createRestrictionCoordinator({
     schedule: () => null,
     cancel() {},
     now: () => 1,
     getCurrentRoom: () => 'global',
     applyState({ timedOut }) {
-      for (const control of Object.values(controls)) control.disabled = timedOut;
+      productionComposition.invoke(timedOut);
     }
   });
   restriction.apply({ timedOut: false, timeoutUntil: null }, 'global');
-  assert.equal(Object.values(controls).every(control => control.disabled === false), true,
-    'an accessible authenticated room enables every composer control');
+  for (const [label, control] of [
+    ['message input', controls.msgInput],
+    ['Send', controls.sendBtn],
+    ['Attachment', controls.attachmentButton],
+    ['Emoji', controls.emojiButton],
+    ['file input', controls.fileUpload]
+  ]) {
+    assert.equal(control.disabled, false,
+      `${label} is enabled by the production composition owner in an accessible authenticated room`);
+  }
 
   const source = fs.readFileSync(chatPath, 'utf8');
   for (const id of ['compose-drop-target', 'compose', 'msg-input', 'send-btn', 'attachment-btn',
