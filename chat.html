@@ -319,6 +319,11 @@
         #attachment-selection-status, #attachment-status { min-height: 1.2rem; padding: 0 1rem 6px; color: var(--text-muted); font-size: 0.82rem; font-weight: 600; }
         #compose-drop-target { border-radius: 10px; transition: box-shadow var(--motion-fast) ease, background-color var(--motion-fast) ease; }
         #compose-drop-target.attachment-drag-active { background: var(--primary-soft); box-shadow: inset 0 0 0 2px var(--primary-indicator); }
+        #shortcut-help-btn { min-height: 44px; min-width: 44px; margin-top: 10px; }
+        .shortcut-table { width: 100%; border-collapse: collapse; margin: 1rem 0; text-align: left; }
+        .shortcut-table th, .shortcut-table td { padding: 10px; border-bottom: 1px solid var(--border-color); }
+        .shortcut-table th { color: var(--text-strong); }
+        .shortcut-table kbd { display: inline-block; min-width: 2rem; padding: 3px 7px; border: 1px solid var(--border-color); border-radius: 4px; background: var(--input-bg); color: var(--text-strong); font-family: monospace; text-align: center; }
         
         /* --- SMOOTH FLOATING EMOJI PICKERS --- */
         .emoji-picker-container { 
@@ -471,9 +476,27 @@
         </div>
     </div>
 
+    <div id="shortcut-help-modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="shortcut-help-title" style="z-index: 1900;">
+        <div class="modal-box" style="max-width: 560px;">
+            <h2 id="shortcut-help-title">Keyboard Shortcuts</h2>
+            <table class="shortcut-table" aria-label="Keyboard shortcuts">
+                <thead><tr><th scope="col">Shortcut</th><th scope="col">Action</th></tr></thead>
+                <tbody>
+                    <tr><td><kbd>?</kbd></td><td>Open keyboard shortcuts</td></tr>
+                    <tr><td><kbd>Alt</kbd> + <kbd>↑</kbd></td><td>Previous joined room</td></tr>
+                    <tr><td><kbd>Alt</kbd> + <kbd>↓</kbd></td><td>Next joined room</td></tr>
+                    <tr><td><kbd>Ctrl/⌘</kbd> + <kbd>,</kbd></td><td>Open Appearance settings</td></tr>
+                    <tr><td><kbd>Ctrl/⌘</kbd> + <kbd>U</kbd></td><td>Upload an image</td></tr>
+                    <tr><td><kbd>Esc</kbd></td><td>Close or cancel the active layer</td></tr>
+                </tbody>
+            </table>
+            <button id="shortcut-help-close" class="btn-primary" type="button">Close</button>
+        </div>
+    </div>
+
     <div id="settings-modal" class="modal" style="z-index: 1000;">
         <div class="modal-box">
-            <button class="close-btn" onclick="document.getElementById('settings-modal').classList.remove('active')">&times;</button>
+            <button class="close-btn" onclick="closeSettings()" aria-label="Close settings">&times;</button>
             <h2>Profile Settings</h2>
             
             <div class="input-group">
@@ -526,6 +549,7 @@
                     </select>
                 </div>
                 <button id="save-appearance-btn" class="btn-primary" type="button">Save Appearance</button>
+                <button id="shortcut-help-btn" class="btn-primary btn-secondary" type="button">Keyboard Shortcuts</button>
                 <div id="appearance-status" role="status" aria-live="polite" style="min-height: 1.2rem; margin-top: 0.5rem; color: var(--text-muted);"></div>
             </section>
             
@@ -571,7 +595,7 @@
 
     <div id="server-modal" class="modal">
         <div class="modal-box">
-            <button class="close-btn" onclick="document.getElementById('server-modal').classList.remove('active')">&times;</button>
+            <button class="close-btn" onclick="closeServerModal()" aria-label="Close server dialog">&times;</button>
             <h2 id="sm-title">Join a Server</h2>
             
             <div id="sm-join-ui" class="active">
@@ -592,7 +616,7 @@
 
     <div id="history-modal" class="modal">
         <div class="modal-box" style="max-width: 500px;">
-            <button class="close-btn" onclick="closeMessageHistory()">&times;</button>
+            <button class="close-btn" onclick="closeHistoryModal()" aria-label="Close message history">&times;</button>
             <h2 id="history-modal-title">Message Edit History</h2>
             <div id="history-list"></div>
         </div>
@@ -716,7 +740,7 @@
         <div class="server-icon active" id="srv-global" onclick="switchServer('global', 'Global Chat')">G<div class="tooltip">Global Chat</div></div>
         <div id="dynamic-servers" style="width: 100%; display: flex; flex-direction: column; align-items: center; gap: 8px;"></div>
         <div style="width: 32px; height: 2px; background: var(--panel-subtle); border-radius: 1px; margin: 4px 0; flex-shrink: 0;"></div>
-        <div class="server-icon add-btn" onclick="document.getElementById('server-modal').classList.add('active'); toggleServerModal('join');">+<div class="tooltip">Add a Server</div></div>
+        <div class="server-icon add-btn" onclick="openServerModal('join')">+<div class="tooltip">Add a Server</div></div>
     </div>
 
     <div id="chat-area">
@@ -1517,6 +1541,294 @@
                 },
                 current() { return { roomCode, clientContextId: epoch }; }
             };
+        },
+
+        createFocusRestoringModalOwner({ element, getActiveElement = () => null } = {}) {
+            let priorFocus = null;
+            return {
+                open(initialFocus = null) {
+                    if (!element || !element.classList) return false;
+                    if (!element.classList.contains('active')) priorFocus = getActiveElement();
+                    element.classList.add('active');
+                    if (initialFocus && typeof initialFocus.focus === 'function') initialFocus.focus();
+                    return true;
+                },
+                close() {
+                    if (!element || !element.classList || !element.classList.contains('active')) return false;
+                    element.classList.remove('active');
+                    const restoreTarget = priorFocus;
+                    priorFocus = null;
+                    if (restoreTarget && restoreTarget.isConnected && typeof restoreTarget.focus === 'function') {
+                        restoreTarget.focus();
+                    }
+                    return true;
+                }
+            };
+        },
+
+        createCustomDialogController({
+            modal, titleElement, messageElement, confirmButton, cancelButton,
+            getActiveElement = () => null
+        } = {}) {
+            let owner = null;
+            const settle = value => {
+                const currentOwner = owner;
+                if (!currentOwner || currentOwner.settled) return false;
+                currentOwner.settled = true;
+                if (modal && modal.classList) modal.classList.remove('active');
+                if (confirmButton) confirmButton.onclick = null;
+                if (cancelButton) cancelButton.onclick = null;
+                owner = null;
+                currentOwner.resolve(value);
+                if (currentOwner.priorFocus && currentOwner.priorFocus.isConnected &&
+                    typeof currentOwner.priorFocus.focus === 'function') currentOwner.priorFocus.focus();
+                return true;
+            };
+            return {
+                open({ title = '', message = '', kind = 'alert', confirmText = 'OK', danger = false } = {}) {
+                    return new Promise(resolve => {
+                        if (owner && !owner.settled) {
+                            resolve(false);
+                            return;
+                        }
+                        if (!modal || !modal.classList || !confirmButton || !cancelButton) {
+                            resolve(false);
+                            return;
+                        }
+                        if (titleElement) titleElement.textContent = title;
+                        if (messageElement) messageElement.textContent = message;
+                        confirmButton.textContent = confirmText;
+                        if (confirmButton.style) {
+                            confirmButton.style.background = danger ? 'var(--error)' : 'var(--primary)';
+                        }
+                        if (cancelButton.style) cancelButton.style.display = kind === 'confirmation' ? 'block' : 'none';
+                        owner = {
+                            kind: kind === 'confirmation' ? 'confirmation' : 'alert',
+                            settled: false,
+                            resolve,
+                            priorFocus: getActiveElement()
+                        };
+                        modal.classList.add('active');
+                        confirmButton.onclick = () => settle(true);
+                        cancelButton.onclick = () => settle(false);
+                        if (typeof confirmButton.focus === 'function') confirmButton.focus();
+                    });
+                },
+                settle,
+                closeAlert() {
+                    if (!owner || owner.kind !== 'alert') return false;
+                    return settle(true);
+                },
+                current() {
+                    return owner ? { kind: owner.kind, settled: owner.settled,
+                        resolve: owner.resolve, priorFocus: owner.priorFocus } : null;
+                }
+            };
+        },
+
+        bindShortcutHelpControl({ button, openHelp } = {}) {
+            if (!button || typeof openHelp !== 'function') return { unbind() {} };
+            const previous = button.onclick || null;
+            button.onclick = openHelp;
+            return {
+                unbind() {
+                    if (button.onclick === openHelp) button.onclick = previous;
+                }
+            };
+        },
+
+        resolveKeyboardShortcut({
+            key = '', altKey = false, ctrlKey = false, metaKey = false, shiftKey = false,
+            repeat = false, isComposing = false, editable = false, password = false,
+            authenticated = false, protectedDialogOpen = false
+        } = {}) {
+            const normalizedKey = typeof key === 'string' ? key : '';
+            if (repeat || isComposing) return null;
+            if (normalizedKey === 'Escape') return protectedDialogOpen ? null : 'escape';
+            if (!authenticated || password) return null;
+            if (!editable && altKey && !ctrlKey && !metaKey && !shiftKey && normalizedKey === 'ArrowUp') {
+                return 'room_previous';
+            }
+            if (!editable && altKey && !ctrlKey && !metaKey && !shiftKey && normalizedKey === 'ArrowDown') {
+                return 'room_next';
+            }
+            if ((ctrlKey || metaKey) && !altKey && !shiftKey && normalizedKey === ',') return 'appearance';
+            if ((ctrlKey || metaKey) && !altKey && !shiftKey && normalizedKey.toLowerCase() === 'u') {
+                return 'upload';
+            }
+            if (!editable && !altKey && !ctrlKey && !metaKey && shiftKey && normalizedKey === '?') return 'help';
+            return null;
+        },
+
+        nextAccessibleRoom({
+            renderedRoomOrder = [], myJoinedServers = [], bannedRooms = [], role = 'user',
+            currentRoomCode = null, direction = 1, isRoomRailAccessible = () => false
+        } = {}) {
+            const joined = new Set(Array.isArray(myJoinedServers) ? myJoinedServers : []);
+            const candidates = [];
+            const seen = new Set();
+            for (const code of Array.isArray(renderedRoomOrder) ? renderedRoomOrder : []) {
+                if (typeof code !== 'string' || seen.has(code) || (code !== 'global' && !joined.has(code))) continue;
+                seen.add(code);
+                if (isRoomRailAccessible({
+                    serverCode: code,
+                    role,
+                    joinedServers: Array.from(joined),
+                    bannedRooms: Array.isArray(bannedRooms) ? bannedRooms : []
+                })) candidates.push(code);
+            }
+            if (!candidates.length) return null;
+            const currentIndex = candidates.indexOf(currentRoomCode);
+            if (currentIndex === -1) return direction < 0 ? candidates[candidates.length - 1] : candidates[0];
+            if (candidates.length === 1) return null;
+            const offset = direction < 0 ? -1 : 1;
+            return candidates[(currentIndex + offset + candidates.length) % candidates.length];
+        },
+
+        escapeAction(layers = []) {
+            for (const layer of Array.isArray(layers) ? layers : []) {
+                if (!layer || typeof layer.active !== 'function' || !layer.active()) continue;
+                if (typeof layer.protected === 'function' && layer.protected()) return false;
+                if (typeof layer.close !== 'function') return false;
+                return layer.close() !== false;
+            }
+            return false;
+        },
+
+        createEscapeLayerRegistry(dependencies = {}) {
+            const getElement = typeof dependencies.getElement === 'function'
+                ? dependencies.getElement : () => null;
+            const hasActiveClass = (id, className) => {
+                const element = getElement(id);
+                return Boolean(element && element.classList && element.classList.contains(className));
+            };
+            const activeClass = (id, className) => () => hasActiveClass(id, className);
+            const call = name => () => typeof dependencies[name] === 'function'
+                ? dependencies[name]() : false;
+            const never = () => false;
+            return [
+                { id: 'reaction-picker', active: activeClass('reaction-picker', 'show'), protected: never,
+                    close: call('closeReactionPicker') },
+                { id: 'emoji-picker', active: activeClass('emoji-picker', 'show'), protected: never,
+                    close: call('closeEmojiPicker') },
+                { id: 'shortcut-help-modal', active: activeClass('shortcut-help-modal', 'active'), protected: never,
+                    close: call('closeShortcutHelp') },
+                { id: 'auth-modal', active: activeClass('auth-modal', 'active'), protected: () => true, close: () => {} },
+                { id: 'custom-dialog-modal', active: activeClass('custom-dialog-modal', 'active'),
+                    protected: () => dependencies.getCustomDialogKind?.() === 'confirmation',
+                    close: call('closeCustomAlert') },
+                { id: 'settings-modal', active: activeClass('settings-modal', 'active'), protected: never,
+                    close: call('closeSettings') },
+                { id: 'server-modal', active: activeClass('server-modal', 'active'), protected: never,
+                    close: call('closeServerModal') },
+                { id: 'history-modal', active: activeClass('history-modal', 'active'), protected: never,
+                    close: call('closeHistoryModal') },
+                { id: 'moderator-center-modal', active: () =>
+                    hasActiveClass('moderator-center-modal', 'active') &&
+                    !['moderation-action-modal', 'report-modal', 'resolution-modal']
+                        .some(id => hasActiveClass(id, 'active')),
+                    protected: () => Boolean(dependencies.isModeratorCenterPending?.()),
+                    close: call('closeModeratorCenter') },
+                { id: 'moderation-action-modal', active: activeClass('moderation-action-modal', 'active'),
+                    protected: () => Boolean(dependencies.isModerationPending?.()),
+                    close: call('closeModerationPrompt') },
+                { id: 'report-modal', active: activeClass('report-modal', 'active'),
+                    protected: () => Boolean(dependencies.isReportPending?.()), close: call('closeReportPrompt') },
+                { id: 'resolution-modal', active: activeClass('resolution-modal', 'active'),
+                    protected: () => Boolean(dependencies.isResolutionPending?.()),
+                    close: call('closeResolutionPrompt') },
+                { id: 'edit-reply-attachment',
+                    active: () => Boolean(dependencies.isCompositionActionActive?.()), protected: never,
+                    close: call('cancelAction') }
+            ];
+        },
+
+        createShortcutController(dependencies = {}) {
+            const eventTarget = dependencies.eventTarget;
+            const editableContext = target => {
+                const tagName = String(target && target.tagName || '').toLowerCase();
+                const password = tagName === 'input' && String(target.type || '').toLowerCase() === 'password';
+                const contentEditableValue = String(target && target.contentEditable || '').toLowerCase();
+                const contentEditable = Boolean(target && (target.isContentEditable === true ||
+                    ['true', 'plaintext-only'].includes(contentEditableValue)));
+                return {
+                    password,
+                    editable: password || contentEditable || ['input', 'textarea', 'select'].includes(tagName)
+                };
+            };
+            let bound = true;
+            const controller = {
+                handleKeydown(event = {}) {
+                    const session = dependencies.getSessionContext?.();
+                    const authenticated = Boolean(session && session.connected && session.authenticated &&
+                        session.socketReference === dependencies.getActiveSocket?.() &&
+                        (typeof dependencies.isSessionContextCurrent !== 'function' ||
+                            dependencies.isSessionContextCurrent(session)));
+                    if (!authenticated) return false;
+                    const escapeLayers = dependencies.getEscapeLayers?.() || [];
+                    const firstActiveEscapeLayer = event.key === 'Escape'
+                        ? escapeLayers.find(layer => layer && typeof layer.active === 'function' && layer.active())
+                        : null;
+                    const protectedDialogOpen = firstActiveEscapeLayer
+                        ? Boolean(firstActiveEscapeLayer.protected?.())
+                        : Boolean(dependencies.getProtectedDialogOpen?.());
+                    if (protectedDialogOpen) return false;
+                    const targetContext = editableContext(event.target);
+                    const action = ChatClientHelpers.resolveKeyboardShortcut({
+                        key: event.key,
+                        altKey: Boolean(event.altKey),
+                        ctrlKey: Boolean(event.ctrlKey),
+                        metaKey: Boolean(event.metaKey),
+                        shiftKey: Boolean(event.shiftKey),
+                        repeat: Boolean(event.repeat),
+                        isComposing: Boolean(event.isComposing),
+                        editable: targetContext.editable,
+                        password: targetContext.password,
+                        authenticated,
+                        protectedDialogOpen
+                    });
+                    let executed = false;
+                    if (action === 'escape') {
+                        executed = ChatClientHelpers.escapeAction(escapeLayers);
+                    } else if (action === 'room_previous' || action === 'room_next') {
+                        const targetRoom = ChatClientHelpers.nextAccessibleRoom({
+                            renderedRoomOrder: dependencies.getRenderedRoomOrder?.(),
+                            myJoinedServers: dependencies.getJoinedRooms?.(),
+                            bannedRooms: dependencies.getBannedRooms?.(),
+                            role: dependencies.getRole?.(),
+                            currentRoomCode: dependencies.getCurrentRoom?.(),
+                            direction: action === 'room_previous' ? -1 : 1,
+                            isRoomRailAccessible: dependencies.isRoomRailAccessible
+                        });
+                        if (targetRoom && typeof dependencies.requestServerSwitch === 'function') {
+                            dependencies.requestServerSwitch(targetRoom);
+                            executed = true;
+                        }
+                    } else if (action === 'appearance' && typeof dependencies.openAppearance === 'function') {
+                        dependencies.openAppearance();
+                        executed = true;
+                    } else if (action === 'upload' && dependencies.isCompositionEnabled?.() &&
+                        typeof dependencies.openUpload === 'function') {
+                        dependencies.openUpload();
+                        executed = true;
+                    } else if (action === 'help' && typeof dependencies.openHelp === 'function') {
+                        dependencies.openHelp();
+                        executed = true;
+                    }
+                    if (executed && typeof event.preventDefault === 'function') event.preventDefault();
+                    return executed;
+                },
+                unbind() {
+                    if (!bound || !eventTarget || typeof eventTarget.removeEventListener !== 'function') return;
+                    bound = false;
+                    eventTarget.removeEventListener('keydown', listener);
+                }
+            };
+            const listener = event => controller.handleKeydown(event);
+            if (eventTarget && typeof eventTarget.addEventListener === 'function') {
+                eventTarget.addEventListener('keydown', listener);
+            } else bound = false;
+            return controller;
         },
 
         isRoomRailAccessible({ serverCode, role, joinedServers, bannedRooms } = {}) {
@@ -2748,22 +3060,26 @@
         }
     }
 
+    const customDialogController = ChatClientHelpers.createCustomDialogController({
+        modal: document.getElementById('custom-dialog-modal'),
+        titleElement: document.getElementById('cm-title'),
+        messageElement: document.getElementById('cm-message'),
+        confirmButton: document.getElementById('cm-confirm-btn'),
+        cancelButton: document.getElementById('cm-cancel-btn'),
+        getActiveElement: () => document.activeElement
+    });
+
+    function settleCustomDialog(value) { return customDialogController.settle(value); }
+
+    function closeCustomAlert() { return customDialogController.closeAlert(); }
+
     function customDialog(title, message, isConfirm, confirmText = "OK", danger = false) {
-        return new Promise((resolve) => {
-            const modal = document.getElementById('custom-dialog-modal');
-            document.getElementById('cm-title').textContent = title;
-            document.getElementById('cm-message').textContent = message;
-            const cancelBtn = document.getElementById('cm-cancel-btn');
-            const confirmBtn = document.getElementById('cm-confirm-btn');
-            confirmBtn.textContent = confirmText;
-            confirmBtn.style.background = danger ? 'var(--error)' : 'var(--primary)';
-            cancelBtn.style.display = isConfirm ? 'block' : 'none';
-            
-            modal.classList.add('active');
-            
-            const cleanup = () => { modal.classList.remove('active'); confirmBtn.onclick = null; cancelBtn.onclick = null; };
-            confirmBtn.onclick = () => { cleanup(); resolve(true); };
-            cancelBtn.onclick = () => { cleanup(); resolve(false); };
+        return customDialogController.open({
+            title,
+            message,
+            kind: isConfirm ? 'confirmation' : 'alert',
+            confirmText,
+            danger
         });
     }
     const showAppAlert = (t, m) => customDialog(t, m, false);
@@ -3074,16 +3390,17 @@
         cancelAction,
         resetAttachment: clearAttachment,
         closeRoomDialogs() {
+            if (customDialogController.current()) settleCustomDialog(false);
+            closeShortcutHelp();
+            closeSettings();
+            closeServerModal();
+            closeHistoryModal();
             closeModeratorCenter();
             closeModerationPrompt();
             closeReportPrompt();
             closeResolutionPrompt();
-            document.getElementById('history-modal').classList.remove('active');
             const contextMenu = document.getElementById('user-context-menu');
             if (contextMenu) contextMenu.remove();
-            document.querySelectorAll('.modal').forEach(modal => {
-                if (modal !== authModal) modal.classList.remove('active');
-            });
         },
         invalidateRequestState() {
             roomSwitchCoordinator.invalidate();
@@ -3868,6 +4185,37 @@
         if(e.target.value.length === 7 && e.target.value.startsWith('#')) document.getElementById('setting-color-picker').value = e.target.value;
     });
 
+    const shortcutHelpModalOwner = ChatClientHelpers.createFocusRestoringModalOwner({
+        element: document.getElementById('shortcut-help-modal'),
+        getActiveElement: () => document.activeElement
+    });
+    const settingsModalOwner = ChatClientHelpers.createFocusRestoringModalOwner({
+        element: document.getElementById('settings-modal'),
+        getActiveElement: () => document.activeElement
+    });
+    const serverModalOwner = ChatClientHelpers.createFocusRestoringModalOwner({
+        element: document.getElementById('server-modal'),
+        getActiveElement: () => document.activeElement
+    });
+    const historyModalOwner = ChatClientHelpers.createFocusRestoringModalOwner({
+        element: document.getElementById('history-modal'),
+        getActiveElement: () => document.activeElement
+    });
+
+    function openShortcutHelp() {
+        return shortcutHelpModalOwner.open(document.getElementById('shortcut-help-close'));
+    }
+
+    function closeShortcutHelp() { return shortcutHelpModalOwner.close(); }
+
+    function closeSettings() { return settingsModalOwner.close(); }
+
+    document.getElementById('shortcut-help-close').onclick = closeShortcutHelp;
+    const shortcutHelpControlBinding = ChatClientHelpers.bindShortcutHelpControl({
+        button: document.getElementById('shortcut-help-btn'),
+        openHelp: openShortcutHelp
+    });
+
     function openSettings(section = 'profile') {
         document.getElementById('setting-displayname').value = myDisplayName || "";
         document.getElementById('setting-avatar').value = myAvatarUrl || "";
@@ -3878,8 +4226,8 @@
         if(myColor && myColor.startsWith('#') && myColor.length === 7) { document.getElementById('setting-color-picker').value = myColor; } 
         else { document.getElementById('setting-color-picker').value = '#5865F2'; }
         ChatClientHelpers.applyAppearanceForm(appearanceFormElements(), appearanceController.current().preferences);
-        document.getElementById('settings-modal').classList.add('active');
-        if (section === 'appearance') document.getElementById('appearance-theme').focus();
+        settingsModalOwner.open(document.getElementById(
+            section === 'appearance' ? 'appearance-theme' : 'setting-displayname'));
     }
 
     document.getElementById('save-appearance-btn').onclick = saveAppearanceSettings;
@@ -4578,6 +4926,14 @@
         document.getElementById('sm-title').textContent = mode === 'join' ? 'Join a Server' : 'Create a Server';
     }
 
+    function openServerModal(mode = 'join') {
+        toggleServerModal(mode);
+        return serverModalOwner.open(document.getElementById(
+            mode === 'create' ? 'create-name' : 'join-code'));
+    }
+
+    function closeServerModal() { return serverModalOwner.close(); }
+
     function renderServers(servers) {
         if (!servers || !Array.isArray(servers)) return; 
         document.getElementById('dynamic-servers').textContent = '';
@@ -4759,7 +5115,7 @@
             guardedRequestAcknowledgement('roomOperation', {}, res => {
             res = res || { error: 'No response from server.' };
             if (res.error) return showAppAlert("Error", res.error);
-            document.getElementById('server-modal').classList.remove('active'); document.getElementById('create-name').value = '';
+            closeServerModal(); document.getElementById('create-name').value = '';
             myJoinedServers.push(res.server.code);
             
             const existingIcon = document.getElementById(`srv-${res.server.code}`);
@@ -4777,7 +5133,7 @@
             guardedRequestAcknowledgement('roomOperation', {}, res => {
             res = res || { error: 'No response from server.' };
             if (res.error) return showAppAlert("Error", res.error);
-            document.getElementById('server-modal').classList.remove('active'); document.getElementById('join-code').value = '';
+            closeServerModal(); document.getElementById('join-code').value = '';
             if (!myJoinedServers.includes(res.server.code)) myJoinedServers.push(res.server.code);
             
             const existingIcon = document.getElementById(`srv-${res.server.code}`);
@@ -4915,7 +5271,7 @@
                     el.appendChild(timeDiv); el.appendChild(textDiv); list.appendChild(el);
                 });
             }
-            document.getElementById('history-modal').classList.add('active');
+            openHistoryModal();
         };
         const handlers = ChatClientHelpers.createAcknowledgementHandlerMap({
             editHistorySuccess: res => {
@@ -4939,11 +5295,19 @@
         }));
     }
 
-    function closeMessageHistory() {
-        messageDetailCoordinator.invalidate();
-        document.getElementById('history-modal').classList.remove('active');
-        document.getElementById('history-list').textContent = '';
+    function openHistoryModal() {
+        const modal = document.getElementById('history-modal');
+        const closeButton = modal.querySelector('.close-btn');
+        return historyModalOwner.open(closeButton);
     }
+
+    function closeHistoryModal() {
+        messageDetailCoordinator.invalidate();
+        document.getElementById('history-list').textContent = '';
+        return historyModalOwner.close();
+    }
+
+    function closeMessageHistory() { return closeHistoryModal(); }
 
     function viewDeleted(msgId) {
         if (!currentServerCode) return;
@@ -4973,7 +5337,7 @@
             }
 
             el.appendChild(timeDiv); el.appendChild(textDiv); list.appendChild(el);
-            document.getElementById('history-modal').classList.add('active');
+            openHistoryModal();
         };
         const handlers = ChatClientHelpers.createAcknowledgementHandlerMap({
             deletedMessageSuccess: res => {
@@ -5217,6 +5581,57 @@
             else ind.textContent = 'Multiple people are typing...';
         }
     }
+
+    const escapeLayerRegistry = ChatClientHelpers.createEscapeLayerRegistry({
+        getElement: id => document.getElementById(id),
+        getCustomDialogKind: () => customDialogController.current()?.kind,
+        isModeratorCenterPending: () => [
+            'reports:list', 'restrictions:list', 'audit:list', 'automod:get',
+            'automod:save', 'reports:resolve'
+        ].some(key => moderatorCenterCoordinator.isPending(key)),
+        isModerationPending: () => moderationDialogCoordinator.current().pending,
+        isReportPending: () => reportDialogCoordinator.current().pending,
+        isResolutionPending: () => resolutionDialogCoordinator.current().pending,
+        isCompositionActionActive: () => Boolean(editingMsgId || replyingToData || pendingAttachmentBase64),
+        closeReactionPicker() {
+            document.getElementById('reaction-picker').classList.remove('show');
+            activeReactMessageId = null;
+        },
+        closeEmojiPicker() { document.getElementById('emoji-picker').classList.remove('show'); },
+        closeShortcutHelp,
+        closeCustomAlert,
+        closeSettings,
+        closeServerModal,
+        closeHistoryModal,
+        closeModeratorCenter,
+        closeModerationPrompt,
+        closeReportPrompt,
+        closeResolutionPrompt,
+        cancelAction
+    });
+
+    const shortcutController = ChatClientHelpers.createShortcutController({
+        eventTarget: document,
+        getSessionContext: () => sessionContextCoordinator.snapshot(),
+        isSessionContextCurrent: context => sessionContextCoordinator.matches(context),
+        getActiveSocket: () => socket,
+        getProtectedDialogOpen: () => escapeLayerRegistry.some(layer => layer.active() && layer.protected()),
+        getEscapeLayers: () => escapeLayerRegistry,
+        getCurrentRoom: () => currentServerCode,
+        getRenderedRoomOrder: () => Array.from(
+            document.querySelectorAll('#servers-sidebar .server-icon[id^="srv-"]'),
+            element => element.id.slice(4)
+        ),
+        getJoinedRooms: () => [...myJoinedServers],
+        getBannedRooms: () => [...myBannedRooms],
+        getRole: () => myRole,
+        isRoomRailAccessible: context => ChatClientHelpers.isRoomRailAccessible(context),
+        requestServerSwitch: code => requestServerSwitch(code),
+        openAppearance: () => openSettings('appearance'),
+        openUpload: () => fileUpload.click(),
+        openHelp: openShortcutHelp,
+        isCompositionEnabled: () => !compositionDisabled
+    });
 </script>
 </body>
 </html>

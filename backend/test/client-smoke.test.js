@@ -2691,3 +2691,406 @@ test('multiple files report the one-attachment rule and select the first support
   assert.match(source, /onProcessing\(message\)[\s\S]{0,100}attachmentStatusController\.processing\(message\)/);
   assert.match(source, /onStatus\(message\)[\s\S]{0,100}attachmentStatusController\.selection\(message\)/);
 });
+
+function shortcutModal(active = false) {
+  const element = new ControlledEventTarget();
+  if (active) element.classList.add('active');
+  return element;
+}
+
+function shortcutControllerHarness(overrides = {}) {
+  const helpers = loadHelpers();
+  const eventTarget = new ControlledEventTarget();
+  const socket = {};
+  const sessionCoordinator = helpers.createSessionContextCoordinator();
+  sessionCoordinator.replace(socket);
+  sessionCoordinator.connected(socket);
+  sessionCoordinator.authenticate(socket);
+  const state = {
+    activeSocket: socket,
+    session: sessionCoordinator.snapshot(),
+    compositionEnabled: true,
+    currentRoom: 'global',
+    renderedRooms: ['global', 'ABC123', 'GHOST1', 'DEF456'],
+    joinedRooms: ['global', 'ABC123', 'DEF456'],
+    bannedRooms: [],
+    role: 'admin',
+    appearance: [], uploads: 0, help: 0, switches: [], cancels: 0
+  };
+  const layers = overrides.layers || [];
+  const controller = helpers.createShortcutController({
+    eventTarget,
+    getSessionContext: () => state.session,
+    isSessionContextCurrent: candidate => sessionCoordinator.matches(candidate),
+    getActiveSocket: () => state.activeSocket,
+    getProtectedDialogOpen: () => layers.some(layer => layer.active() && layer.protected()),
+    getEscapeLayers: () => layers,
+    getCurrentRoom: () => state.currentRoom,
+    getRenderedRoomOrder: () => state.renderedRooms,
+    getJoinedRooms: () => state.joinedRooms,
+    getBannedRooms: () => state.bannedRooms,
+    getRole: () => state.role,
+    isRoomRailAccessible: context => helpers.isRoomRailAccessible(context),
+    requestServerSwitch: code => state.switches.push(code),
+    openAppearance: () => state.appearance.push('appearance'),
+    openUpload: () => { state.uploads += 1; },
+    openHelp: () => { state.help += 1; },
+    isCompositionEnabled: () => state.compositionEnabled,
+    ...overrides.dependencies
+  });
+  return { helpers, controller, eventTarget, sessionCoordinator, socket, state };
+}
+
+test('keyboard resolver maps the exact approved shortcuts on Windows and macOS', () => {
+  const { resolveKeyboardShortcut: resolve } = loadHelpers();
+  const base = { repeat: false, isComposing: false, editable: false, password: false,
+    authenticated: true, protectedDialogOpen: false };
+  assert.equal(resolve({ ...base, key: 'Escape' }), 'escape');
+  assert.equal(resolve({ ...base, key: 'ArrowUp', altKey: true }), 'room_previous');
+  assert.equal(resolve({ ...base, key: 'ArrowDown', altKey: true }), 'room_next');
+  assert.equal(resolve({ ...base, key: ',', ctrlKey: true }), 'appearance');
+  assert.equal(resolve({ ...base, key: ',', metaKey: true }), 'appearance');
+  assert.equal(resolve({ ...base, key: 'u', ctrlKey: true }), 'upload');
+  assert.equal(resolve({ ...base, key: 'U', metaKey: true }), 'upload');
+  assert.equal(resolve({ ...base, key: '?', shiftKey: true }), 'help');
+  for (const candidate of [
+    { key: '?', shiftKey: false }, { key: '/', shiftKey: true },
+    { key: '?', shiftKey: true, ctrlKey: true }, { key: 'u', ctrlKey: true, shiftKey: true },
+    { key: ',', ctrlKey: true, altKey: true }, { key: 'ArrowUp', altKey: true, metaKey: true },
+    { key: 'k', ctrlKey: true }, { key: 'ArrowLeft', altKey: true }
+  ]) assert.equal(resolve({ ...base, ...candidate }), null, JSON.stringify(candidate));
+});
+
+test('keyboard resolver ignores repeats IME protected dialogs password and unsafe editable targets', () => {
+  const { resolveKeyboardShortcut: resolve } = loadHelpers();
+  const base = { key: 'u', ctrlKey: true, authenticated: true, editable: false,
+    password: false, protectedDialogOpen: false };
+  for (const mutation of [
+    { repeat: true }, { isComposing: true }, { authenticated: false }, { password: true },
+    { key: 'ArrowDown', ctrlKey: false, altKey: true, editable: true },
+    { key: '?', ctrlKey: false, shiftKey: true, editable: true },
+    { key: 'Escape', ctrlKey: false, protectedDialogOpen: true }
+  ]) assert.equal(resolve({ ...base, ...mutation }), null, JSON.stringify(mutation));
+  assert.equal(resolve({ ...base, editable: true }), 'upload');
+  assert.equal(resolve({ ...base, key: ',', ctrlKey: true, editable: true }), 'appearance');
+
+  const harness = shortcutControllerHarness();
+  const unsafeEditable = { tagName: 'TEXTAREA' };
+  const contentEditable = { tagName: 'DIV', contentEditable: 'true' };
+  const password = { tagName: 'INPUT', type: 'password' };
+  for (const event of [
+    { key: '?', shiftKey: true, repeat: true },
+    { key: '?', shiftKey: true, isComposing: true },
+    { key: '?', shiftKey: true, target: unsafeEditable },
+    { key: '?', shiftKey: true, target: contentEditable },
+    { key: 'u', ctrlKey: true, target: password }
+  ]) assert.equal(harness.eventTarget.dispatch('keydown', event).defaultPrevented, false);
+  assert.equal(harness.state.help, 0);
+  assert.equal(harness.state.uploads, 0);
+});
+
+test('Escape performs exactly one highest-priority safe action', async () => {
+  const helpers = loadHelpers();
+  const ids = ['reaction-picker', 'emoji-picker', 'shortcut-help-modal', 'auth-modal',
+    'custom-dialog-modal', 'settings-modal', 'server-modal', 'history-modal',
+    'moderator-center-modal', 'moderation-action-modal', 'report-modal', 'resolution-modal'];
+  const modals = Object.fromEntries(ids.map(id => [id, shortcutModal()]));
+  const calls = [];
+  const pending = { center: false, moderation: false, report: false, resolution: false };
+  const cleanupCoordinators = {
+    history: helpers.createDialogRequestCoordinator(),
+    center: helpers.createModeratorCenterCoordinator(),
+    moderation: helpers.createDialogRequestCoordinator(),
+    report: helpers.createDialogRequestCoordinator(),
+    resolution: helpers.createDialogRequestCoordinator()
+  };
+  let customKind = 'alert';
+  let compositionActive = false;
+  const registry = helpers.createEscapeLayerRegistry({
+    getElement: id => modals[id],
+    getCustomDialogKind: () => customKind,
+    isModeratorCenterPending: () => pending.center,
+    isModerationPending: () => pending.moderation,
+    isReportPending: () => pending.report,
+    isResolutionPending: () => pending.resolution,
+    isCompositionActionActive: () => compositionActive,
+    closeReactionPicker: () => { calls.push('reaction-picker'); modals['reaction-picker'].classList.remove('show'); },
+    closeEmojiPicker: () => { calls.push('emoji-picker'); modals['emoji-picker'].classList.remove('show'); },
+    closeShortcutHelp: () => { calls.push('shortcut-help-modal'); modals['shortcut-help-modal'].classList.remove('active'); },
+    closeCustomAlert: () => { calls.push('custom-dialog-modal'); modals['custom-dialog-modal'].classList.remove('active'); },
+    closeSettings: () => { calls.push('settings-modal'); modals['settings-modal'].classList.remove('active'); },
+    closeServerModal: () => { calls.push('server-modal'); modals['server-modal'].classList.remove('active'); },
+    closeHistoryModal: () => { cleanupCoordinators.history.close(); calls.push('history-modal'); modals['history-modal'].classList.remove('active'); },
+    closeModeratorCenter: () => { cleanupCoordinators.center.close(); calls.push('moderator-center-modal'); modals['moderator-center-modal'].classList.remove('active'); },
+    closeModerationPrompt: () => { cleanupCoordinators.moderation.close(); calls.push('moderation-action-modal'); modals['moderation-action-modal'].classList.remove('active'); },
+    closeReportPrompt: () => { cleanupCoordinators.report.close(); calls.push('report-modal'); modals['report-modal'].classList.remove('active'); },
+    closeResolutionPrompt: () => { cleanupCoordinators.resolution.close(); calls.push('resolution-modal'); modals['resolution-modal'].classList.remove('active'); },
+    cancelAction: () => { calls.push('edit-reply-attachment'); compositionActive = false; }
+  });
+  assert.deepEqual([...registry].map(layer => layer.id), [...ids, 'edit-reply-attachment']);
+  for (const layer of registry) {
+    assert.equal(typeof layer.active, 'function', layer.id);
+    assert.equal(typeof layer.protected, 'function', layer.id);
+    assert.equal(typeof layer.close, 'function', layer.id);
+  }
+
+  modals['emoji-picker'].classList.add('show');
+  modals['reaction-picker'].classList.add('show');
+  assert.equal(helpers.escapeAction(registry), true);
+  assert.deepEqual(calls, ['reaction-picker']);
+  assert.equal(modals['emoji-picker'].classList.contains('show'), true);
+  assert.equal(helpers.escapeAction(registry), true);
+  assert.equal(calls.at(-1), 'emoji-picker');
+  assert.equal(modals['emoji-picker'].classList.contains('show'), false);
+
+  for (const modal of Object.values(modals)) {
+    modal.classList.remove('active');
+    modal.classList.remove('show');
+  }
+  modals['moderator-center-modal'].classList.add('active');
+  modals['resolution-modal'].classList.add('active');
+  assert.equal(helpers.escapeAction(registry), true);
+  assert.equal(calls.at(-1), 'resolution-modal', 'the nested prompt closes before its owning center');
+  assert.equal(modals['moderator-center-modal'].classList.contains('active'), true);
+
+  for (const id of ids.filter(id => !['reaction-picker', 'emoji-picker', 'auth-modal'].includes(id))) {
+    for (const modal of Object.values(modals)) {
+      modal.classList.remove('active');
+      modal.classList.remove('show');
+    }
+    if (id === 'custom-dialog-modal') customKind = 'alert';
+    pending.center = pending.moderation = pending.report = pending.resolution = false;
+    if (id === 'history-modal') cleanupCoordinators.history.open('history');
+    if (id === 'moderator-center-modal') cleanupCoordinators.center.open('ABC123', 'reports');
+    if (id === 'moderation-action-modal') cleanupCoordinators.moderation.open('moderation');
+    if (id === 'report-modal') cleanupCoordinators.report.open('report');
+    if (id === 'resolution-modal') cleanupCoordinators.resolution.open('resolution');
+    modals[id].classList.add('active');
+    assert.equal(helpers.escapeAction(registry), true, id);
+    assert.equal(calls.at(-1), id, id);
+    if (id === 'custom-dialog-modal') {
+      const settledCalls = calls.length;
+      assert.equal(helpers.escapeAction(registry), false);
+      assert.equal(calls.length, settledCalls, 'an alert owner settles only once');
+    }
+    if (id === 'history-modal') assert.equal(cleanupCoordinators.history.current().identity, null);
+    if (id === 'moderator-center-modal') assert.equal(cleanupCoordinators.center.current().room, null);
+    if (id === 'moderation-action-modal') assert.equal(cleanupCoordinators.moderation.current().identity, null);
+    if (id === 'report-modal') assert.equal(cleanupCoordinators.report.current().identity, null);
+    if (id === 'resolution-modal') assert.equal(cleanupCoordinators.resolution.current().identity, null);
+  }
+  compositionActive = true;
+  assert.equal(helpers.escapeAction(registry), true);
+  assert.equal(calls.at(-1), 'edit-reply-attachment');
+
+  for (const [id, protect] of [
+    ['auth-modal', () => {}],
+    ['custom-dialog-modal', () => { customKind = 'confirmation'; }],
+    ['moderator-center-modal', () => { pending.center = true; }],
+    ['moderation-action-modal', () => { pending.moderation = true; }],
+    ['report-modal', () => { pending.report = true; }],
+    ['resolution-modal', () => { pending.resolution = true; }]
+  ]) {
+    for (const modal of Object.values(modals)) {
+      modal.classList.remove('active');
+      modal.classList.remove('show');
+    }
+    customKind = 'alert'; pending.center = pending.moderation = pending.report = pending.resolution = false;
+    compositionActive = true; protect(); modals[id].classList.add('active');
+    const before = calls.length;
+    assert.equal(helpers.escapeAction(registry), false, id);
+    assert.equal(calls.length, before, `${id} did not close or fall through`);
+    assert.equal(compositionActive, true, `${id} preserves lower composition state`);
+  }
+  const source = fs.readFileSync(chatPath, 'utf8');
+  assert.match(source, /const customDialogController\s*=\s*ChatClientHelpers\.createCustomDialogController\(\{/);
+  assert.match(source, /function customDialog\([\s\S]{0,300}customDialogController\.open\(\{/);
+  assert.match(source, /getCustomDialogKind:\s*\(\)\s*=>\s*customDialogController\.current\(\)\?\.kind/);
+  const ownerlessAlert = shortcutModal(true);
+  const ownerlessRegistry = helpers.createEscapeLayerRegistry({
+    getElement: id => id === 'custom-dialog-modal' ? ownerlessAlert : shortcutModal(false),
+    getCustomDialogKind: () => 'alert'
+  });
+  assert.equal(helpers.escapeAction(ownerlessRegistry), false,
+    'an active layer without an executable owner is not accepted');
+  for (const modal of Object.values(modals)) {
+    modal.classList.remove('active');
+    modal.classList.remove('show');
+  }
+  customKind = 'confirmation';
+  modals['reaction-picker'].classList.add('show');
+  modals['custom-dialog-modal'].classList.add('active');
+  const controllerHarness = shortcutControllerHarness({ layers: registry });
+  const prioritizedEscape = controllerHarness.eventTarget.dispatch('keydown', { key: 'Escape' });
+  assert.equal(prioritizedEscape.defaultPrevented, true);
+  assert.equal(calls.at(-1), 'reaction-picker');
+  assert.equal(modals['custom-dialog-modal'].classList.contains('active'), true);
+  const ownedModal = shortcutModal();
+  const priorFocus = { isConnected: true, focusCount: 0, focus() { this.focusCount += 1; } };
+  const confirmButton = { style: {}, focusCount: 0, focus() { this.focusCount += 1; }, onclick: null };
+  const cancelButton = { style: {}, onclick: null };
+  const dialogOwner = helpers.createCustomDialogController({
+    modal: ownedModal,
+    titleElement: { textContent: '' },
+    messageElement: { textContent: '' },
+    confirmButton,
+    cancelButton,
+    getActiveElement: () => priorFocus
+  });
+  const alertPromise = dialogOwner.open({ title: 'Notice', message: 'Done', kind: 'alert' });
+  assert.equal(dialogOwner.current().kind, 'alert');
+  assert.equal(dialogOwner.closeAlert(), true);
+  assert.equal(dialogOwner.closeAlert(), false);
+  assert.equal(await alertPromise, true);
+  assert.equal(priorFocus.focusCount, 1);
+  assert.equal(ownedModal.classList.contains('active'), false);
+  const confirmationPromise = dialogOwner.open({ title: 'Delete', message: 'Sure?', kind: 'confirmation' });
+  assert.equal(dialogOwner.closeAlert(), false);
+  assert.equal(ownedModal.classList.contains('active'), true);
+  assert.equal(dialogOwner.settle(false), true);
+  assert.equal(await confirmationPromise, false);
+  const sanitizerClose = source.slice(source.indexOf('closeRoomDialogs() {'), source.indexOf('invalidateRequestState()', source.indexOf('closeRoomDialogs() {')));
+  for (const owner of ['settleCustomDialog(false)', 'closeShortcutHelp()', 'closeSettings()',
+    'closeServerModal()', 'closeHistoryModal()', 'closeModeratorCenter()', 'closeModerationPrompt()',
+    'closeReportPrompt()', 'closeResolutionPrompt()']) assert.match(sanitizerClose, new RegExp(owner.replace(/[()]/g, '\\$&')));
+  assert.doesNotMatch(sanitizerClose, /querySelectorAll\(['"]\.modal/);
+});
+
+test('room keyboard traversal wraps and skips inaccessible entries', () => {
+  const helpers = loadHelpers();
+  const context = {
+    renderedRoomOrder: ['global', 'ABC123', 'GHOST1', 'ABC123', 'BANNED', 'DEF456'],
+    myJoinedServers: ['global', 'ABC123', 'BANNED', 'DEF456'],
+    bannedRooms: ['BANNED'], role: 'admin',
+    isRoomRailAccessible: candidate => helpers.isRoomRailAccessible(candidate)
+  };
+  assert.equal(helpers.nextAccessibleRoom({ ...context, currentRoomCode: 'global', direction: 1 }), 'ABC123');
+  assert.equal(helpers.nextAccessibleRoom({ ...context, currentRoomCode: 'ABC123', direction: 1 }), 'DEF456');
+  assert.equal(helpers.nextAccessibleRoom({ ...context, currentRoomCode: 'DEF456', direction: 1 }), 'global');
+  assert.equal(helpers.nextAccessibleRoom({ ...context, currentRoomCode: 'global', direction: -1 }), 'DEF456');
+  assert.equal(helpers.nextAccessibleRoom({ ...context, currentRoomCode: 'GHOST1', direction: 1 }), 'global');
+  assert.equal(helpers.nextAccessibleRoom({ ...context, currentRoomCode: 'BANNED', direction: -1 }), 'DEF456');
+  assert.equal(helpers.nextAccessibleRoom({ ...context, myJoinedServers: [], bannedRooms: ['global'],
+    currentRoomCode: 'global', direction: 1 }), null);
+});
+
+test('room keyboard traversal uses the serialized switch coordinator', () => {
+  const { eventTarget, state } = shortcutControllerHarness();
+  const first = eventTarget.dispatch('keydown', { key: 'ArrowDown', altKey: true });
+  assert.equal(first.defaultPrevented, true);
+  assert.deepEqual(state.switches, ['ABC123']);
+  state.currentRoom = 'ABC123';
+  const second = eventTarget.dispatch('keydown', { key: 'ArrowDown', altKey: true });
+  assert.equal(second.defaultPrevented, true);
+  assert.deepEqual(state.switches, ['ABC123', 'DEF456']);
+  const source = fs.readFileSync(chatPath, 'utf8');
+  assert.match(source, /requestServerSwitch:\s*code\s*=>\s*requestServerSwitch\(code\)/);
+  assert.doesNotMatch(source.slice(source.indexOf('createShortcutController({'), source.indexOf('createShortcutController({') + 1800),
+    /emit\(['"]switch_server/);
+});
+
+test('appearance and upload shortcuts call existing visible UI actions', () => {
+  const { eventTarget, state } = shortcutControllerHarness();
+  const editable = { tagName: 'INPUT', type: 'text' };
+  assert.equal(eventTarget.dispatch('keydown', { key: ',', ctrlKey: true, target: editable }).defaultPrevented, true);
+  assert.deepEqual(state.appearance, ['appearance']);
+  assert.equal(eventTarget.dispatch('keydown', { key: 'u', metaKey: true, target: editable }).defaultPrevented, true);
+  assert.equal(state.uploads, 1);
+  state.compositionEnabled = false;
+  assert.equal(eventTarget.dispatch('keydown', { key: 'u', ctrlKey: true }).defaultPrevented, false);
+  assert.equal(state.uploads, 1);
+  const source = fs.readFileSync(chatPath, 'utf8');
+  assert.match(source, /openAppearance:\s*\(\)\s*=>\s*openSettings\(['"]appearance['"]\)/);
+  assert.match(source, /openUpload:\s*\(\)\s*=>\s*fileUpload\.click\(\)/);
+});
+
+test('shortcut help is accessible and restores prior focus', () => {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  assert.match(source, /id="shortcut-help-modal"[^>]*class="modal"[^>]*role="dialog"[^>]*aria-modal="true"[^>]*aria-labelledby="shortcut-help-title"/);
+  assert.match(source, /id="shortcut-help-title"[^>]*>Keyboard Shortcuts</);
+  assert.match(source, /id="shortcut-help-close"[^>]*>Close</);
+  assert.match(source, /<table[^>]*aria-label="Keyboard shortcuts"/);
+  assert.match(source, /const shortcutHelpModalOwner\s*=\s*ChatClientHelpers\.createFocusRestoringModalOwner\(\{/);
+  assert.match(source, /function openShortcutHelp\(\)[\s\S]{0,180}shortcutHelpModalOwner\.open/);
+  assert.match(source, /function closeShortcutHelp\(\)[\s\S]{0,140}shortcutHelpModalOwner\.close/);
+  const { eventTarget, state } = shortcutControllerHarness();
+  assert.equal(eventTarget.dispatch('keydown', { key: '?', shiftKey: true }).defaultPrevented, true);
+  assert.equal(state.help, 1);
+  const helpers = loadHelpers();
+  const modal = shortcutModal();
+  const priorFocus = { isConnected: true, focusCount: 0, focus() { this.focusCount += 1; } };
+  const closeButton = { focusCount: 0, focus() { this.focusCount += 1; } };
+  const owner = helpers.createFocusRestoringModalOwner({
+    element: modal,
+    getActiveElement: () => priorFocus
+  });
+  assert.equal(owner.open(closeButton), true);
+  assert.equal(modal.classList.contains('active'), true);
+  assert.equal(closeButton.focusCount, 1);
+  assert.equal(owner.close(), true);
+  assert.equal(priorFocus.focusCount, 1);
+  assert.equal(owner.close(), false);
+});
+
+test('visible shortcut help control opens the same accessible dialog', () => {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  assert.match(source, /<button[^>]*id="shortcut-help-btn"[^>]*>Keyboard Shortcuts<\/button>/);
+  assert.match(source, /#shortcut-help-btn\s*\{[^}]*min-height:\s*44px[^}]*min-width:\s*44px/s);
+  assert.match(source, /ChatClientHelpers\.bindShortcutHelpControl\(\{[\s\S]{0,180}shortcut-help-btn[\s\S]{0,120}openHelp:\s*openShortcutHelp/);
+  assert.match(source, /openHelp:\s*openShortcutHelp/);
+  const keydownListeners = [...source.matchAll(/\.addEventListener\(['"]keydown['"]/g)];
+  assert.equal(keydownListeners.length, 1, 'exactly one keydown listener is installed');
+  assert.match(source, /event\s*=>\s*controller\.handleKeydown\(event\)/);
+  const helpers = loadHelpers();
+  const button = { onclick: null };
+  let openCalls = 0;
+  const binding = helpers.bindShortcutHelpControl({ button, openHelp: () => { openCalls += 1; } });
+  button.onclick();
+  assert.equal(openCalls, 1);
+  binding.unbind();
+  assert.equal(button.onclick, null);
+});
+
+test('replaced sockets logged-out state and destructive dialogs reject shortcut effects', () => {
+  const modal = shortcutModal(true);
+  const helpers = loadHelpers();
+  const protectedLayers = helpers.createEscapeLayerRegistry({
+    getElement: id => id === 'custom-dialog-modal' ? modal : shortcutModal(false),
+    getCustomDialogKind: () => 'confirmation'
+  });
+  const harness = shortcutControllerHarness({ layers: protectedLayers });
+  harness.state.activeSocket = {};
+  for (const event of [
+    { key: ',', ctrlKey: true }, { key: 'u', ctrlKey: true },
+    { key: 'ArrowDown', altKey: true }, { key: '?', shiftKey: true }, { key: 'Escape' }
+  ]) assert.equal(harness.eventTarget.dispatch('keydown', event).defaultPrevented, false);
+  assert.deepEqual({ appearance: harness.state.appearance, uploads: harness.state.uploads,
+    help: harness.state.help, switches: harness.state.switches },
+  { appearance: [], uploads: 0, help: 0, switches: [] });
+  harness.state.activeSocket = harness.socket;
+  harness.state.session = Object.freeze({ ...harness.state.session, authenticated: false });
+  assert.equal(harness.eventTarget.dispatch('keydown', { key: '?', shiftKey: true }).defaultPrevented, false);
+  harness.state.session = harness.sessionCoordinator.snapshot();
+  for (const event of [{ key: ',', ctrlKey: true }, { key: 'u', ctrlKey: true },
+    { key: 'ArrowDown', altKey: true }, { key: '?', shiftKey: true }, { key: 'Escape' }]) {
+    assert.equal(harness.eventTarget.dispatch('keydown', event).defaultPrevented, false,
+      `protected confirmation rejects ${event.key}`);
+  }
+});
+
+test('same-object reconnect disables shortcuts until a new login succeeds', () => {
+  const harness = shortcutControllerHarness();
+  assert.equal(harness.eventTarget.dispatch('keydown', { key: '?', shiftKey: true }).defaultPrevented, true);
+  harness.sessionCoordinator.disconnect(harness.socket);
+  harness.sessionCoordinator.connected(harness.socket);
+  assert.equal(harness.eventTarget.dispatch('keydown', { key: '?', shiftKey: true }).defaultPrevented, false);
+  harness.state.session = harness.sessionCoordinator.snapshot();
+  assert.equal(harness.eventTarget.dispatch('keydown', { key: '?', shiftKey: true }).defaultPrevented, false);
+  harness.sessionCoordinator.authenticate(harness.socket);
+  harness.state.session = harness.sessionCoordinator.snapshot();
+  assert.equal(harness.eventTarget.dispatch('keydown', { key: '?', shiftKey: true }).defaultPrevented, true);
+  const before = harness.state.help;
+  harness.controller.unbind();
+  harness.eventTarget.dispatch('keydown', { key: '?', shiftKey: true });
+  assert.equal(harness.state.help, before);
+});
