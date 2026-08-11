@@ -138,8 +138,8 @@ function createClientSocket(initiallyConnected = false) {
       listeners.set(event, listeners.get(event).filter(candidate => candidate !== handler));
     },
     emit(event, ...args) { emitted.push({ event, args }); },
-    deliver(event, payload) {
-      for (const handler of [...(listeners.get(event) || [])]) handler(payload);
+    deliver(event, ...args) {
+      for (const handler of [...(listeners.get(event) || [])]) handler(...args);
     }
   };
 }
@@ -738,6 +738,77 @@ test('sanitized sessions reject prior socket events and delayed room and detail 
   assert.equal(guard.acceptSocket(sameObjectToken), false);
 });
 
+test('same-generation room A backend packets cannot mutate room B', () => {
+  const helpers = loadHelpers();
+  const socket = createClientSocket(true);
+  const session = helpers.createSessionContextCoordinator();
+  session.replace(socket);
+  session.connected(socket);
+  session.authenticate(socket);
+  let currentRoom = 'ROOMA1';
+  let clientContextId = 9;
+  const mutations = [];
+  const guard = helpers.createSessionDispatchGuard({
+    sessionCoordinator: session,
+    getActiveSocket: () => socket,
+    getCurrentRoomCode: () => currentRoom,
+    getClientContextId: () => clientContextId
+  });
+  const roomEvents = [
+    ['chat_message', 'chatMessage', { text: 'ROOM_A_CHAT' }],
+    ['system_message', 'systemMessage', 'ROOM_A_SYSTEM'],
+    ['room_role_updated', 'roomRoleUpdated', { username: 'Alice', targetServer: 'ROOMA1' }],
+    ['moderation_queue_updated', 'moderationQueueUpdated', { serverCode: 'ROOMA1' }],
+    ['message_blocked', 'messageBlocked', {
+      rule: 'content_policy', serverCode: 'ROOMA1', clientContextId
+    }],
+    ['message_edited', 'messageEdited', { id: 'm1', text: 'ROOM_A_EDIT' }],
+    ['message_deleted', 'messageDeleted', 'm1'],
+    ['reaction_updated', 'reactionUpdated', { id: 'm1', reactions: {} }],
+    ['online_users', 'onlineUsers', [{ username: 'Alice' }]],
+    ['typing', 'typing', { username: 'Alice', isTyping: true }]
+  ];
+  const listenerTable = helpers.createAuthenticatedListenerTable(Object.fromEntries(
+    roomEvents.map(([, dependency]) => [dependency, (...args) => mutations.push([dependency, args])])
+  ));
+  const binding = helpers.createAuthenticatedSocketBinder({
+    socket,
+    bindingToken: guard.capture(socket, {}),
+    dispatchGuard: guard,
+    listenerTable
+  });
+
+  currentRoom = 'ROOMB2';
+  clientContextId = 10;
+  for (const [eventName, , payload] of roomEvents) {
+    socket.deliver(eventName, payload, { serverCode: 'ROOMA1' });
+  }
+  assert.deepEqual(mutations, [], 'late room-A metadata must reject every room-scoped handler');
+
+  for (const [eventName, , payload] of roomEvents) socket.deliver(eventName, payload);
+  assert.deepEqual(mutations, [], 'missing canonical room metadata must fail closed');
+
+  currentRoom = 'global';
+  socket.deliver('system_message', 'NONCANONICAL_GLOBAL', { serverCode: 'GLOBAL' });
+  assert.deepEqual(mutations, [], 'noncanonical global metadata must fail closed');
+  currentRoom = 'ROOMB2';
+
+  for (const [eventName, dependency, payload] of roomEvents) {
+    let currentPayload = payload;
+    if (eventName === 'moderation_queue_updated') currentPayload = { serverCode: 'ROOMB2' };
+    if (eventName === 'message_blocked') {
+      currentPayload = { rule: 'content_policy', serverCode: 'ROOMB2', clientContextId };
+    }
+    if (eventName === 'room_role_updated') {
+      currentPayload = { username: 'Alice', targetServer: 'ROOMB2' };
+    }
+    socket.deliver(eventName, currentPayload, { serverCode: 'ROOMB2' });
+    assert.equal(mutations.at(-1)[0], dependency, `${eventName} accepts current-room metadata`);
+  }
+  assert.equal(mutations.length, roomEvents.length);
+  binding.unbind();
+});
+
 test('complete authenticated listener binding rejects retired force logout generations', () => {
   const helpers = loadHelpers();
   const socket = createClientSocket(true);
@@ -764,8 +835,16 @@ test('complete authenticated listener binding rejects retired force logout gener
   const firstToken = guard.capture(socket, {});
   const firstBinding = helpers.createAuthenticatedSocketBinder({ socket, bindingToken: firstToken, dispatchGuard: guard, listenerTable: table });
   const oldForceLogout = socket.listeners.get('force_logout')[0];
+  const roomScoped = new Set([
+    'chat_message', 'system_message', 'room_role_updated', 'moderation_queue_updated',
+    'message_blocked', 'message_edited', 'message_deleted', 'reaction_updated',
+    'online_users', 'typing'
+  ]);
   for (const event of Object.values(dependencyNames)) {
-    socket.deliver(event, event === 'message_deleted' ? 'm1' : {});
+    let payload = event === 'message_deleted' ? 'm1' : {};
+    if (event === 'message_blocked') payload = { serverCode: 'global', clientContextId: 1 };
+    if (event === 'moderation_queue_updated') payload = { serverCode: 'global' };
+    socket.deliver(event, payload, ...(roomScoped.has(event) ? [{ serverCode: 'global' }] : []));
   }
   assert.deepEqual(calls, Object.values(dependencyNames), 'the production table binds every authenticated event');
 
@@ -786,6 +865,168 @@ test('complete authenticated listener binding rejects retired force logout gener
   const source = fs.readFileSync(chatPath, 'utf8');
   assert.doesNotMatch(source, /activeSocket\.on\(['"]force_logout['"]/);
   assert.match(source, /authenticatedEventTarget\.on\(['"]force_logout['"]/);
+});
+
+test('production force logout clears private state before non-blocking notification', () => {
+  const helpers = loadHelpers();
+  const privateState = {
+    chat: ['ALICE_PRIVATE_MESSAGE_SENTINEL'], members: ['Alice'], room: 'ROOMA1',
+    servers: ['ROOMA1'], role: 'admin', typing: ['Alice'], composition: 'secret draft',
+    attachment: 'data:secret', dialogs: ['history'], requests: ['detail'], bound: true,
+    audio: ['oscillator'], navigation: ['ROOMA1'], authenticated: true
+  };
+  const sequence = [];
+  const owners = helpers.createProductionUnauthenticatedOwners({
+    clearChatHistory: () => { privateState.chat = []; },
+    clearHistoryDetails: () => {},
+    clearMembers: () => { privateState.members = []; },
+    clearRoomState: () => { privateState.room = null; },
+    clearServerState: () => { privateState.servers = []; },
+    resetRoles: () => { privateState.role = 'user'; },
+    resetTyping: () => { privateState.typing = []; },
+    resetCompositionState: () => { privateState.composition = ''; },
+    cancelAction: () => {},
+    resetAttachment: () => { privateState.attachment = null; },
+    closeRoomDialogs: () => { privateState.dialogs = []; },
+    invalidateRequestState: () => { privateState.requests = []; },
+    unbindAuthenticatedEvents: () => { privateState.bound = false; },
+    clearAudio: () => { privateState.audio = []; },
+    clearNavigationState: () => { privateState.navigation = []; },
+    hideRoomControls: () => {},
+    showAuthentication: reason => sequence.push(`authentication:${reason}`)
+  });
+  const sanitizer = helpers.createUnauthenticatedStateSanitizer(owners);
+  const remembered = new Map([['pro_chat_user', 'Alice']]);
+  let notified = null;
+  const runtime = loadProductionFunction('handleRemoteForceLogout', {
+    appearanceRuntimeBridge: {
+      invalidate() { privateState.authenticated = false; sequence.push('authority-invalidated'); }
+    },
+    enterSanitizedUnauthenticatedState(reason) {
+      sequence.push('sanitize-start');
+      sanitizer.sanitize(reason);
+      sequence.push('sanitize-finished');
+    },
+    localStorage: {
+      removeItem(key) { remembered.delete(key); sequence.push(`removed:${key}`); }
+    },
+    showError(message, success) {
+      notified = { message, success, snapshot: structuredClone(privateState) };
+      sequence.push('notified');
+    }
+  });
+
+  runtime.invoke('Remote session ended.');
+
+  assert.deepEqual(privateState, {
+    chat: [], members: [], room: null, servers: [], role: 'user', typing: [], composition: '',
+    attachment: null, dialogs: [], requests: [], bound: false, audio: [], navigation: [],
+    authenticated: false
+  });
+  assert.equal(remembered.has('pro_chat_user'), false);
+  assert.deepEqual(notified, { message: 'Remote session ended.', success: false, snapshot: privateState });
+  assert.ok(sequence.indexOf('authority-invalidated') < sequence.indexOf('sanitize-start'));
+  assert.ok(sequence.indexOf('sanitize-finished') < sequence.indexOf('notified'));
+  const source = fs.readFileSync(chatPath, 'utf8');
+  assert.match(source, /authenticatedEventTarget\.on\(['"]force_logout['"],\s*handleRemoteForceLogout\)/);
+  assert.doesNotMatch(source,
+    /authenticatedEventTarget\.on\(['"]force_logout['"][\s\S]{0,260}\b(?:alert|reload)\s*\(/,
+    'remote logout notification is non-blocking and never precedes sanitization');
+});
+
+test('production audio owner invalidates pending resumes and disconnects active oscillators', async () => {
+  const helpers = loadHelpers();
+  const resumeGate = deferred();
+  let pendingCreates = 0;
+  const pendingContext = {
+    state: 'suspended',
+    currentTime: 5,
+    destination: {},
+    resume() { return resumeGate.promise.then(() => { this.state = 'running'; }); },
+    createOscillator() { pendingCreates += 1; return {}; },
+    createGain() { return {}; }
+  };
+  const pendingOwner = helpers.createAudioController({ audioContext: pendingContext });
+  const pendingPlay = pendingOwner.play('msg');
+  pendingOwner.sanitize();
+  resumeGate.resolve();
+  await pendingPlay;
+  assert.equal(pendingCreates, 0, 'sanitized resume work cannot create a later oscillator');
+
+  const events = [];
+  const oscillator = {
+    type: '',
+    frequency: {
+      setValueAtTime: (...args) => events.push(['frequency', ...args]),
+      exponentialRampToValueAtTime: (...args) => events.push(['frequency-ramp', ...args])
+    },
+    connect: target => events.push(['osc-connect', target]),
+    disconnect: () => events.push(['osc-disconnect']),
+    start: time => events.push(['start', time]),
+    stop: time => events.push(['stop', time])
+  };
+  const gain = {
+    gain: {
+      setValueAtTime: (...args) => events.push(['gain', ...args]),
+      exponentialRampToValueAtTime: (...args) => events.push(['gain-ramp', ...args])
+    },
+    connect: target => events.push(['gain-connect', target]),
+    disconnect: () => events.push(['gain-disconnect'])
+  };
+  const runningContext = {
+    state: 'running', currentTime: 12, destination: { id: 'speaker' },
+    createOscillator: () => oscillator,
+    createGain: () => gain
+  };
+  const activeOwner = helpers.createAudioController({ audioContext: runningContext });
+  await activeOwner.play('ping');
+  assert.equal(events.some(event => event[0] === 'start'), true);
+  activeOwner.sanitize();
+  assert.equal(events.some(event => event[0] === 'osc-disconnect'), true,
+    'active oscillator disconnects synchronously');
+  assert.equal(events.some(event => event[0] === 'gain-disconnect'), true,
+    'active gain disconnects synchronously');
+  assert.ok(events.filter(event => event[0] === 'stop').length >= 2,
+    'sanitization immediately stops an oscillator that already had a scheduled stop');
+
+  const source = fs.readFileSync(chatPath, 'utf8');
+  assert.match(source, /const audioController\s*=\s*ChatClientHelpers\.createAudioController\(\{\s*audioContext:\s*audioCtx\s*\}\)/);
+  assert.match(source, /function playSound\(type\)\s*\{\s*return audioController\.play\(type\);\s*\}/s);
+  assert.match(source, /clearAudio:\s*\(\)\s*=>\s*audioController\.sanitize\(\)/);
+});
+
+test('authenticated listener unbind and socket replacement release listener-table entries', () => {
+  const helpers = loadHelpers();
+  const socket = createClientSocket(true);
+  const session = helpers.createSessionContextCoordinator();
+  session.replace(socket);
+  session.connected(socket);
+  session.authenticate(socket);
+  const guard = helpers.createSessionDispatchGuard({
+    sessionCoordinator: session,
+    getActiveSocket: () => socket,
+    getCurrentRoomCode: () => 'global',
+    getClientContextId: () => 1
+  });
+  const listenerTables = new Map([[socket, helpers.createAuthenticatedListenerTable()]]);
+  const binding = helpers.createAuthenticatedSocketBinder({
+    socket,
+    bindingToken: guard.capture(socket, {}),
+    dispatchGuard: guard,
+    listenerTable: listenerTables.get(socket),
+    onUnbind: socketReference => listenerTables.delete(socketReference)
+  });
+  binding.unbind();
+  binding.unbind();
+  assert.equal(listenerTables.size, 0, 'unbind releases the socket-keyed closure table exactly once');
+
+  const source = fs.readFileSync(chatPath, 'utf8');
+  assert.match(source,
+    /createAuthenticatedSocketBinder\(\{[\s\S]{0,300}onUnbind:\s*\(\)\s*=>\s*authenticatedListenerTables\.delete\(socketReference\)/,
+    'the production binding releases its table entry');
+  assert.match(source,
+    /if\s*\(socket\s*!==\s*previousSocket\)\s*\{[\s\S]{0,260}authenticatedListenerTables\.delete\(previousSocket\)/,
+    'replacement releases a setup-only socket table that was never authenticated');
 });
 
 test('light theme and compact mode expose semantic attributes tokens and touch-target rules', () => {
@@ -871,6 +1112,72 @@ test('dark and light semantic text colors meet WCAG contrast ratios', () => {
     assert.match(source, new RegExp(`${selector.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&')}\\s*\\{[^}]*var\\(--border-color\\)`, 's'),
       `${selector} uses a contrast-safe divider or connector token`);
   }
+});
+
+test('server rail cascade preserves text contrast without whole-control opacity', () => {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  const css = source.slice(source.indexOf('<style>') + 7, source.indexOf('</style>'));
+  const declarations = block => Object.fromEntries([...block.matchAll(/([\w-]+):\s*([^;]+);/g)]
+    .map(match => [match[1], match[2].trim().replace(/\s*!important$/, '')]));
+  const rule = pattern => {
+    const match = css.match(pattern);
+    assert.ok(match, `missing server-rail rule ${pattern}`);
+    return declarations(match[1]);
+  };
+  const base = rule(/\.server-icon\s*\{([^}]+)\}/s);
+  const active = { ...base, ...rule(/\.server-icon:hover,\s*\.server-icon\.active\s*\{([^}]+)\}/s) };
+  const disabled = {
+    ...base,
+    ...rule(/\.server-icon\[aria-disabled="true"\]\s*\{([^}]+)\}/s),
+    ...rule(/\.server-icon\[aria-disabled="true"\]:hover\s*\{([^}]+)\}/s)
+  };
+  const themeBlocks = [...source.matchAll(
+    /:root(?:,\s*:root\[data-theme="dark"\]|\[data-theme="light"\])\s*\{([^}]+)\}/g
+  )];
+  const themes = {
+    dark: declarations(themeBlocks[0][1]),
+    light: declarations(themeBlocks.find(match => match[0].includes('light'))[1])
+  };
+  const resolve = (value, tokens, depth = 0) => {
+    assert.ok(depth < 8, `cyclic CSS token ${value}`);
+    const variable = /^var\((--[\w-]+)\)$/.exec(value || '');
+    return variable ? resolve(tokens[variable[1]], tokens, depth + 1) : value;
+  };
+  const channel = value => {
+    const scaled = value / 255;
+    return scaled <= 0.04045 ? scaled / 12.92 : ((scaled + 0.055) / 1.055) ** 2.4;
+  };
+  const luminance = hex => 0.2126 * channel(parseInt(hex.slice(1, 3), 16)) +
+    0.7152 * channel(parseInt(hex.slice(3, 5), 16)) + 0.0722 * channel(parseInt(hex.slice(5, 7), 16));
+  const contrast = (foreground, background) => {
+    const values = [luminance(foreground), luminance(background)].sort((a, b) => b - a);
+    return (values[0] + 0.05) / (values[1] + 0.05);
+  };
+  const composite = (foreground, background, alpha) => {
+    const channels = [1, 3, 5].map(index => Math.round(
+      parseInt(foreground.slice(index, index + 2), 16) * alpha +
+      parseInt(background.slice(index, index + 2), 16) * (1 - alpha)
+    ));
+    return `#${channels.map(value => value.toString(16).padStart(2, '0')).join('')}`;
+  };
+
+  for (const [theme, tokens] of Object.entries(themes)) {
+    const page = resolve(tokens['--page-bg'], tokens);
+    for (const [state, style] of [['active', active], ['disabled', disabled]]) {
+      const opacity = style.opacity === undefined ? 1 : Number(style.opacity);
+      const foreground = resolve(style.color, tokens);
+      const background = resolve(style.background, tokens);
+      const effectiveForeground = composite(foreground, page, opacity);
+      const effectiveBackground = composite(background, page, opacity);
+      assert.ok(contrast(effectiveForeground, effectiveBackground) >= 4.5,
+        `${theme} ${state} server text remains readable after cascade and alpha compositing`);
+    }
+  }
+  assert.equal(active.color, 'var(--on-primary)');
+  assert.equal(resolve(active.background, themes.light), themes.light['--primary-surface']);
+  assert.equal(Number(disabled.opacity || 1), 1, 'disabled text does not use ancestor opacity');
+  assert.doesNotMatch(source, /\bicon\.style\.(?:background|opacity)\s*=/,
+    'dynamic room icons use controlled semantic surfaces');
 });
 
 test('context-menu removal waits for the shared base motion duration', () => {
@@ -1108,6 +1415,77 @@ test('production switch helper owns rejection and success mutation boundaries', 
   });
   assert.equal(accepted.currentServerCode, 'BBBBBB');
   assert.deepEqual(mutations, [['BBBBBB', 'user']]);
+});
+
+test('join-from-snoop acknowledgements retain the captured room and exact response room', () => {
+  const helpers = loadHelpers();
+  const socket = createClientSocket(true);
+  const session = helpers.createSessionContextCoordinator();
+  session.replace(socket);
+  session.connected(socket);
+  session.authenticate(socket);
+  let currentRoom = 'ROOMA1';
+  const guard = helpers.createSessionDispatchGuard({
+    sessionCoordinator: session,
+    getActiveSocket: () => socket,
+    getCurrentRoomCode: () => currentRoom,
+    getClientContextId: () => 1
+  });
+  const switches = [];
+  const alerts = [];
+  const joined = [];
+  const icons = new Map([
+    ['srv-ROOMA1', { style: { opacity: '0.4', border: 'dashed' }, classList: { add() {}, remove() {} } }],
+    ['srv-ROOMB2', { style: { opacity: '0.4', border: 'dashed' }, classList: { add() {}, remove() {} } }]
+  ]);
+  const guardedRequestAcknowledgement = (kind, context, handler) => {
+    const handlers = helpers.createAcknowledgementHandlerMap({
+      [`${kind}Success`]: handler,
+      [`${kind}Error`]: handler
+    });
+    return helpers.createGuardedAcknowledgementAdapter({ dispatchGuard: guard, handlers })
+      .capture(kind, socket, context);
+  };
+  const runtime = loadProductionFunction('joinFromSnoop', {
+    currentServerCode: currentRoom,
+    socket,
+    guardedRequestAcknowledgement,
+    myJoinedServers: joined,
+    document: { getElementById: id => icons.get(id) || null },
+    switchServer: code => switches.push(code),
+    showAppAlert: (...args) => alerts.push(args)
+  });
+  const invoke = () => {
+    runtime.context.currentServerCode = currentRoom;
+    runtime.invoke();
+    return socket.emitted.at(-1).args[1];
+  };
+
+  let acknowledgement = invoke();
+  currentRoom = 'ROOMB2';
+  runtime.context.currentServerCode = currentRoom;
+  acknowledgement({ success: true, server: { code: 'ROOMA1' } });
+  assert.deepEqual({ switches, alerts, joined }, { switches: [], alerts: [], joined: [] },
+    'delayed success from room A has zero room-B effects');
+
+  currentRoom = 'ROOMA1';
+  acknowledgement = invoke();
+  currentRoom = 'ROOMB2';
+  runtime.context.currentServerCode = currentRoom;
+  acknowledgement({ error: 'ROOM_A_PRIVATE_ERROR' });
+  assert.deepEqual({ switches, alerts, joined }, { switches: [], alerts: [], joined: [] },
+    'delayed error from room A has zero room-B effects');
+
+  currentRoom = 'ROOMA1';
+  acknowledgement = invoke();
+  acknowledgement({ success: true, server: { code: 'ROOMB2' } });
+  assert.deepEqual({ switches, alerts, joined }, { switches: [], alerts: [], joined: [] },
+    'a current acknowledgement cannot substitute a different response room');
+
+  acknowledgement = invoke();
+  acknowledgement({ success: true, server: { code: 'ROOMA1' } });
+  assert.deepEqual(switches, ['ROOMA1']);
+  assert.deepEqual(joined, ['ROOMA1']);
 });
 
 test('room switches serialize and retain only the latest queued target', () => {
@@ -2328,6 +2706,32 @@ test('attachment intake rejects a decoder dimension mismatch before canvas alloc
   }
 });
 
+test('swapped PNG and WebP dimensions reject before canvas while JPEG orientation may swap', async () => {
+  for (const candidate of [
+    { label: 'PNG', type: 'image/png', bytes: pngAttachmentHeader(2, 3), accepted: false },
+    { label: 'WebP', type: 'image/webp', bytes: webpAttachmentHeader('VP8X', 2, 3), accepted: false },
+    { label: 'JPEG', type: 'image/jpeg', bytes: jpegAttachmentHeader(2, 3), accepted: true }
+  ]) {
+    let canvasAllocations = 0;
+    const probe = attachmentControllerHarness({
+      decodeImageBytes: async () => ({ image: {}, width: 3, height: 2 }),
+      createCanvas: () => {
+        canvasAllocations += 1;
+        return {
+          getContext: () => ({ drawImage() {} }),
+          toDataURL: () => 'data:image/jpeg;base64,AAAA'
+        };
+      }
+    });
+    await probe.controller.intake(attachmentFile(candidate.type, candidate.bytes), 'picker');
+    assert.equal(canvasAllocations, candidate.accepted ? 1 : 0, candidate.label);
+    assert.equal(probe.state.accepted.length, candidate.accepted ? 1 : 0, candidate.label);
+    if (!candidate.accepted) {
+      assert.equal(probe.state.errors.at(-1)[0], 'Could not process that image.', candidate.label);
+    }
+  }
+});
+
 test('attachment decoder revokes its object URL exactly once on every terminal path', async () => {
   const helpers = loadHelpers();
   const revoked = [];
@@ -2452,6 +2856,41 @@ test('text paste remains native while focused image paste enters the shared pipe
   assert.equal(imagePaste.defaultPrevented, true);
   await settleAttachmentWork();
   assert.equal(state.accepted.at(-1)[1].source, 'paste');
+  binding.unbind();
+});
+
+test('clipboard intake tolerates failed items and selects across all clipboard files', async () => {
+  const helpers = loadHelpers();
+  const fileInput = new ControlledEventTarget();
+  const dropTarget = new ControlledEventTarget();
+  const messageInput = new ControlledEventTarget();
+  const firstValid = attachmentFile('image/webp', webpAttachmentHeader('VP8X'), { name: 'first.webp' });
+  const laterValid = attachmentFile('image/png', pngAttachmentHeader(), { name: 'later.png' });
+  const calls = [];
+  const statuses = [];
+  const binding = helpers.bindAttachmentInputs({
+    fileInput,
+    dropTarget,
+    messageInput,
+    intakeAttachment(file, source) {
+      calls.push({ file, source });
+      return Promise.resolve(file);
+    },
+    onStatus: message => statuses.push(message)
+  });
+
+  const paste = messageInput.dispatch('paste', {
+    clipboardData: { items: [
+      { kind: 'file', type: 'image/png', getAsFile() { throw new Error('clipboard item failed'); } },
+      { kind: 'file', type: 'image/webp', getAsFile: () => firstValid },
+      { kind: 'file', type: 'image/png', getAsFile: () => laterValid }
+    ] }
+  });
+  await Promise.resolve();
+
+  assert.equal(paste.defaultPrevented, true);
+  assert.deepEqual(calls, [{ file: firstValid, source: 'paste' }]);
+  assert.equal(statuses.at(-1), 'Only one image can be attached; using the first supported image.');
   binding.unbind();
 });
 
@@ -3097,6 +3536,135 @@ test('room keyboard traversal uses the serialized switch coordinator', () => {
   assert.match(source, /requestServerSwitch:\s*code\s*=>\s*requestServerSwitch\(code\)/);
   assert.doesNotMatch(source.slice(source.indexOf('createShortcutController({'), source.indexOf('createShortcutController({') + 1800),
     /emit\(['"]switch_server/);
+});
+
+test('production shortcut room transition closes and invalidates room-A message history', () => {
+  const helpers = loadHelpers();
+  const detailCoordinator = helpers.createDialogRequestCoordinator();
+  detailCoordinator.open('edit:ROOMA1:m1');
+  const roomARequest = detailCoordinator.begin('edit:ROOMA1:m1');
+  const historyList = { textContent: 'ROOM_A_PRIVATE_HISTORY_SENTINEL' };
+  const historyModal = shortcutModal(true);
+  const order = [];
+  let handleRuntime;
+  const closeHistoryModal = loadProductionFunction('closeHistoryModal', {
+    messageDetailCoordinator: detailCoordinator,
+    document: { getElementById: id => id === 'history-list' ? historyList : null },
+    historyModalOwner: {
+      close() {
+        order.push(`close:${handleRuntime.context.currentServerCode}`);
+        historyModal.classList.remove('active');
+        return true;
+      }
+    }
+  });
+  const closeMessageHistory = loadProductionFunction('closeMessageHistory', {
+    closeHistoryModal: () => closeHistoryModal.invoke()
+  });
+  const elements = new Map();
+  const element = id => {
+    if (!elements.has(id)) {
+      const value = shortcutModal();
+      value.id = id;
+      value.style = {};
+      value.children = [];
+      value.textContent = '';
+      value.appendChild = child => value.children.push(child);
+      elements.set(id, value);
+    }
+    return elements.get(id);
+  };
+  for (const id of ['invite-code-btn', 'leave-server-btn', 'delete-server-btn', 'join-server-btn',
+    'server-title', 'srv-ROOMA1', 'srv-ROOMB2']) element(id);
+  element('srv-ROOMA1').classList.add('active');
+  const document = {
+    getElementById: id => element(id),
+    querySelectorAll: selector => selector === '.server-icon'
+      ? [element('srv-ROOMA1'), element('srv-ROOMB2')] : [],
+    createElement(tagName) {
+      return {
+        tagName, className: '', textContent: '', style: {}, children: [],
+        appendChild(child) { this.children.push(child); }
+      };
+    }
+  };
+  const composition = helpers.createCompositionContextCoordinator();
+  composition.activate('ROOMA1');
+  const typingUsers = new Map([['Alice', 'Alice']]);
+  handleRuntime = loadProductionFunction('handleSwitchResult', {
+    ChatClientHelpers: helpers,
+    currentServerCode: 'ROOMA1',
+    showAppAlert: (...args) => order.push(`alert:${args.join(':')}`),
+    serversCache: {
+      ROOMA1: { name: 'Room A', owner: 'Alice' },
+      ROOMB2: { name: 'Room B', owner: 'Bob' }
+    },
+    myRole: 'user',
+    myJoinedServers: ['ROOMA1', 'ROOMB2'],
+    myUsername: 'Alice',
+    closeMessageHistory: () => closeMessageHistory.invoke(),
+    closeModeratorCenter: () => {},
+    closeModerationPrompt: () => {},
+    closeReportPrompt: () => {},
+    currentServerCodeSetter: () => {},
+    compositionContextCoordinator: composition,
+    myRoomRole: 'user',
+    applyRestrictionState: () => {},
+    renderServerAccess: () => {},
+    updateModeratorCenterAccess: () => {},
+    document,
+    chatWindow: { textContent: '' },
+    typingUsers,
+    updateTypingUI: () => {},
+    cancelAction: () => {},
+    loadHistory: () => order.push(`render:${handleRuntime.context.currentServerCode}`),
+    authenticatedSurfaceGate: { acceptRoom: () => {} }
+  });
+  const socket = {};
+  const session = helpers.createSessionContextCoordinator();
+  session.replace(socket);
+  session.connected(socket);
+  session.authenticate(socket);
+  let currentRoom = 'ROOMA1';
+  let switchAcknowledgement;
+  const switchCoordinator = helpers.createSwitchCoordinator(
+    (_target, callback) => { switchAcknowledgement = callback; },
+    (target, response) => {
+      handleRuntime.context.currentServerCode = currentRoom;
+      handleRuntime.invoke(target, response);
+      currentRoom = handleRuntime.context.currentServerCode;
+    }
+  );
+  const eventTarget = new ControlledEventTarget();
+  const shortcut = helpers.createShortcutController({
+    eventTarget,
+    getSessionContext: () => session.snapshot(),
+    isSessionContextCurrent: candidate => session.matches(candidate),
+    getActiveSocket: () => socket,
+    getProtectedDialogOpen: () => false,
+    getEscapeLayers: () => [],
+    getCurrentRoom: () => currentRoom,
+    getRenderedRoomOrder: () => ['ROOMA1', 'ROOMB2'],
+    getJoinedRooms: () => ['ROOMA1', 'ROOMB2'],
+    getBannedRooms: () => [],
+    getRole: () => 'user',
+    isRoomRailAccessible: context => helpers.isRoomRailAccessible(context),
+    requestServerSwitch: target => switchCoordinator.request(target),
+    isCompositionEnabled: () => true
+  });
+
+  const keydown = eventTarget.dispatch('keydown', { key: 'ArrowDown', altKey: true });
+  assert.equal(keydown.defaultPrevented, true);
+  switchAcknowledgement({ history: [], roomRole: 'user', restriction: {} });
+
+  assert.equal(currentRoom, 'ROOMB2');
+  assert.equal(historyList.textContent, '');
+  assert.equal(historyModal.classList.contains('active'), false);
+  assert.equal(detailCoordinator.finish(roomARequest), false,
+    'accepted room transition invalidates the old detail request');
+  assert.deepEqual(order.slice(0, 2), ['close:ROOMA1', 'render:ROOMB2'],
+    'history cleanup runs before room commit and rendering');
+  shortcut.unbind();
 });
 
 test('appearance and upload shortcuts call existing visible UI actions', () => {

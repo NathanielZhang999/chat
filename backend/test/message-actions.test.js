@@ -709,6 +709,82 @@ test('typing emits a complete payload only for accessible active rooms and boole
   }]);
 });
 
+test('room-scoped backend events preserve payloads and attach canonical room metadata', async () => {
+  const message = {
+    _id: '507f1f77bcf86cd799439011',
+    serverCode: 'ABC123',
+    username: 'alice',
+    displayName: 'Alice',
+    role: 'user',
+    roomRole: 'user',
+    text: 'before',
+    history: [],
+    reactions: {},
+    deleted: false,
+    markModified() {},
+    async save() {}
+  };
+  const { socket, ioInstance } = registerMessages({
+    ChatServerModel: {
+      async findOne(query) {
+        return {
+          code: query.code,
+          moderators: [],
+          autoMod: {
+            blockedKeywords: ['blocked'], mentionLimit: 8,
+            repeatLimit: 3, repeatWindowSeconds: 30,
+            messageLimit: 10, messageWindowSeconds: 30
+          }
+        };
+      }
+    },
+    MessageModel: {
+      async findById() { return message; },
+      async create(value) {
+        return {
+          ...value,
+          _id: '507f1f77bcf86cd799439012',
+          timestamp: new Date('2026-08-11T00:00:00.000Z')
+        };
+      }
+    },
+    ModerationAuditModel: { async create(value) { return value; } }
+  });
+  authenticate(socket, { serverCode: 'ABC123', joinedServers: ['global', 'ABC123'] });
+
+  await socket.trigger('chat_message', { text: 'new message' });
+  await socket.trigger('toggle_reaction', { id: message._id, emoji: '👍' });
+  await socket.trigger('edit_message', { id: message._id, text: 'after' });
+  await socket.trigger('typing', true);
+  await socket.trigger('delete_message', message._id);
+  await socket.trigger('chat_message', { text: 'blocked phrase' });
+
+  const expectedEvents = [
+    [ioInstance.outbound, 'chat_message'],
+    [ioInstance.outbound, 'reaction_updated'],
+    [ioInstance.outbound, 'message_edited'],
+    [ioInstance.outbound, 'message_deleted'],
+    [socket.outbound, 'typing'],
+    [socket.outbound, 'message_blocked']
+  ];
+  for (const [records, eventName] of expectedEvents) {
+    const record = records.find(item => item.event === eventName);
+    assert.ok(record, `${eventName} was emitted through its real handler`);
+    assert.equal(record.args[0], record.payload, `${eventName} keeps its first payload argument`);
+    assert.deepEqual(record.args[1], { serverCode: 'ABC123' },
+      `${eventName} has canonical second-argument room metadata`);
+    assert.equal(record.args.length, 2, `${eventName} exposes only payload plus room metadata`);
+  }
+
+  const source = require('node:fs').readFileSync(require('node:path').resolve(__dirname, '../server.js'), 'utf8');
+  for (const eventName of ['online_users', 'system_message', 'room_role_updated',
+    'moderation_queue_updated', 'message_blocked', 'chat_message', 'reaction_updated',
+    'message_edited', 'message_deleted', 'typing']) {
+    assert.match(source, new RegExp(`emitRoomEvent\\([\\s\\S]{0,180}['"]${eventName}['"]`),
+      `${eventName} routes through canonical metadata emission`);
+  }
+});
+
 test('editing neutralizes client ping tokens before resolving mentions', async () => {
   let resolverInput;
   const message = {

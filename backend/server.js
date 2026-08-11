@@ -74,6 +74,13 @@ function normalizeServerCode(value) {
   return SERVER_CODE_RE.test(upper) ? upper : null;
 }
 
+function emitRoomEvent(target, eventName, payload, serverCode) {
+  const canonicalServerCode = normalizeServerCode(serverCode);
+  if (!target || typeof target.emit !== 'function' || !canonicalServerCode) return false;
+  target.emit(eventName, payload, Object.freeze({ serverCode: canonicalServerCode }));
+  return true;
+}
+
 function normalizeModerationAction(value) {
   if (typeof value !== 'string') return null;
   const action = value.trim().toLowerCase();
@@ -980,7 +987,7 @@ async function broadcastOnlineUsers(serverCode) {
       } catch (err) { logUnexpectedError(console, 'broadcast_online_users', err); }
   }
 
-  io.to(serverCode).emit('online_users', usersList);
+  emitRoomEvent(io.to(serverCode), 'online_users', usersList, serverCode);
 }
 
 function createConnectionHandler({
@@ -1400,7 +1407,8 @@ function createConnectionHandler({
     rawText,
     result
   }) {
-    socket.emit('message_blocked', { rule: 'content_policy', serverCode, clientContextId });
+    emitRoomEvent(socket, 'message_blocked',
+      { rule: 'content_policy', serverCode, clientContextId }, serverCode);
     if (result.shouldAudit === false) return;
     await appendAuditReliably({
       correlationId: new mongoose.Types.ObjectId().toString(),
@@ -1462,7 +1470,7 @@ function createConnectionHandler({
       if (!username) continue;
       try {
         const access = await loadModeratorAccess(serverCode, username);
-        if (access) live.emit('moderation_queue_updated', { serverCode });
+        if (access) emitRoomEvent(live, 'moderation_queue_updated', { serverCode }, serverCode);
       } catch (err) {
         logUnexpectedError(logger, 'moderation_queue_notification', err);
       }
@@ -1587,13 +1595,13 @@ function createConnectionHandler({
           serverCode: live.serverCode ?? session?.serverCode ?? null,
           bannedRooms: [...reconciliation.activeBannedRooms]
         });
-        live.emit('room_restriction_updated', {
+        emitRoomEvent(live, 'room_restriction_updated', {
           serverCode,
           banned: restrictionState.banned,
           timedOut: restrictionState.timedOut,
           timeoutUntil: restrictionState.timeoutUntil,
           bannedRooms: [...reconciliation.activeBannedRooms]
-        });
+        }, serverCode);
       } catch (err) {
         logUnexpectedError(logger, 'moderation_target_notification', err);
       }
@@ -1720,7 +1728,10 @@ function createConnectionHandler({
 
         const isVisible = defaultServerCode &&
           (socket.role !== 'admin' || socket.joinedServers.includes(defaultServerCode) || defaultServerCode === 'global');
-        if (isVisible) socket.to(defaultServerCode).emit('system_message', `${socket.displayName} joined the app.`);
+        if (isVisible) {
+          emitRoomEvent(socket.to(defaultServerCode), 'system_message',
+            `${socket.displayName} joined the app.`, defaultServerCode);
+        }
 
         return {
           success: true,
@@ -1998,7 +2009,9 @@ function createConnectionHandler({
                   }
                 }
 
-                ioInstance.emit('system_message', `${socket.displayName} ${action === 'promote_global_admin' ? 'promoted' : 'demoted'} ${targetDisp} ${action === 'promote_global_admin' ? 'to' : 'from'} Global Admin.`);
+                emitRoomEvent(ioInstance, 'system_message',
+                  `${socket.displayName} ${action === 'promote_global_admin' ? 'promoted' : 'demoted'} ${targetDisp} ${action === 'promote_global_admin' ? 'to' : 'from'} Global Admin.`,
+                  'global');
                 const roomsToUpdate = new Set(access.authoritativeMemberships);
                 if (access.fallbackCode) roomsToUpdate.add(access.fallbackCode);
                 roomsToUpdate.forEach(code => broadcastOnlineUsersFn(code));
@@ -2044,20 +2057,22 @@ function createConnectionHandler({
                 if (!Array.isArray(srv.moderators)) srv.moderators = [];
                 srv.moderators.push(targetUserDoc.username);
                 await srv.save();
-                ioInstance.to(serverCode).emit('system_message', `${socket.displayName} promoted ${targetDisp} to Room Moderator.`);
+                emitRoomEvent(ioInstance.to(serverCode), 'system_message',
+                  `${socket.displayName} promoted ${targetDisp} to Room Moderator.`, serverCode);
               }
             } else if (action === 'demote_mod') {
               if (!isGlobalAdmin) return { error: 'Only Global Admins can remove moderator roles.' };
               srv.moderators = (Array.isArray(srv.moderators) ? srv.moderators : [])
                 .filter(username => normalizeAccountKey(username) !== normalizeAccountKey(targetUserDoc.username));
               await srv.save();
-              ioInstance.to(serverCode).emit('system_message', `${socket.displayName} removed ${targetDisp}'s Room Moderator role.`);
+              emitRoomEvent(ioInstance.to(serverCode), 'system_message',
+                `${socket.displayName} removed ${targetDisp}'s Room Moderator role.`, serverCode);
             }
             broadcastOnlineUsersFn(serverCode);
-            ioInstance.to(serverCode).emit('room_role_updated', {
+            emitRoomEvent(ioInstance.to(serverCode), 'room_role_updated', {
               username: targetUserDoc.username,
               targetServer: serverCode
-            });
+            }, serverCode);
             return { success: true };
           })
         );
@@ -2355,7 +2370,8 @@ function createConnectionHandler({
             serverCode
           });
           if (action === 'kick' || action === 'ban') {
-            ioInstance.to(serverCode).emit('system_message', 'A member was removed by moderation.');
+            emitRoomEvent(ioInstance.to(serverCode), 'system_message',
+              'A member was removed by moderation.', serverCode);
           }
           const presenceRooms = new Set([serverCode]);
           if (access.fallbackCode) presenceRooms.add(access.fallbackCode);
@@ -2834,7 +2850,8 @@ function createConnectionHandler({
             broadcastOnlineUsersFn(srv.code);
 
             if (socket.serverCode === srv.code) {
-                socket.to(srv.code).emit('system_message', `${socket.displayName} joined.`);
+                emitRoomEvent(socket.to(srv.code), 'system_message',
+                  `${socket.displayName} joined.`, srv.code);
             }
           }
           return { success: true, server: srv };
@@ -2866,7 +2883,8 @@ function createConnectionHandler({
 
         const sockets = await fetchLiveSockets();
         if (wasActive) {
-            socket.to(serverCode).emit('system_message', `${socket.displayName} left the server.`);
+            emitRoomEvent(socket.to(serverCode), 'system_message',
+              `${socket.displayName} left the server.`, serverCode);
         }
         const access = await loadAccountSessionAccess(user);
         const transportSynchronized = await synchronizeMembership(
@@ -3330,10 +3348,10 @@ function createConnectionHandler({
             text: cleanText, attachment, replyTo, reactions: {}
         });
 
-        ioInstance.to(msg.serverCode || serverCode).emit('chat_message', {
+        emitRoomEvent(ioInstance.to(msg.serverCode || serverCode), 'chat_message', {
             _id: msg._id, username: msg.username, displayName: msg.displayName, role: msg.role, roomRole: msg.roomRole, color: msg.color, avatarUrl: msg.avatarUrl,
             text: msg.text, attachment: sanitizeAttachment(msg.attachment), replyTo: msg.replyTo, reactions: {}, timestamp: msg.timestamp, edited: false, deleted: false
-        });
+        }, msg.serverCode || serverCode);
       });
     } catch (err) {
       logUnexpectedError(logger, 'chat_message', err);
@@ -3384,7 +3402,8 @@ function createConnectionHandler({
             msg.markModified('reactions');
             await msg.save();
 
-            ioInstance.to(msg.serverCode).emit('reaction_updated', { id: msg._id, reactions: msg.reactions });
+            emitRoomEvent(ioInstance.to(msg.serverCode), 'reaction_updated',
+              { id: msg._id, reactions: msg.reactions }, msg.serverCode);
           });
       } catch (err) {
           logUnexpectedError(logger, 'toggle_reaction', err);
@@ -3451,7 +3470,9 @@ function createConnectionHandler({
                 msg.history = appendBoundedHistory(msg.history, { text: msg.text, timestamp: new Date() });
                 msg.text = cleanText; msg.edited = true; msg.markModified('history');
                 await msg.save();
-                ioInstance.to(msg.serverCode).emit('message_edited', { id: msg._id, username: msg.username, role: msg.role, roomRole: msg.roomRole, text: cleanText });
+                emitRoomEvent(ioInstance.to(msg.serverCode), 'message_edited',
+                  { id: msg._id, username: msg.username, role: msg.role, roomRole: msg.roomRole, text: cleanText },
+                  msg.serverCode);
             }
           });
         }
@@ -3486,7 +3507,7 @@ function createConnectionHandler({
           // Sender, SysAdmin, or RoomMod can delete it
           if (msg.username === socket.username || access.user.role === 'admin' || freshRoomRole === 'mod') {
             msg.deleted = true; await msg.save();
-            ioInstance.to(msg.serverCode).emit('message_deleted', msgId);
+            emitRoomEvent(ioInstance.to(msg.serverCode), 'message_deleted', msgId, msg.serverCode);
           }
         });
       }
@@ -3560,11 +3581,11 @@ function createConnectionHandler({
         });
         if (socket.serverCode !== intendedServerCode || !access.allowed ||
             access.restriction.timedOut || !canAccessRoom(socket, serverCode)) return;
-        socket.to(serverCode).emit('typing', {
+        emitRoomEvent(socket.to(serverCode), 'typing', {
           username: socket.username,
           displayName: socket.displayName || socket.username,
           isTyping
-        });
+        }, serverCode);
       });
     } catch (err) {
       logUnexpectedError(logger, 'typing', err);
@@ -3591,8 +3612,9 @@ function createConnectionHandler({
       if (serverCode) {
         const isVisible = socket.role !== 'admin' || (joinedServers && joinedServers.includes(serverCode)) || serverCode === 'global';
         if (isVisible) {
-            ioInstance.to(serverCode).emit('system_message', `${dName} disconnected.`);
-            ioInstance.to(serverCode).emit('typing', { username: socket.username, isTyping: false });
+            emitRoomEvent(ioInstance.to(serverCode), 'system_message', `${dName} disconnected.`, serverCode);
+            emitRoomEvent(ioInstance.to(serverCode), 'typing',
+              { username: socket.username, isTyping: false }, serverCode);
         }
       }
     }

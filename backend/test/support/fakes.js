@@ -26,18 +26,26 @@ class FakeSocket {
   }
   join(room) { this.joinedRooms.add(room); }
   leave(room) { this.joinedRooms.delete(room); this.leftRooms.push(room); }
-  emit(event, payload) { this.outbound.push({ target: 'self', event, payload }); }
+  emit(event, ...args) { this.outbound.push(outboundRecord({ target: 'self', event }, args)); }
   to(room) {
-    return { emit: (event, payload) => this.outbound.push({ target: room, event, payload }) };
+    return { emit: (event, ...args) => this.outbound.push(outboundRecord({ target: room, event }, args)) };
   }
   disconnect() { this.disconnected = true; }
 }
 
 class FakeIo {
   constructor() { this.outbound = []; this.sockets = []; }
-  to(room) { return { emit: (event, payload) => this.outbound.push({ room, event, payload }) }; }
-  emit(event, payload) { this.outbound.push({ room: '*', event, payload }); }
+  to(room) { return { emit: (event, ...args) => this.outbound.push(outboundRecord({ room, event }, args)) }; }
+  emit(event, ...args) { this.outbound.push(outboundRecord({ room: '*', event }, args)); }
   async fetchSockets() { return this.sockets; }
+}
+
+function outboundRecord(base, args) {
+  const record = { ...base, payload: args[0] };
+  Object.defineProperty(record, 'args', {
+    value: [...args], enumerable: false, configurable: false, writable: false
+  });
+  return record;
 }
 
 function queryResult(value) {
@@ -51,15 +59,15 @@ function queryResult(value) {
   };
 }
 
-function valuesMatch(value, expected) {
+function valuesMatch(value, expected, exists = true) {
   if (expected === null) return value === null || value === undefined;
   if (expected instanceof RegExp) return expected.test(String(value || ''));
   if (expected && typeof expected === 'object' && !Array.isArray(expected)) {
-    if ('$in' in expected) return expected.$in.some(candidate => valuesMatch(value, candidate));
+    if ('$in' in expected) return expected.$in.some(candidate => valuesMatch(value, candidate, exists));
     if ('$lt' in expected) return value < expected.$lt;
     if ('$gt' in expected) return value > expected.$gt;
-    if ('$regex' in expected) return valuesMatch(value, expected.$regex);
-    if ('$exists' in expected) return expected.$exists ? value !== undefined : value === undefined;
+    if ('$regex' in expected) return valuesMatch(value, expected.$regex, exists);
+    if ('$exists' in expected) return expected.$exists ? exists : !exists;
   }
   return value === expected;
 }
@@ -67,7 +75,7 @@ function valuesMatch(value, expected) {
 function matchesQuery(row, query = {}) {
   return Object.entries(query).every(([key, expected]) => {
     if (key === '$or') return Array.isArray(expected) && expected.some(clause => matchesQuery(row, clause));
-    return valuesMatch(row[key], expected);
+    return valuesMatch(row[key], expected, Object.prototype.hasOwnProperty.call(row, key));
   });
 }
 
@@ -112,14 +120,27 @@ function createMemoryModel(initialRows = []) {
     },
     async findOneAndUpdate(query, update, options = {}) {
       let row = rows.find(candidate => matchesQuery(candidate, query));
-      if (!row && options.upsert) {
-        row = { ...query };
-        rows.push(row);
-      }
+      const isUpsert = !row && options.upsert;
+      if (isUpsert) row = clone(query);
       if (!row) return null;
-      if (update.$set) Object.assign(row, clone(update.$set));
-      else if (!Object.keys(update).some(key => key.startsWith('$'))) Object.assign(row, clone(update));
-      for (const [key, value] of Object.entries(update.$inc || {})) row[key] = (row[key] || 0) + value;
+      const next = clone(row);
+      if (update.$set) Object.assign(next, clone(update.$set));
+      else if (!Object.keys(update).some(key => key.startsWith('$'))) Object.assign(next, clone(update));
+      for (const [key, value] of Object.entries(update.$inc || {})) {
+        const exists = Object.prototype.hasOwnProperty.call(next, key);
+        if (typeof value !== 'number' || !Number.isFinite(value) ||
+            (exists && (typeof next[key] !== 'number' || !Number.isFinite(next[key])))) {
+          throw new TypeError(`Cannot apply $inc to nonnumeric field ${key}`);
+        }
+        next[key] = (exists ? next[key] : 0) + value;
+      }
+      if (isUpsert) {
+        rows.push(next);
+        row = next;
+      } else {
+        for (const key of Object.keys(row)) delete row[key];
+        Object.assign(row, next);
+      }
       return documentFor(row);
     },
     async updateOne(query, update) {

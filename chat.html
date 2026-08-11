@@ -176,11 +176,12 @@
         #servers-sidebar { width: 72px; background: var(--page-bg); color: var(--text-normal); display: flex; flex-direction: column; align-items: center; padding: 12px 0; gap: 8px; overflow-y: auto; overflow-x: hidden; flex-shrink: 0; scrollbar-width: none; }
         #servers-sidebar::-webkit-scrollbar { display: none; width: 0; height: 0; }
         .server-icon { width: 48px; height: 48px; border-radius: 50%; background: var(--panel-bg); color: var(--text-strong); display: flex; justify-content: center; align-items: center; cursor: pointer; font-weight: bold; transition: border-radius var(--motion-base) var(--ease-standard), background-color var(--motion-base) ease, color var(--motion-fast) ease, transform var(--motion-fast) var(--ease-standard), opacity var(--motion-fast) ease; font-size: 1.2rem; position: relative; flex-shrink: 0; animation: popIn var(--motion-base) var(--ease-standard); }
-        .server-icon:hover, .server-icon.active { border-radius: 16px; background: var(--primary); opacity: 1 !important; transform: scale(1.05); }
+        .server-icon:hover, .server-icon.active { border-radius: 16px; background: var(--primary-surface); color: var(--on-primary); opacity: 1 !important; transform: scale(1.05); }
         .server-icon.add-btn { background: var(--panel-bg); color: var(--success-text); font-weight: 300; font-size: 1.5rem; }
         .server-icon.add-btn:hover { background: var(--success-surface); color: var(--on-success); }
-        .server-icon[aria-disabled="true"] { opacity: 0.35 !important; cursor: not-allowed; filter: grayscale(0.8); }
-        .server-icon[aria-disabled="true"]:hover { border-radius: 50%; background: var(--panel-bg); transform: none; }
+        .server-icon.ghost-room:not(.active) { background: var(--panel-subtle); color: var(--text-normal); border: 1px dashed var(--border-color); }
+        .server-icon[aria-disabled="true"] { opacity: 1 !important; cursor: not-allowed; background: var(--panel-subtle); color: var(--disabled-text); }
+        .server-icon[aria-disabled="true"]:hover { border-radius: 50%; background: var(--panel-subtle); color: var(--disabled-text); transform: none; }
         
         .tooltip { 
             position: absolute; left: 70px; background: var(--tooltip-bg); color: var(--tooltip-text); padding: 6px 12px; border-radius: 6px;
@@ -1043,11 +1044,26 @@
         },
 
         createAuthenticatedListenerTable(dependencies = {}) {
-            const roomContext = payload => {
-                if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return {};
-                const context = {};
-                for (const key of ['serverCode', 'clientContextId', 'messageId', 'id']) {
-                    if (Object.prototype.hasOwnProperty.call(payload, key)) context[key] = payload[key];
+            const canonicalRoom = value => {
+                if (typeof value !== 'string') return null;
+                const trimmed = value.trim();
+                if (trimmed.toLowerCase() === 'global') return 'global';
+                const upper = trimmed.toUpperCase();
+                return /^[A-Z0-9]{6}$/.test(upper) ? upper : null;
+            };
+            const roomContext = (payload, metadata) => {
+                if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) return null;
+                const serverCode = canonicalRoom(metadata.serverCode);
+                if (!serverCode || metadata.serverCode !== serverCode) return null;
+                const context = { serverCode };
+                if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
+                    for (const key of ['clientContextId', 'messageId', 'id']) {
+                        if (Object.prototype.hasOwnProperty.call(payload, key)) context[key] = payload[key];
+                    }
+                    for (const key of ['serverCode', 'targetServer']) {
+                        if (!Object.prototype.hasOwnProperty.call(payload, key)) continue;
+                        if (canonicalRoom(payload[key]) !== serverCode) return null;
+                    }
                 }
                 return context;
             };
@@ -1057,7 +1073,7 @@
             });
             return {
                 chat_message: entry('chatMessage'),
-                system_message: entry('systemMessage', () => ({})),
+                system_message: entry('systemMessage'),
                 global_role_updated: entry('globalRoleUpdated', () => ({})),
                 room_role_updated: entry('roomRoleUpdated'),
                 room_access_updated: entry('roomAccessUpdated', () => ({})),
@@ -1066,25 +1082,30 @@
                 message_blocked: entry('messageBlocked'),
                 profile_updated: entry('profileUpdated', () => ({})),
                 message_edited: entry('messageEdited'),
-                message_deleted: entry('messageDeleted', payload => ({ messageId: payload && payload.id ? payload.id : payload })),
+                message_deleted: entry('messageDeleted', (payload, metadata) => {
+                    const context = roomContext(payload, metadata);
+                    if (!context) return null;
+                    return { ...context, messageId: payload && payload.id ? payload.id : payload };
+                }),
                 reaction_updated: entry('reactionUpdated'),
                 admin_new_server: entry('adminNewServer', () => ({})),
                 server_deleted: entry('serverDeleted', () => ({})),
-                online_users: entry('onlineUsers', () => ({})),
+                online_users: entry('onlineUsers'),
                 typing: entry('typing'),
                 force_logout: entry('forceLogout', () => ({}))
             };
         },
 
-        createAuthenticatedSocketBinder({ socket, bindingToken, dispatchGuard, listenerTable } = {}) {
+        createAuthenticatedSocketBinder({ socket, bindingToken, dispatchGuard, listenerTable, onUnbind } = {}) {
             const wrappers = [];
             for (const [eventName, entry] of Object.entries(listenerTable || {})) {
-                const wrapper = payload => {
+                const wrapper = (...eventArgs) => {
                     if (!dispatchGuard.acceptSocket(bindingToken)) return;
                     const payloadContext = typeof entry.contextFromPayload === 'function'
-                        ? entry.contextFromPayload(payload) : {};
+                        ? entry.contextFromPayload(...eventArgs) : {};
+                    if (!payloadContext) return;
                     if (!dispatchGuard.acceptSocket(bindingToken, payloadContext)) return;
-                    entry.handle(payload);
+                    entry.handle(...eventArgs);
                 };
                 wrappers.push({ eventName, wrapper });
                 socket.on(eventName, wrapper);
@@ -1095,6 +1116,7 @@
                     if (unbound) return;
                     unbound = true;
                     for (const { eventName, wrapper } of wrappers) socket.off(eventName, wrapper);
+                    if (typeof onUnbind === 'function') onUnbind(socket);
                 }
             });
         },
@@ -2590,19 +2612,95 @@
             }
         },
 
-        clipboardImageFile(items) {
-            const allowed = new Set(['image/jpeg', 'image/png', 'image/webp']);
+        createAudioController({ audioContext } = {}) {
+            let generation = 0;
+            const activeTones = new Set();
+            const disconnectTone = (tone, stopNow) => {
+                if (!tone) return;
+                activeTones.delete(tone);
+                if (tone.oscillator) tone.oscillator.onended = null;
+                if (stopNow && tone.oscillator && typeof tone.oscillator.stop === 'function') {
+                    try { tone.oscillator.stop(Number(audioContext && audioContext.currentTime) || 0); } catch {}
+                }
+                for (const node of [tone.oscillator, tone.gain]) {
+                    if (node && typeof node.disconnect === 'function') {
+                        try { node.disconnect(); } catch {}
+                    }
+                }
+            };
+            const startTone = (type, token) => {
+                if (token !== generation || !audioContext ||
+                    typeof audioContext.createOscillator !== 'function' ||
+                    typeof audioContext.createGain !== 'function') return false;
+                let oscillator = null;
+                let gain = null;
+                const tone = { oscillator: null, gain: null };
+                try {
+                    oscillator = audioContext.createOscillator();
+                    gain = audioContext.createGain();
+                    tone.oscillator = oscillator;
+                    tone.gain = gain;
+                    oscillator.connect(gain);
+                    gain.connect(audioContext.destination);
+                    const now = Number(audioContext.currentTime) || 0;
+                    oscillator.type = 'sine';
+                    if (type === 'ping') {
+                        oscillator.frequency.setValueAtTime(500, now);
+                        oscillator.frequency.exponentialRampToValueAtTime(1000, now + 0.1);
+                        gain.gain.setValueAtTime(0.5, now);
+                        gain.gain.exponentialRampToValueAtTime(0.01, now + 0.3);
+                        activeTones.add(tone);
+                        oscillator.onended = () => disconnectTone(tone, false);
+                        oscillator.start(now);
+                        oscillator.stop(now + 0.3);
+                    } else {
+                        oscillator.frequency.setValueAtTime(400, now);
+                        gain.gain.setValueAtTime(0.1, now);
+                        gain.gain.exponentialRampToValueAtTime(0.01, now + 0.1);
+                        activeTones.add(tone);
+                        oscillator.onended = () => disconnectTone(tone, false);
+                        oscillator.start(now);
+                        oscillator.stop(now + 0.1);
+                    }
+                    return true;
+                } catch {
+                    disconnectTone(tone, true);
+                    return false;
+                }
+            };
+            return Object.freeze({
+                async play(type) {
+                    if (type !== 'ping' && type !== 'msg') return false;
+                    const token = generation;
+                    try {
+                        if (audioContext && audioContext.state === 'suspended' &&
+                            typeof audioContext.resume === 'function') await audioContext.resume();
+                    } catch {
+                        return false;
+                    }
+                    return startTone(type, token);
+                },
+                sanitize() {
+                    generation += 1;
+                    for (const tone of [...activeTones]) disconnectTone(tone, true);
+                }
+            });
+        },
+
+        clipboardFiles(items) {
+            const files = [];
             for (const item of Array.from(items || [])) {
-                if (!item || item.kind !== 'file' || !allowed.has(item.type) ||
-                    typeof item.getAsFile !== 'function') continue;
+                if (!item || item.kind !== 'file' || typeof item.getAsFile !== 'function') continue;
                 try {
                     const file = item.getAsFile();
-                    if (file && allowed.has(file.type)) return file;
-                } catch {
-                    return null;
-                }
+                    if (file) files.push(file);
+                } catch {}
             }
-            return null;
+            return files;
+        },
+
+        clipboardImageFile(items) {
+            return this.selectAttachmentCandidate(this.clipboardFiles(items)).file;
         },
 
         createAttachmentStatusController({ selectionStatus, phaseStatus } = {}) {
@@ -2846,10 +2944,10 @@
                 processFiles(event.dataTransfer && event.dataTransfer.files, 'drop').finally(restore);
             });
             listen(messageInput, 'paste', event => {
-                const file = this.clipboardImageFile(event && event.clipboardData && event.clipboardData.items);
-                if (!file) return;
+                const files = this.clipboardFiles(event && event.clipboardData && event.clipboardData.items);
+                if (!files.length) return;
                 event.preventDefault();
-                processFiles([file], 'paste');
+                processFiles(files, 'paste');
             });
             let unbound = false;
             return Object.freeze({ unbind() {
@@ -3076,18 +3174,8 @@
 
     // --- AUDIO ---
     const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    function playSound(type) {
-        if (audioCtx.state === 'suspended') audioCtx.resume();
-        const osc = audioCtx.createOscillator(); const gain = audioCtx.createGain();
-        osc.connect(gain); gain.connect(audioCtx.destination); const now = audioCtx.currentTime;
-        if (type === 'ping') {
-            osc.type = 'sine'; osc.frequency.setValueAtTime(500, now); osc.frequency.exponentialRampToValueAtTime(1000, now + 0.1);
-            gain.gain.setValueAtTime(0.5, now); gain.gain.exponentialRampToValueAtTime(0.01, now + 0.3); osc.start(now); osc.stop(now + 0.3);
-        } else if (type === 'msg') {
-            osc.type = 'sine'; osc.frequency.setValueAtTime(400, now); gain.gain.setValueAtTime(0.1, now); gain.gain.exponentialRampToValueAtTime(0.01, now + 0.1);
-            osc.start(now); osc.stop(now + 0.1);
-        }
-    }
+    const audioController = ChatClientHelpers.createAudioController({ audioContext: audioCtx });
+    function playSound(type) { return audioController.play(type); }
 
     const customDialogController = ChatClientHelpers.createCustomDialogController({
         modal: document.getElementById('custom-dialog-modal'),
@@ -3450,7 +3538,7 @@
             if (authenticatedSocketBinding) authenticatedSocketBinding.unbind();
             authenticatedSocketBinding = null;
         },
-        clearAudio() {},
+        clearAudio: () => audioController.sanitize(),
         clearNavigationState() {
             chatScrollCoordinator.invalidate();
             document.querySelectorAll('.server-icon').forEach(icon => icon.classList.remove('active'));
@@ -3510,15 +3598,18 @@
 
     function bindAuthenticatedSocketEvents(socketReference, authenticatedSnapshot) {
         if (authenticatedSocketBinding) authenticatedSocketBinding.unbind();
-        const listenerTable = authenticatedListenerTables.get(socketReference) ||
-            ChatClientHelpers.createAuthenticatedListenerTable();
+        if (!authenticatedListenerTables.has(socketReference)) {
+            setupAuthenticatedListenerTable(socketReference);
+        }
+        const listenerTable = authenticatedListenerTables.get(socketReference);
         const bindingToken = sessionDispatchGuard.capture(socketReference, {});
         if (!bindingToken || authenticatedSnapshot.generation !== bindingToken.session.generation) return null;
         authenticatedSocketBinding = ChatClientHelpers.createAuthenticatedSocketBinder({
             socket: socketReference,
             bindingToken,
             dispatchGuard: sessionDispatchGuard,
-            listenerTable
+            listenerTable,
+            onUnbind: () => authenticatedListenerTables.delete(socketReference)
         });
         return authenticatedSocketBinding;
     }
@@ -3636,11 +3727,9 @@
                 icon.removeAttribute('title');
             }
             if (code !== 'global' && myRole === 'admin' && !myJoinedServers.includes(code) && !banned) {
-                icon.style.opacity = '0.4';
-                icon.style.border = '1px dashed var(--border-color)';
+                icon.classList.add('ghost-room');
             } else {
-                icon.style.opacity = '';
-                icon.style.border = '';
+                icon.classList.remove('ghost-room');
             }
         });
     }
@@ -4366,6 +4455,7 @@
         socket = replacement.socket;
         socketUrl = replacement.socketUrl;
         if (socket !== previousSocket) {
+            authenticatedListenerTables.delete(previousSocket);
             if (appearanceSocketBinding) appearanceSocketBinding.unbind();
             appearanceSocketBinding = null;
             enterSanitizedUnauthenticatedState('socket-replacement');
@@ -4411,8 +4501,6 @@
                     applyAppearanceSnapshot();
                     bindAuthenticatedSocketEvents(authSocket, sessionContextCoordinator.snapshot());
                     
-                    if (audioCtx.state === 'suspended') audioCtx.resume();
-                    
                     renderServers(res.servers || []);
                     const initialCode = Object.prototype.hasOwnProperty.call(res, 'defaultServerCode')
                         ? res.defaultServerCode : 'global';
@@ -4442,6 +4530,13 @@
 
     function showError(msg, success) { authError.style.color = success ? "var(--success-text)" : "var(--error-text)"; authError.textContent = msg; }
 
+    function handleRemoteForceLogout(message) {
+        appearanceRuntimeBridge.invalidate();
+        enterSanitizedUnauthenticatedState('force-logout');
+        localStorage.removeItem('pro_chat_user');
+        showError(message || 'You have been logged out remotely.', false);
+    }
+
     function setupSocket(activeSocket) {
         ChatClientHelpers.bindConnectErrorRecovery({
             activeSocket,
@@ -4450,7 +4545,10 @@
             authButton: authBtn,
             showError
         });
-        
+        setupAuthenticatedListenerTable(activeSocket);
+    }
+
+    function setupAuthenticatedListenerTable(activeSocket) {
         const listenerDependencyNames = {
             chat_message: 'chatMessage', system_message: 'systemMessage',
             global_role_updated: 'globalRoleUpdated', room_role_updated: 'roomRoleUpdated',
@@ -4763,11 +4861,7 @@
                 updateTypingUI();
             }, data);
         });
-        authenticatedEventTarget.on('force_logout', (msg) => {
-            localStorage.removeItem('pro_chat_user');
-            alert(msg || "You have been logged out remotely.");
-            location.reload();
-        });
+        authenticatedEventTarget.on('force_logout', handleRemoteForceLogout);
         authenticatedListenerTables.set(activeSocket,
             ChatClientHelpers.createAuthenticatedListenerTable(listenerDependencies));
     }
@@ -4969,12 +5063,11 @@
         const icon = document.createElement('div');
         icon.className = 'server-icon';
         icon.id = `srv-${code}`;
-        icon.style.background = getUserColor(code); 
         icon.textContent = name.substring(0, 2).toUpperCase();
         ChatClientHelpers.appendTextElement(document, icon, 'div', 'tooltip', name);
         icon.onclick = () => switchServer(code);
         
-        if (myRole === 'admin' && !myJoinedServers.includes(code) && code !== 'global') { icon.style.opacity = '0.4'; icon.style.border = '1px dashed var(--border-color)'; }
+        if (myRole === 'admin' && !myJoinedServers.includes(code) && code !== 'global') icon.classList.add('ghost-room');
         document.getElementById('dynamic-servers').appendChild(icon);
         renderServerAccess();
     }
@@ -5008,6 +5101,7 @@
                 closeModeratorCenter();
                 closeModerationPrompt();
                 closeReportPrompt();
+                closeMessageHistory();
                 currentServerCode = targetServerCode;
                 compositionContextCoordinator.activate(targetServerCode);
                 myRoomRole = response.roomRole || 'user';
@@ -5095,7 +5189,7 @@
                     else switchServer('global');
                 }
             } else if (icon) {
-                icon.style.opacity = '0.4'; icon.style.border = '1px dashed var(--border-color)';
+                icon.classList.add('ghost-room');
                 if (currentServerCode === serverCode) switchServer(serverCode);
             }
         }));
@@ -5118,13 +5212,14 @@
     function joinFromSnoop() {
         const serverCode = currentServerCode;
         socket.emit('join_server', serverCode,
-            guardedRequestAcknowledgement('roomOperation', {}, res => {
+            guardedRequestAcknowledgement('roomOperation', { serverCode }, res => {
             res = res || { error: 'No response from server.' };
             if (res.error) return showAppAlert("Error", res.error);
-            if (!myJoinedServers.includes(res.server.code)) myJoinedServers.push(res.server.code);
-            const icon = document.getElementById(`srv-${res.server.code}`);
-            if (icon) { icon.style.opacity = '1'; icon.style.border = 'none'; }
-            switchServer(res.server.code);
+            if (!res.server || res.server.code !== serverCode) return;
+            if (!myJoinedServers.includes(serverCode)) myJoinedServers.push(serverCode);
+            const icon = document.getElementById(`srv-${serverCode}`);
+            if (icon) icon.classList.remove('ghost-room');
+            switchServer(serverCode);
         }));
     }
 
@@ -5139,7 +5234,7 @@
             myJoinedServers.push(res.server.code);
             
             const existingIcon = document.getElementById(`srv-${res.server.code}`);
-            if (existingIcon) { existingIcon.style.opacity = '1'; existingIcon.style.border = 'none'; }
+            if (existingIcon) existingIcon.classList.remove('ghost-room');
             else { addServerToList(res.server.code, res.server.name, myUsername); } 
             
             switchServer(res.server.code);

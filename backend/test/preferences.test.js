@@ -335,6 +335,44 @@ test('legacy version zero compare-and-swap matches missing stored version', asyn
   assert.equal(ack.value().preferencesVersion, 1);
 });
 
+test('shared memory model distinguishes absent fields from explicit undefined for exists', async () => {
+  const model = createMemoryModel([
+    { _id: 'absent' },
+    { _id: 'undefined', preferencesVersion: undefined },
+    { _id: 'zero', preferencesVersion: 0 }
+  ]);
+  const missing = await model.find({ preferencesVersion: { $exists: false } });
+  const present = await model.find({ preferencesVersion: { $exists: true } });
+  assert.deepEqual(missing.map(row => row._id), ['absent']);
+  assert.deepEqual(present.map(row => row._id), ['undefined', 'zero']);
+});
+
+test('shared memory model rejects nonnumeric increments atomically', async () => {
+  const model = createMemoryModel([
+    { _id: 'bad-string', preferencesVersion: 'bad', marker: 'before' },
+    { _id: 'bad-undefined', preferencesVersion: undefined, marker: 'before' },
+    { _id: 'missing', marker: 'before' },
+    { _id: 'numeric', preferencesVersion: 2, marker: 'before' }
+  ]);
+  for (const id of ['bad-string', 'bad-undefined']) {
+    await assert.rejects(model.findOneAndUpdate(
+      { _id: id },
+      { $set: { marker: 'after' }, $inc: { preferencesVersion: 1 } },
+      { new: true }
+    ));
+    const row = model.rows.find(candidate => candidate._id === id);
+    assert.equal(row.marker, 'before', `${id} update remains atomic`);
+  }
+  await model.findOneAndUpdate(
+    { _id: 'missing' }, { $inc: { preferencesVersion: 1 } }, { new: true }
+  );
+  await model.findOneAndUpdate(
+    { _id: 'numeric' }, { $inc: { preferencesVersion: 1 } }, { new: true }
+  );
+  assert.equal(model.rows.find(row => row._id === 'missing').preferencesVersion, 1);
+  assert.equal(model.rows.find(row => row._id === 'numeric').preferencesVersion, 3);
+});
+
 test('malformed and maximum stored preference versions fail closed without overwrite', async () => {
   for (const rawVersion of [-1, 1.5, '1', 'invalid', Number.MAX_SAFE_INTEGER]) {
     const UserModel = createMemoryModel([preferenceUser({ preferencesVersion: 2 })]);
