@@ -9,6 +9,7 @@ const {
   storedPreferencesVersion,
   safePreferencesSnapshot,
   readRawPreferencesVersion,
+  applyPreferencesSnapshotToSessions,
   UserSchema,
   createConnectionHandler
 } = require('../server');
@@ -387,6 +388,26 @@ test('preference publication reaches every same-account session before acknowled
   await socket.trigger('update_preferences', updateData(), () => { acknowledged = true; });
   assert.equal(sawAckDuringEvent, false); assert.equal(acknowledged, true);
   assert.equal(target.outbound.filter(event => event.event === 'preferences_updated').length, 1);
+});
+
+test('preference publication excludes other accounts and sanitizes committed snapshots', () => {
+  const alice = new FakeSocket(); alice.id = 'alice'; alice.username = 'ALICE';
+  const bob = new FakeSocket(); bob.id = 'bob'; bob.username = 'bob';
+  applyPreferencesSnapshotToSessions([alice, bob], 'Alice', {
+    preferences: {
+      theme: 'light', textScale: 125, compactMessages: true, motion: 'reduce',
+      hostile: 'PREFERENCE_SECRET'
+    },
+    preferencesVersion: 3,
+    hostileSnapshotKey: 'PREFERENCE_SECRET'
+  });
+  assert.deepEqual(alice.outbound, [{
+    target: 'self', event: 'preferences_updated', payload: {
+      preferences: { theme: 'light', textScale: 125, compactMessages: true, motion: 'reduce' },
+      preferencesVersion: 3
+    }
+  }]);
+  assert.deepEqual(bob.outbound, []);
 });
 
 test('preference acknowledgement remains inside the account lock', async () => {
