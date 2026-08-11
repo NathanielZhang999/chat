@@ -41,6 +41,16 @@ const MODERATION_DURATIONS = Object.freeze({
   '7d': 7 * 24 * 60 * 60 * 1000
 });
 const PROTECTED_USERNAMES = new Set(['nyzhang1', 'system']);
+const DEFAULT_APPEARANCE_PREFERENCES = Object.freeze({
+  theme: 'dark',
+  textScale: 100,
+  compactMessages: false,
+  motion: 'system'
+});
+const APPEARANCE_KEYS = Object.freeze(Object.keys(DEFAULT_APPEARANCE_PREFERENCES));
+const APPEARANCE_THEMES = new Set(['dark', 'light']);
+const APPEARANCE_TEXT_SCALES = new Set([100, 112.5, 125]);
+const APPEARANCE_MOTIONS = new Set(['system', 'reduce']);
 
 function safeAck(callback) {
   return typeof callback === 'function' ? callback : () => {};
@@ -78,6 +88,47 @@ function normalizeModerationReason(value, maxLength = 200) {
 
 function normalizeAccountKey(value) {
   return String(value || '').normalize('NFKC').trim().toLowerCase();
+}
+
+function normalizeAppearancePreferences(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  if (Object.keys(value).length !== APPEARANCE_KEYS.length ||
+      APPEARANCE_KEYS.some(key => !Object.prototype.hasOwnProperty.call(value, key))) return null;
+  if (!APPEARANCE_THEMES.has(value.theme) ||
+      !APPEARANCE_TEXT_SCALES.has(value.textScale) ||
+      typeof value.compactMessages !== 'boolean' ||
+      !APPEARANCE_MOTIONS.has(value.motion)) return null;
+  return Object.freeze({
+    theme: value.theme,
+    textScale: value.textScale,
+    compactMessages: value.compactMessages,
+    motion: value.motion
+  });
+}
+
+function normalizeStoredAppearancePreferences(value) {
+  const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  return Object.freeze({
+    theme: APPEARANCE_THEMES.has(source.theme) ? source.theme : 'dark',
+    textScale: APPEARANCE_TEXT_SCALES.has(source.textScale) ? source.textScale : 100,
+    compactMessages: typeof source.compactMessages === 'boolean' ? source.compactMessages : false,
+    motion: APPEARANCE_MOTIONS.has(source.motion) ? source.motion : 'system'
+  });
+}
+
+function normalizePreferencesVersion(value) {
+  return Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function storedPreferencesVersion(value) {
+  return normalizePreferencesVersion(value) ?? 0;
+}
+
+function safePreferencesSnapshot(user) {
+  return {
+    preferences: normalizeStoredAppearancePreferences(user && user.preferences),
+    preferencesVersion: storedPreferencesVersion(user && user.preferencesVersion)
+  };
 }
 
 function normalizeAutoModSettings(value) {
@@ -620,7 +671,18 @@ const UserSchema = new mongoose.Schema({
   role: { type: String, default: 'user' },
   color: { type: String, default: '' },      
   avatarUrl: { type: String, default: '' },  
-  servers: { type: [String], default: ['global'] } 
+  servers: { type: [String], default: ['global'] },
+  preferences: {
+    theme: { type: String, enum: ['dark', 'light'], default: 'dark' },
+    textScale: { type: Number, enum: [100, 112.5, 125], default: 100 },
+    compactMessages: { type: Boolean, default: false },
+    motion: { type: String, enum: ['system', 'reduce'], default: 'system' }
+  },
+  preferencesVersion: {
+    type: Number,
+    default: 0,
+    validate: value => Number.isSafeInteger(value) && value >= 0
+  }
 });
 const User = mongoose.model('User', UserSchema);
 
@@ -1526,8 +1588,10 @@ function createConnectionHandler({
         if (existingDisp) return { error: 'Display Name is already taken.' };
 
         const hashedPassword = await bcryptImpl.hash(data.password, 10);
-        await UserModel.create({ username: cleanUser, displayName: cleanDisp, password: hashedPassword, servers: ['global'] });
-        return { success: true };
+        const createdUser = await UserModel.create({
+          username: cleanUser, displayName: cleanDisp, password: hashedPassword, servers: ['global']
+        });
+        return { success: true, ...safePreferencesSnapshot(createdUser) };
       });
 
       if (result.success) rateLimiter.clear(rateKey);
@@ -1624,6 +1688,7 @@ function createConnectionHandler({
 
         return {
           success: true,
+          ...safePreferencesSnapshot(user),
           username: user.username,
           displayName: socket.displayName,
           role: socket.role,
@@ -3487,6 +3552,13 @@ module.exports = {
   normalizeAutoModSettings,
   normalizeStoredAutoModSettings,
   normalizeAccountKey,
+  DEFAULT_APPEARANCE_PREFERENCES,
+  normalizeAppearancePreferences,
+  normalizeStoredAppearancePreferences,
+  normalizePreferencesVersion,
+  storedPreferencesVersion,
+  safePreferencesSnapshot,
+  UserSchema,
   createAutoModTracker,
   evaluateAutoMod,
   evaluateMessageRate,

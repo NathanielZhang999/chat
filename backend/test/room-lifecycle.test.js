@@ -2461,7 +2461,11 @@ test('concurrent registrations allocate case-insensitive identity names only onc
 
   assert.equal(records.length, 1);
   assert.deepEqual([firstAck.value(), secondAck.value()], [
-    { success: true },
+    {
+      success: true,
+      preferences: { theme: 'dark', textScale: 100, compactMessages: false, motion: 'system' },
+      preferencesVersion: 0
+    },
     { error: 'Username taken.' }
   ]);
 });
@@ -2554,7 +2558,11 @@ test('identity mutation lock releases after a failed registration', async () => 
     username: 'alice', displayName: 'Alice', password: '123456'
   }, secondAck.callback);
   assert.deepEqual(firstAck.value(), { error: 'Registration failed.' });
-  assert.deepEqual(secondAck.value(), { success: true });
+  assert.deepEqual(secondAck.value(), {
+    success: true,
+    preferences: { theme: 'dark', textScale: 100, compactMessages: false, motion: 'system' },
+    preferencesVersion: 0
+  });
 });
 
 test('registration rejects case-insensitive username collisions', async () => {
