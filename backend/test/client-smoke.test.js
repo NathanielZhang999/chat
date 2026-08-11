@@ -1981,17 +1981,594 @@ test('production client invalidates revoked access and sends every room mutation
   }
 });
 
-test('production image uploads cannot complete into a replaced room composition context', () => {
-  const source = fs.readFileSync(chatPath, 'utf8');
-  const start = source.indexOf("document.getElementById('file-upload').addEventListener('change'");
-  const end = source.indexOf('// --- SETTINGS LOGIC ---', start);
-  assert.notEqual(start, -1);
-  assert.ok(end > start);
-  const uploadBlock = source.slice(start, end);
+function pngAttachmentHeader(width = 2, height = 3) {
+  const bytes = new Uint8Array(33);
+  bytes.set([137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82]);
+  new DataView(bytes.buffer).setUint32(16, width, false);
+  new DataView(bytes.buffer).setUint32(20, height, false);
+  return bytes;
+}
 
-  assert.match(uploadBlock, /const uploadContext = compositionContextCoordinator\.payload\(\)/);
-  assert.match(uploadBlock, /const uploadEpoch = \+\+attachmentLoadEpoch/);
-  assert.match(uploadBlock, /const isCurrentUpload[\s\S]*compositionContextCoordinator\.matches\(uploadContext\)/);
-  assert.equal((uploadBlock.match(/if \(!isCurrentUpload\(\)\) return/g) || []).length, 2);
-  assert.match(uploadBlock, /uploadEpoch === attachmentLoadEpoch/);
+function jpegAttachmentHeader(width = 2, height = 3) {
+  const bytes = new Uint8Array(21);
+  bytes.set([0xff, 0xd8, 0xff, 0xc0, 0x00, 0x11, 0x08]);
+  new DataView(bytes.buffer).setUint16(7, height, false);
+  new DataView(bytes.buffer).setUint16(9, width, false);
+  return bytes;
+}
+
+function jpegAttachmentHeaderAfterMetadata(width = 2, height = 3) {
+  const segmentCount = 5;
+  const segmentLength = 60000;
+  const frame = jpegAttachmentHeader(width, height).slice(2);
+  const bytes = new Uint8Array(2 + segmentCount * (segmentLength + 2) + frame.length);
+  bytes.set([0xff, 0xd8]);
+  let offset = 2;
+  for (let index = 0; index < segmentCount; index += 1) {
+    bytes.set([0xff, 0xe1], offset);
+    new DataView(bytes.buffer).setUint16(offset + 2, segmentLength, false);
+    offset += segmentLength + 2;
+  }
+  bytes.set(frame, offset);
+  return bytes;
+}
+
+function webpAttachmentHeader(kind = 'VP8X', width = 2, height = 3) {
+  const payloadLength = kind === 'VP8L' ? 5 : 10;
+  const paddedLength = payloadLength + (payloadLength % 2);
+  const bytes = new Uint8Array(20 + paddedLength);
+  bytes.set([82, 73, 70, 70], 0);
+  new DataView(bytes.buffer).setUint32(4, bytes.length - 8, true);
+  bytes.set([87, 69, 66, 80], 8);
+  bytes.set([...kind.padEnd(4, ' ')].map(character => character.charCodeAt(0)), 12);
+  new DataView(bytes.buffer).setUint32(16, payloadLength, true);
+  if (kind === 'VP8X') {
+    const write24 = (offset, value) => {
+      bytes[offset] = value & 0xff;
+      bytes[offset + 1] = (value >>> 8) & 0xff;
+      bytes[offset + 2] = (value >>> 16) & 0xff;
+    };
+    write24(24, width - 1);
+    write24(27, height - 1);
+  } else if (kind === 'VP8L') {
+    bytes[20] = 0x2f;
+    new DataView(bytes.buffer).setUint32(21, (width - 1) | ((height - 1) << 14), true);
+  } else {
+    bytes.set([0, 0, 0, 0x9d, 0x01, 0x2a], 20);
+    new DataView(bytes.buffer).setUint16(26, width, true);
+    new DataView(bytes.buffer).setUint16(28, height, true);
+  }
+  return bytes;
+}
+
+function attachmentFile(type = 'image/png', bytes = pngAttachmentHeader(), overrides = {}) {
+  return { name: 'image.bin', type, size: bytes.byteLength, bytes, ...overrides };
+}
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+function attachmentControllerHarness(overrides = {}) {
+  const helpers = loadHelpers();
+  const socket = {};
+  const state = {
+    session: Object.freeze({ socketReference: socket, generation: 4, connected: true, authenticated: true }),
+    composition: Object.freeze({ roomCode: 'global', clientContextId: 7 }),
+    enabled: true,
+    processing: [], accepted: [], cleared: [], errors: [], calls: []
+  };
+  const dependencies = {
+    getSessionContext: () => state.session,
+    getCompositionContext: () => state.composition,
+    isCompositionEnabled: () => state.enabled,
+    readArrayBuffer: async file => {
+      state.calls.push('read');
+      return file.bytes.buffer.slice(file.bytes.byteOffset, file.bytes.byteOffset + file.bytes.byteLength);
+    },
+    decodeImageBytes: async (bytes, mimeType) => {
+      state.calls.push('decode');
+      const dimensions = helpers.readAttachmentHeaderDimensions(bytes, mimeType);
+      return { image: { marker: 'decoded' }, width: dimensions.width, height: dimensions.height };
+    },
+    createCanvas: () => {
+      state.calls.push('canvas');
+      return {
+        width: 0,
+        height: 0,
+        getContext: () => ({ drawImage() {} }),
+        toDataURL: () => 'data:image/jpeg;base64,AAAA'
+      };
+    },
+    sanitizeAttachment: value => helpers.sanitizeAttachment(value),
+    onProcessing: (...args) => state.processing.push(args),
+    onAccepted: (...args) => state.accepted.push(args),
+    onCleared: (...args) => state.cleared.push(args),
+    onError: (...args) => state.errors.push(args),
+    ...overrides
+  };
+  return { helpers, state, controller: helpers.createAttachmentIntakeController(dependencies), dependencies };
+}
+
+class ControlledEventTarget {
+  constructor() {
+    this.listeners = new Map();
+    this.files = [];
+    this.value = '';
+    this.classNames = new Set();
+    this.classList = {
+      add: value => this.classNames.add(value),
+      remove: value => this.classNames.delete(value),
+      contains: value => this.classNames.has(value)
+    };
+  }
+  addEventListener(type, handler) {
+    const handlers = this.listeners.get(type) || [];
+    handlers.push(handler);
+    this.listeners.set(type, handlers);
+  }
+  removeEventListener(type, handler) {
+    this.listeners.set(type, (this.listeners.get(type) || []).filter(candidate => candidate !== handler));
+  }
+  dispatch(type, values = {}) {
+    const event = {
+      type,
+      target: this,
+      currentTarget: this,
+      defaultPrevented: false,
+      preventDefault() { this.defaultPrevented = true; },
+      ...values
+    };
+    for (const handler of [...(this.listeners.get(type) || [])]) handler(event);
+    return event;
+  }
+}
+
+const settleAttachmentWork = () => new Promise(resolve => setImmediate(resolve));
+
+test('attachment candidate accepts only JPEG PNG and WebP at most ten MiB', () => {
+  const helpers = loadHelpers();
+  const limit = 10 * 1024 * 1024;
+  for (const type of ['image/jpeg', 'image/png', 'image/webp']) {
+    const accepted = helpers.selectAttachmentCandidate([attachmentFile(type, pngAttachmentHeader(), { size: limit })]);
+    assert.equal(accepted.file.type, type);
+    assert.equal(accepted.suppliedCount, 1);
+    assert.equal(accepted.supportedCount, 1);
+  }
+  for (const type of ['image/gif', 'image/svg+xml', 'image/jpg', 'text/plain', '', 'IMAGE/PNG']) {
+    assert.equal(helpers.selectAttachmentCandidate([attachmentFile(type)]).file, null, type);
+  }
+  assert.equal(helpers.selectAttachmentCandidate([
+    attachmentFile('image/png', pngAttachmentHeader(), { size: limit + 1 })
+  ]).file, null);
+});
+
+test('attachment header parser rejects truncated deceptive and malformed JPEG PNG and WebP', () => {
+  const helpers = loadHelpers();
+  assert.deepEqual({ ...helpers.readAttachmentHeaderDimensions(pngAttachmentHeader(), 'image/png') }, { width: 2, height: 3 });
+  assert.deepEqual({ ...helpers.readAttachmentHeaderDimensions(jpegAttachmentHeader(), 'image/jpeg') }, { width: 2, height: 3 });
+  for (const kind of ['VP8X', 'VP8L', 'VP8']) {
+    assert.deepEqual({ ...helpers.readAttachmentHeaderDimensions(webpAttachmentHeader(kind), 'image/webp') }, { width: 2, height: 3 });
+  }
+  assert.deepEqual({ ...helpers.readAttachmentHeaderDimensions(jpegAttachmentHeaderAfterMetadata(), 'image/jpeg') },
+    { width: 2, height: 3 });
+  const largeWebp = new Uint8Array(300000);
+  largeWebp.set(webpAttachmentHeader('VP8X'));
+  new DataView(largeWebp.buffer).setUint32(4, largeWebp.length - 8, true);
+  assert.deepEqual({ ...helpers.readAttachmentHeaderDimensions(largeWebp, 'image/webp') }, { width: 2, height: 3 });
+
+  const deceptivePng = pngAttachmentHeader();
+  deceptivePng[0] = 0;
+  const wrongFirstPngChunk = pngAttachmentHeader();
+  wrongFirstPngChunk.set([73, 68, 65, 84], 12);
+  const deceptiveJpeg = jpegAttachmentHeader();
+  deceptiveJpeg[1] = 0;
+  const deceptiveWebp = webpAttachmentHeader();
+  deceptiveWebp[8] = 0;
+  const trailingWebp = new Uint8Array(webpAttachmentHeader().length + 1);
+  trailingWebp.set(webpAttachmentHeader());
+  const malformedJpeg = jpegAttachmentHeader();
+  malformedJpeg[4] = 0xff;
+  malformedJpeg[5] = 0xff;
+  const malformedWebp = webpAttachmentHeader();
+  new DataView(malformedWebp.buffer).setUint32(16, 0x7fffffff, true);
+  for (const [bytes, type] of [
+    [pngAttachmentHeader().slice(0, 23), 'image/png'],
+    [jpegAttachmentHeader().slice(0, 10), 'image/jpeg'],
+    [webpAttachmentHeader().slice(0, 25), 'image/webp'],
+    [deceptivePng, 'image/png'], [deceptiveJpeg, 'image/jpeg'], [deceptiveWebp, 'image/webp'],
+    [trailingWebp, 'image/webp'],
+    [wrongFirstPngChunk, 'image/png'],
+    [new Uint8Array([0xff, 0xd8, 0xff, 0xda, 0x00, 0x02]), 'image/jpeg'],
+    [malformedJpeg, 'image/jpeg'], [malformedWebp, 'image/webp'],
+    [webpAttachmentHeader('ANIM'), 'image/webp'],
+    [pngAttachmentHeader(), 'image/webp']
+  ]) assert.equal(helpers.readAttachmentHeaderDimensions(bytes, type), null);
+});
+
+test('attachment header parser rejects dimensions and pixels before browser decode', async () => {
+  const helpers = loadHelpers();
+  assert.deepEqual({ ...helpers.readAttachmentHeaderDimensions(pngAttachmentHeader(16384, 1), 'image/png') },
+    { width: 16384, height: 1 });
+  assert.equal(helpers.readAttachmentHeaderDimensions(pngAttachmentHeader(16385, 1), 'image/png'), null);
+  assert.equal(helpers.readAttachmentHeaderDimensions(pngAttachmentHeader(8000, 5001), 'image/png'), null);
+  assert.equal(helpers.readAttachmentHeaderDimensions(jpegAttachmentHeader(8000, 5001), 'image/jpeg'), null);
+  assert.equal(helpers.readAttachmentHeaderDimensions(webpAttachmentHeader('VP8X', 8000, 5001), 'image/webp'), null);
+  assert.equal(helpers.readAttachmentHeaderDimensions(pngAttachmentHeader(0, 3), 'image/png'), null);
+
+  const order = [];
+  const { controller } = attachmentControllerHarness({
+    readArrayBuffer: async file => { order.push('read'); return file.bytes.buffer; },
+    decodeImageBytes: async () => { order.push('decode'); throw new Error('must not decode'); }
+  });
+  await controller.intake(attachmentFile('image/png', pngAttachmentHeader(8000, 5001)), 'picker');
+  assert.deepEqual(order, ['read']);
+});
+
+test('attachment intake rejects a decoder dimension mismatch before canvas allocation', async () => {
+  let canvasAllocations = 0;
+  const { controller, state } = attachmentControllerHarness({
+    decodeImageBytes: async () => ({ image: {}, width: 10, height: 11 }),
+    createCanvas: () => { canvasAllocations += 1; return {}; }
+  });
+  await controller.intake(attachmentFile(), 'picker');
+  assert.equal(canvasAllocations, 0);
+  assert.equal(state.accepted.length, 0);
+  assert.equal(state.errors.at(-1)[0], 'Could not process that image.');
+});
+
+test('attachment decoder revokes its object URL exactly once on every terminal path', async () => {
+  const helpers = loadHelpers();
+  const revoked = [];
+  let nextUrl = 0;
+  const adapters = imageFactory => ({
+    BlobCtor: class BlobDouble { constructor(parts, options) { this.parts = parts; this.type = options.type; } },
+    createObjectURL: () => `blob:attachment-${++nextUrl}`,
+    revokeObjectURL: url => revoked.push(url),
+    imageFactory
+  });
+  const loads = () => {
+    const image = { naturalWidth: 2, naturalHeight: 3 };
+    Object.defineProperty(image, 'src', { set() { image.onload(); } });
+    return image;
+  };
+  const errors = () => {
+    const image = {};
+    Object.defineProperty(image, 'src', { set() { image.onerror(new Error('DECODER_SECRET_SENTINEL')); } });
+    return image;
+  };
+  const throwsFromCallback = () => {
+    const image = {};
+    Object.defineProperty(image, 'naturalWidth', { get() { throw new Error('DECODER_SECRET_SENTINEL'); } });
+    Object.defineProperty(image, 'src', { set() { image.onload(); } });
+    return image;
+  };
+  const loaded = await helpers.decodeAttachmentBytes(pngAttachmentHeader(), 'image/png', adapters(loads));
+  assert.equal(loaded.width, 2);
+  assert.equal(loaded.height, 3);
+  await assert.rejects(helpers.decodeAttachmentBytes(pngAttachmentHeader(), 'image/png', adapters(errors)));
+  await assert.rejects(helpers.decodeAttachmentBytes(pngAttachmentHeader(), 'image/png', adapters(throwsFromCallback)));
+
+  let pendingImage;
+  let pendingImageSource = null;
+  const pendingImageCreated = deferred();
+  const pendingAdapters = adapters(() => {
+    pendingImage = { naturalWidth: 2, naturalHeight: 3 };
+    Object.defineProperty(pendingImage, 'src', { set(value) { pendingImageSource = value; } });
+    pendingImageCreated.resolve();
+    return pendingImage;
+  });
+  const { controller, state } = attachmentControllerHarness({
+    decodeImageBytes: (bytes, mimeType, control) => helpers.decodeAttachmentBytes(
+      bytes, mimeType, { ...pendingAdapters, ...control })
+  });
+  const invalidated = controller.intake(attachmentFile(), 'picker');
+  await pendingImageCreated.promise;
+  controller.invalidate('room switch');
+  const terminal = await Promise.race([
+    invalidated.then(() => 'settled'),
+    new Promise(resolve => setTimeout(() => resolve('still pending'), 25))
+  ]);
+  assert.equal(terminal, 'settled');
+  assert.equal(pendingImageSource, '');
+  assert.equal(state.accepted.length, 0);
+  assert.deepEqual(revoked, [
+    'blob:attachment-1', 'blob:attachment-2', 'blob:attachment-3', 'blob:attachment-4'
+  ]);
+  assert.equal(revoked.includes('blob:unrelated'), false);
+});
+
+test('attachment dimensions enforce positive bounded pixels and fit within eight hundred pixels', () => {
+  const helpers = loadHelpers();
+  for (const values of [[0, 1], [-1, 1], [1, Infinity], [NaN, 1], [16385, 1], [8000, 5001]]) {
+    assert.equal(helpers.fitAttachmentDimensions(...values), null);
+  }
+  assert.deepEqual({ ...helpers.fitAttachmentDimensions(1600, 800) }, { width: 800, height: 400 });
+  assert.deepEqual({ ...helpers.fitAttachmentDimensions(400, 1200) }, { width: 267, height: 800 });
+  assert.deepEqual({ ...helpers.fitAttachmentDimensions(1, 1) }, { width: 1, height: 1 });
+});
+
+test('attachment intake permits one file and the newest intake supersedes older work', async () => {
+  const firstRead = deferred();
+  const { controller, state } = attachmentControllerHarness({
+    readArrayBuffer: file => file.name === 'older.png' ? firstRead.promise : Promise.resolve(file.bytes.buffer)
+  });
+  const older = controller.intake(attachmentFile('image/png', pngAttachmentHeader(), { name: 'older.png' }), 'picker');
+  const activeToken = controller.current().token;
+  assert.equal(Object.isFrozen(activeToken), true);
+  assert.equal(activeToken.generation, 4);
+  assert.equal(activeToken.socketReference, state.session.socketReference);
+  assert.equal(activeToken.serverCode, 'global');
+  assert.equal(activeToken.clientContextId, 7);
+  const newer = controller.intake(attachmentFile('image/png', pngAttachmentHeader(4, 5), { name: 'newer.png' }), 'drop');
+  await newer;
+  firstRead.resolve(pngAttachmentHeader().buffer);
+  await older;
+  assert.equal(state.accepted.length, 1);
+  assert.equal(state.accepted[0][1].source, 'drop');
+  assert.equal(controller.current().active, false);
+
+  const invalidatedRead = deferred();
+  const invalidatedHarness = attachmentControllerHarness({ readArrayBuffer: () => invalidatedRead.promise });
+  const invalidatedWork = invalidatedHarness.controller.intake(attachmentFile(), 'picker');
+  await Promise.resolve();
+  await invalidatedHarness.controller.intake(
+    attachmentFile('image/png', pngAttachmentHeader(), { size: 10 * 1024 * 1024 + 1 }), 'drop');
+  invalidatedRead.resolve(pngAttachmentHeader().buffer);
+  await invalidatedWork;
+  assert.equal(invalidatedHarness.state.accepted.length, 0);
+  assert.equal(invalidatedHarness.state.cleared.length, 1);
+  assert.deepEqual(invalidatedHarness.state.errors.map(args => args[0]),
+    ['Only JPEG, PNG, and WebP images up to 10 MiB are supported.']);
+});
+
+test('text paste remains native while focused image paste enters the shared pipeline', async () => {
+  const { helpers, controller, state } = attachmentControllerHarness();
+  const fileInput = new ControlledEventTarget();
+  const dropTarget = new ControlledEventTarget();
+  const messageInput = new ControlledEventTarget();
+  const binding = helpers.bindAttachmentInputs({
+    fileInput, dropTarget, messageInput, intakeAttachment: controller.intake
+  });
+  const textPaste = messageInput.dispatch('paste', {
+    clipboardData: { items: [{ kind: 'string', type: 'text/plain', getAsFile: () => null }] }
+  });
+  assert.equal(textPaste.defaultPrevented, false);
+  const image = attachmentFile('image/png');
+  const imagePaste = messageInput.dispatch('paste', {
+    clipboardData: { items: [{ kind: 'file', type: 'image/png', getAsFile: () => image }] }
+  });
+  assert.equal(imagePaste.defaultPrevented, true);
+  await settleAttachmentWork();
+  assert.equal(state.accepted.at(-1)[1].source, 'paste');
+  binding.unbind();
+});
+
+test('file picker drag drop and paste execute the same intake function', async () => {
+  const { helpers, controller, state } = attachmentControllerHarness();
+  const fileInput = new ControlledEventTarget();
+  const dropTarget = new ControlledEventTarget();
+  const messageInput = new ControlledEventTarget();
+  const binding = helpers.bindAttachmentInputs({
+    fileInput, dropTarget, messageInput, intakeAttachment: controller.intake
+  });
+  const file = attachmentFile();
+  const textDrag = dropTarget.dispatch('dragenter', { dataTransfer: { types: ['text/plain'], files: [] } });
+  assert.equal(textDrag.defaultPrevented, false);
+  assert.equal(dropTarget.classList.contains('attachment-drag-active'), false);
+  assert.equal(dropTarget.dispatch('dragenter', { dataTransfer: { types: ['Files'], files: [file] } }).defaultPrevented, true);
+  dropTarget.dispatch('dragenter', { dataTransfer: { types: ['Files'], files: [file] } });
+  dropTarget.dispatch('dragleave', { dataTransfer: { types: ['Files'], files: [file] } });
+  assert.equal(dropTarget.classList.contains('attachment-drag-active'), true);
+  dropTarget.dispatch('dragleave', { dataTransfer: { types: ['Files'], files: [file] } });
+  assert.equal(dropTarget.classList.contains('attachment-drag-active'), false);
+  fileInput.files = [file];
+  fileInput.dispatch('change');
+  dropTarget.dispatch('drop', { dataTransfer: { types: ['Files'], files: [file] } });
+  messageInput.dispatch('paste', {
+    clipboardData: { items: [{ kind: 'file', type: 'image/png', getAsFile: () => file }] }
+  });
+  await settleAttachmentWork();
+  assert.deepEqual(state.accepted.map(args => args[1].source), ['paste']);
+  assert.ok(state.processing.some(args => args[1] === 'picker'));
+  assert.ok(state.processing.some(args => args[1] === 'drop'));
+  assert.ok(state.processing.some(args => args[1] === 'paste'));
+  const processingCount = state.processing.length;
+  binding.unbind();
+  fileInput.dispatch('change');
+  assert.equal(state.processing.length, processingCount);
+});
+
+test('attachment processing invalidates on room switch socket replacement clear and send', async () => {
+  const cases = [
+    ['room switch', 'read'], ['socket replacement', 'decode'],
+    ['clear', 'read'], ['send', 'decode']
+  ];
+  for (const [invalidation, stage] of cases) {
+    const boundary = deferred();
+    const boundaryStarted = deferred();
+    const overrides = stage === 'read'
+      ? { readArrayBuffer: () => { boundaryStarted.resolve(); return boundary.promise; } }
+      : { decodeImageBytes: () => { boundaryStarted.resolve(); return boundary.promise; } };
+    const { controller, state } = attachmentControllerHarness(overrides);
+    const work = controller.intake(attachmentFile(), 'picker');
+    await boundaryStarted.promise;
+    if (invalidation === 'room switch') {
+      state.composition = Object.freeze({ roomCode: 'ABC123', clientContextId: 8 });
+    } else if (invalidation === 'socket replacement') {
+      state.session = Object.freeze({ ...state.session, socketReference: {}, generation: 5 });
+    }
+    if (invalidation === 'clear') controller.clear();
+    else controller.invalidate(invalidation);
+    const callbackCount = state.processing.length + state.accepted.length + state.cleared.length + state.errors.length;
+    boundary.resolve(stage === 'read'
+      ? pngAttachmentHeader().buffer
+      : { image: {}, width: 2, height: 3 });
+    await work;
+    assert.equal(state.processing.length + state.accepted.length + state.cleared.length + state.errors.length,
+      callbackCount, invalidation);
+    assert.equal(state.accepted.length, 0, invalidation);
+  }
+
+  const source = fs.readFileSync(chatPath, 'utf8');
+  assert.match(source, /async function intakeAttachment\(file, source\)[\s\S]{0,220}attachmentIntakeController\.intake\(file, source\)/);
+  assert.match(source, /ChatClientHelpers\.bindAttachmentInputs\(\{[\s\S]{0,260}intakeAttachment,/);
+  assert.match(source, /function clearAttachment\(\)[\s\S]{0,180}attachmentIntakeController\.clear\(\)/);
+  assert.match(source, /resetAttachment:\s*clearAttachment/);
+  const switchBlock = source.slice(source.indexOf('function handleSwitchResult'), source.indexOf('async function leaveServer'));
+  assert.match(switchBlock, /compositionContextCoordinator\.activate\(targetServerCode\)[\s\S]*cancelAction\(\)/);
+  const submitBlock = source.slice(source.indexOf("document.getElementById('compose').addEventListener('submit'"),
+    source.indexOf("msgInput.addEventListener('input'"));
+  assert.match(submitBlock, /socket\.emit\('chat_message'[\s\S]*cancelAction\(\)/);
+});
+
+test('same-object reconnect cannot complete or send an older attachment intake', async () => {
+  const decode = deferred();
+  const decodeStarted = deferred();
+  const { controller, state } = attachmentControllerHarness({
+    decodeImageBytes: () => { decodeStarted.resolve(); return decode.promise; }
+  });
+  const work = controller.intake(attachmentFile(), 'picker');
+  await decodeStarted.promise;
+  state.session = Object.freeze({ ...state.session, generation: state.session.generation + 2 });
+  decode.resolve({ image: {}, width: 2, height: 3 });
+  await work;
+  assert.equal(state.accepted.length, 0);
+  assert.equal(state.errors.length, 0);
+});
+
+test('failed decode canvas and output validation clear only the current intake', async () => {
+  const badOutputs = [
+    'data:image/png;base64,AAAA',
+    'data:image/gif;base64,AAAA',
+    'data:image/webp;base64,AAAA',
+    'data:image/jpeg;base64,%%%%',
+    'data:image/jpeg;base64,A=A=',
+    `data:image/jpeg;base64,${'A'.repeat(8000000)}`
+  ];
+  const mutations = [
+    { decodeImageBytes: async () => { throw new Error('DECODER_SECRET_SENTINEL'); } },
+    { createCanvas: () => { throw new Error('canvas'); } },
+    { createCanvas: () => ({ getContext: () => null, toDataURL: () => 'data:image/jpeg;base64,AAAA' }) },
+    ...badOutputs.map(output => ({
+      createCanvas: () => ({ getContext: () => ({ drawImage() {} }), toDataURL: () => output })
+    }))
+  ];
+  for (const mutation of mutations) {
+    const { controller, state } = attachmentControllerHarness(mutation);
+    await controller.intake(attachmentFile(), 'picker');
+    assert.equal(state.accepted.length, 0);
+    assert.equal(state.cleared.length, 1);
+    assert.deepEqual(state.errors.map(args => args[0]), ['Could not process that image.']);
+  }
+
+  const olderDecode = deferred();
+  const olderDecodeStarted = deferred();
+  let decodeCalls = 0;
+  const { controller, state } = attachmentControllerHarness({
+    decodeImageBytes: async () => {
+      decodeCalls += 1;
+      if (decodeCalls === 1) {
+        olderDecodeStarted.resolve();
+        return olderDecode.promise;
+      }
+      return { image: {}, width: 2, height: 3 };
+    }
+  });
+  const older = controller.intake(attachmentFile(), 'picker');
+  await olderDecodeStarted.promise;
+  await controller.intake(attachmentFile(), 'drop');
+  olderDecode.reject(new Error('DECODER_SECRET_SENTINEL'));
+  await older;
+  assert.equal(state.accepted.length, 1);
+  assert.equal(state.cleared.length, 0);
+});
+
+test('drop target and attachment status are accessible and motion aware', () => {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  assert.match(source, /id="attachment-status"[^>]*role="status"[^>]*aria-live="polite"/);
+  assert.match(source, /id="preview-img"[^>]*alt="Attached image preview"/);
+  assert.match(source, /id="clear-attachment-btn"[^>]*aria-label="Remove attachment"/);
+  assert.match(source, /#clear-attachment-btn\s*\{[^}]*min-width:\s*44px[^}]*min-height:\s*44px/s);
+  assert.match(source, /id="compose-drop-target"[^>]*role="group"[^>]*aria-label="Message composer and image drop target"[^>]*aria-describedby="attachment-drop-instructions"/);
+  assert.match(source, /id="attachment-drop-instructions"[^>]*class="visually-hidden"[^>]*>Drop one JPEG, PNG, or WebP image here\.</);
+  assert.match(source, /#compose-drop-target\.attachment-drag-active/);
+  assert.match(source, /@media\s*\(prefers-reduced-motion:\s*reduce\)[\s\S]*#compose-drop-target/);
+});
+
+test('attachment errors redact hostile filenames clipboard data and decoder messages', async () => {
+  const secretBytes = new TextEncoder().encode('CLIPBOARD_SECRET_SENTINEL');
+  const { helpers, controller, state } = attachmentControllerHarness({
+    decodeImageBytes: async () => { throw new Error('DECODER_SECRET_SENTINEL'); }
+  });
+  const hostile = attachmentFile('image/png', pngAttachmentHeader(), { name: 'PRIVATE_FILENAME_SENTINEL.png' });
+  await controller.intake(hostile, 'picker');
+  const fileInput = new ControlledEventTarget();
+  const dropTarget = new ControlledEventTarget();
+  const messageInput = new ControlledEventTarget();
+  const statuses = [];
+  helpers.bindAttachmentInputs({
+    fileInput, dropTarget, messageInput, intakeAttachment: controller.intake,
+    onStatus: message => statuses.push(message)
+  });
+  messageInput.dispatch('paste', {
+    clipboardData: {
+      marker: secretBytes,
+      items: [{ kind: 'file', type: 'image/png', getAsFile: () => hostile }]
+    }
+  });
+  await settleAttachmentWork();
+  const exposed = JSON.stringify({ processing: state.processing, accepted: state.accepted,
+    cleared: state.cleared, errors: state.errors, statuses });
+  assert.doesNotMatch(exposed, /PRIVATE_FILENAME_SENTINEL|CLIPBOARD_SECRET_SENTINEL|DECODER_SECRET_SENTINEL/);
+  assert.match(exposed, /Could not process that image\./);
+});
+
+test('multiple files report the one-attachment rule and select the first supported image', async () => {
+  const { helpers, controller, state } = attachmentControllerHarness();
+  const fileInput = new ControlledEventTarget();
+  const dropTarget = new ControlledEventTarget();
+  const messageInput = new ControlledEventTarget();
+  const statuses = [];
+  helpers.bindAttachmentInputs({
+    fileInput, dropTarget, messageInput, intakeAttachment: controller.intake,
+    onStatus: message => statuses.push(message)
+  });
+  const unsupported = attachmentFile('image/gif', pngAttachmentHeader(), { name: 'first.gif' });
+  const firstSupported = attachmentFile('image/jpeg', jpegAttachmentHeader(), { name: 'second.jpg' });
+  const laterSupported = attachmentFile('image/png', pngAttachmentHeader(), { name: 'third.png' });
+  const dropped = dropTarget.dispatch('drop', {
+    dataTransfer: { types: ['Files'], files: [unsupported, firstSupported, laterSupported] }
+  });
+  assert.equal(dropped.defaultPrevented, true);
+  await settleAttachmentWork();
+  assert.equal(statuses[0], 'Only one image can be attached; using the first supported image.');
+  assert.equal(state.accepted.length, 1);
+  assert.equal(state.accepted[0][1].source, 'drop');
+  assert.equal(state.accepted[0][1].mimeType, 'image/jpeg');
+
+  const olderRead = deferred();
+  const second = attachmentControllerHarness({ readArrayBuffer: () => olderRead.promise });
+  const secondFileInput = new ControlledEventTarget();
+  const secondDropTarget = new ControlledEventTarget();
+  const secondMessageInput = new ControlledEventTarget();
+  second.helpers.bindAttachmentInputs({
+    fileInput: secondFileInput,
+    dropTarget: secondDropTarget,
+    messageInput: secondMessageInput,
+    intakeAttachment: second.controller.intake
+  });
+  const olderWork = second.controller.intake(attachmentFile(), 'picker');
+  secondDropTarget.dispatch('drop', {
+    dataTransfer: { types: ['Files'], files: [attachmentFile('image/gif')] }
+  });
+  olderRead.resolve(pngAttachmentHeader().buffer);
+  await olderWork;
+  assert.equal(second.state.accepted.length, 0);
 });

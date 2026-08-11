@@ -120,6 +120,7 @@
             transition-delay: 0s !important;
         }
         * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        .visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
         body { background: var(--page-bg); color: var(--text-normal); height: 100vh; display: flex; align-items: center; justify-content: center; overflow: hidden; }
         
         #app { width: 100%; height: 100vh; background: var(--panel-bg); display: flex; position: relative; }
@@ -313,8 +314,11 @@
         .info-bar-btn:hover { color: var(--text-strong); }
         
         #attachment-preview img { max-height: 80px; border-radius: 4px; border: 1px solid var(--border-color); }
-        #clear-attachment-btn { position: absolute; top: 5px; right: 5px; background: var(--error-surface); color: var(--on-error); border: none; border-radius: 50%; width: 20px; height: 20px; cursor: pointer; font-weight: bold; display: flex; align-items: center; justify-content: center; padding-bottom: 2px; transition: transform 0.2s;}
+        #clear-attachment-btn { position: absolute; top: -8px; right: -8px; background: var(--error-surface); color: var(--on-error); border: none; border-radius: 50%; width: 44px; height: 44px; min-width: 44px; min-height: 44px; cursor: pointer; font-weight: bold; display: flex; align-items: center; justify-content: center; transition: transform var(--motion-fast) ease;}
         #clear-attachment-btn:hover { transform: scale(1.05); }
+        #attachment-status { min-height: 1.2rem; padding: 0 1rem 6px; color: var(--text-muted); font-size: 0.82rem; font-weight: 600; }
+        #compose-drop-target { border-radius: 10px; transition: box-shadow var(--motion-fast) ease, background-color var(--motion-fast) ease; }
+        #compose-drop-target.attachment-drag-active { background: var(--primary-soft); box-shadow: inset 0 0 0 2px var(--primary-indicator); }
         
         /* --- SMOOTH FLOATING EMOJI PICKERS --- */
         .emoji-picker-container { 
@@ -439,6 +443,7 @@
           }
 
           #chat-window { scroll-behavior: auto !important; }
+          #compose-drop-target { transition: none !important; }
           .msg, .system-msg, .server-icon, .user-item, .reaction-bubble {
             animation: none !important;
             transform: none !important;
@@ -731,7 +736,8 @@
         <div id="chat-window"></div>
         <div id="typing-indicator"></div>
         
-        <div style="position: relative;">
+        <div id="compose-drop-target" role="group" aria-label="Message composer and image drop target" aria-describedby="attachment-drop-instructions" style="position: relative;">
+            <span id="attachment-drop-instructions" class="visually-hidden">Drop one JPEG, PNG, or WebP image here.</span>
             <div id="info-bar" class="compose-addon">
                 <span id="info-bar-text" class="info-bar-text">Editing</span>
                 <button type="button" class="info-bar-btn" onclick="cancelAction()">&times; Cancel</button>
@@ -739,16 +745,17 @@
             
             <div id="attachment-preview" class="compose-addon" style="position: relative;">
                 <div style="position:relative; width: max-content;">
-                    <img id="preview-img" src="">
-                    <button type="button" id="clear-attachment-btn" title="Remove Attachment">&times;</button>
+                    <img id="preview-img" src="" alt="Attached image preview">
+                    <button type="button" id="clear-attachment-btn" title="Remove attachment" aria-label="Remove attachment">&times;</button>
                 </div>
             </div>
+            <div id="attachment-status" role="status" aria-live="polite"></div>
             <div id="restriction-notice" aria-live="polite"></div>
 
             <form id="compose">
                 <div class="input-wrapper">
                     <button type="button" class="chat-icon-btn plus" id="attachment-btn" onclick="document.getElementById('file-upload').click()" title="Upload Image">➕</button>
-                    <input type="file" id="file-upload" accept="image/*" style="display:none;">
+                    <input type="file" id="file-upload" accept="image/jpeg,image/png,image/webp" style="display:none;">
                     
                     <input type="text" id="msg-input" placeholder="Message... (/shrug, /tableflip, /clear)" autocomplete="off" disabled>
                     
@@ -1987,6 +1994,487 @@
             return token;
         },
 
+        selectAttachmentCandidate(files) {
+            const allowed = new Set(['image/jpeg', 'image/png', 'image/webp']);
+            const list = Array.from(files || []);
+            const supported = list.filter(file => file && allowed.has(file.type) &&
+                Number.isFinite(file.size) && file.size >= 0 && file.size <= 10 * 1024 * 1024);
+            return {
+                file: supported[0] || null,
+                suppliedCount: list.length,
+                supportedCount: supported.length
+            };
+        },
+
+        fitAttachmentDimensions(width, height) {
+            if (!Number.isFinite(width) || !Number.isFinite(height) ||
+                width <= 0 || height <= 0 || width > 16384 || height > 16384 ||
+                width * height > 40000000) return null;
+            const scale = Math.min(1, 800 / Math.max(width, height));
+            return {
+                width: Math.max(1, Math.round(width * scale)),
+                height: Math.max(1, Math.round(height * scale))
+            };
+        },
+
+        readAttachmentHeaderDimensions(bytes, mimeType) {
+            const byteLength = bytes && Number.isSafeInteger(bytes.byteLength) ? bytes.byteLength : -1;
+            if (byteLength < 0 || !bytes.buffer) return null;
+            let view;
+            try {
+                view = new Uint8Array(bytes.buffer, bytes.byteOffset || 0, byteLength);
+            } catch {
+                return null;
+            }
+            if (view.length > 10 * 1024 * 1024) return null;
+            const data = new DataView(view.buffer, view.byteOffset, view.byteLength);
+            const valid = (width, height) => Number.isInteger(width) && Number.isInteger(height) &&
+                width > 0 && height > 0 && width <= 16384 && height <= 16384 &&
+                width * height <= 40000000 ? { width, height } : null;
+            const ascii = (offset, value) => {
+                if (offset < 0 || offset + value.length > view.length) return false;
+                for (let index = 0; index < value.length; index += 1) {
+                    if (view[offset + index] !== value.charCodeAt(index)) return false;
+                }
+                return true;
+            };
+
+            try {
+                if (mimeType === 'image/png') {
+                    const signature = [137, 80, 78, 71, 13, 10, 26, 10];
+                    if (view.length < 33 || signature.some((value, index) => view[index] !== value) ||
+                        data.getUint32(8, false) !== 13 || !ascii(12, 'IHDR')) return null;
+                    return valid(data.getUint32(16, false), data.getUint32(20, false));
+                }
+
+                if (mimeType === 'image/jpeg') {
+                    if (view.length < 4 || view[0] !== 0xff || view[1] !== 0xd8) return null;
+                    const scanLimit = view.length;
+                    const startOfFrame = new Set([
+                        0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7,
+                        0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf
+                    ]);
+                    let offset = 2;
+                    while (offset < scanLimit) {
+                        if (view[offset] !== 0xff) return null;
+                        while (offset < scanLimit && view[offset] === 0xff) offset += 1;
+                        if (offset >= scanLimit) return null;
+                        const marker = view[offset++];
+                        if (marker === 0xd9 || marker === 0xda) return null;
+                        if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) continue;
+                        if (offset + 2 > scanLimit) return null;
+                        const segmentLength = data.getUint16(offset, false);
+                        if (segmentLength < 2 || offset + segmentLength > scanLimit) return null;
+                        if (startOfFrame.has(marker)) {
+                            if (segmentLength < 7) return null;
+                            return valid(data.getUint16(offset + 5, false),
+                                data.getUint16(offset + 3, false));
+                        }
+                        offset += segmentLength;
+                    }
+                    return null;
+                }
+
+                if (mimeType === 'image/webp') {
+                    if (view.length < 20 || !ascii(0, 'RIFF') || !ascii(8, 'WEBP')) return null;
+                    const declaredEnd = data.getUint32(4, true) + 8;
+                    if (declaredEnd < 20 || declaredEnd !== view.length) return null;
+                    let offset = 12;
+                    while (offset + 8 <= declaredEnd) {
+                        const chunkType = String.fromCharCode(view[offset], view[offset + 1],
+                            view[offset + 2], view[offset + 3]);
+                        const chunkLength = data.getUint32(offset + 4, true);
+                        const payload = offset + 8;
+                        const payloadEnd = payload + chunkLength;
+                        if (!Number.isSafeInteger(payloadEnd) || payloadEnd > declaredEnd) return null;
+                        if (chunkType === 'VP8X') {
+                            if (chunkLength < 10) return null;
+                            const read24 = position => view[position] |
+                                (view[position + 1] << 8) | (view[position + 2] << 16);
+                            return valid(read24(payload + 4) + 1, read24(payload + 7) + 1);
+                        }
+                        if (chunkType === 'VP8L') {
+                            if (chunkLength < 5 || view[payload] !== 0x2f) return null;
+                            const packed = data.getUint32(payload + 1, true);
+                            return valid((packed & 0x3fff) + 1, ((packed >>> 14) & 0x3fff) + 1);
+                        }
+                        if (chunkType === 'VP8 ') {
+                            if (chunkLength < 10 || view[payload + 3] !== 0x9d ||
+                                view[payload + 4] !== 0x01 || view[payload + 5] !== 0x2a) return null;
+                            return valid(data.getUint16(payload + 6, true) & 0x3fff,
+                                data.getUint16(payload + 8, true) & 0x3fff);
+                        }
+                        offset = payloadEnd + (chunkLength % 2);
+                    }
+                }
+            } catch {
+                return null;
+            }
+            return null;
+        },
+
+        createAttachmentIntakeCoordinator({
+            getSessionContext = () => null,
+            getCompositionContext = () => null,
+            isCompositionEnabled = () => false
+        } = {}) {
+            let epoch = 0;
+            let latestToken = null;
+            const controller = {
+                begin() {
+                    const session = getSessionContext();
+                    const composition = getCompositionContext();
+                    if (!session || !session.connected || !session.authenticated ||
+                        !session.socketReference || !Number.isSafeInteger(session.generation) ||
+                        !composition || !composition.roomCode ||
+                        !Number.isSafeInteger(composition.clientContextId) ||
+                        !isCompositionEnabled()) return null;
+                    latestToken = Object.freeze({
+                        epoch: ++epoch,
+                        generation: session.generation,
+                        socketReference: session.socketReference,
+                        serverCode: composition.roomCode,
+                        clientContextId: composition.clientContextId
+                    });
+                    return latestToken;
+                },
+                isCurrent(token) {
+                    if (!token || token !== latestToken || token.epoch !== epoch || !isCompositionEnabled()) return false;
+                    const session = getSessionContext();
+                    const composition = getCompositionContext();
+                    return Boolean(session && session.connected && session.authenticated &&
+                        session.generation === token.generation &&
+                        session.socketReference === token.socketReference &&
+                        composition && composition.roomCode === token.serverCode &&
+                        composition.clientContextId === token.clientContextId);
+                },
+                finish(token) {
+                    if (!controller.isCurrent(token)) return false;
+                    latestToken = null;
+                    return true;
+                },
+                invalidate() {
+                    epoch += 1;
+                    latestToken = null;
+                },
+                current() {
+                    return Object.freeze({ epoch, active: Boolean(latestToken), token: latestToken });
+                }
+            };
+            return controller;
+        },
+
+        async decodeAttachmentBytes(bytes, mimeType, adapters = {}) {
+            const BlobCtor = adapters.BlobCtor || globalThis.Blob;
+            const createObjectURL = adapters.createObjectURL || (value => URL.createObjectURL(value));
+            const revokeObjectURL = adapters.revokeObjectURL || (value => URL.revokeObjectURL(value));
+            const imageFactory = adapters.imageFactory || (() => new Image());
+            const signal = adapters.signal || null;
+            if (typeof BlobCtor !== 'function' || typeof createObjectURL !== 'function' ||
+                typeof revokeObjectURL !== 'function' || typeof imageFactory !== 'function') {
+                throw new Error('image decoder unavailable');
+            }
+            if (signal && signal.aborted) throw new Error('image decode cancelled');
+            const blob = new BlobCtor([bytes], { type: mimeType });
+            const objectUrl = createObjectURL(blob);
+            let image = null;
+            let abortHandler = null;
+            try {
+                return await new Promise((resolve, reject) => {
+                    let settled = false;
+                    const detach = () => {
+                        if (signal && abortHandler && typeof signal.removeEventListener === 'function') {
+                            signal.removeEventListener('abort', abortHandler);
+                        }
+                        if (image) {
+                            image.onload = null;
+                            image.onerror = null;
+                        }
+                    };
+                    const settle = (callback, value) => {
+                        if (settled) return;
+                        settled = true;
+                        detach();
+                        callback(value);
+                    };
+                    const fail = () => settle(reject, new Error('image decode failed'));
+                    try {
+                        image = imageFactory();
+                        if (!image) return fail();
+                        image.onload = () => {
+                            try {
+                                const width = Number(image.naturalWidth || image.width);
+                                const height = Number(image.naturalHeight || image.height);
+                                if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+                                    return fail();
+                                }
+                                settle(resolve, { image, width, height });
+                            } catch {
+                                fail();
+                            }
+                        };
+                        image.onerror = fail;
+                        abortHandler = () => {
+                            if (settled) return;
+                            settled = true;
+                            detach();
+                            try { image.src = ''; } catch {}
+                            reject(new Error('image decode cancelled'));
+                        };
+                        if (signal && typeof signal.addEventListener === 'function') {
+                            signal.addEventListener('abort', abortHandler);
+                        }
+                        if (signal && signal.aborted) return abortHandler();
+                        image.src = objectUrl;
+                    } catch {
+                        fail();
+                    }
+                });
+            } finally {
+                if (signal && abortHandler && typeof signal.removeEventListener === 'function') {
+                    signal.removeEventListener('abort', abortHandler);
+                }
+                if (image) {
+                    image.onload = null;
+                    image.onerror = null;
+                }
+                revokeObjectURL(objectUrl);
+            }
+        },
+
+        clipboardImageFile(items) {
+            const allowed = new Set(['image/jpeg', 'image/png', 'image/webp']);
+            for (const item of Array.from(items || [])) {
+                if (!item || item.kind !== 'file' || !allowed.has(item.type) ||
+                    typeof item.getAsFile !== 'function') continue;
+                try {
+                    const file = item.getAsFile();
+                    if (file && allowed.has(file.type)) return file;
+                } catch {
+                    return null;
+                }
+            }
+            return null;
+        },
+
+        createAttachmentIntakeController(dependencies = {}) {
+            const {
+                getSessionContext, getCompositionContext, isCompositionEnabled,
+                readArrayBuffer, decodeImageBytes, createCanvas, sanitizeAttachment,
+                onProcessing = () => {}, onAccepted = () => {}, onCleared = () => {}, onError = () => {}
+            } = dependencies;
+            const coordinator = this.createAttachmentIntakeCoordinator({
+                getSessionContext, getCompositionContext, isCompositionEnabled
+            });
+            let activeCancellation = null;
+            const createCancellation = () => {
+                let aborted = false;
+                const handlers = new Set();
+                const signal = Object.freeze({
+                    get aborted() { return aborted; },
+                    addEventListener(type, handler) {
+                        if (type !== 'abort' || typeof handler !== 'function') return;
+                        handlers.add(handler);
+                    },
+                    removeEventListener(type, handler) {
+                        if (type === 'abort') handlers.delete(handler);
+                    }
+                });
+                return {
+                    signal,
+                    abort() {
+                        if (aborted) return;
+                        aborted = true;
+                        for (const handler of [...handlers]) handler();
+                        handlers.clear();
+                    }
+                };
+            };
+            const cancelActive = () => {
+                const cancellation = activeCancellation;
+                activeCancellation = null;
+                if (cancellation) cancellation.abort();
+            };
+            const genericError = 'Could not process that image.';
+            const supportedError = 'Only JPEG, PNG, and WebP images up to 10 MiB are supported.';
+            const intake = async (candidate, requestedSource) => {
+                const supersededActiveIntake = coordinator.current().active;
+                cancelActive();
+                coordinator.invalidate('superseded');
+                const selected = this.selectAttachmentCandidate(candidate ? [candidate] : []);
+                if (!selected.file) {
+                    if (supersededActiveIntake) onCleared();
+                    onError(supportedError);
+                    return null;
+                }
+                const source = ['picker', 'drop', 'paste'].includes(requestedSource) ? requestedSource : 'picker';
+                const token = coordinator.begin();
+                if (!token) return null;
+                const cancellation = createCancellation();
+                activeCancellation = cancellation;
+                onProcessing('Processing image…', source);
+                try {
+                    if (typeof readArrayBuffer !== 'function' || typeof decodeImageBytes !== 'function' ||
+                        typeof createCanvas !== 'function' || typeof sanitizeAttachment !== 'function') {
+                        throw new Error('image intake unavailable');
+                    }
+                    const buffer = await readArrayBuffer(selected.file);
+                    if (!coordinator.isCurrent(token)) return null;
+                    const bytes = buffer && buffer.buffer && Number.isSafeInteger(buffer.byteLength)
+                        ? new Uint8Array(buffer.buffer, buffer.byteOffset || 0, buffer.byteLength)
+                        : buffer && Number.isSafeInteger(buffer.byteLength)
+                            ? new Uint8Array(buffer)
+                            : null;
+                    if (!bytes || bytes.byteLength > 10 * 1024 * 1024) throw new Error('invalid image bytes');
+                    const headerDimensions = this.readAttachmentHeaderDimensions(bytes, selected.file.type);
+                    if (!headerDimensions) throw new Error('invalid image header');
+                    if (!coordinator.isCurrent(token)) return null;
+                    const decoded = await decodeImageBytes(bytes, selected.file.type,
+                        { signal: cancellation.signal });
+                    if (!coordinator.isCurrent(token)) return null;
+                    const decodedWidth = decoded && Number(decoded.width);
+                    const decodedHeight = decoded && Number(decoded.height);
+                    const exactDimensions = decodedWidth === headerDimensions.width &&
+                        decodedHeight === headerDimensions.height;
+                    const orientedJpeg = selected.file.type === 'image/jpeg' &&
+                        decodedWidth === headerDimensions.height && decodedHeight === headerDimensions.width;
+                    if (!decoded || !decoded.image || (!exactDimensions && !orientedJpeg)) {
+                        throw new Error('image dimensions changed');
+                    }
+                    const outputDimensions = this.fitAttachmentDimensions(decodedWidth, decodedHeight);
+                    if (!outputDimensions || !coordinator.isCurrent(token)) return null;
+                    const canvas = createCanvas(outputDimensions.width, outputDimensions.height);
+                    if (!canvas) throw new Error('canvas unavailable');
+                    canvas.width = outputDimensions.width;
+                    canvas.height = outputDimensions.height;
+                    const context = typeof canvas.getContext === 'function' ? canvas.getContext('2d') : null;
+                    if (!context || typeof context.drawImage !== 'function') throw new Error('canvas unavailable');
+                    context.drawImage(decoded.image, 0, 0, outputDimensions.width, outputDimensions.height);
+                    if (!coordinator.isCurrent(token)) return null;
+                    const output = typeof canvas.toDataURL === 'function'
+                        ? canvas.toDataURL('image/jpeg', 0.8) : null;
+                    const jpegPrefix = 'data:image/jpeg;base64,';
+                    const encoded = typeof output === 'string' && output.startsWith(jpegPrefix)
+                        ? output.slice(jpegPrefix.length) : '';
+                    const validBase64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+                    if (typeof output !== 'string' || !encoded || !validBase64.test(encoded) ||
+                        output.length > 8000000 || sanitizeAttachment(output) !== output) {
+                        throw new Error('invalid image output');
+                    }
+                    if (!coordinator.isCurrent(token) || !coordinator.finish(token)) return null;
+                    const details = Object.freeze({
+                        source,
+                        mimeType: selected.file.type,
+                        width: outputDimensions.width,
+                        height: outputDimensions.height,
+                        serverCode: token.serverCode,
+                        clientContextId: token.clientContextId,
+                        generation: token.generation
+                    });
+                    onAccepted(output, details);
+                    return output;
+                } catch {
+                    if (!coordinator.isCurrent(token)) return null;
+                    coordinator.finish(token);
+                    onCleared();
+                    onError(genericError);
+                    return null;
+                } finally {
+                    if (activeCancellation === cancellation) activeCancellation = null;
+                }
+            };
+            return Object.freeze({
+                intake,
+                invalidate(reason) {
+                    cancelActive();
+                    coordinator.invalidate(reason);
+                },
+                clear() {
+                    cancelActive();
+                    coordinator.invalidate('clear');
+                    onCleared();
+                },
+                current: () => coordinator.current()
+            });
+        },
+
+        bindAttachmentInputs({
+            fileInput,
+            dropTarget,
+            messageInput,
+            intakeAttachment,
+            onStatus = () => {}
+        } = {}) {
+            const listeners = [];
+            let dragDepth = 0;
+            const listen = (target, type, handler) => {
+                if (!target || typeof target.addEventListener !== 'function') return;
+                target.addEventListener(type, handler);
+                listeners.push([target, type, handler]);
+            };
+            const hasFiles = event => {
+                try { return Array.from(event && event.dataTransfer && event.dataTransfer.types || []).includes('Files'); }
+                catch { return false; }
+            };
+            const processFiles = (files, source) => {
+                const selected = this.selectAttachmentCandidate(files);
+                if (selected.suppliedCount > 1 && selected.file) {
+                    onStatus('Only one image can be attached; using the first supported image.');
+                } else if (!selected.file && selected.suppliedCount) {
+                    onStatus('Only JPEG, PNG, and WebP images up to 10 MiB are supported.');
+                }
+                if (typeof intakeAttachment !== 'function') return Promise.resolve(null);
+                if (!selected.file) {
+                    if (!selected.suppliedCount) return Promise.resolve(null);
+                    try { return Promise.resolve(intakeAttachment(null, source)); }
+                    catch { return Promise.resolve(null); }
+                }
+                try { return Promise.resolve(intakeAttachment(selected.file, source)); }
+                catch { return Promise.resolve(null); }
+            };
+            listen(fileInput, 'change', event => processFiles(event && event.target && event.target.files, 'picker'));
+            listen(dropTarget, 'dragenter', event => {
+                if (!hasFiles(event)) return;
+                event.preventDefault();
+                dragDepth += 1;
+                if (dropTarget.classList) dropTarget.classList.add('attachment-drag-active');
+            });
+            listen(dropTarget, 'dragover', event => {
+                if (!hasFiles(event)) return;
+                event.preventDefault();
+                if (dropTarget.classList) dropTarget.classList.add('attachment-drag-active');
+            });
+            listen(dropTarget, 'dragleave', event => {
+                if (!hasFiles(event)) return;
+                event.preventDefault();
+                dragDepth = Math.max(0, dragDepth - 1);
+                if (dragDepth === 0 && dropTarget.classList) dropTarget.classList.remove('attachment-drag-active');
+            });
+            listen(dropTarget, 'drop', event => {
+                if (!hasFiles(event)) return;
+                event.preventDefault();
+                dragDepth = 0;
+                const restore = () => {
+                    if (dropTarget.classList) dropTarget.classList.remove('attachment-drag-active');
+                };
+                processFiles(event.dataTransfer && event.dataTransfer.files, 'drop').finally(restore);
+            });
+            listen(messageInput, 'paste', event => {
+                const file = this.clipboardImageFile(event && event.clipboardData && event.clipboardData.items);
+                if (!file) return;
+                event.preventDefault();
+                processFiles([file], 'paste');
+            });
+            let unbound = false;
+            return Object.freeze({ unbind() {
+                if (unbound) return;
+                unbound = true;
+                for (const [target, type, handler] of listeners) target.removeEventListener(type, handler);
+                dragDepth = 0;
+                if (dropTarget && dropTarget.classList) dropTarget.classList.remove('attachment-drag-active');
+            } });
+        },
+
         sanitizeAttachment(value) {
             if (typeof value !== 'string' || value.length === 0 || value.length > 8000000) return null;
             return /^data:image\/(?:jpeg|png|gif|webp);base64,[A-Za-z0-9+/=]+$/.test(value) ? value : null;
@@ -2173,17 +2661,24 @@
     // --- ATTACHMENT & PICKER STATE ---
     let pendingAttachmentBase64 = null; 
     let attachmentLoadEpoch = 0;
+    let attachmentIntakeController = null;
+    let attachmentInputBinding = null;
     let activeReactMessageId = null; 
-    
-    function clearAttachment() {
-        const clearEpoch = ++attachmentLoadEpoch;
+
+    function resetAttachmentPresentation() {
         pendingAttachmentBase64 = null;
         document.getElementById('attachment-preview').classList.remove('show');
-        setTimeout(() => {
-            if (clearEpoch !== attachmentLoadEpoch) return;
-            document.getElementById('preview-img').src = '';
-            document.getElementById('file-upload').value = ''; 
-        }, 300); 
+        document.getElementById('preview-img').src = '';
+        document.getElementById('file-upload').value = '';
+        document.getElementById('attachment-status').textContent = '';
+        document.getElementById('attachment-btn').disabled = compositionDisabled;
+        document.getElementById('send-btn').disabled = compositionDisabled;
+    }
+
+    function clearAttachment() {
+        attachmentLoadEpoch += 1;
+        if (attachmentIntakeController) attachmentIntakeController.clear();
+        else resetAttachmentPresentation();
     }
 
     document.getElementById('clear-attachment-btn').onclick = clearAttachment;
@@ -2373,6 +2868,61 @@
         getClientContextId: () => compositionContextCoordinator.current().clientContextId
     });
 
+    function readAttachmentArrayBuffer(file) {
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(reader.result);
+            reader.onerror = () => reject(new Error('attachment read failed'));
+            reader.onabort = () => reject(new Error('attachment read failed'));
+            reader.readAsArrayBuffer(file);
+        });
+    }
+
+    async function intakeAttachment(file, source) {
+        attachmentLoadEpoch += 1;
+        return attachmentIntakeController
+            ? attachmentIntakeController.intake(file, source)
+            : null;
+    }
+
+    attachmentIntakeController = ChatClientHelpers.createAttachmentIntakeController({
+        getSessionContext: () => sessionContextCoordinator.snapshot(),
+        getCompositionContext: () => compositionContextCoordinator.current(),
+        isCompositionEnabled: () => !compositionDisabled,
+        readArrayBuffer: readAttachmentArrayBuffer,
+        decodeImageBytes: (bytes, mimeType, control) =>
+            ChatClientHelpers.decodeAttachmentBytes(bytes, mimeType, control),
+        createCanvas: () => document.createElement('canvas'),
+        sanitizeAttachment: value => ChatClientHelpers.sanitizeAttachment(value),
+        onProcessing(message) {
+            document.getElementById('attachment-status').textContent = message;
+            attachmentButton.disabled = true;
+            sendBtn.disabled = true;
+        },
+        onAccepted(output) {
+            pendingAttachmentBase64 = output;
+            document.getElementById('preview-img').src = output;
+            document.getElementById('attachment-preview').classList.add('show');
+            document.getElementById('attachment-status').textContent = 'Image attached.';
+            attachmentButton.disabled = compositionDisabled;
+            sendBtn.disabled = compositionDisabled;
+            msgInput.focus();
+        },
+        onCleared: resetAttachmentPresentation,
+        onError(message) {
+            document.getElementById('attachment-status').textContent = message;
+        }
+    });
+    attachmentInputBinding = ChatClientHelpers.bindAttachmentInputs({
+        fileInput: fileUpload,
+        dropTarget: document.getElementById('compose-drop-target'),
+        messageInput: msgInput,
+        intakeAttachment,
+        onStatus(message) {
+            document.getElementById('attachment-status').textContent = message;
+        }
+    });
+
     function appearanceFormElements() {
         return {
             theme: document.getElementById('appearance-theme'),
@@ -2468,13 +3018,7 @@
             setCompositionDisabled(true);
         },
         cancelAction,
-        resetAttachment() {
-            attachmentLoadEpoch += 1;
-            pendingAttachmentBase64 = null;
-            document.getElementById('attachment-preview').classList.remove('show');
-            document.getElementById('preview-img').src = '';
-            document.getElementById('file-upload').value = '';
-        },
+        resetAttachment: clearAttachment,
         closeRoomDialogs() {
             closeModeratorCenter();
             closeModerationPrompt();
@@ -3262,44 +3806,6 @@
         if (!e.target.closest('#reaction-picker') && !e.target.closest('.action-btn.react')) {
             document.getElementById('reaction-picker').classList.remove('show');
         }
-    });
-
-    // --- IMAGE UPLOAD COMPRESSOR ENGINE ---
-    document.getElementById('file-upload').addEventListener('change', async (e) => {
-        if (compositionDisabled) return;
-        const file = e.target.files[0]; if (!file) return;
-        if (!file.type.startsWith('image/')) return showAppAlert("Error", "Only image files are allowed.");
-        
-        if(file.size > 10 * 1024 * 1024) return showAppAlert("Error", "File too large. Max 10MB before compression.");
-        const uploadContext = compositionContextCoordinator.payload();
-        if (!uploadContext) return;
-        const uploadEpoch = ++attachmentLoadEpoch;
-        const isCurrentUpload = () => uploadEpoch === attachmentLoadEpoch &&
-            !compositionDisabled && compositionContextCoordinator.matches(uploadContext);
-        
-        const reader = new FileReader();
-        reader.onload = (event) => {
-            if (!isCurrentUpload()) return;
-            const img = new Image();
-            img.onload = () => {
-                if (!isCurrentUpload()) return;
-                const canvas = document.createElement('canvas');
-                let w = img.width; let h = img.height;
-                const max = 800; 
-                if (w > h && w > max) { h *= max / w; w = max; }
-                else if (h > max) { w *= max / h; h = max; }
-                canvas.width = w; canvas.height = h;
-                const ctx = canvas.getContext('2d');
-                ctx.drawImage(img, 0, 0, w, h);
-                
-                pendingAttachmentBase64 = canvas.toDataURL('image/jpeg', 0.8);
-                document.getElementById('preview-img').src = pendingAttachmentBase64;
-                document.getElementById('attachment-preview').classList.add('show');
-                msgInput.focus();
-            };
-            img.src = event.target.result;
-        };
-        reader.readAsDataURL(file);
     });
 
     // --- SETTINGS LOGIC ---
