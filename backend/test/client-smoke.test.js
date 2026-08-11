@@ -2698,6 +2698,43 @@ function shortcutModal(active = false) {
   return element;
 }
 
+function shortcutHelpDocumentHarness() {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  const elements = new Map();
+  const document = {
+    activeElement: null,
+    getElementById(id) { return elements.get(id) || null; }
+  };
+  for (const id of ['shortcut-help-modal', 'shortcut-help-title', 'shortcut-help-close', 'shortcut-help-btn']) {
+    const match = source.match(new RegExp(`<([a-z][a-z0-9]*)\\b([^>]*\\bid="${id}"[^>]*)>([^<]*)`, 'i'));
+    assert.ok(match, `${id} exists in production markup`);
+    const element = new ControlledEventTarget();
+    element.tagName = match[1].toUpperCase();
+    element.id = id;
+    element.isConnected = true;
+    element.style = {};
+    element.textContent = match[3].trim();
+    element.attributes = Object.fromEntries(
+      [...match[2].matchAll(/([\w:-]+)="([^"]*)"/g)].map(attribute => [attribute[1], attribute[2]])
+    );
+    for (const className of String(element.attributes.class || '').split(/\s+/).filter(Boolean)) {
+      element.classList.add(className);
+    }
+    element.getAttribute = name => element.attributes[name] ?? null;
+    element.focusCount = 0;
+    element.focus = () => {
+      element.focusCount += 1;
+      document.activeElement = element;
+    };
+    element.click = () => {
+      document.activeElement = element;
+      if (typeof element.onclick === 'function') element.onclick({ target: element });
+    };
+    elements.set(id, element);
+  }
+  return { document, elements };
+}
+
 function shortcutControllerHarness(overrides = {}) {
   const helpers = loadHelpers();
   const eventTarget = new ControlledEventTarget();
@@ -2787,6 +2824,53 @@ test('keyboard resolver ignores repeats IME protected dialogs password and unsaf
   ]) assert.equal(harness.eventTarget.dispatch('keydown', event).defaultPrevented, false);
   assert.equal(harness.state.help, 0);
   assert.equal(harness.state.uploads, 0);
+
+  let sessionReads = 0;
+  let resolutionReads = 0;
+  let escapeEffects = 0;
+  let preventCalls = 0;
+  let preventedState = null;
+  const preventedLayers = [{ id: 'escape-test', active: () => true, protected: () => false,
+    close: () => { escapeEffects += 1; } }];
+  const preventedHarness = shortcutControllerHarness({
+    layers: preventedLayers,
+    dependencies: {
+      getSessionContext: () => { sessionReads += 1; return preventedState.session; },
+      getEscapeLayers: () => { resolutionReads += 1; return preventedLayers; },
+      getProtectedDialogOpen: () => { resolutionReads += 1; return false; }
+    }
+  });
+  preventedState = preventedHarness.state;
+  for (const event of [
+    { key: ',', ctrlKey: true }, { key: 'u', ctrlKey: true },
+    { key: 'ArrowDown', altKey: true }, { key: '?', shiftKey: true }, { key: 'Escape' }
+  ]) {
+    const dispatched = preventedHarness.eventTarget.dispatch('keydown', {
+      ...event,
+      defaultPrevented: true,
+      preventDefault() { preventCalls += 1; }
+    });
+    assert.equal(dispatched.defaultPrevented, true);
+  }
+  assert.equal(sessionReads, 0, 'the dispatcher exits before reading authentication state');
+  assert.equal(resolutionReads, 0, 'the dispatcher exits before resolving shortcut layers');
+  assert.deepEqual({
+    appearance: preventedHarness.state.appearance,
+    uploads: preventedHarness.state.uploads,
+    help: preventedHarness.state.help,
+    switches: preventedHarness.state.switches,
+    escapeEffects,
+    preventCalls
+  }, { appearance: [], uploads: 0, help: 0, switches: [], escapeEffects: 0, preventCalls: 0 });
+  const shortcutFieldReads = [];
+  const guardedPreventedEvent = new Proxy({ defaultPrevented: true }, {
+    get(target, property) {
+      if (property !== 'defaultPrevented') shortcutFieldReads.push(property);
+      return target[property];
+    }
+  });
+  assert.equal(preventedHarness.controller.handleKeydown(guardedPreventedEvent), false);
+  assert.deepEqual(shortcutFieldReads, [], 'no shortcut event fields are read after the early guard');
 });
 
 test('Escape performs exactly one highest-priority safe action', async () => {
@@ -3010,9 +3094,9 @@ test('shortcut help is accessible and restores prior focus', () => {
   assert.match(source, /id="shortcut-help-title"[^>]*>Keyboard Shortcuts</);
   assert.match(source, /id="shortcut-help-close"[^>]*>Close</);
   assert.match(source, /<table[^>]*aria-label="Keyboard shortcuts"/);
-  assert.match(source, /const shortcutHelpModalOwner\s*=\s*ChatClientHelpers\.createFocusRestoringModalOwner\(\{/);
-  assert.match(source, /function openShortcutHelp\(\)[\s\S]{0,180}shortcutHelpModalOwner\.open/);
-  assert.match(source, /function closeShortcutHelp\(\)[\s\S]{0,140}shortcutHelpModalOwner\.close/);
+  assert.match(source, /const shortcutHelpRuntime\s*=\s*ChatClientHelpers\.createShortcutHelpRuntime\(\{\s*document\s*\}\)/);
+  assert.match(source, /function openShortcutHelp\(\)[\s\S]{0,180}shortcutHelpRuntime\.openShortcutHelp/);
+  assert.match(source, /function closeShortcutHelp\(\)[\s\S]{0,140}shortcutHelpRuntime\.closeShortcutHelp/);
   const { eventTarget, state } = shortcutControllerHarness();
   assert.equal(eventTarget.dispatch('keydown', { key: '?', shiftKey: true }).defaultPrevented, true);
   assert.equal(state.help, 1);
@@ -3036,19 +3120,66 @@ test('visible shortcut help control opens the same accessible dialog', () => {
   const source = fs.readFileSync(chatPath, 'utf8');
   assert.match(source, /<button[^>]*id="shortcut-help-btn"[^>]*>Keyboard Shortcuts<\/button>/);
   assert.match(source, /#shortcut-help-btn\s*\{[^}]*min-height:\s*44px[^}]*min-width:\s*44px/s);
-  assert.match(source, /ChatClientHelpers\.bindShortcutHelpControl\(\{[\s\S]{0,180}shortcut-help-btn[\s\S]{0,120}openHelp:\s*openShortcutHelp/);
-  assert.match(source, /openHelp:\s*openShortcutHelp/);
+  assert.match(source, /ChatClientHelpers\.createShortcutHelpRuntime\(\{\s*document\s*\}\)/);
+  const productionControllerStart = source.lastIndexOf(
+    'const shortcutController = ChatClientHelpers.createShortcutController({'
+  );
+  assert.notEqual(productionControllerStart, -1);
+  const productionControllerBlock = source.slice(
+    productionControllerStart,
+    source.indexOf('</script>', productionControllerStart)
+  );
+  assert.match(productionControllerBlock, /openHelp:\s*openShortcutHelp/,
+    'the production document controller delegates help to the production runtime wrapper');
+  assert.doesNotMatch(productionControllerBlock.replace(/openHelp:\s*openShortcutHelp,?/, ''),
+    /openHelp:\s*openShortcutHelp/, 'removing the production dependency breaks the wiring proof');
   const keydownListeners = [...source.matchAll(/\.addEventListener\(['"]keydown['"]/g)];
   assert.equal(keydownListeners.length, 1, 'exactly one keydown listener is installed');
   assert.match(source, /event\s*=>\s*controller\.handleKeydown\(event\)/);
   const helpers = loadHelpers();
-  const button = { onclick: null };
-  let openCalls = 0;
-  const binding = helpers.bindShortcutHelpControl({ button, openHelp: () => { openCalls += 1; } });
-  button.onclick();
-  assert.equal(openCalls, 1);
-  binding.unbind();
+  const { document, elements } = shortcutHelpDocumentHarness();
+  const modal = elements.get('shortcut-help-modal');
+  const title = elements.get('shortcut-help-title');
+  const close = elements.get('shortcut-help-close');
+  const button = elements.get('shortcut-help-btn');
+  const runtime = helpers.createShortcutHelpRuntime({ document });
+  assert.equal(modal.getAttribute('role'), 'dialog');
+  assert.equal(modal.getAttribute('aria-modal'), 'true');
+  assert.equal(modal.getAttribute('aria-labelledby'), title.id);
+  assert.equal(button.textContent, 'Keyboard Shortcuts');
+  const eventTarget = new ControlledEventTarget();
+  const socket = {};
+  const sessionCoordinator = helpers.createSessionContextCoordinator();
+  sessionCoordinator.replace(socket);
+  sessionCoordinator.connected(socket);
+  sessionCoordinator.authenticate(socket);
+  const controller = helpers.createShortcutController({
+    eventTarget,
+    getSessionContext: () => sessionCoordinator.snapshot(),
+    isSessionContextCurrent: candidate => sessionCoordinator.matches(candidate),
+    getActiveSocket: () => socket,
+    getProtectedDialogOpen: () => false,
+    getEscapeLayers: () => [],
+    openHelp: runtime.openShortcutHelp
+  });
+  document.activeElement = title;
+  assert.equal(eventTarget.dispatch('keydown', { key: '?', shiftKey: true }).defaultPrevented, true);
+  assert.equal(modal.classList.contains('active'), true);
+  assert.equal(document.activeElement, close);
+  close.click();
+  assert.equal(document.activeElement, title, 'keyboard lifecycle restores its prior focus');
+  button.click();
+  assert.equal(modal.classList.contains('active'), true);
+  assert.equal(close.focusCount, 2, 'keyboard and visible production openers both focus Close');
+  assert.equal(document.activeElement, close);
+  close.click();
+  assert.equal(modal.classList.contains('active'), false);
+  assert.equal(document.activeElement, button, 'production owner restores the invoking control');
+  assert.equal(button.focusCount, 1);
+  controller.unbind();
+  runtime.unbind();
   assert.equal(button.onclick, null);
+  assert.equal(close.onclick, null);
 });
 
 test('replaced sockets logged-out state and destructive dialogs reject shortcut effects', () => {

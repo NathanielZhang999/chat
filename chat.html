@@ -1637,6 +1637,34 @@
             };
         },
 
+        createShortcutHelpRuntime({ document: documentReference } = {}) {
+            const modal = documentReference?.getElementById?.('shortcut-help-modal');
+            const closeButton = documentReference?.getElementById?.('shortcut-help-close');
+            const visibleButton = documentReference?.getElementById?.('shortcut-help-btn');
+            const modalOwner = this.createFocusRestoringModalOwner({
+                element: modal,
+                getActiveElement: () => documentReference?.activeElement || null
+            });
+            const openShortcutHelp = () => modalOwner.open(closeButton);
+            const closeShortcutHelp = () => modalOwner.close();
+            const visibleBinding = this.bindShortcutHelpControl({
+                button: visibleButton,
+                openHelp: openShortcutHelp
+            });
+            const previousClose = closeButton?.onclick || null;
+            if (closeButton) closeButton.onclick = closeShortcutHelp;
+            return {
+                openShortcutHelp,
+                closeShortcutHelp,
+                unbind() {
+                    visibleBinding.unbind();
+                    if (closeButton && closeButton.onclick === closeShortcutHelp) {
+                        closeButton.onclick = previousClose;
+                    }
+                }
+            };
+        },
+
         resolveKeyboardShortcut({
             key = '', altKey = false, ctrlKey = false, metaKey = false, shiftKey = false,
             repeat = false, isComposing = false, editable = false, password = false,
@@ -1759,6 +1787,7 @@
             let bound = true;
             const controller = {
                 handleKeydown(event = {}) {
+                    if (event.defaultPrevented) return false;
                     const session = dependencies.getSessionContext?.();
                     const authenticated = Boolean(session && session.connected && session.authenticated &&
                         session.socketReference === dependencies.getActiveSocket?.() &&
@@ -4185,10 +4214,7 @@
         if(e.target.value.length === 7 && e.target.value.startsWith('#')) document.getElementById('setting-color-picker').value = e.target.value;
     });
 
-    const shortcutHelpModalOwner = ChatClientHelpers.createFocusRestoringModalOwner({
-        element: document.getElementById('shortcut-help-modal'),
-        getActiveElement: () => document.activeElement
-    });
+    const shortcutHelpRuntime = ChatClientHelpers.createShortcutHelpRuntime({ document });
     const settingsModalOwner = ChatClientHelpers.createFocusRestoringModalOwner({
         element: document.getElementById('settings-modal'),
         getActiveElement: () => document.activeElement
@@ -4203,18 +4229,12 @@
     });
 
     function openShortcutHelp() {
-        return shortcutHelpModalOwner.open(document.getElementById('shortcut-help-close'));
+        return shortcutHelpRuntime.openShortcutHelp();
     }
 
-    function closeShortcutHelp() { return shortcutHelpModalOwner.close(); }
+    function closeShortcutHelp() { return shortcutHelpRuntime.closeShortcutHelp(); }
 
     function closeSettings() { return settingsModalOwner.close(); }
-
-    document.getElementById('shortcut-help-close').onclick = closeShortcutHelp;
-    const shortcutHelpControlBinding = ChatClientHelpers.bindShortcutHelpControl({
-        button: document.getElementById('shortcut-help-btn'),
-        openHelp: openShortcutHelp
-    });
 
     function openSettings(section = 'profile') {
         document.getElementById('setting-displayname').value = myDisplayName || "";
