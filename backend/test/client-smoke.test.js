@@ -1994,6 +1994,7 @@ function jpegAttachmentHeader(width = 2, height = 3) {
   bytes.set([0xff, 0xd8, 0xff, 0xc0, 0x00, 0x11, 0x08]);
   new DataView(bytes.buffer).setUint16(7, height, false);
   new DataView(bytes.buffer).setUint16(9, width, false);
+  bytes.set([3, 1, 0x11, 0, 2, 0x11, 0, 3, 0x11, 0], 11);
   return bytes;
 }
 
@@ -2062,7 +2063,8 @@ function attachmentControllerHarness(overrides = {}) {
     session: Object.freeze({ socketReference: socket, generation: 4, connected: true, authenticated: true }),
     composition: Object.freeze({ roomCode: 'global', clientContextId: 7 }),
     enabled: true,
-    processing: [], accepted: [], cleared: [], errors: [], calls: []
+    processing: [], accepted: [], cleared: [], errors: [], calls: [],
+    canvasRequests: [], canvases: [], contextTypes: [], draws: [], encodes: []
   };
   const dependencies = {
     getSessionContext: () => state.session,
@@ -2077,14 +2079,23 @@ function attachmentControllerHarness(overrides = {}) {
       const dimensions = helpers.readAttachmentHeaderDimensions(bytes, mimeType);
       return { image: { marker: 'decoded' }, width: dimensions.width, height: dimensions.height };
     },
-    createCanvas: () => {
+    createCanvas: (width, height) => {
       state.calls.push('canvas');
-      return {
+      state.canvasRequests.push({ width, height });
+      const canvas = {
         width: 0,
         height: 0,
-        getContext: () => ({ drawImage() {} }),
-        toDataURL: () => 'data:image/jpeg;base64,AAAA'
+        getContext: type => {
+          state.contextTypes.push(type);
+          return { drawImage: (...args) => state.draws.push(args) };
+        },
+        toDataURL: (mimeType, quality) => {
+          state.encodes.push({ mimeType, quality });
+          return 'data:image/jpeg;base64,AAAA';
+        }
       };
+      state.canvases.push(canvas);
+      return canvas;
     },
     sanitizeAttachment: value => helpers.sanitizeAttachment(value),
     onProcessing: (...args) => state.processing.push(args),
@@ -2147,6 +2158,14 @@ test('attachment candidate accepts only JPEG PNG and WebP at most ten MiB', () =
   assert.equal(helpers.selectAttachmentCandidate([
     attachmentFile('image/png', pngAttachmentHeader(), { size: limit + 1 })
   ]).file, null);
+  assert.equal(helpers.selectAttachmentCandidate([
+    attachmentFile('image/png', pngAttachmentHeader(), { size: 0 })
+  ]).file.size, 0);
+  for (const size of [-1, NaN, Infinity, -Infinity, 0.5, 1.25]) {
+    assert.equal(helpers.selectAttachmentCandidate([
+      attachmentFile('image/png', pngAttachmentHeader(), { size })
+    ]).file, null, `size ${size}`);
+  }
 });
 
 test('attachment header parser rejects truncated deceptive and malformed JPEG PNG and WebP', () => {
@@ -2176,8 +2195,25 @@ test('attachment header parser rejects truncated deceptive and malformed JPEG PN
   const malformedJpeg = jpegAttachmentHeader();
   malformedJpeg[4] = 0xff;
   malformedJpeg[5] = 0xff;
+  const zeroComponentJpeg = jpegAttachmentHeader();
+  zeroComponentJpeg[11] = 0;
+  const mismatchedComponentJpeg = jpegAttachmentHeader();
+  mismatchedComponentJpeg[11] = 1;
   const malformedWebp = webpAttachmentHeader();
   new DataView(malformedWebp.buffer).setUint32(16, 0x7fffffff, true);
+  const longVp8x = new Uint8Array(webpAttachmentHeader('VP8X').length + 2);
+  longVp8x.set(webpAttachmentHeader('VP8X'));
+  new DataView(longVp8x.buffer).setUint32(4, longVp8x.length - 8, true);
+  new DataView(longVp8x.buffer).setUint32(16, 11, true);
+  const reservedVp8xFlag = webpAttachmentHeader('VP8X');
+  reservedVp8xFlag[20] = 0x01;
+  const reservedVp8xByte = webpAttachmentHeader('VP8X');
+  reservedVp8xByte[21] = 0x01;
+  const interframeVp8 = webpAttachmentHeader('VP8');
+  interframeVp8[20] |= 0x01;
+  const versionedVp8l = webpAttachmentHeader('VP8L');
+  new DataView(versionedVp8l.buffer).setUint32(21,
+    new DataView(versionedVp8l.buffer).getUint32(21, true) | (1 << 29), true);
   for (const [bytes, type] of [
     [pngAttachmentHeader().slice(0, 23), 'image/png'],
     [jpegAttachmentHeader().slice(0, 10), 'image/jpeg'],
@@ -2186,7 +2222,11 @@ test('attachment header parser rejects truncated deceptive and malformed JPEG PN
     [trailingWebp, 'image/webp'],
     [wrongFirstPngChunk, 'image/png'],
     [new Uint8Array([0xff, 0xd8, 0xff, 0xda, 0x00, 0x02]), 'image/jpeg'],
-    [malformedJpeg, 'image/jpeg'], [malformedWebp, 'image/webp'],
+    [malformedJpeg, 'image/jpeg'], [zeroComponentJpeg, 'image/jpeg'],
+    [mismatchedComponentJpeg, 'image/jpeg'], [malformedWebp, 'image/webp'],
+    [longVp8x, 'image/webp'], [reservedVp8xFlag, 'image/webp'],
+    [reservedVp8xByte, 'image/webp'], [interframeVp8, 'image/webp'],
+    [versionedVp8l, 'image/webp'],
     [webpAttachmentHeader('ANIM'), 'image/webp'],
     [pngAttachmentHeader(), 'image/webp']
   ]) assert.equal(helpers.readAttachmentHeaderDimensions(bytes, type), null);
@@ -2221,6 +2261,45 @@ test('attachment intake rejects a decoder dimension mismatch before canvas alloc
   assert.equal(canvasAllocations, 0);
   assert.equal(state.accepted.length, 0);
   assert.equal(state.errors.at(-1)[0], 'Could not process that image.');
+
+  const cases = [
+    {
+      label: 'landscape',
+      file: attachmentFile('image/png', pngAttachmentHeader(1600, 800)),
+      expected: { width: 800, height: 400, marker: 'decoded' }
+    },
+    {
+      label: 'portrait',
+      file: attachmentFile('image/png', pngAttachmentHeader(400, 1200)),
+      expected: { width: 267, height: 800, marker: 'decoded' }
+    },
+    {
+      label: 'oriented JPEG portrait',
+      file: attachmentFile('image/jpeg', jpegAttachmentHeader(1200, 400)),
+      decodeImageBytes: async () => ({ image: { marker: 'oriented' }, width: 400, height: 1200 }),
+      expected: { width: 267, height: 800, marker: 'oriented' }
+    }
+  ];
+  for (const probeCase of cases) {
+    const probe = attachmentControllerHarness(probeCase.decodeImageBytes
+      ? { decodeImageBytes: probeCase.decodeImageBytes }
+      : {});
+    await probe.controller.intake(probeCase.file, 'picker');
+    assert.equal(probe.state.accepted.length, 1, probeCase.label);
+    assert.equal(probe.state.canvases.length, 1, probeCase.label);
+    assert.equal(probe.state.canvases[0].width, probeCase.expected.width, probeCase.label);
+    assert.equal(probe.state.canvases[0].height, probeCase.expected.height, probeCase.label);
+    assert.deepEqual(probe.state.canvasRequests,
+      [{ width: probeCase.expected.width, height: probeCase.expected.height }], probeCase.label);
+    assert.ok(Math.max(probe.state.canvases[0].width, probe.state.canvases[0].height) <= 800,
+      probeCase.label);
+    assert.deepEqual(probe.state.contextTypes, ['2d'], probeCase.label);
+    assert.equal(probe.state.draws.length, 1, probeCase.label);
+    assert.equal(probe.state.draws[0][0].marker, probeCase.expected.marker, probeCase.label);
+    assert.deepEqual(probe.state.draws[0].slice(1),
+      [0, 0, probeCase.expected.width, probeCase.expected.height], probeCase.label);
+    assert.deepEqual(probe.state.encodes, [{ mimeType: 'image/jpeg', quality: 0.8 }], probeCase.label);
+  }
 });
 
 test('attachment decoder revokes its object URL exactly once on every terminal path', async () => {
@@ -2492,6 +2571,7 @@ test('failed decode canvas and output validation clear only the current intake',
 
 test('drop target and attachment status are accessible and motion aware', () => {
   const source = fs.readFileSync(chatPath, 'utf8');
+  assert.match(source, /id="attachment-selection-status"[^>]*role="status"[^>]*aria-live="polite"/);
   assert.match(source, /id="attachment-status"[^>]*role="status"[^>]*aria-live="polite"/);
   assert.match(source, /id="preview-img"[^>]*alt="Attached image preview"/);
   assert.match(source, /id="clear-attachment-btn"[^>]*aria-label="Remove attachment"/);
@@ -2571,4 +2651,43 @@ test('multiple files report the one-attachment rule and select the first support
   olderRead.resolve(pngAttachmentHeader().buffer);
   await olderWork;
   assert.equal(second.state.accepted.length, 0);
+
+  const selectionStatus = { textContent: '' };
+  const phaseStatus = { textContent: '' };
+  const liveStatus = helpers.createAttachmentStatusController({ selectionStatus, phaseStatus });
+  const statusRead = deferred();
+  const statusHarness = attachmentControllerHarness({
+    readArrayBuffer: () => statusRead.promise,
+    onProcessing: message => liveStatus.processing(message),
+    onAccepted: () => liveStatus.accepted(),
+    onCleared: () => liveStatus.clear(),
+    onError: message => liveStatus.error(message)
+  });
+  const statusFileInput = new ControlledEventTarget();
+  const statusDropTarget = new ControlledEventTarget();
+  const statusMessageInput = new ControlledEventTarget();
+  statusHarness.helpers.bindAttachmentInputs({
+    fileInput: statusFileInput,
+    dropTarget: statusDropTarget,
+    messageInput: statusMessageInput,
+    intakeAttachment: statusHarness.controller.intake,
+    onStatus: message => liveStatus.selection(message)
+  });
+  const statusFile = attachmentFile('image/jpeg', jpegAttachmentHeader());
+  statusDropTarget.dispatch('drop', {
+    dataTransfer: { types: ['Files'], files: [statusFile, attachmentFile('image/png')] }
+  });
+  assert.equal(selectionStatus.textContent,
+    'Only one image can be attached; using the first supported image.');
+  assert.equal(phaseStatus.textContent, 'Processing image…');
+  statusRead.resolve(jpegAttachmentHeader().buffer);
+  await settleAttachmentWork();
+  assert.equal(selectionStatus.textContent,
+    'Only one image can be attached; using the first supported image.');
+  assert.equal(phaseStatus.textContent, 'Image attached.');
+
+  const source = fs.readFileSync(chatPath, 'utf8');
+  assert.match(source, /createAttachmentStatusController\(\{[\s\S]{0,220}attachment-selection-status[\s\S]{0,120}attachment-status/);
+  assert.match(source, /onProcessing\(message\)[\s\S]{0,100}attachmentStatusController\.processing\(message\)/);
+  assert.match(source, /onStatus\(message\)[\s\S]{0,100}attachmentStatusController\.selection\(message\)/);
 });
