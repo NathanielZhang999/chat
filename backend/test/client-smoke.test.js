@@ -3225,3 +3225,637 @@ test('same-object reconnect disables shortcuts until a new login succeeds', () =
   harness.eventTarget.dispatch('keydown', { key: '?', shiftKey: true });
   assert.equal(harness.state.help, before);
 });
+
+test('complete usability race matrix preserves the newest account room socket and preference context', async () => {
+  const helpers = loadHelpers();
+  const dark = { theme: 'dark', textScale: 100, compactMessages: false, motion: 'system' };
+  const aliceAppearance = { theme: 'light', textScale: 125, compactMessages: true, motion: 'reduce' };
+  const bobEventFirst = { theme: 'light', textScale: 112.5, compactMessages: true, motion: 'reduce' };
+  const bobAckFirst = { theme: 'dark', textScale: 125, compactMessages: false, motion: 'system' };
+  const backendUrl = 'https://one.example';
+  const storageValues = new Map();
+  storageValues.set(helpers.appearanceCacheKey(backendUrl, 'Alice'), JSON.stringify({
+    preferences: { theme: 'light', textScale: 112.5, compactMessages: true, motion: 'reduce' },
+    preferencesVersion: 8
+  }));
+  const storageWrites = [];
+  const storage = {
+    getItem(key) { return storageValues.get(key) ?? null; },
+    setItem(key, value) { storageValues.set(key, value); storageWrites.push({ key, value: JSON.parse(value) }); }
+  };
+  const rootElement = appearanceRoot();
+  const formElements = appearanceElements();
+  const preferenceRequests = [];
+  const appearanceStatuses = [];
+  const session = helpers.createSessionContextCoordinator();
+  let activeSocket = createClientSocket(false);
+  activeSocket.id = 'alice-generation-a';
+  const aliceSocket = activeSocket;
+  let selectedAccount = 'Alice';
+  const state = {
+    dom: [], historyDetail: [], members: [], room: null, contextId: 1, cache: {}, role: 'user', typing: [],
+    composition: '', attachment: null, dialogs: [], alerts: [], audio: [], navigation: [], statuses: [],
+    authSurface: 'authentication', account: null
+  };
+  let authenticatedBinding = null;
+  const owners = helpers.createProductionUnauthenticatedOwners({
+    clearChatHistory: () => { state.dom = []; },
+    clearHistoryDetails: () => { state.historyDetail = []; },
+    clearMembers: () => { state.members = []; },
+    clearRoomState: () => { state.room = null; state.contextId += 1; },
+    clearServerState: () => { state.cache = {}; },
+    resetRoles: () => { state.role = 'user'; },
+    resetTyping: () => { state.typing = []; },
+    resetCompositionState: () => { state.composition = ''; state.statuses = []; },
+    cancelAction: () => { state.attachment = null; },
+    resetAttachment: () => { state.attachment = null; },
+    closeRoomDialogs: () => { state.dialogs = []; state.alerts = []; },
+    invalidateRequestState: () => {},
+    unbindAuthenticatedEvents: () => {
+      if (authenticatedBinding) authenticatedBinding.unbind();
+      authenticatedBinding = null;
+    },
+    clearAudio: () => { state.audio = []; },
+    clearNavigationState: () => { state.navigation = []; },
+    hideRoomControls: () => {},
+    showAuthentication: () => { state.authSurface = 'authentication'; state.account = null; }
+  });
+  const sanitizer = helpers.createUnauthenticatedStateSanitizer(owners);
+  const surfaceGate = helpers.createAuthenticatedSurfaceGate({
+    showAuthentication: () => { state.authSurface = 'authentication'; },
+    showAuthenticated: destination => { state.authSurface = destination; }
+  });
+  const appearance = helpers.createAppearanceController({
+    getSessionContext: () => session.snapshot(),
+    getBackendUrl: () => backendUrl,
+    getUsername: () => selectedAccount,
+    storage,
+    rootElement,
+    formElements,
+    deviceReducedMotion: () => false,
+    onStatus: message => appearanceStatuses.push(message),
+    emitUpdate(payload, callback) { preferenceRequests.push({ payload, callback }); }
+  });
+  const bridge = helpers.createAppearanceRuntimeBridge({
+    sessionCoordinator: session,
+    appearanceController: appearance,
+    getActiveSocket: () => activeSocket,
+    authenticatedSurfaceGate: surfaceGate,
+    enterSanitizedUnauthenticatedState: reason => sanitizer.sanitize(reason),
+    onAuthenticated: response => { state.account = response.username; },
+    onAuthFailure: error => { state.statuses.push(error); }
+  });
+  const assertNoAliceRoomLeak = label => {
+    assert.doesNotMatch(JSON.stringify(state),
+      /ALICE_PRIVATE|SECRET1|Alice|alice draft|alice tone|alice status/, label);
+  };
+
+  session.replace(aliceSocket);
+  bridge.bindSocket(aliceSocket);
+  bridge.selectAuthCandidate(backendUrl, 'Alice');
+  assert.equal(session.snapshot().authenticated, false, 'the account-A cache is provisional while unauthenticated');
+  assert.equal(rootElement.values['data-theme'], 'light');
+  aliceSocket.connected = true;
+  aliceSocket.deliver('connect');
+  const firstAliceLogin = bridge.beginConnectedAuth(aliceSocket);
+  bridge.finishAuth(firstAliceLogin, backendUrl, 'Alice', {
+    username: 'Alice', preferences: aliceAppearance, preferencesVersion: 9
+  });
+  surfaceGate.acceptRoom();
+
+  aliceSocket.connected = false;
+  aliceSocket.deliver('disconnect');
+  selectedAccount = 'Bob';
+  bridge.selectAuthCandidate(backendUrl, 'Bob');
+  assert.equal(bridge.beginConnectedAuth(aliceSocket), null,
+    'a login click before reconnect cannot create an authentication token');
+  assert.equal(rootElement.values['data-theme'], 'dark');
+  aliceSocket.id = 'alice-generation-b';
+  aliceSocket.connected = true;
+  aliceSocket.deliver('connect');
+  const failedBobLogin = bridge.beginConnectedAuth(aliceSocket);
+  assert.ok(failedBobLogin);
+  assert.equal(failedBobLogin.session.connected, true);
+  bridge.finishAuth(failedBobLogin, backendUrl, 'Bob', { error: 'bad password' });
+  assert.equal(rootElement.values['data-theme'], 'dark', 'failed account-B login restores safe Dark defaults');
+  selectedAccount = 'Alice';
+  bridge.selectAuthCandidate(backendUrl, 'Alice');
+  const freshAliceLogin = bridge.beginConnectedAuth(aliceSocket);
+  assert.ok(freshAliceLogin);
+  assert.notEqual(freshAliceLogin.session.generation, firstAliceLogin.session.generation);
+  bridge.finishAuth(freshAliceLogin, backendUrl, 'Alice', {
+    username: 'Alice', preferences: aliceAppearance, preferencesVersion: 10
+  });
+  assert.equal(session.snapshot().authenticated, true);
+  assert.equal(rootElement.values['data-theme'], 'light');
+  assert.equal(appearance.current().preferencesVersion, 10,
+    'fresh account-A authority replaces the failed account-B attempt');
+
+  Object.assign(state, {
+    dom: ['ALICE_PRIVATE_MESSAGE_SENTINEL'], historyDetail: ['ALICE_PRIVATE_HISTORY_SENTINEL'],
+    members: ['Alice'], room: 'SECRET1', contextId: 7,
+    cache: { SECRET1: 'ALICE_PRIVATE_CACHE_SENTINEL' }, role: 'admin', typing: ['Alice'],
+    composition: 'alice draft', attachment: 'ALICE_PRIVATE_ATTACHMENT_SENTINEL',
+    dialogs: ['ALICE_PRIVATE_DIALOG_SENTINEL'], alerts: [], audio: ['alice tone'],
+    navigation: ['SECRET1'], statuses: ['alice status'], authSurface: 'room', account: 'Alice'
+  });
+  const guard = helpers.createSessionDispatchGuard({
+    sessionCoordinator: session,
+    getActiveSocket: () => activeSocket,
+    getCurrentRoomCode: () => state.room,
+    getClientContextId: () => state.contextId
+  });
+  const aliceBindingToken = guard.capture(aliceSocket, { serverCode: 'SECRET1', clientContextId: 7 });
+  const listenerTable = helpers.createAuthenticatedListenerTable({
+    chatMessage: payload => state.dom.push(payload.text),
+    onlineUsers: payload => { state.members = payload.map(user => user.username); }
+  });
+  authenticatedBinding = helpers.createAuthenticatedSocketBinder({
+    socket: aliceSocket, bindingToken: aliceBindingToken, dispatchGuard: guard, listenerTable
+  });
+  const oldChatHandler = aliceSocket.listeners.get('chat_message').at(-1);
+  const oldMemberHandler = aliceSocket.listeners.get('online_users').at(-1);
+  const acknowledgementHandlers = helpers.createAcknowledgementHandlerMap({
+    switchHistorySuccess: response => { state.dom = response.history; state.navigation.push(response.serverCode); },
+    switchHistoryError: response => { state.alerts.push(response.error); },
+    editHistorySuccess: response => { state.dialogs.push(response.history); state.cache.edit = response.history; },
+    editHistoryError: response => { state.alerts.push(response.error); state.statuses.push(response.error); },
+    deletedMessageSuccess: response => { state.dom.push(response.text); state.audio.push('delete'); },
+    deletedMessageError: response => { state.alerts.push(response.error); state.navigation.push('delete-error'); }
+  });
+  const acknowledgements = helpers.createGuardedAcknowledgementAdapter({
+    dispatchGuard: guard, handlers: acknowledgementHandlers
+  });
+  const oldSwitch = acknowledgements.capture('switchHistory', aliceSocket,
+    { serverCode: 'SECRET1', clientContextId: 7 });
+  const oldEdit = acknowledgements.capture('editHistory', aliceSocket,
+    { serverCode: 'SECRET1', clientContextId: 7, messageId: 'alice-message' });
+  const oldDeleted = acknowledgements.capture('deletedMessage', aliceSocket,
+    { serverCode: 'SECRET1', clientContextId: 7, messageId: 'alice-message' });
+  const oldPreferenceHandler = aliceSocket.listeners.get('preferences_updated').at(-1);
+
+  selectedAccount = 'Bob';
+  bridge.selectAuthCandidate(backendUrl, 'Bob');
+  assertNoAliceRoomLeak('account change sanitizes Alice before Bob can authenticate');
+  aliceSocket.connected = false;
+  aliceSocket.deliver('disconnect');
+  assertNoAliceRoomLeak('disconnect preserves the sanitized boundary');
+  const bobSocket = createClientSocket(false);
+  bobSocket.id = 'bob-socket';
+  activeSocket = bobSocket;
+  session.replace(bobSocket);
+  bridge.bindSocket(bobSocket);
+  bobSocket.connected = true;
+  bobSocket.deliver('connect');
+  const bobLogin = bridge.beginConnectedAuth(bobSocket);
+  bridge.finishAuth(bobLogin, backendUrl, 'Bob', {
+    username: 'Bob', preferences: dark, preferencesVersion: 2
+  });
+  assert.equal(state.account, 'Bob');
+  assert.equal(state.authSurface, 'authentication', 'Bob remains covered until room access resolves');
+  assertNoAliceRoomLeak('Bob login exposes no Alice room state');
+
+  oldSwitch({
+    history: ['ALICE_PRIVATE_DELAYED_SWITCH_SENTINEL'], serverCode: 'SECRET1', clientContextId: 7
+  });
+  const failedInitialSwitch = helpers.applySwitchResult({
+    currentServerCode: null,
+    targetServerCode: 'global',
+    response: { error: 'No accessible room.' },
+    showAlert: (title, message) => state.alerts.push(`${title}:${message}`),
+    applySuccess: () => { state.room = 'global'; }
+  });
+  assert.equal(failedInitialSwitch.accepted, false);
+  assert.equal(surfaceGate.acceptLobby(), true);
+  assert.equal(state.authSurface, 'lobby');
+  assert.equal(state.room, null);
+  assertNoAliceRoomLeak('failed initial switch resolves only to a neutral Bob lobby');
+
+  const beforeRetiredTraffic = JSON.stringify(state);
+  const beforeRetiredAppearanceStatuses = appearanceStatuses.length;
+  const beforeRetiredStorageWrites = storageWrites.length;
+  oldChatHandler({ serverCode: 'SECRET1', clientContextId: 7, text: 'ALICE_PRIVATE_CHAT_SENTINEL' });
+  oldMemberHandler([{ username: 'Alice' }]);
+  for (const callback of [oldSwitch, oldEdit, oldDeleted]) {
+    callback({
+      history: ['ALICE_PRIVATE_CALLBACK_SENTINEL'], text: 'ALICE_PRIVATE_CALLBACK_SENTINEL',
+      serverCode: 'SECRET1', clientContextId: 7, messageId: 'alice-message'
+    });
+    callback({
+      error: 'ALICE_PRIVATE_ERROR_SENTINEL', serverCode: 'SECRET1',
+      clientContextId: 7, messageId: 'alice-message'
+    });
+  }
+  oldPreferenceHandler({ preferences: aliceAppearance, preferencesVersion: 99 });
+  assert.equal(JSON.stringify(state), beforeRetiredTraffic,
+    'retired events and success/error callbacks cannot mutate DOM modal alert cache audio navigation or status state');
+  assert.equal(appearanceStatuses.length, beforeRetiredAppearanceStatuses);
+  assert.equal(storageWrites.length, beforeRetiredStorageWrites);
+  assert.equal(appearance.current().preferencesVersion, 2);
+  assertNoAliceRoomLeak('post-Bob retired traffic remains private');
+
+  const eventFirstSave = appearance.beginSave(bobEventFirst);
+  const eventFirstRequest = preferenceRequests.at(-1);
+  assert.deepEqual(structuredClone(eventFirstRequest.payload), {
+    preferences: bobEventFirst, expectedVersion: 2
+  });
+  const eventFirstStatusCount = appearanceStatuses.length;
+  bobSocket.deliver('preferences_updated', { preferences: bobEventFirst, preferencesVersion: 3 });
+  assert.equal(appearance.current().preferencesVersion, 3);
+  assert.equal(appearanceStatuses.length, eventFirstStatusCount,
+    'event-first authority applies without manufacturing an acknowledgement status');
+  eventFirstRequest.callback({ success: true, preferences: bobEventFirst, preferencesVersion: 3 });
+  assert.equal(appearanceStatuses.at(-1), 'Appearance saved.');
+  assert.equal(eventFirstSave.payload.expectedVersion, 2);
+  assert.deepEqual(structuredClone(appearance.current()), { preferences: bobEventFirst, preferencesVersion: 3 });
+  const ackFirstSave = appearance.beginSave(bobAckFirst);
+  const ackFirstRequest = preferenceRequests.at(-1);
+  ackFirstRequest.callback({ success: true, preferences: bobAckFirst, preferencesVersion: 4 });
+  assert.equal(appearance.current().preferencesVersion, 4);
+  assert.equal(appearanceStatuses.at(-1), 'Appearance saved.');
+  bobSocket.deliver('preferences_updated', { preferences: bobAckFirst, preferencesVersion: 4 });
+  assert.equal(ackFirstSave.payload.expectedVersion, 3);
+  assert.deepEqual(structuredClone(appearance.current()), { preferences: bobAckFirst, preferencesVersion: 4 });
+
+  const sameObjectSave = appearance.beginSave(bobEventFirst);
+  const sameObjectRequest = preferenceRequests.at(-1);
+  const retiredSameObjectPreference = bobSocket.listeners.get('preferences_updated').at(-1);
+  bobSocket.connected = false;
+  bobSocket.deliver('disconnect');
+  bobSocket.id = 'bob-socket-generation-b';
+  bobSocket.connected = true;
+  bobSocket.deliver('connect');
+  const sameObjectLogin = bridge.beginConnectedAuth(bobSocket);
+  bridge.finishAuth(sameObjectLogin, backendUrl, 'Bob', {
+    username: 'Bob', preferences: bobAckFirst, preferencesVersion: 4
+  });
+  sameObjectRequest.callback({ success: true, preferences: aliceAppearance, preferencesVersion: 99 });
+  retiredSameObjectPreference({ preferences: aliceAppearance, preferencesVersion: 99 });
+  assert.equal(sameObjectSave.payload.expectedVersion, 4);
+  assert.deepEqual(structuredClone(appearance.current()), { preferences: bobAckFirst, preferencesVersion: 4 });
+
+  const replacedSave = appearance.beginSave(bobEventFirst);
+  const replacedRequest = preferenceRequests.at(-1);
+  const retiredReplacementPreference = bobSocket.listeners.get('preferences_updated').at(-1);
+  bridge.invalidate();
+  const newestBobSocket = createClientSocket(false);
+  newestBobSocket.id = 'bob-newest-socket';
+  activeSocket = newestBobSocket;
+  session.replace(newestBobSocket);
+  bridge.bindSocket(newestBobSocket);
+  newestBobSocket.connected = true;
+  newestBobSocket.deliver('connect');
+  const replacementLogin = bridge.beginConnectedAuth(newestBobSocket);
+  bridge.finishAuth(replacementLogin, backendUrl, 'Bob', {
+    username: 'Bob', preferences: bobEventFirst, preferencesVersion: 5
+  });
+  replacedRequest.callback({ success: true, preferences: aliceAppearance, preferencesVersion: 100 });
+  retiredReplacementPreference({ preferences: aliceAppearance, preferencesVersion: 100 });
+  assert.equal(replacedSave.payload.expectedVersion, 4);
+  assert.deepEqual(structuredClone(appearance.current()), { preferences: bobEventFirst, preferencesVersion: 5 });
+
+  const composition = helpers.createCompositionContextCoordinator();
+  composition.activate('ROOMA1');
+  state.room = 'ROOMA1';
+  state.contextId = composition.current().clientContextId;
+  const decode = deferred();
+  const decodeStarted = deferred();
+  const acceptedAttachments = [];
+  const attachment = helpers.createAttachmentIntakeController({
+    getSessionContext: () => session.snapshot(),
+    getCompositionContext: () => composition.current(),
+    isCompositionEnabled: () => true,
+    readArrayBuffer: async file => file.bytes.buffer,
+    decodeImageBytes: () => { decodeStarted.resolve(); return decode.promise; },
+    createCanvas: () => ({
+      getContext: () => ({ drawImage() {} }),
+      toDataURL: () => 'data:image/jpeg;base64,AAAA'
+    }),
+    sanitizeAttachment: value => helpers.sanitizeAttachment(value),
+    onAccepted: value => acceptedAttachments.push(value)
+  });
+  const upload = attachment.intake(attachmentFile(), 'picker');
+  await decodeStarted.promise;
+  const switchRequests = [];
+  const switchCoordinator = helpers.createSwitchCoordinator(
+    (target, callback) => switchRequests.push({ target, callback }),
+    (target, response) => helpers.applySwitchResult({
+      currentServerCode: state.room,
+      targetServerCode: target,
+      response,
+      showAlert: (title, message) => state.alerts.push(`${title}:${message}`),
+      applySuccess: nextRoom => {
+        state.room = nextRoom;
+        composition.activate(nextRoom);
+        state.contextId = composition.current().clientContextId;
+        attachment.invalidate('room switch');
+      }
+    })
+  );
+  const keyTarget = new ControlledEventTarget();
+  const shortcut = helpers.createShortcutController({
+    eventTarget: keyTarget,
+    getSessionContext: () => session.snapshot(),
+    isSessionContextCurrent: candidate => session.matches(candidate),
+    getActiveSocket: () => activeSocket,
+    getProtectedDialogOpen: () => false,
+    getEscapeLayers: () => [],
+    getCurrentRoom: () => state.room,
+    getRenderedRoomOrder: () => ['ROOMA1', 'ROOMB2'],
+    getJoinedRooms: () => ['ROOMA1', 'ROOMB2'],
+    getBannedRooms: () => [],
+    getRole: () => 'user',
+    isRoomRailAccessible: context => helpers.isRoomRailAccessible(context),
+    requestServerSwitch: target => switchCoordinator.request(target),
+    isCompositionEnabled: () => true
+  });
+  const shortcutEvent = keyTarget.dispatch('keydown', { key: 'ArrowDown', altKey: true });
+  assert.equal(shortcutEvent.defaultPrevented, true);
+  assert.deepEqual(switchRequests.map(request => request.target), ['ROOMB2']);
+  switchRequests[0].callback({ history: [], roomRole: 'user', restriction: {} });
+  decode.resolve({ image: {}, width: 2, height: 3 });
+  await upload;
+  assert.equal(state.room, 'ROOMB2');
+  assert.equal(acceptedAttachments.length, 0, 'room-A upload cannot complete in room B');
+  assertNoAliceRoomLeak('the newest Bob room/socket/preference context remains isolated');
+  shortcut.unbind();
+  assert.ok(storageWrites.length >= 1, 'only normalized authoritative preference snapshots reach storage');
+  for (const write of storageWrites) {
+    assert.deepEqual(Object.keys(write.value).sort(), ['preferences', 'preferencesVersion']);
+    assert.deepEqual(Object.keys(write.value.preferences).sort(),
+      ['compactMessages', 'motion', 'textScale', 'theme']);
+    assert.equal(Number.isSafeInteger(write.value.preferencesVersion), true);
+  }
+});
+
+test('appearance changes during image processing cannot revive a stale attachment', async () => {
+  const helpers = loadHelpers();
+  const socket = createClientSocket(true);
+  const session = helpers.createSessionContextCoordinator();
+  session.replace(socket);
+  session.connected(socket);
+  session.authenticate(socket);
+  const composition = helpers.createCompositionContextCoordinator();
+  composition.activate('ROOMA1');
+  const rootElement = appearanceRoot();
+  const appearance = helpers.createAppearanceController({
+    getSessionContext: () => session.snapshot(),
+    getBackendUrl: () => 'https://one.example',
+    getUsername: () => 'Alice',
+    storage: { getItem() { return null; }, setItem() {} },
+    rootElement,
+    formElements: appearanceElements()
+  });
+  appearance.acceptAuthoritative('https://one.example', 'Alice', {
+    preferences: { theme: 'dark', textScale: 100, compactMessages: false, motion: 'system' },
+    preferencesVersion: 1
+  });
+  const decode = deferred();
+  const decodeStarted = deferred();
+  const accepted = [];
+  const attachment = helpers.createAttachmentIntakeController({
+    getSessionContext: () => session.snapshot(),
+    getCompositionContext: () => composition.current(),
+    isCompositionEnabled: () => true,
+    readArrayBuffer: async file => file.bytes.buffer,
+    decodeImageBytes: () => { decodeStarted.resolve(); return decode.promise; },
+    createCanvas: () => ({
+      getContext: () => ({ drawImage() {} }),
+      toDataURL: () => 'data:image/jpeg;base64,AAAA'
+    }),
+    sanitizeAttachment: value => helpers.sanitizeAttachment(value),
+    onAccepted: value => accepted.push(value)
+  });
+  const pending = attachment.intake(attachmentFile(), 'picker');
+  await decodeStarted.promise;
+  const changed = appearance.handleEvent(socket, {
+    preferences: { theme: 'light', textScale: 125, compactMessages: true, motion: 'reduce' },
+    preferencesVersion: 2
+  });
+  assert.equal(changed.accepted, true);
+  assert.equal(rootElement.values['data-theme'], 'light');
+  session.disconnect(socket);
+  session.connected(socket);
+  session.authenticate(socket);
+  decode.resolve({ image: {}, width: 2, height: 3 });
+  await pending;
+  assert.equal(accepted.length, 0);
+  assert.equal(appearance.current().preferencesVersion, 2,
+    'the appearance event remains authoritative without making older upload work current');
+});
+
+test('shortcut room switch during image processing invalidates the old upload', async () => {
+  const helpers = loadHelpers();
+  const socket = createClientSocket(true);
+  const session = helpers.createSessionContextCoordinator();
+  session.replace(socket);
+  session.connected(socket);
+  session.authenticate(socket);
+  const composition = helpers.createCompositionContextCoordinator();
+  composition.activate('ROOMA1');
+  let currentRoom = 'ROOMA1';
+  const decode = deferred();
+  const decodeStarted = deferred();
+  const accepted = [];
+  const attachment = helpers.createAttachmentIntakeController({
+    getSessionContext: () => session.snapshot(),
+    getCompositionContext: () => composition.current(),
+    isCompositionEnabled: () => true,
+    readArrayBuffer: async file => file.bytes.buffer,
+    decodeImageBytes: () => { decodeStarted.resolve(); return decode.promise; },
+    createCanvas: () => ({
+      getContext: () => ({ drawImage() {} }),
+      toDataURL: () => 'data:image/jpeg;base64,AAAA'
+    }),
+    sanitizeAttachment: value => helpers.sanitizeAttachment(value),
+    onAccepted: value => accepted.push(value)
+  });
+  const pending = attachment.intake(attachmentFile(), 'drop');
+  await decodeStarted.promise;
+  const emittedSwitches = [];
+  const switchCoordinator = helpers.createSwitchCoordinator(
+    (target, callback) => emittedSwitches.push({ target, callback }),
+    (target, response) => helpers.applySwitchResult({
+      currentServerCode: currentRoom,
+      targetServerCode: target,
+      response,
+      showAlert() {},
+      applySuccess: nextRoom => {
+        currentRoom = nextRoom;
+        composition.activate(nextRoom);
+        attachment.invalidate('room switch');
+      }
+    })
+  );
+  const eventTarget = new ControlledEventTarget();
+  const shortcut = helpers.createShortcutController({
+    eventTarget,
+    getSessionContext: () => session.snapshot(),
+    isSessionContextCurrent: candidate => session.matches(candidate),
+    getActiveSocket: () => socket,
+    getProtectedDialogOpen: () => false,
+    getEscapeLayers: () => [],
+    getCurrentRoom: () => currentRoom,
+    getRenderedRoomOrder: () => ['ROOMA1', 'ROOMB2'],
+    getJoinedRooms: () => ['ROOMA1', 'ROOMB2'],
+    getBannedRooms: () => [],
+    getRole: () => 'user',
+    isRoomRailAccessible: context => helpers.isRoomRailAccessible(context),
+    requestServerSwitch: room => switchCoordinator.request(room),
+    isCompositionEnabled: () => true
+  });
+  const event = eventTarget.dispatch('keydown', { key: 'ArrowDown', altKey: true });
+  assert.equal(event.defaultPrevented, true);
+  assert.deepEqual(emittedSwitches.map(request => request.target), ['ROOMB2']);
+  emittedSwitches[0].callback({ history: [], roomRole: 'user', restriction: {} });
+  decode.resolve({ image: {}, width: 2, height: 3 });
+  await pending;
+  assert.equal(currentRoom, 'ROOMB2');
+  assert.equal(accepted.length, 0);
+  assert.equal(attachment.current().active, false);
+  shortcut.unbind();
+});
+
+test('reduced motion applies to attachment drop appearance and shortcut dialogs', async () => {
+  const helpers = loadHelpers();
+  const socket = createClientSocket(true);
+  const session = helpers.createSessionContextCoordinator();
+  session.replace(socket);
+  session.connected(socket);
+  session.authenticate(socket);
+  const rootElement = appearanceRoot();
+  const appearance = helpers.createAppearanceController({
+    getSessionContext: () => session.snapshot(),
+    getBackendUrl: () => 'https://one.example',
+    getUsername: () => 'Alice',
+    storage: { getItem() { return null; }, setItem() {} },
+    rootElement,
+    formElements: appearanceElements(),
+    deviceReducedMotion: () => false
+  });
+  appearance.acceptAuthoritative('https://one.example', 'Alice', {
+    preferences: { theme: 'light', textScale: 112.5, compactMessages: true, motion: 'reduce' },
+    preferencesVersion: 1
+  });
+  assert.equal(rootElement.values['data-motion'], 'reduce');
+
+  const composition = helpers.createCompositionContextCoordinator();
+  composition.activate('global');
+  const attachment = helpers.createAttachmentIntakeController({
+    getSessionContext: () => session.snapshot(),
+    getCompositionContext: () => composition.current(),
+    isCompositionEnabled: () => true,
+    readArrayBuffer: async file => file.bytes.buffer,
+    decodeImageBytes: async () => ({ image: {}, width: 2, height: 3 }),
+    createCanvas: () => ({
+      getContext: () => ({ drawImage() {} }),
+      toDataURL: () => 'data:image/jpeg;base64,AAAA'
+    }),
+    sanitizeAttachment: value => helpers.sanitizeAttachment(value)
+  });
+  const fileInput = new ControlledEventTarget();
+  const dropTarget = new ControlledEventTarget();
+  const messageInput = new ControlledEventTarget();
+  const attachmentBinding = helpers.bindAttachmentInputs({
+    fileInput, dropTarget, messageInput, intakeAttachment: attachment.intake
+  });
+  dropTarget.dispatch('dragenter', { dataTransfer: { types: ['Files'], files: [attachmentFile()] } });
+  assert.equal(dropTarget.classList.contains('attachment-drag-active'), true);
+  dropTarget.dispatch('drop', { dataTransfer: { types: ['Files'], files: [attachmentFile()] } });
+  await settleAttachmentWork();
+  assert.equal(dropTarget.classList.contains('attachment-drag-active'), false);
+
+  const settingsModal = shortcutModal();
+  const settingsOwner = helpers.createFocusRestoringModalOwner({ element: settingsModal });
+  const helpHarness = shortcutHelpDocumentHarness();
+  const helpRuntime = helpers.createShortcutHelpRuntime({ document: helpHarness.document });
+  const eventTarget = new ControlledEventTarget();
+  const shortcut = helpers.createShortcutController({
+    eventTarget,
+    getSessionContext: () => session.snapshot(),
+    isSessionContextCurrent: candidate => session.matches(candidate),
+    getActiveSocket: () => socket,
+    getProtectedDialogOpen: () => false,
+    getEscapeLayers: () => [],
+    openAppearance: () => settingsOwner.open(),
+    openHelp: helpRuntime.openShortcutHelp,
+    isCompositionEnabled: () => true
+  });
+  assert.equal(eventTarget.dispatch('keydown', { key: ',', ctrlKey: true }).defaultPrevented, true);
+  assert.equal(settingsModal.classList.contains('active'), true);
+  settingsOwner.close();
+  assert.equal(eventTarget.dispatch('keydown', { key: '?', shiftKey: true }).defaultPrevented, true);
+  assert.equal(helpHarness.elements.get('shortcut-help-modal').classList.contains('active'), true);
+
+  const source = fs.readFileSync(chatPath, 'utf8');
+  assert.match(source,
+    /:root\[data-motion="reduce"\]\s+\*[\s\S]{0,260}animation-duration:\s*0\.01ms\s*!important[\s\S]{0,220}transition-duration:\s*0\.01ms\s*!important/);
+  assert.match(source,
+    /@media\s*\(prefers-reduced-motion:\s*reduce\)[\s\S]{0,700}#compose-drop-target\s*\{\s*transition:\s*none\s*!important/);
+  attachmentBinding.unbind();
+  shortcut.unbind();
+  helpRuntime.unbind();
+});
+
+test('light compact large-text state keeps composer controls present enabled and semantically labelled', () => {
+  const helpers = loadHelpers();
+  const socket = createClientSocket(true);
+  const session = helpers.createSessionContextCoordinator();
+  session.replace(socket);
+  session.connected(socket);
+  session.authenticate(socket);
+  const rootElement = appearanceRoot();
+  const appearance = helpers.createAppearanceController({
+    getSessionContext: () => session.snapshot(),
+    getBackendUrl: () => 'https://one.example',
+    getUsername: () => 'Alice',
+    storage: { getItem() { return null; }, setItem() {} },
+    rootElement,
+    formElements: appearanceElements()
+  });
+  appearance.acceptAuthoritative('https://one.example', 'Alice', {
+    preferences: { theme: 'light', textScale: 125, compactMessages: true, motion: 'system' },
+    preferencesVersion: 1
+  });
+  assert.deepEqual(rootElement.values, {
+    'data-theme': 'light', 'data-text-scale': '125',
+    'data-density': 'compact', 'data-motion': 'system'
+  });
+
+  const controls = Object.fromEntries(['msg-input', 'send-btn', 'attachment-btn', 'emoji-btn', 'file-upload']
+    .map(id => [id, { disabled: true }]));
+  const restriction = helpers.createRestrictionCoordinator({
+    schedule: () => null,
+    cancel() {},
+    now: () => 1,
+    getCurrentRoom: () => 'global',
+    applyState({ timedOut }) {
+      for (const control of Object.values(controls)) control.disabled = timedOut;
+    }
+  });
+  restriction.apply({ timedOut: false, timeoutUntil: null }, 'global');
+  assert.equal(Object.values(controls).every(control => control.disabled === false), true,
+    'an accessible authenticated room enables every composer control');
+
+  const source = fs.readFileSync(chatPath, 'utf8');
+  for (const id of ['compose-drop-target', 'compose', 'msg-input', 'send-btn', 'attachment-btn',
+    'emoji-btn', 'file-upload', 'attachment-selection-status', 'attachment-status']) {
+    assert.match(source, new RegExp(`id=["']${id}["']`), `${id} remains present`);
+  }
+  assert.match(source,
+    /id="compose-drop-target"[^>]*role="group"[^>]*aria-label="Message composer and image drop target"[^>]*aria-describedby="attachment-drop-instructions"/);
+  assert.match(source, /id="attachment-btn"[^>]*title="Upload Image"/);
+  assert.match(source, /id="file-upload"[^>]*accept="image\/jpeg,image\/png,image\/webp"/);
+  assert.match(source, /id="msg-input"[^>]*placeholder="Message\.\.\./);
+  assert.match(source, /id="emoji-btn"[^>]*title="Emojis"/);
+  assert.match(source, /id="send-btn"[^>]*>Send<\/button>/);
+  assert.match(source, /id="attachment-selection-status"[^>]*role="status"[^>]*aria-live="polite"/);
+  assert.match(source, /id="attachment-status"[^>]*role="status"[^>]*aria-live="polite"/);
+  assert.match(source, /:root\[data-text-scale="125"\]\s*\{\s*font-size:\s*125%\s*;\s*\}/);
+  assert.match(source,
+    /:root\[data-density="compact"\]\s+\.msg\s*\{[^}]*padding-block:\s*0\.2rem[^}]*margin-top:\s*2px[^}]*gap:\s*10px/);
+  assert.match(source,
+    /:root\[data-density="compact"\]\s+\.msg-avatar\s*\{[^}]*width:\s*34px[^}]*height:\s*34px/);
+  assert.match(source,
+    /function setCompositionDisabled\(disabled,[^)]*\)[\s\S]{0,380}msgInput\.disabled\s*=\s*compositionDisabled[\s\S]{0,260}fileUpload\.disabled\s*=\s*compositionDisabled/);
+});
