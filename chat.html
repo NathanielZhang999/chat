@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>Chat v1.3.2</title>
     <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
     <style>
@@ -79,8 +79,7 @@
         /* Chat Area */
         #chat-area { flex: 1; display: flex; flex-direction: column; position: relative; min-width: 0; }
         header { padding: 0 1rem; height: 50px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; background: var(--surface); box-shadow: 0 1px 2px rgba(0,0,0,0.2); z-index: 10; }
-        .room-title-group { min-width: 0; display: flex; align-items: center; gap: 6px; flex: 1; }
-        #server-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; font-size: 1rem; color: white; display: flex; align-items: center; gap: 8px; }
+        #server-title { font-weight: 600; font-size: 1rem; color: white; display: flex; align-items: center; gap: 8px; }
         
         .admin-badge { background: #ed4245; color: white; font-size: 0.65rem; padding: 2px 6px; border-radius: 4px; font-weight: 700; text-transform: uppercase; margin-left: 2px; display: inline-flex; align-items: center; gap: 3px; border: 1px solid #202225; }
         .admin-badge::before { content: '👑'; font-size: 0.7rem; margin-right: 2px; }
@@ -96,12 +95,6 @@
         .header-btn.settings { background: #4f545c; display: block; }
         .header-btn:hover { filter: brightness(1.15); transform: translateY(-1px); box-shadow: 0 2px 5px rgba(0,0,0,0.2); }
         .header-btn.logout { display: block; }
-        .feature-header-btn { min-width: 44px; min-height: 44px; padding: 4px 8px; border: 0; border-radius: 4px; background: #4f545c; color: white; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; gap: 4px; font-size: 0.78rem; font-weight: 700; flex: 0 0 auto; }
-        .feature-header-btn:hover { background: var(--primary); }
-        #pins-count { min-width: 18px; padding: 1px 4px; border-radius: 9px; background: #202225; font-size: 0.68rem; }
-        #header-overflow-btn { display: none; }
-        #header-overflow-menu { top: 48px; right: 8px; min-width: 190px; }
-        #header-overflow-menu .header-btn { display: block; width: 100%; text-align: left; }
 
         #chat-window { flex: 1; overflow-y: auto; padding: 1rem; display: flex; flex-direction: column; gap: 1rem; background: var(--surface); scroll-behavior: auto; }
         
@@ -144,9 +137,6 @@
             will-change: opacity, transform;
         }
         .msg:hover .msg-actions { opacity: 1; visibility: visible; transform: translateY(0); transition-delay: 0s; }
-        .msg:focus-within .msg-actions { opacity: 1; visibility: visible; transform: translateY(0); transition-delay: 0s; }
-        .msg.keyboard-actions-open .msg-actions { opacity: 1; visibility: visible; transform: translateY(0); transition-delay: 0s; }
-        .msg-actions[hidden] { display: flex; }
         .action-btn { background: none; border: none; padding: 6px 12px; color: var(--text-muted); font-size: 0.8rem; cursor: pointer; transition: background-color var(--motion-fast) ease, color var(--motion-fast) ease, transform var(--motion-fast) var(--ease-standard); display: flex; align-items: center; gap: 5px; font-weight: 500; }
         .action-btn:hover { background: var(--surface-dark); color: white; }
         .action-btn:active { transform: scale(0.95); }
@@ -264,24 +254,6 @@
         
         .stealth-admin { color: var(--warning) !important; font-style: italic; }
 
-        button.user-item { width: 100%; border: 0; background: transparent; text-align: left; }
-        .member-trigger, .author-trigger, .message-menu-trigger { border: 0; background: transparent; color: inherit; cursor: pointer; font: inherit; }
-        .author-trigger { font-weight: 500; }
-        .message-menu-trigger { min-width: 36px; min-height: 36px; border-radius: 4px; }
-        .room-attention-badge { position: absolute; right: -4px; bottom: -2px; min-width: 20px; min-height: 20px; padding: 2px 4px; border-radius: 10px; display: inline-flex; align-items: center; justify-content: center; background: var(--error); color: white; font-size: 0.65rem; line-height: 1; box-shadow: 0 0 0 2px #202225; }
-
-        .room-feature-modal { max-width: 560px; }
-        .room-feature-actions { display: flex; gap: 8px; }
-        .room-feature-actions .btn-primary { flex: 1; }
-        .pins-list, .blocked-users-list { display: flex; flex-direction: column; gap: 8px; }
-        .pin-row, .blocked-user-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px; border-radius: 4px; background: var(--surface-dark); }
-        .pin-summary { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
-        .pin-summary strong, .pin-summary span { overflow-wrap: anywhere; }
-        .blocked-user-row .btn-primary { width: auto; min-height: 44px; }
-        .empty-state { color: var(--text-muted); font-size: 0.9rem; padding: 8px 0; }
-        .blocked-message { width: 100%; min-height: 44px; padding: 8px 12px; border: 1px solid var(--border); border-radius: 4px; background: var(--surface-dark); color: var(--text-muted); cursor: pointer; text-align: left; }
-        .blocked-message-reveal { margin-top: 8px; padding: 8px; border-left: 3px solid var(--primary); color: var(--text); overflow-wrap: anywhere; }
-
         #history-list { max-height: 350px; overflow-y: auto; margin-top: 1rem; text-align: left; }
         .hist-item { background: var(--surface-dark); padding: 1rem; border-radius: 4px; margin-bottom: 0.5rem; border-left: 3px solid var(--primary); }
         .hist-time { font-size: 0.75rem; color: var(--text-muted); margin-bottom: 0.5rem; font-weight: 600;}
@@ -342,30 +314,6 @@
         #sm-join-ui.active, #sm-create-ui.active { display: block; animation: fadePop var(--motion-base) var(--ease-standard) forwards; }
         .no-enter-animation { animation: none !important; }
 
-        @media (hover: none), (pointer: coarse) {
-          .msg-actions { opacity: 1; visibility: visible; transform: translateY(0); position: static; margin-left: auto; }
-          .action-btn { min-width: 44px; min-height: 44px; justify-content: center; }
-        }
-
-        @media (max-width: 700px) {
-          header { min-height: 50px; height: auto; padding: 3px 4px; gap: 4px; flex-wrap: wrap; align-content: center; }
-          .room-title-group { gap: 4px; flex: 1 1 188px; }
-          #server-title { flex: 1 1 44px; }
-          #room-info-btn { display: inline-flex; min-width: 44px; min-height: 44px; }
-          #pins-btn { display: inline-flex; min-width: 44px; min-height: 44px; }
-          #header-overflow-btn { display: inline-flex; min-width: 44px; min-height: 44px; }
-          #invite-code-btn { display: none !important; }
-          #leave-server-btn { display: none !important; }
-          #delete-server-btn { display: none !important; }
-          #join-server-btn { display: none !important; }
-          #moderator-center-btn { display: none !important; }
-          #settings-btn { display: none !important; }
-          #logout-btn { display: none !important; }
-          #header-overflow-menu .header-btn { min-height: 44px; width: 100%; display: block !important; }
-          #header-overflow-menu .header-btn[hidden] { display: none !important; }
-          form#compose { padding-left: 6px; padding-right: 6px; }
-        }
-
         @media (prefers-reduced-motion: reduce) {
           *, *::before, *::after {
             animation-duration: 0.01ms !important;
@@ -375,7 +323,7 @@
           }
 
           #chat-window { scroll-behavior: auto !important; }
-          .msg, .system-msg, .server-icon, .user-item, .reaction-bubble, .modal-box, .context-menu {
+          .msg, .system-msg, .server-icon, .user-item, .reaction-bubble {
             animation: none !important;
             transform: none !important;
           }
@@ -438,47 +386,6 @@
             
             <button id="change-password-btn" class="btn-primary btn-secondary" style="margin-bottom: 10px;">Change Password</button>
             <button id="logout-all-btn" class="btn-primary" style="background: var(--error);">Log Out All Other Devices</button>
-
-            <hr style="border: 0; border-top: 1px solid var(--surface-dark); margin: 20px 0;">
-            <h3 style="color: white; margin-bottom: 0.75rem; font-size: 1.1rem;">Blocked Users</h3>
-            <p id="blocked-users-empty" class="empty-state">You have not blocked anyone.</p>
-            <div id="blocked-users-list" class="blocked-users-list"></div>
-        </div>
-    </div>
-
-    <div id="room-info-modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="room-info-title" aria-hidden="true" hidden>
-        <div class="modal-box room-feature-modal">
-            <button id="room-info-close" class="close-btn" type="button" aria-label="Close Room Info">&times;</button>
-            <h2 id="room-info-title">Room Info</h2>
-            <div class="input-group">
-                <label for="room-description">Description</label>
-                <textarea id="room-description" class="text-input" rows="4" maxlength="500" readonly></textarea>
-            </div>
-            <div class="input-group">
-                <label for="room-rules">Rules</label>
-                <textarea id="room-rules" class="text-input" rows="7" maxlength="2000" readonly></textarea>
-            </div>
-            <div class="input-group">
-                <label for="room-notification-level">Notifications</label>
-                <select id="room-notification-level" class="text-input">
-                    <option value="all">All messages</option>
-                    <option value="mentions">Mentions only</option>
-                    <option value="none">None</option>
-                </select>
-            </div>
-            <div class="room-feature-actions">
-                <button id="room-info-edit" class="btn-primary btn-secondary" type="button" hidden>Edit</button>
-                <button id="room-info-save" class="btn-primary" type="button" hidden>Save</button>
-            </div>
-            <div id="room-info-error" class="moderation-error"></div>
-        </div>
-    </div>
-
-    <div id="pins-modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="pins-title" aria-hidden="true" hidden>
-        <div class="modal-box room-feature-modal">
-            <button id="pins-close" class="close-btn" type="button" aria-label="Close Pins">&times;</button>
-            <h2 id="pins-title">Pinned Messages</h2>
-            <div id="pins-list" class="pins-list"></div>
         </div>
     </div>
 
@@ -649,37 +556,23 @@
     </div>
 
     <div id="servers-sidebar">
-        <button class="server-icon active" id="srv-global" type="button" aria-label="Global Chat" onclick="switchServer('global')">G<span class="tooltip">Global Chat</span></button>
+        <div class="server-icon active" id="srv-global" onclick="switchServer('global', 'Global Chat')">G<div class="tooltip">Global Chat</div></div>
         <div id="dynamic-servers" style="width: 100%; display: flex; flex-direction: column; align-items: center; gap: 8px;"></div>
         <div style="width: 32px; height: 2px; background: #2f3136; border-radius: 1px; margin: 4px 0; flex-shrink: 0;"></div>
-        <button class="server-icon add-btn" type="button" aria-label="Add a Server" onclick="document.getElementById('server-modal').classList.add('active'); toggleServerModal('join');">+<span class="tooltip">Add a Server</span></button>
+        <div class="server-icon add-btn" onclick="document.getElementById('server-modal').classList.add('active'); toggleServerModal('join');">+<div class="tooltip">Add a Server</div></div>
     </div>
 
     <div id="chat-area">
         <header>
-            <div class="room-title-group">
-                <div id="server-title">Loading...</div>
-                <button id="room-info-btn" class="feature-header-btn" type="button" aria-haspopup="dialog">Info</button>
-                <button id="pins-btn" class="feature-header-btn" type="button" aria-haspopup="dialog">Pins <span id="pins-count" aria-hidden="true">0</span></button>
-            </div>
+            <div id="server-title">Loading...</div>
             <div class="header-actions">
-                <button class="header-btn primary" id="invite-code-btn" type="button" onclick="copyCode()" style="display: none;">Copy Code</button>
-                <button class="header-btn danger" id="leave-server-btn" type="button" onclick="leaveServer()" style="display: none;">Leave</button>
-                <button class="header-btn delete" id="delete-server-btn" type="button" onclick="deleteServer()" style="display: none;">Delete</button>
-                <button class="header-btn success" id="join-server-btn" type="button" onclick="joinFromSnoop()" style="display: none;">Join (Visible)</button>
-                <button class="header-btn primary" id="moderator-center-btn" type="button" onclick="openModeratorCenter()" style="display: none;">Moderate</button>
-                <button class="header-btn settings always-on" id="settings-btn" type="button" onclick="openSettings()">⚙️ Settings</button>
-                <button class="header-btn logout always-on" id="logout-btn" type="button" onclick="logoutApp()">Log Out</button>
-                <button id="header-overflow-btn" class="feature-header-btn" type="button" aria-haspopup="menu" aria-controls="header-overflow-menu" aria-expanded="false" aria-label="More room actions">More</button>
-                <div id="header-overflow-menu" class="context-menu header-overflow-menu" role="menu" aria-hidden="true" hidden>
-                    <button id="overflow-invite-btn" class="header-btn primary" type="button" role="menuitem" onclick="copyCode()">Copy Code</button>
-                    <button id="overflow-leave-btn" class="header-btn danger" type="button" role="menuitem" onclick="leaveServer()">Leave</button>
-                    <button id="overflow-delete-btn" class="header-btn delete" type="button" role="menuitem" onclick="deleteServer()">Delete</button>
-                    <button id="overflow-join-btn" class="header-btn success" type="button" role="menuitem" onclick="joinFromSnoop()">Join (Visible)</button>
-                    <button id="overflow-moderate-btn" class="header-btn primary" type="button" role="menuitem" onclick="openModeratorCenter()">Moderate</button>
-                    <button id="overflow-settings-btn" class="header-btn settings" type="button" role="menuitem" onclick="openSettings()">Settings</button>
-                    <button id="overflow-logout-btn" class="header-btn logout" type="button" role="menuitem" onclick="logoutApp()">Log Out</button>
-                </div>
+                <button class="header-btn primary" id="invite-code-btn" onclick="copyCode()" style="display: none;">Copy Code</button>
+                <button class="header-btn danger" id="leave-server-btn" onclick="leaveServer()" style="display: none;">Leave</button>
+                <button class="header-btn delete" id="delete-server-btn" onclick="deleteServer()" style="display: none;">Delete</button>
+                <button class="header-btn success" id="join-server-btn" onclick="joinFromSnoop()" style="display: none;">Join (Visible)</button>
+                <button class="header-btn primary" id="moderator-center-btn" onclick="openModeratorCenter()" style="display: none;">Moderate</button>
+                <button class="header-btn settings always-on" onclick="openSettings()">⚙️ Settings</button>
+                <button class="header-btn logout always-on" onclick="logoutApp()">Log Out</button>
             </div>
         </header>
         
@@ -750,542 +643,6 @@
                 socket: ioFactory(newUrl, { reconnectionAttempts: Infinity }),
                 socketUrl: newUrl
             };
-        },
-
-        acceptVersionedState(current, incoming, kind) {
-            if (!incoming || typeof incoming !== 'object' || Array.isArray(incoming)) return current;
-            const integer = value => Number.isInteger(value) && value >= 0;
-            const roomCode = value => {
-                if (typeof value !== 'string') return null;
-                const trimmed = value.trim();
-                if (trimmed.toLowerCase() === 'global') return 'global';
-                const upper = trimmed.toUpperCase();
-                return /^[A-Z0-9]{6}$/.test(upper) ? upper : null;
-            };
-            const canonicalRoom = roomCode(incoming.serverCode);
-            const currentRoom = current ? roomCode(current.serverCode) : canonicalRoom;
-            const sameRoom = canonicalRoom && currentRoom === canonicalRoom;
-            const clone = value => ({ ...value, ...(canonicalRoom ? { serverCode: canonicalRoom } : {}) });
-            const same = (left, right, fields) => fields.every(field => {
-                const a = left && left[field];
-                const b = right && right[field];
-                if (a === b) return true;
-                if (a == null || b == null) return a == null && b == null;
-                return String(a) === String(b);
-            });
-
-            if (kind === 'metadata' || kind === 'details') {
-                if (!sameRoom || !integer(incoming.metadataVersion)) return current;
-                const currentVersion = current && integer(current.metadataVersion)
-                    ? current.metadataVersion : -1;
-                if (incoming.metadataVersion < currentVersion) return current;
-                if (incoming.metadataVersion === currentVersion) {
-                    if (!current || !same(current, incoming, [
-                        'serverCode', 'description', 'rules', 'metadataVersion'
-                    ])) return current;
-                    if (typeof incoming.canEdit !== 'boolean' || incoming.canEdit === current.canEdit) {
-                        return current;
-                    }
-                    return { ...current, canEdit: incoming.canEdit };
-                }
-                const next = clone(incoming);
-                if (typeof incoming.canEdit !== 'boolean' && typeof current?.canEdit === 'boolean') {
-                    next.canEdit = current.canEdit;
-                }
-                return next;
-            }
-
-            if (kind === 'blocks' || kind === 'block') {
-                if (!integer(incoming.blockVersion) || !Array.isArray(incoming.blockedUsers)) return current;
-                const currentVersion = current && integer(current.blockVersion) ? current.blockVersion : -1;
-                if (incoming.blockVersion <= currentVersion) return current;
-                const accountKey = typeof incoming.accountKey === 'string'
-                    ? incoming.accountKey.trim().toLowerCase() : null;
-                const currentAccountKey = typeof current?.accountKey === 'string'
-                    ? current.accountKey.trim().toLowerCase() : accountKey;
-                if (accountKey && currentAccountKey !== accountKey) return current;
-                return {
-                    ...incoming,
-                    ...(accountKey ? { accountKey } : {}),
-                    blockedUsers: incoming.blockedUsers.slice()
-                };
-            }
-
-            if (kind === 'pins' || kind === 'pin') {
-                if (!sameRoom || !integer(incoming.pinCount) || !integer(incoming.pinVersion) ||
-                    !integer(incoming.blockVersion)) return current;
-                if (!current) return clone(incoming);
-                if (!integer(current.pinVersion) || !integer(current.blockVersion)) return current;
-                if (incoming.blockVersion < current.blockVersion) return current;
-                if (incoming.blockVersion > current.blockVersion) {
-                    return incoming.pinVersion >= current.pinVersion ? clone(incoming) : current;
-                }
-                if (incoming.pinVersion > current.pinVersion) return clone(incoming);
-                if (incoming.pinVersion < current.pinVersion) return current;
-                return same(current, incoming, ['serverCode', 'pinCount', 'pinVersion', 'blockVersion'])
-                    ? current : current;
-            }
-
-            if (kind === 'room-state' || kind === 'roomState' || kind === 'attention') {
-                const levels = new Set(['all', 'mentions', 'none']);
-                if (!sameRoom || !integer(incoming.version) || !integer(incoming.blockVersion) ||
-                    !integer(incoming.unreadCount) || !integer(incoming.mentionCount) ||
-                    !levels.has(incoming.notificationLevel)) return current;
-                if (current?.usernameKey && incoming.usernameKey &&
-                    String(current.usernameKey).trim().toLowerCase() !==
-                    String(incoming.usernameKey).trim().toLowerCase()) return current;
-                if (!current) return clone(incoming);
-                if (!integer(current.version) || !integer(current.blockVersion)) return current;
-                if (incoming.blockVersion < current.blockVersion) return current;
-                if (incoming.blockVersion > current.blockVersion) {
-                    return incoming.version >= current.version ? clone(incoming) : current;
-                }
-                if (incoming.version > current.version) return clone(incoming);
-                if (incoming.version < current.version) return current;
-                const identical = same(current, incoming, [
-                    'serverCode', 'usernameKey', 'notificationLevel', 'lastReadAt',
-                    'lastReadMessageId', 'countedThroughAt', 'countedThroughMessageId',
-                    'unreadCount', 'mentionCount', 'version', 'blockVersion'
-                ]);
-                return identical ? current : current;
-            }
-
-            return current;
-        },
-
-        acceptPinBodies(current, incoming) {
-            if (!current || !incoming || current.pinsLoaded === true ||
-                incoming.requestTokenCurrent !== true || !Array.isArray(incoming.pins)) return current;
-            const room = value => typeof value === 'string' && value.toLowerCase() === 'global'
-                ? 'global'
-                : (typeof value === 'string' && /^[A-Z0-9]{6}$/.test(value.toUpperCase())
-                    ? value.toUpperCase() : null);
-            if (!room(current.serverCode) || room(current.serverCode) !== room(incoming.serverCode)) return current;
-            for (const field of ['pinVersion', 'pinCount', 'blockVersion']) {
-                if (!Number.isInteger(current[field]) || current[field] < 0 || incoming[field] !== current[field]) {
-                    return current;
-                }
-            }
-            return { ...current, pins: incoming.pins.slice(), pinsLoaded: true };
-        },
-
-        matchesCurrentVersionedSnapshot(current, incoming, kind) {
-            const snapshot = incoming && incoming.pin ? incoming.pin : incoming;
-            if (!current || !snapshot) return false;
-            const canonicalRoom = value => {
-                if (typeof value !== 'string') return null;
-                if (value.trim().toLowerCase() === 'global') return 'global';
-                const upper = value.trim().toUpperCase();
-                return /^[A-Z0-9]{6}$/.test(upper) ? upper : null;
-            };
-            if (!canonicalRoom(current.serverCode) ||
-                canonicalRoom(current.serverCode) !== canonicalRoom(snapshot.serverCode)) return false;
-            const fields = kind === 'metadata' || kind === 'details'
-                ? ['metadataVersion', 'description', 'rules']
-                : (kind === 'pins' || kind === 'pin'
-                    ? ['pinVersion', 'pinCount', 'blockVersion']
-                    : []);
-            if (!fields.length) return false;
-            return fields.every(field => current[field] === snapshot[field]);
-        },
-
-        createScopedGenerationCoordinator() {
-            let socketGeneration = 0;
-            const scopes = new Map();
-            const identities = new Map();
-            return {
-                begin(scope, identity) {
-                    if (typeof scope !== 'string' || !scope) return null;
-                    const generation = (scopes.get(scope) || 0) + 1;
-                    scopes.set(scope, generation);
-                    identities.set(scope, identity);
-                    return Object.freeze({ scope, identity, generation, socketGeneration });
-                },
-                isCurrent(token, identity) {
-                    return Boolean(token && token.socketGeneration === socketGeneration &&
-                        token.generation === scopes.get(token.scope) &&
-                        token.identity === identities.get(token.scope) && token.identity === identity);
-                },
-                invalidate(scope) {
-                    if (typeof scope !== 'string' || !scope) return;
-                    scopes.set(scope, (scopes.get(scope) || 0) + 1);
-                    identities.delete(scope);
-                },
-                invalidateAll() {
-                    socketGeneration += 1;
-                    for (const [scope, generation] of scopes) scopes.set(scope, generation + 1);
-                    identities.clear();
-                    scopes.clear();
-                },
-                current(scope) {
-                    return { socketGeneration, generation: scopes.get(scope) || 0, identity: identities.get(scope) };
-                }
-            };
-        },
-
-        createRecentIdSet(limit = 256) {
-            const maximum = Number.isInteger(limit) && limit > 0 ? limit : 256;
-            const entries = new Map();
-            const cursorValue = cursor => {
-                const timestamp = new Date(cursor && (cursor.timestamp ?? cursor.lastReadAt)).getTime();
-                const messageId = String(cursor && (cursor.messageId ?? cursor.lastReadMessageId) || '');
-                return Number.isFinite(timestamp) && messageId ? { timestamp, messageId } : null;
-            };
-            const compare = (left, right) => {
-                const a = cursorValue(left);
-                const b = cursorValue(right);
-                if (!a || !b) return null;
-                if (a.timestamp !== b.timestamp) return a.timestamp < b.timestamp ? -1 : 1;
-                return a.messageId === b.messageId ? 0 : (a.messageId < b.messageId ? -1 : 1);
-            };
-            return {
-                add(id, cursor = null) {
-                    const key = typeof id === 'string' ? id : '';
-                    if (!key || entries.has(key)) return false;
-                    entries.set(key, cursorValue(cursor));
-                    while (entries.size > maximum) entries.delete(entries.keys().next().value);
-                    return true;
-                },
-                has(id) { return entries.has(id); },
-                clear() { entries.clear(); },
-                clearAtOrBefore(cursor) {
-                    for (const [id, storedCursor] of entries) {
-                        const order = compare(storedCursor, cursor);
-                        if (order !== null && order <= 0) entries.delete(id);
-                    }
-                },
-                values() { return [...entries.keys()]; },
-                get size() { return entries.size; }
-            };
-        },
-
-        applyRoomActivity(state, activity, recentIds) {
-            if (!state || !activity || !recentIds || typeof recentIds.has !== 'function' ||
-                typeof recentIds.add !== 'function') return state;
-            const canonical = value => {
-                if (typeof value !== 'string') return null;
-                if (value.toLowerCase() === 'global') return 'global';
-                return /^[A-Z0-9]{6}$/.test(value.toUpperCase()) ? value.toUpperCase() : null;
-            };
-            const room = canonical(state.serverCode);
-            const activityRoom = canonical(activity.serverCode);
-            const messageId = typeof activity.messageId === 'string' ? activity.messageId : '';
-            const timestamp = new Date(activity.timestamp).getTime();
-            if (!room || room !== activityRoom || !messageId || !Number.isFinite(timestamp) ||
-                !Number.isInteger(state.blockVersion) || activity.blockVersion !== state.blockVersion ||
-                recentIds.has(messageId)) return state;
-            const cursorTimestamp = state.lastReadAt == null ? -Infinity : new Date(state.lastReadAt).getTime();
-            const cursorId = state.lastReadMessageId == null ? '' : String(state.lastReadMessageId);
-            if (!Number.isFinite(cursorTimestamp) && cursorTimestamp !== -Infinity) return state;
-            if (timestamp < cursorTimestamp || (timestamp === cursorTimestamp && messageId <= cursorId)) return state;
-            const countedThroughTimestamp = state.countedThroughAt == null
-                ? -Infinity : new Date(state.countedThroughAt).getTime();
-            const countedThroughId = state.countedThroughMessageId == null
-                ? '' : String(state.countedThroughMessageId);
-            if (!Number.isFinite(countedThroughTimestamp) && countedThroughTimestamp !== -Infinity) return state;
-            if (timestamp < countedThroughTimestamp ||
-                (timestamp === countedThroughTimestamp && messageId <= countedThroughId)) return state;
-            if (!recentIds.add(messageId, { timestamp: activity.timestamp, messageId })) return state;
-            return {
-                ...state,
-                unreadCount: (Number.isInteger(state.unreadCount) && state.unreadCount >= 0 ? state.unreadCount : 0) + 1,
-                mentionCount: (Number.isInteger(state.mentionCount) && state.mentionCount >= 0 ? state.mentionCount : 0) +
-                    (activity.mentioned === true ? 1 : 0)
-            };
-        },
-
-        attentionPresentation(state) {
-            const hidden = { badgeText: '', ariaLabel: '', title: '', visible: false };
-            if (!state || !['all', 'mentions', 'none'].includes(state.notificationLevel)) return hidden;
-            const unread = Number.isInteger(state.unreadCount) && state.unreadCount > 0 ? state.unreadCount : 0;
-            const mentions = Number.isInteger(state.mentionCount) && state.mentionCount > 0 ? state.mentionCount : 0;
-            if (state.notificationLevel === 'none') return hidden;
-            if (mentions > 0) {
-                const mentionText = `${mentions} mention${mentions === 1 ? '' : 's'}`;
-                return {
-                    badgeText: `@${mentions > 99 ? '99+' : mentions}`,
-                    ariaLabel: mentionText,
-                    title: state.notificationLevel === 'all' && unread > 0
-                        ? `${mentionText}, ${unread} unread message${unread === 1 ? '' : 's'}`
-                        : mentionText,
-                    visible: true
-                };
-            }
-            if (state.notificationLevel !== 'all' || unread === 0) return hidden;
-            const unreadText = `${unread} unread message${unread === 1 ? '' : 's'}`;
-            return {
-                badgeText: unread > 99 ? '99+' : String(unread),
-                ariaLabel: unreadText,
-                title: unreadText,
-                visible: true
-            };
-        },
-
-        soundPolicy(level, mentioned, blocked = false) {
-            if (blocked) return null;
-            if (level === 'all') return mentioned ? 'ping' : 'msg';
-            if (level === 'mentions' && mentioned) return 'ping';
-            return null;
-        },
-
-        isMarkReadEligible(context) {
-            if (!context || !context.roomCode || context.currentRoom !== context.roomCode ||
-                context.visibilityState !== 'visible' || context.nearBottom !== true) return false;
-            const suppression = context.suppressionToken;
-            return !(suppression && suppression.roomCode === context.roomCode &&
-                suppression.roomGeneration === context.roomGeneration);
-        },
-
-        releaseExactToken(currentToken, ownerToken) {
-            return currentToken === ownerToken ? null : currentToken;
-        },
-
-        sameSuppressionOwner(leftToken, rightToken) {
-            if (!leftToken || !rightToken) return false;
-            const leftOwner = leftToken.ownerToken || leftToken;
-            const rightOwner = rightToken.ownerToken || rightToken;
-            return leftOwner === rightOwner;
-        },
-
-        rebindSuppressionToken(token, roomCode, roomGeneration, blockVersion = token?.blockVersion) {
-            if (!token || token.roomCode !== roomCode ||
-                !Number.isInteger(roomGeneration) || roomGeneration <= 0) return token;
-            const rebound = {
-                ...token,
-                ownerToken: token.ownerToken || token,
-                roomCode,
-                roomGeneration
-            };
-            if (Number.isInteger(blockVersion) && blockVersion >= 0) {
-                rebound.blockVersion = blockVersion;
-            }
-            return Object.freeze(rebound);
-        },
-
-        scheduleAfterScrollFrame(scheduleFrame, callback) {
-            if (typeof scheduleFrame !== 'function' || typeof callback !== 'function') return false;
-            scheduleFrame(() => scheduleFrame(callback));
-            return true;
-        },
-
-        createOperationReceiptCoordinator() {
-            let nextRequestId = 0;
-            const currentByKind = new Map();
-            return {
-                begin(kind, identity) {
-                    if (!kind || !identity) return null;
-                    const token = Object.freeze({ kind, identity, requestId: ++nextRequestId });
-                    currentByKind.set(kind, { token, eventSettled: false });
-                    return token;
-                },
-                canFinish(token, identity) {
-                    const entry = token && currentByKind.get(token.kind);
-                    return Boolean(entry && entry.token === token && token.identity === identity);
-                },
-                settleFromEvent(token, identity) {
-                    if (!this.canFinish(token, identity)) return false;
-                    currentByKind.get(token.kind).eventSettled = true;
-                    return true;
-                },
-                finish(token, identity) {
-                    if (!this.canFinish(token, identity)) return false;
-                    currentByKind.delete(token.kind);
-                    return true;
-                },
-                invalidate(kind) { currentByKind.delete(kind); }
-            };
-        },
-
-        messageActionsFor(context = {}) {
-            const actions = [];
-            const active = context.timedOut !== true;
-            if (active && context.canReply) actions.push('reply');
-            if (active && context.canReact) actions.push('react');
-            if (active && context.canManagePins) actions.push(context.pinned ? 'unpin' : 'pin');
-            if (active && context.canEdit) actions.push('edit');
-            if (context.canReport) actions.push('report');
-            if (context.canDelete && (active || context.isOwn === true)) actions.push('delete');
-            return actions;
-        },
-
-        syncPinActionControls(controls, snapshot, event = null) {
-            const candidates = [...(controls || [])];
-            const setState = (control, pinned) => {
-                if (!control || !control.dataset) return false;
-                control.dataset.pinned = pinned ? 'true' : 'false';
-                control.textContent = pinned ? 'Unpin' : 'Pin';
-                return true;
-            };
-            if (event && typeof event.messageId === 'string' &&
-                typeof event.pinned === 'boolean') {
-                let updated = 0;
-                for (const control of candidates) {
-                    if (control?.dataset?.messageId !== event.messageId) continue;
-                    if (setState(control, event.pinned)) updated += 1;
-                }
-                return updated;
-            }
-            if (!snapshot?.pinsLoaded || !Array.isArray(snapshot.pins)) return 0;
-            const pinnedIds = new Set(snapshot.pins
-                .map(pin => String(pin?.messageId || ''))
-                .filter(Boolean));
-            let updated = 0;
-            for (const control of candidates) {
-                if (!control?.dataset?.messageId) continue;
-                if (setState(control, pinnedIds.has(control.dataset.messageId))) updated += 1;
-            }
-            return updated;
-        },
-
-        blockActionFor(context = {}) {
-            if (!context.username || context.isSelf) return null;
-            return context.blocked
-                ? { action: 'unblock', label: 'Unblock', blocked: false }
-                : { action: 'block', label: 'Block', blocked: true };
-        },
-
-        createFocusDialogController({ dialog, documentTarget, getInitialFocus, onOpen, onClose } = {}) {
-            let trigger = null;
-            let open = false;
-            const target = documentTarget || (dialog && dialog.ownerDocument);
-            const handleKeydown = event => {
-                if (!open || event.key !== 'Escape') return;
-                if (typeof event.preventDefault === 'function') event.preventDefault();
-                controller.close();
-            };
-            const controller = {
-                open(nextTrigger = null) {
-                    if (!dialog) return false;
-                    trigger = nextTrigger || (target && target.activeElement) || null;
-                    open = true;
-                    dialog.hidden = false;
-                    dialog.classList.add('active');
-                    dialog.setAttribute('aria-hidden', 'false');
-                    if (target && typeof target.addEventListener === 'function') {
-                        target.addEventListener('keydown', handleKeydown);
-                    }
-                    if (typeof onOpen === 'function') onOpen();
-                    const initial = typeof getInitialFocus === 'function' ? getInitialFocus() : null;
-                    if (initial && typeof initial.focus === 'function') initial.focus();
-                    return true;
-                },
-                close() {
-                    if (!dialog || !open) return false;
-                    open = false;
-                    dialog.classList.remove('active');
-                    dialog.hidden = true;
-                    dialog.setAttribute('aria-hidden', 'true');
-                    if (target && typeof target.removeEventListener === 'function') {
-                        target.removeEventListener('keydown', handleKeydown);
-                    }
-                    if (typeof onClose === 'function') onClose();
-                    const restore = trigger;
-                    trigger = null;
-                    if (restore && restore.isConnected !== false && typeof restore.focus === 'function') restore.focus();
-                    return true;
-                },
-                isOpen() { return open; },
-                handleKeydown
-            };
-            return controller;
-        },
-
-        createMenuController({ menu, documentTarget, getItems, onOpen, onClose } = {}) {
-            let trigger = null;
-            let open = false;
-            const target = documentTarget || (menu && menu.ownerDocument);
-            const items = () => {
-                const candidates = typeof getItems === 'function'
-                    ? getItems()
-                    : (menu && typeof menu.querySelectorAll === 'function'
-                        ? menu.querySelectorAll('button, [role="menuitem"]') : []);
-                return [...(candidates || [])].filter(item => !item.disabled && item.hidden !== true);
-            };
-            const handleKeydown = event => {
-                if (!open || event.key !== 'Escape') return;
-                if (typeof event.preventDefault === 'function') event.preventDefault();
-                controller.close(true);
-            };
-            const handlePointer = event => {
-                if (!open) return;
-                const insideMenu = menu && typeof menu.contains === 'function' && menu.contains(event.target);
-                const insideTrigger = trigger && typeof trigger.contains === 'function' && trigger.contains(event.target);
-                if (!insideMenu && !insideTrigger) controller.close(true);
-            };
-            const controller = {
-                open(nextTrigger) {
-                    if (!menu || !nextTrigger) return false;
-                    if (open && trigger !== nextTrigger) controller.close(false);
-                    trigger = nextTrigger;
-                    open = true;
-                    menu.hidden = false;
-                    menu.classList.add('show');
-                    menu.setAttribute('aria-hidden', 'false');
-                    trigger.setAttribute('aria-expanded', 'true');
-                    if (target && typeof target.addEventListener === 'function') {
-                        target.addEventListener('keydown', handleKeydown);
-                        target.addEventListener('pointerdown', handlePointer);
-                    }
-                    if (typeof onOpen === 'function') onOpen(trigger);
-                    const first = items()[0];
-                    if (first && typeof first.focus === 'function') first.focus();
-                    return true;
-                },
-                close(restoreFocus = true) {
-                    if (!menu || !open) return false;
-                    open = false;
-                    menu.classList.remove('show');
-                    menu.hidden = true;
-                    menu.setAttribute('aria-hidden', 'true');
-                    if (trigger) trigger.setAttribute('aria-expanded', 'false');
-                    if (target && typeof target.removeEventListener === 'function') {
-                        target.removeEventListener('keydown', handleKeydown);
-                        target.removeEventListener('pointerdown', handlePointer);
-                    }
-                    if (typeof onClose === 'function') onClose();
-                    const restore = trigger;
-                    trigger = null;
-                    if (restoreFocus && restore && restore.isConnected !== false &&
-                        typeof restore.focus === 'function') restore.focus();
-                    return true;
-                },
-                toggle(nextTrigger) {
-                    return open && trigger === nextTrigger ? controller.close(true) : controller.open(nextTrigger);
-                },
-                handleTriggerKeydown(event, nextTrigger) {
-                    if (!event || !['Enter', ' ', 'ArrowDown'].includes(event.key)) return false;
-                    if (typeof event.preventDefault === 'function') event.preventDefault();
-                    controller.open(nextTrigger);
-                    return true;
-                },
-                isOpen() { return open; },
-                trigger() { return trigger; }
-            };
-            return controller;
-        },
-
-        headerLayoutContract(width, textScale = 1) {
-            const breakpoint = 700;
-            const targetSize = 44;
-            const gap = 4;
-            const safeWidth = Number.isFinite(width) && width > 0 ? width : 320;
-            const mobile = safeWidth <= breakpoint;
-            const visible = mobile
-                ? ['room-info-btn', 'pins-btn', 'header-overflow-btn']
-                : ['room-info-btn', 'pins-btn'];
-            const total = mobile ? (targetSize * 3) + (gap * 2) : (targetSize * 2) + gap;
-            const left = Math.max(0, safeWidth - total);
-            const slots = visible.map((id, index) => {
-                const slotLeft = left + index * (targetSize + gap);
-                return {
-                    id,
-                    left: slotLeft,
-                    right: slotLeft + targetSize,
-                    width: targetSize,
-                    height: targetSize
-                };
-            });
-            return { breakpoint, targetSize, gap, textScale, mobile, visible, slots };
         },
 
         createDialogRequestCoordinator({ onPendingChange = () => {} } = {}) {
@@ -1656,10 +1013,10 @@
                 bannedRooms = new Set(Array.isArray(rooms) ? rooms : []);
                 renderAccess([...bannedRooms]);
             };
-            const requestRoom = (code, options) => {
+            const requestRoom = code => {
                 if (!code || bannedRooms.has(code)) return false;
-                const result = requestSwitch(code, options);
-                return result && typeof result === 'object' ? result : true;
+                requestSwitch(code);
+                return true;
             };
             return {
                 replaceBannedRooms,
@@ -1893,7 +1250,6 @@
             currentServerCode,
             targetServerCode,
             response,
-            acceptedBlockVersion,
             showAlert,
             applySuccess
         }) {
@@ -1902,76 +1258,28 @@
                 showAlert('Error', normalizedResponse.error);
                 return { accepted: false, currentServerCode, response: normalizedResponse };
             }
-            if (Number.isInteger(acceptedBlockVersion)) {
-                const pinBlockVersion = normalizedResponse.pin?.blockVersion;
-                const notificationBlockVersion = normalizedResponse.notification?.blockVersion;
-                const matchesBlockAuthority = pinBlockVersion === acceptedBlockVersion &&
-                    (normalizedResponse.notification == null ||
-                        notificationBlockVersion === acceptedBlockVersion);
-                if (!matchesBlockAuthority) {
-                    return {
-                        accepted: false,
-                        stale: true,
-                        currentServerCode,
-                        response: normalizedResponse
-                    };
-                }
-            }
             applySuccess(targetServerCode, normalizedResponse);
             return { accepted: true, currentServerCode: targetServerCode, response: normalizedResponse };
         },
 
         createSwitchCoordinator(emitSwitch, handleResult) {
-            let inFlightRequest = null;
-            let queuedRequest = null;
-            let nextRequestId = 0;
-            let epoch = 0;
+            let inFlightTarget = null;
+            let queuedTarget = null;
 
-            const cancellationContextFor = request => request ? Object.freeze({
-                target: request.target,
-                token: request.token,
-                forceRefresh: request.options.forceRefresh === true,
-                suppressAutoRead: request.options.suppressAutoRead === true,
-                suppressionToken: request.options.suppressionToken || null
-            }) : null;
-
-            const cancelRequest = (request, reason, activeRequest = null) => {
-                if (!request || request.cancelled === true) return;
-                request.cancelled = true;
-                if (typeof request.options.onCancel !== 'function') return;
-                request.options.onCancel(
-                    reason,
-                    request.token,
-                    cancellationContextFor(activeRequest)
-                );
-            };
-
-            const start = request => {
-                inFlightRequest = request;
-                emitSwitch(request.target, result => {
-                    if (request.epoch !== epoch || inFlightRequest !== request) return;
-                    let handledOutcome = null;
+            const start = target => {
+                inFlightTarget = target;
+                emitSwitch(target, result => {
                     try {
-                        handledOutcome = handleResult(
-                            request.target,
-                            result,
-                            request.token,
-                            request.options
-                        );
+                        handleResult(target, result);
                     } finally {
-                        const completedRequest = inFlightRequest;
-                        const completedSuccessfully = Boolean(result && !result.error) &&
-                            handledOutcome?.accepted !== false;
-                        const nextRequest = queuedRequest;
-                        inFlightRequest = null;
-                        queuedRequest = null;
-                        if (nextRequest !== null) {
-                            if (completedSuccessfully && nextRequest.target === completedRequest.target &&
-                                nextRequest.options.forceRefresh !== true) {
-                                cancelRequest(nextRequest, 'coalesced');
-                            } else {
-                                start(nextRequest);
-                            }
+                        const completedTarget = inFlightTarget;
+                        const completedSuccessfully = Boolean(result && !result.error);
+                        const nextTarget = queuedTarget;
+                        inFlightTarget = null;
+                        queuedTarget = null;
+                        if (nextTarget !== null &&
+                            !(completedSuccessfully && nextTarget === completedTarget)) {
+                            start(nextTarget);
                         }
                     }
                 });
@@ -1979,24 +1287,14 @@
 
             return {
                 isPending() {
-                    return inFlightRequest !== null;
+                    return inFlightTarget !== null;
                 },
-                request(target, options = {}) {
-                    const token = Object.freeze({ epoch, requestId: ++nextRequestId, target });
-                    const request = { target, token, options: { ...options }, epoch };
-                    if (inFlightRequest !== null) {
-                        const displacedRequest = queuedRequest;
-                        queuedRequest = request;
-                        cancelRequest(displacedRequest, 'replaced', inFlightRequest);
-                        return token;
+                request(target) {
+                    if (inFlightTarget !== null) {
+                        queuedTarget = target;
+                        return;
                     }
-                    start(request);
-                    return token;
-                },
-                invalidate() {
-                    epoch += 1;
-                    inFlightRequest = null;
-                    queuedRequest = null;
+                    start(target);
                 }
             };
         },
@@ -2142,25 +1440,6 @@
     let moderatorCenterTab = 'reports';
     const moderatorCenterCursors = { reports: null, restrictions: null, audit: null };
     const compositionContextCoordinator = ChatClientHelpers.createCompositionContextCoordinator();
-    const featureGenerations = ChatClientHelpers.createScopedGenerationCoordinator();
-    const operationReceipts = ChatClientHelpers.createOperationReceiptCoordinator();
-    const roomDetailsByCode = new Map();
-    const pinsByRoom = new Map();
-    const roomStateByCode = new Map();
-    const attentionByRoom = new Map();
-    const recentActivityIdsByRoom = new Map();
-    const blockedUsersByKey = new Map();
-    let acceptedBlockVersion = -1;
-    let acceptedBlockState = null;
-    let currentRoomGeneration = 0;
-    let readSuppressionToken = null;
-    let markReadFramePending = false;
-    let currentRestrictionState = Object.freeze({
-        roomCode: null,
-        timedOut: false,
-        timeoutUntil: null,
-        version: 0
-    });
 
     let isLoginMode = true;
     let typingTimeout;
@@ -2168,301 +1447,6 @@
     
     let editingMsgId = null;
     let replyingToData = null; 
-
-    function clearFeatureStateForSocketReplacement() {
-        featureGenerations.invalidateAll();
-        roomSwitchCoordinator.invalidate();
-        roomDetailsByCode.clear();
-        pinsByRoom.clear();
-        roomStateByCode.clear();
-        attentionByRoom.clear();
-        recentActivityIdsByRoom.clear();
-        blockedUsersByKey.clear();
-        acceptedBlockVersion = -1;
-        acceptedBlockState = null;
-        currentRoomGeneration = 0;
-        readSuppressionToken = null;
-        markReadFramePending = false;
-        currentRestrictionState = Object.freeze({
-            roomCode: null,
-            timedOut: false,
-            timeoutUntil: null,
-            version: 0
-        });
-        if (pendingMetadataOperation) roomInfoSave.disabled = false;
-        if (pendingPinOperation?.control?.isConnected) pendingPinOperation.control.disabled = false;
-        pendingMetadataOperation = null;
-        pendingPinOperation = null;
-        pendingBlockOperation = null;
-        for (const kind of ['metadata', 'pin', 'block']) operationReceipts.invalidate(kind);
-    }
-
-    function replaceFeatureStateFromLogin(response) {
-        roomDetailsByCode.clear();
-        pinsByRoom.clear();
-        roomStateByCode.clear();
-        attentionByRoom.clear();
-        recentActivityIdsByRoom.clear();
-        blockedUsersByKey.clear();
-        acceptedBlockState = ChatClientHelpers.acceptVersionedState(null, response.blockState, 'blocks');
-        acceptedBlockVersion = acceptedBlockState?.blockVersion ?? -1;
-        for (const entry of acceptedBlockState?.blockedUsers || []) {
-            blockedUsersByKey.set(entry.usernameKey, entry);
-        }
-        for (const room of Array.isArray(response.servers) ? response.servers : []) {
-            if (!room?.pin || room.pin.blockVersion !== acceptedBlockVersion) continue;
-            const pin = ChatClientHelpers.acceptVersionedState(null, room.pin, 'pins');
-            if (pin) pinsByRoom.set(pin.serverCode, { ...pin, pinsLoaded: false, pins: [] });
-        }
-        for (const snapshot of Array.isArray(response.roomStates) ? response.roomStates : []) {
-            if (snapshot?.blockVersion !== acceptedBlockVersion) continue;
-            const state = ChatClientHelpers.acceptVersionedState(null, snapshot, 'room-state');
-            if (!state) continue;
-            roomStateByCode.set(state.serverCode, state);
-            attentionByRoom.set(state.serverCode, state);
-            recentIdsForRoom(state.serverCode);
-        }
-        renderBlockedUsers();
-    }
-
-    function invalidateRoomScopedFeatureCallbacks() {
-        for (const scope of [
-            'room-info', 'room-info-save', 'pins', 'pin-action', 'reveal',
-            'mark-read', 'room-notification'
-        ]) featureGenerations.invalidate(scope);
-        operationReceipts.invalidate('metadata');
-        operationReceipts.invalidate('pin');
-        if (pendingMetadataOperation) roomInfoSave.disabled = false;
-        if (pendingPinOperation?.control?.isConnected) pendingPinOperation.control.disabled = false;
-        pendingMetadataOperation = null;
-        pendingPinOperation = null;
-    }
-
-    function invalidateAllFeatureCallbacksExceptBlock() {
-        invalidateRoomScopedFeatureCallbacks();
-        for (const scope of ['room-switch', 'joined-room-info']) featureGenerations.invalidate(scope);
-    }
-
-    function replaceActiveMessagesWithBlockRefreshState() {
-        if (!currentServerCode) return;
-        cancelAction();
-        chatWindow.textContent = '';
-        const status = ChatClientHelpers.appendTextElement(
-            document,
-            chatWindow,
-            'div',
-            'system-msg block-refresh-state',
-            'Refreshing messages…'
-        );
-        status.dataset.blockRefresh = 'true';
-    }
-
-    function renderBlockedUsers() {
-        const list = document.getElementById('blocked-users-list');
-        const empty = document.getElementById('blocked-users-empty');
-        if (!list || !empty) return;
-        list.textContent = '';
-        empty.hidden = blockedUsersByKey.size !== 0;
-        for (const entry of blockedUsersByKey.values()) {
-            const row = document.createElement('div');
-            row.className = 'blocked-user-row';
-            ChatClientHelpers.appendTextElement(document, row, 'span', '', `@${entry.username}`);
-            const button = ChatClientHelpers.appendTextElement(document, row, 'button', 'btn-primary btn-secondary', 'Unblock');
-            button.type = 'button';
-            button.dataset.usernameKey = entry.usernameKey;
-            button.onclick = () => setUserBlocked(entry.username, false, button);
-            list.appendChild(row);
-        }
-    }
-
-    function applyAcceptedBlockState(incoming) {
-        const next = ChatClientHelpers.acceptVersionedState(acceptedBlockState, incoming, 'blocks');
-        if (next === acceptedBlockState) return false;
-        replaceActiveMessagesWithBlockRefreshState();
-        acceptedBlockState = next;
-        acceptedBlockVersion = next.blockVersion;
-        blockedUsersByKey.clear();
-        for (const entry of next.blockedUsers) {
-            blockedUsersByKey.set(entry.usernameKey, entry);
-        }
-        pinsByRoom.clear();
-        document.getElementById('pins-list').textContent = '';
-        closePins();
-        recentActivityIdsByRoom.clear();
-        typingUsers.clear();
-        updateTypingUI();
-        invalidateAllFeatureCallbacksExceptBlock();
-        closeRoleManager();
-        renderBlockedUsers();
-        return true;
-    }
-
-    function acceptRoomDetailsSnapshot(incoming) {
-        if (!incoming || !incoming.serverCode) return false;
-        const current = roomDetailsByCode.get(incoming.serverCode) || null;
-        const next = ChatClientHelpers.acceptVersionedState(current, incoming, 'metadata');
-        if (!next || next === current) return false;
-        roomDetailsByCode.set(next.serverCode, next);
-        if (currentServerCode === next.serverCode) renderRoomInfo();
-        return true;
-    }
-
-    function recentIdsForRoom(serverCode) {
-        if (!recentActivityIdsByRoom.has(serverCode)) {
-            recentActivityIdsByRoom.set(serverCode, ChatClientHelpers.createRecentIdSet());
-        }
-        return recentActivityIdsByRoom.get(serverCode);
-    }
-
-    function renderRoomAttention(serverCode) {
-        const state = attentionByRoom.get(serverCode) || roomStateByCode.get(serverCode);
-        const icon = document.getElementById(`srv-${serverCode}`);
-        if (!icon || !state) return;
-        const presentation = ChatClientHelpers.attentionPresentation(state);
-        let badge = icon.querySelector('.room-attention-badge');
-        if (!presentation.visible) {
-            if (badge) badge.remove();
-            icon.removeAttribute('aria-describedby');
-            return;
-        }
-        if (!badge) {
-            badge = document.createElement('span');
-            badge.className = 'room-attention-badge';
-            badge.id = `room-attention-${serverCode}`;
-            icon.appendChild(badge);
-        }
-        badge.textContent = presentation.badgeText;
-        badge.setAttribute('aria-label', presentation.ariaLabel);
-        badge.title = presentation.title;
-        icon.setAttribute('aria-describedby', badge.id);
-    }
-
-    function acceptRoomStateSnapshot(incoming) {
-        if (!incoming || incoming.blockVersion !== acceptedBlockVersion) return false;
-        const current = roomStateByCode.get(incoming.serverCode) || null;
-        const next = ChatClientHelpers.acceptVersionedState(current, incoming, 'room-state');
-        if (!next) return false;
-        if (next !== current) {
-            roomStateByCode.set(next.serverCode, next);
-            attentionByRoom.set(next.serverCode, next);
-            recentIdsForRoom(next.serverCode).clearAtOrBefore({
-                timestamp: next.countedThroughAt ?? next.lastReadAt,
-                messageId: next.countedThroughMessageId ?? next.lastReadMessageId
-            });
-        }
-        renderRoomAttention(next.serverCode);
-        return true;
-    }
-
-    function acceptPinSnapshot(incoming) {
-        const snapshot = incoming && incoming.pin ? incoming.pin : incoming;
-        if (!snapshot || snapshot.blockVersion !== acceptedBlockVersion) return false;
-        const current = pinsByRoom.get(snapshot.serverCode) || null;
-        const next = ChatClientHelpers.acceptVersionedState(current, snapshot, 'pins');
-        const idempotent = Boolean(current) && ['serverCode', 'pinCount', 'pinVersion', 'blockVersion']
-            .every(field => current[field] === snapshot[field]);
-        if (!next || (next === current && !idempotent)) return false;
-        if (next !== current) pinsByRoom.set(next.serverCode, { ...next, pinsLoaded: false, pins: [] });
-        updatePinsButton();
-        return true;
-    }
-
-    function applyRoomActivitySnapshot(activity) {
-        if (!activity || activity.blockVersion !== acceptedBlockVersion) return false;
-        const current = roomStateByCode.get(activity.serverCode);
-        if (!current) return false;
-        const next = ChatClientHelpers.applyRoomActivity(
-            current,
-            activity,
-            recentIdsForRoom(activity.serverCode)
-        );
-        if (next === current) return false;
-        roomStateByCode.set(activity.serverCode, next);
-        attentionByRoom.set(activity.serverCode, next);
-        renderRoomAttention(activity.serverCode);
-        return true;
-    }
-
-    function disarmReadSuppression(token = readSuppressionToken) {
-        if (!token) return false;
-        const nextToken = ChatClientHelpers.releaseExactToken(readSuppressionToken, token);
-        if (nextToken === readSuppressionToken) return false;
-        readSuppressionToken = nextToken;
-        return true;
-    }
-
-    function scheduleMaybeMarkCurrentRoomRead() {
-        if (markReadFramePending) return;
-        markReadFramePending = true;
-        scheduleAnimationFrame(() => {
-            markReadFramePending = false;
-            maybeMarkCurrentRoomRead();
-        });
-    }
-
-    function maybeMarkCurrentRoomRead() {
-        const roomCode = currentServerCode;
-        if (!ChatClientHelpers.isMarkReadEligible({
-            currentRoom: currentServerCode,
-            roomCode,
-            visibilityState: document.visibilityState,
-            nearBottom: ChatClientHelpers.isNearScrollEnd(chatWindow),
-            roomGeneration: currentRoomGeneration,
-            suppressionToken: readSuppressionToken
-        })) return false;
-        const messages = chatWindow.querySelectorAll('.msg[data-id]');
-        const lastMessage = messages[messages.length - 1];
-        const messageId = lastMessage?.dataset.id;
-        if (!messageId) return false;
-        const identity = `${roomCode}:${currentRoomGeneration}:${messageId}`;
-        const token = featureGenerations.begin('mark-read', identity);
-        socket.emit('mark_room_read', { serverCode: roomCode, messageId }, response => {
-            if (!featureGenerations.isCurrent(token, identity)) return;
-            response = response || { error: 'No response from server.' };
-            if (response.error) return;
-            acceptRoomStateSnapshot(response);
-        });
-        return true;
-    }
-
-    function handleRoomRefreshRequired(data, activeSocket = socket) {
-        if (activeSocket !== socket) return;
-        if (!data || data.serverCode !== currentServerCode ||
-            data.blockVersion !== acceptedBlockVersion || currentRoomGeneration <= 0) return;
-        const suppressionToken = Object.freeze({
-            roomCode: data.serverCode,
-            roomGeneration: currentRoomGeneration,
-            blockVersion: data.blockVersion
-        });
-        readSuppressionToken = suppressionToken;
-        const releaseSuppressionOwner = (_reason, _requestToken, activeRequest) => {
-            const ownedToken = ChatClientHelpers.sameSuppressionOwner(
-                readSuppressionToken,
-                suppressionToken
-            ) ? readSuppressionToken : null;
-            if (!ownedToken) return;
-            const activeSuppressionToken = activeRequest?.suppressionToken;
-            const canTransferToActiveRefresh = activeRequest?.target === data.serverCode &&
-                activeRequest.forceRefresh === true && activeRequest.suppressAutoRead === true &&
-                activeSuppressionToken?.roomCode === data.serverCode &&
-                activeSuppressionToken.blockVersion === data.blockVersion;
-            if (canTransferToActiveRefresh) {
-                readSuppressionToken = ChatClientHelpers.rebindSuppressionToken(
-                    activeSuppressionToken,
-                    data.serverCode,
-                    currentRoomGeneration
-                );
-                return;
-            }
-            disarmReadSuppression(ownedToken);
-        };
-        requestServerSwitch(data.serverCode, {
-            forceRefresh: true,
-            suppressAutoRead: true,
-            suppressionToken,
-            onCancel: releaseSuppressionOwner
-        });
-    }
 
     const authModal = document.getElementById('auth-modal');
     const authBtn = document.getElementById('auth-btn');
@@ -2478,8 +1462,6 @@
         () => chatWindow,
         prefersReducedMotion
     );
-    chatWindow.addEventListener('scroll', scheduleMaybeMarkCurrentRoomRead, { passive: true });
-    document.addEventListener('visibilitychange', scheduleMaybeMarkCurrentRoomRead);
     const msgInput = document.getElementById('msg-input');
     const sendBtn = document.getElementById('send-btn');
     const attachmentButton = document.getElementById('attachment-btn');
@@ -2495,19 +1477,11 @@
         cancel: timerId => clearTimeout(timerId),
         now: () => Date.now(),
         getCurrentRoom: () => currentServerCode,
-        applyState({ timedOut, timeoutUntil, roomCode, version }) {
-            currentRestrictionState = Object.freeze({
-                roomCode,
-                timedOut,
-                timeoutUntil,
-                version
-            });
+        applyState({ timedOut, timeoutUntil }) {
             const notice = timedOut
                 ? `You are timed out in this room until ${formatExactDate(timeoutUntil)}.`
                 : '';
             setCompositionDisabled(timedOut, notice);
-            syncMessageActionAvailability();
-            if (pinsDialogController.isOpen()) renderPins();
         }
     });
     const roomAccessCoordinator = ChatClientHelpers.createRoomAccessCoordinator({
@@ -2546,412 +1520,6 @@
             document.getElementById('resolution-confirm').disabled = pending;
         }
     });
-    const roomInfoModal = document.getElementById('room-info-modal');
-    const roomDescription = document.getElementById('room-description');
-    const roomRules = document.getElementById('room-rules');
-    const roomNotificationLevel = document.getElementById('room-notification-level');
-    const roomInfoEdit = document.getElementById('room-info-edit');
-    const roomInfoSave = document.getElementById('room-info-save');
-    const pinsModal = document.getElementById('pins-modal');
-    let roomInfoEditing = false;
-    let pendingJoinedRoomInfoIntent = null;
-    let pendingMetadataOperation = null;
-    let pendingPinOperation = null;
-    let pendingBlockOperation = null;
-    let activeRoleMenuController = null;
-    let activeRoleMenuElement = null;
-    const roomInfoDialogController = ChatClientHelpers.createFocusDialogController({
-        dialog: roomInfoModal,
-        documentTarget: document,
-        getInitialFocus: () => document.getElementById('room-info-close'),
-        onClose() {
-            featureGenerations.invalidate('room-info');
-            featureGenerations.invalidate('room-info-save');
-            operationReceipts.invalidate('metadata');
-            pendingMetadataOperation = null;
-            roomInfoSave.disabled = false;
-            roomInfoEditing = false;
-        }
-    });
-    const pinsDialogController = ChatClientHelpers.createFocusDialogController({
-        dialog: pinsModal,
-        documentTarget: document,
-        getInitialFocus: () => document.getElementById('pins-close'),
-        onClose() {
-            featureGenerations.invalidate('pins');
-            featureGenerations.invalidate('pin-action');
-            operationReceipts.invalidate('pin');
-            if (pendingPinOperation?.control?.isConnected) pendingPinOperation.control.disabled = false;
-            pendingPinOperation = null;
-        }
-    });
-    const headerOverflowController = ChatClientHelpers.createMenuController({
-        menu: document.getElementById('header-overflow-menu'),
-        documentTarget: document,
-        getItems: () => document.querySelectorAll('#header-overflow-menu .header-btn:not([hidden])')
-    });
-
-    function renderRoomInfo() {
-        const details = roomDetailsByCode.get(currentServerCode) || {
-            description: '', rules: '', canEdit: false
-        };
-        roomDescription.textContent = details.description || '';
-        roomRules.textContent = details.rules || '';
-        if (!roomInfoEditing) {
-            roomDescription.value = details.description || '';
-            roomRules.value = details.rules || '';
-        }
-        const state = roomStateByCode.get(currentServerCode);
-        roomNotificationLevel.value = state?.notificationLevel || 'all';
-        roomNotificationLevel.disabled = !state;
-        roomDescription.readOnly = !roomInfoEditing;
-        roomRules.readOnly = !roomInfoEditing;
-        roomInfoEdit.hidden = !details.canEdit || roomInfoEditing;
-        roomInfoSave.hidden = !details.canEdit || !roomInfoEditing;
-        document.getElementById('room-info-error').textContent = '';
-    }
-
-    function openRoomInfo(trigger = document.getElementById('room-info-btn')) {
-        const roomCode = currentServerCode;
-        if (!roomCode || !socket) return false;
-        roomInfoEditing = false;
-        renderRoomInfo();
-        roomInfoDialogController.open(trigger);
-        const token = featureGenerations.begin('room-info', roomCode);
-        socket.emit('get_room_details', { serverCode: roomCode }, response => {
-            if (!featureGenerations.isCurrent(token, roomCode)) return;
-            response = response || { error: 'No response from server.' };
-            if (response.error) {
-                document.getElementById('room-info-error').textContent = response.error;
-                return;
-            }
-            acceptRoomDetailsSnapshot(response);
-            renderRoomInfo();
-        });
-        return true;
-    }
-
-    function closeRoomInfo() {
-        return roomInfoDialogController.close();
-    }
-
-    function editRoomInfo() {
-        const details = roomDetailsByCode.get(currentServerCode);
-        if (!details?.canEdit) return;
-        roomInfoEditing = true;
-        renderRoomInfo();
-        roomDescription.focus();
-    }
-
-    function saveRoomInfo() {
-        const roomCode = currentServerCode;
-        const details = roomDetailsByCode.get(roomCode);
-        if (!roomCode || !details?.canEdit) return;
-        const normalized = value => String(value || '').normalize('NFKC').trim();
-        const payload = {
-            serverCode: roomCode,
-            description: normalized(roomDescription.value),
-            rules: normalized(roomRules.value)
-        };
-        const identity = JSON.stringify(payload);
-        const receiptToken = operationReceipts.begin('metadata', identity);
-        const generationToken = featureGenerations.begin('room-info-save', roomCode);
-        pendingMetadataOperation = { receiptToken, generationToken, identity, payload };
-        roomInfoSave.disabled = true;
-        socket.emit('update_room_details', payload, response => {
-            if (!featureGenerations.isCurrent(generationToken, roomCode) ||
-                !operationReceipts.canFinish(receiptToken, identity)) return;
-            response = response || { error: 'No response from server.' };
-            if (response.error) {
-                roomInfoSave.disabled = false;
-                document.getElementById('room-info-error').textContent = response.error;
-                operationReceipts.finish(receiptToken, identity);
-                pendingMetadataOperation = null;
-                return;
-            }
-            acceptRoomDetailsSnapshot(response);
-            operationReceipts.finish(receiptToken, identity);
-            pendingMetadataOperation = null;
-            roomInfoSave.disabled = false;
-            roomInfoEditing = false;
-            renderRoomInfo();
-        });
-    }
-
-    function settleMetadataControlFromEvent(data) {
-        const pending = pendingMetadataOperation;
-        if (!pending || data.serverCode !== pending.payload.serverCode ||
-            data.description !== pending.payload.description || data.rules !== pending.payload.rules ||
-            !operationReceipts.settleFromEvent(pending.receiptToken, pending.identity)) return false;
-        roomInfoSave.disabled = false;
-        roomInfoEditing = false;
-        renderRoomInfo();
-        return true;
-    }
-
-    function isCurrentRoomTimedOut() {
-        return Boolean(currentServerCode &&
-            currentRestrictionState.roomCode === currentServerCode &&
-            currentRestrictionState.timedOut === true);
-    }
-
-    function hasPinManagementRoleInCurrentRoom() {
-        return myRole === 'admin' || myRoomRole === 'mod' ||
-            serversCache[currentServerCode]?.owner === myUsername;
-    }
-
-    function canManagePinsInCurrentRoom() {
-        return !isCurrentRoomTimedOut() && hasPinManagementRoleInCurrentRoom();
-    }
-
-    function configureActiveRoomMutation(control) {
-        if (!control) return control;
-        control.setAttribute('data-active-room-required', 'true');
-        if (isCurrentRoomTimedOut()) {
-            control.hidden = true;
-            if (!control.disabled) control.dataset.timeoutDisabled = 'true';
-            control.disabled = true;
-        }
-        return control;
-    }
-
-    function syncMessageActionAvailability() {
-        const timedOut = isCurrentRoomTimedOut();
-        for (const control of document.querySelectorAll('[data-active-room-required="true"]')) {
-            control.hidden = timedOut;
-            if (timedOut) {
-                if (!control.disabled) control.dataset.timeoutDisabled = 'true';
-                control.disabled = true;
-            } else if (control.dataset.timeoutDisabled === 'true') {
-                control.disabled = false;
-                delete control.dataset.timeoutDisabled;
-            }
-        }
-    }
-
-    function renderPins() {
-        const list = document.getElementById('pins-list');
-        const snapshot = pinsByRoom.get(currentServerCode);
-        list.textContent = '';
-        if (!snapshot?.pinsLoaded) {
-            ChatClientHelpers.appendTextElement(document, list, 'p', 'empty-state', 'Loading pinned messages…');
-            return;
-        }
-        if (!snapshot.pins.length) {
-            ChatClientHelpers.appendTextElement(document, list, 'p', 'empty-state', 'No pinned messages.');
-            return;
-        }
-        const canManagePins = canManagePinsInCurrentRoom();
-        for (const pin of snapshot.pins) {
-            const row = document.createElement('article');
-            row.className = 'pin-row';
-            const summary = document.createElement('div');
-            summary.className = 'pin-summary';
-            ChatClientHelpers.appendTextElement(document, summary, 'strong', '', pin.displayName || pin.username || 'Member');
-            ChatClientHelpers.appendTextElement(
-                document,
-                summary,
-                'span',
-                '',
-                pin.text || pin.attachmentSummary || 'Pinned message'
-            );
-            row.appendChild(summary);
-            if (canManagePins) {
-                const unpin = ChatClientHelpers.appendTextElement(document, row, 'button', 'ctx-btn danger', 'Unpin');
-                unpin.type = 'button';
-                unpin.onclick = () => setMessagePinned(pin.messageId, false, unpin);
-            }
-            list.appendChild(row);
-        }
-    }
-
-    function openPins(trigger = document.getElementById('pins-btn')) {
-        const roomCode = currentServerCode;
-        if (!roomCode || !socket) return false;
-        featureGenerations.invalidate('pins');
-        pinsDialogController.open(trigger);
-        renderPins();
-        const token = featureGenerations.begin('pins', roomCode);
-        const context = compositionContextCoordinator.current();
-        socket.emit('list_pinned_messages', {
-            serverCode: roomCode,
-            clientContextId: context.clientContextId
-        }, response => {
-            if (!featureGenerations.isCurrent(token, roomCode)) return;
-            response = response || { error: 'No response from server.' };
-            if (response.error) {
-                const list = document.getElementById('pins-list');
-                list.textContent = '';
-                ChatClientHelpers.appendTextElement(document, list, 'p', 'moderation-error', response.error);
-                return;
-            }
-            const current = pinsByRoom.get(roomCode);
-            const hydrated = ChatClientHelpers.acceptPinBodies(current, {
-                ...response,
-                requestTokenCurrent: true
-            });
-            if (hydrated === current) return;
-            pinsByRoom.set(roomCode, hydrated);
-            syncMessagePinControls(roomCode);
-            renderPins();
-        });
-        return true;
-    }
-
-    function closePins() {
-        return pinsDialogController.close();
-    }
-
-    function setMessagePinControlState(control, pinned) {
-        if (!control?.dataset?.messageId) return false;
-        return ChatClientHelpers.syncPinActionControls([control], null, {
-            messageId: control.dataset.messageId,
-            pinned
-        }) === 1;
-    }
-
-    function updateMessagePinControlState(serverCode, messageId, pinned) {
-        if (serverCode !== currentServerCode || !messageId || typeof pinned !== 'boolean') return false;
-        return ChatClientHelpers.syncPinActionControls(
-            document.querySelectorAll('.message-pin-action[data-message-id]'),
-            null,
-            { messageId: String(messageId), pinned }
-        ) > 0;
-    }
-
-    function syncMessagePinControls(serverCode = currentServerCode) {
-        if (serverCode !== currentServerCode) return false;
-        const snapshot = pinsByRoom.get(serverCode);
-        if (!snapshot?.pinsLoaded) return false;
-        ChatClientHelpers.syncPinActionControls(
-            document.querySelectorAll('.message-pin-action[data-message-id]'),
-            snapshot
-        );
-        return true;
-    }
-
-    function updatePinsButton() {
-        const snapshot = pinsByRoom.get(currentServerCode);
-        const count = snapshot?.pinCount || 0;
-        document.getElementById('pins-count').textContent = count > 99 ? '99+' : String(count);
-        document.getElementById('pins-btn').setAttribute(
-            'aria-label',
-            `Pinned messages, ${count} pin${count === 1 ? '' : 's'}`
-        );
-    }
-
-    function setMessagePinned(messageId, pinned, control) {
-        if (isCurrentRoomTimedOut() || !canManagePinsInCurrentRoom()) return;
-        const context = compositionContextCoordinator.current();
-        if (!context.roomCode || !messageId) return;
-        const payload = {
-            serverCode: context.roomCode,
-            clientContextId: context.clientContextId,
-            messageId,
-            pinned
-        };
-        const identity = JSON.stringify(payload);
-        const receiptToken = operationReceipts.begin('pin', identity);
-        const generationToken = featureGenerations.begin('pin-action', context.roomCode);
-        pendingPinOperation = { receiptToken, generationToken, identity, payload, control };
-        if (control) control.disabled = true;
-        socket.emit('set_message_pin', payload, response => {
-            if (!featureGenerations.isCurrent(generationToken, context.roomCode) ||
-                !operationReceipts.canFinish(receiptToken, identity)) return;
-            response = response || { error: 'No response from server.' };
-            if (response.error) {
-                if (control?.isConnected) control.disabled = false;
-                operationReceipts.finish(receiptToken, identity);
-                pendingPinOperation = null;
-                showAppAlert('Pin update failed', response.error);
-                return;
-            }
-            const accepted = acceptPinSnapshot(response);
-            if (accepted) updateMessagePinControlState(
-                payload.serverCode,
-                payload.messageId,
-                payload.pinned
-            );
-            operationReceipts.finish(receiptToken, identity);
-            pendingPinOperation = null;
-            if (control?.isConnected) control.disabled = false;
-        });
-    }
-
-    function settlePinControlFromEvent(data) {
-        const pending = pendingPinOperation;
-        if (!pending || data.messageId !== pending.payload.messageId ||
-            data.pinned !== pending.payload.pinned ||
-            !operationReceipts.settleFromEvent(pending.receiptToken, pending.identity)) return false;
-        if (pending.control?.isConnected) pending.control.disabled = false;
-        return true;
-    }
-
-    function setUserBlocked(username, blocked, control) {
-        if (!username || username === myUsername) return;
-        const payload = { username, blocked };
-        const identity = JSON.stringify({ username: username.toLowerCase(), blocked });
-        const receiptToken = operationReceipts.begin('block', identity);
-        pendingBlockOperation = { receiptToken, identity, payload, control };
-        if (control) control.disabled = true;
-        socket.emit('set_user_block', payload, response => {
-            if (!operationReceipts.canFinish(receiptToken, identity)) return;
-            response = response || { error: 'No response from server.' };
-            if (response.error) {
-                if (control?.isConnected) control.disabled = false;
-                operationReceipts.finish(receiptToken, identity);
-                pendingBlockOperation = null;
-                showAppAlert('Block update failed', response.error);
-                return;
-            }
-            applyAcceptedBlockState(response);
-            operationReceipts.finish(receiptToken, identity);
-            pendingBlockOperation = null;
-            if (control?.isConnected) control.disabled = false;
-        });
-    }
-
-    function settleBlockControlFromEvent(data) {
-        const pending = pendingBlockOperation;
-        if (!pending || data.usernameKey !== pending.payload.username.toLowerCase() ||
-            blockedUsersByKey.has(data.usernameKey) !== pending.payload.blocked ||
-            !operationReceipts.settleFromEvent(pending.receiptToken, pending.identity)) return false;
-        if (pending.control?.isConnected) pending.control.disabled = false;
-        return true;
-    }
-
-    function closeRoleManager() {
-        if (activeRoleMenuController) activeRoleMenuController.close(false);
-        if (activeRoleMenuElement?.isConnected) activeRoleMenuElement.remove();
-        activeRoleMenuController = null;
-        activeRoleMenuElement = null;
-    }
-
-    document.getElementById('room-info-btn').onclick = event => openRoomInfo(event.currentTarget);
-    document.getElementById('room-info-close').onclick = closeRoomInfo;
-    document.getElementById('room-info-edit').onclick = editRoomInfo;
-    document.getElementById('room-info-save').onclick = saveRoomInfo;
-    document.getElementById('pins-btn').onclick = event => openPins(event.currentTarget);
-    document.getElementById('pins-close').onclick = closePins;
-    document.getElementById('header-overflow-btn').onclick = event =>
-        headerOverflowController.toggle(event.currentTarget);
-    document.getElementById('header-overflow-btn').onkeydown = event =>
-        headerOverflowController.handleTriggerKeydown(event, event.currentTarget);
-    roomNotificationLevel.onchange = () => {
-        const roomCode = currentServerCode;
-        const level = roomNotificationLevel.value;
-        const token = featureGenerations.begin('room-notification', roomCode);
-        socket.emit('update_room_notification', { serverCode: roomCode, level }, response => {
-            if (!featureGenerations.isCurrent(token, roomCode)) return;
-            response = response || { error: 'No response from server.' };
-            if (response.error) {
-                renderRoomInfo();
-                return showAppAlert('Notification update failed', response.error);
-            }
-            acceptRoomStateSnapshot(response);
-            renderRoomInfo();
-        });
-    };
 
     function setCompositionDisabled(disabled, notice = '') {
         compositionDisabled = Boolean(disabled);
@@ -2970,19 +1538,9 @@
 
     function enterLobby() {
         compositionContextCoordinator.invalidate();
-        featureGenerations.invalidate('active-room');
-        invalidateRoomScopedFeatureCallbacks();
-        currentRoomGeneration = 0;
-        readSuppressionToken = null;
         currentServerCode = null;
         myRoomRole = 'user';
         restrictionCoordinator.clear();
-        currentRestrictionState = Object.freeze({
-            roomCode: null,
-            timedOut: false,
-            timeoutUntil: null,
-            version: restrictionCoordinator.version()
-        });
         clearTimeout(typingTimeout);
         typingUsers.clear();
         updateTypingUI();
@@ -2994,16 +1552,10 @@
         for (const id of ['invite-code-btn', 'leave-server-btn', 'delete-server-btn', 'join-server-btn']) {
             document.getElementById(id).style.display = 'none';
         }
-        syncHeaderOverflowActions();
         closeModeratorCenter();
         closeModerationPrompt();
         closeReportPrompt();
         closeResolutionPrompt();
-        closeRoomInfo();
-        closePins();
-        closeRoleManager();
-        document.getElementById('room-info-btn').disabled = true;
-        document.getElementById('pins-btn').disabled = true;
         updateModeratorCenterAccess();
         cancelAction();
         ChatClientHelpers.applyLobbyState({
@@ -3084,29 +1636,10 @@
             (currentServerCode !== 'global' && myRoomRole === 'mod'));
     }
 
-    function syncHeaderOverflowActions() {
-        for (const [directId, overflowId] of [
-            ['invite-code-btn', 'overflow-invite-btn'],
-            ['leave-server-btn', 'overflow-leave-btn'],
-            ['delete-server-btn', 'overflow-delete-btn'],
-            ['join-server-btn', 'overflow-join-btn'],
-            ['moderator-center-btn', 'overflow-moderate-btn']
-        ]) {
-            const direct = document.getElementById(directId);
-            const overflow = document.getElementById(overflowId);
-            overflow.hidden = direct.style.display === 'none';
-            overflow.disabled = direct.disabled;
-            if (direct.textContent) overflow.textContent = direct.textContent;
-        }
-        document.getElementById('overflow-settings-btn').hidden = false;
-        document.getElementById('overflow-logout-btn').hidden = false;
-    }
-
     function updateModeratorCenterAccess() {
         const button = document.getElementById('moderator-center-btn');
         const allowed = canModerateCurrentRoom();
         button.style.display = allowed ? 'block' : 'none';
-        syncHeaderOverflowActions();
         if (!allowed && document.getElementById('moderator-center-modal').classList.contains('active')) {
             invalidatePrivilegedAccess();
         }
@@ -3626,7 +2159,7 @@
 
         const span2 = document.createElement('span'); span2.className = 'emoji-item'; span2.textContent = emo;
         span2.onclick = () => { 
-            if(activeReactMessageId && socket && currentServerCode && !isCurrentRoomTimedOut()) {
+            if(activeReactMessageId && socket && currentServerCode) {
                 const payload = compositionContextCoordinator.payload({
                     id: activeReactMessageId,
                     emoji: emo
@@ -3700,7 +2233,6 @@
     });
 
     function openSettings() {
-        headerOverflowController.close(false);
         document.getElementById('setting-displayname').value = myDisplayName || "";
         document.getElementById('setting-avatar').value = myAvatarUrl || "";
         document.getElementById('setting-color-text').value = myColor || "";
@@ -3709,7 +2241,6 @@
 
         if(myColor && myColor.startsWith('#') && myColor.length === 7) { document.getElementById('setting-color-picker').value = myColor; } 
         else { document.getElementById('setting-color-picker').value = '#5865F2'; }
-        renderBlockedUsers();
         document.getElementById('settings-modal').classList.add('active');
     }
 
@@ -3823,7 +2354,6 @@
         socket = replacement.socket;
         socketUrl = replacement.socketUrl;
         if (socket !== previousSocket) {
-            clearFeatureStateForSocketReplacement();
             compositionContextCoordinator.invalidate();
             closeModerationPrompt();
             closeReportPrompt();
@@ -3855,7 +2385,6 @@
                     roomAccessCoordinator.replaceBannedRooms(res.bannedRooms || []);
                     myAvatarUrl = res.avatarUrl || ''; 
                     myColor = res.color || '';
-                    replaceFeatureStateFromLogin(res);
                     
                     if (audioCtx.state === 'suspended') audioCtx.resume();
                     
@@ -3897,94 +2426,29 @@
             authButton: authBtn,
             showError
         });
-
-        activeSocket.on('room_details_updated', (data) => {
-            if (activeSocket !== socket) return;
-            acceptRoomDetailsSnapshot(data);
-            const current = data?.serverCode ? roomDetailsByCode.get(data.serverCode) : null;
-            if (ChatClientHelpers.matchesCurrentVersionedSnapshot(current, data, 'metadata')) {
-                settleMetadataControlFromEvent(data);
-            }
-        });
-
-        activeSocket.on('message_pin_updated', (data) => {
-            if (activeSocket !== socket) return;
-            const accepted = acceptPinSnapshot(data);
-            const pin = data && data.pin;
-            if (accepted && pin?.serverCode) {
-                updateMessagePinControlState(pin.serverCode, data.messageId, data.pinned);
-            }
-            const current = pin?.serverCode ? pinsByRoom.get(pin.serverCode) : null;
-            if (ChatClientHelpers.matchesCurrentVersionedSnapshot(current, pin, 'pins')) {
-                settlePinControlFromEvent(data || {});
-            }
-            if (accepted && pin?.serverCode === currentServerCode && pinsDialogController.isOpen()) {
-                featureGenerations.invalidate('pins');
-                openPins(document.getElementById('pins-btn'));
-            }
-        });
-
-        activeSocket.on('room_notification_updated', (data) => {
-            if (activeSocket !== socket) return;
-            acceptRoomStateSnapshot(data);
-        });
-
-        activeSocket.on('room_read_updated', (data) => {
-            if (activeSocket !== socket) return;
-            acceptRoomStateSnapshot(data);
-        });
-
-        activeSocket.on('room_activity', (data) => {
-            if (activeSocket !== socket) return;
-            applyRoomActivitySnapshot(data);
-        });
-
-        activeSocket.on('room_attention_updated', (data) => {
-            if (activeSocket !== socket) return;
-            acceptRoomStateSnapshot(data);
-        });
-
-        activeSocket.on('user_block_updated', (data) => {
-            if (activeSocket !== socket) return;
-            applyAcceptedBlockState(data);
-            settleBlockControlFromEvent(data || {});
-        });
-
-        activeSocket.on('room_refresh_required', (data) => {
-            if (activeSocket !== socket) return;
-            handleRoomRefreshRequired(data, activeSocket);
-        });
         
         activeSocket.on('force_logout', (msg) => {
-            if (activeSocket !== socket) return;
             localStorage.removeItem('pro_chat_user'); alert(msg || "You have been logged out remotely."); location.reload(); 
         });
 
         activeSocket.on('chat_message', (msg) => {
-            if (activeSocket !== socket) return;
-            if (!msg || msg.serverCode !== currentServerCode) return;
             ChatClientHelpers.dispatchRoomEvent(currentServerCode, data => {
                 const isMe = data.username === myUsername;
                 appendMessage(data, isMe);
                 typingUsers.delete(data.username); updateTypingUI();
-                scheduleMaybeMarkCurrentRoomRead();
 
                 if (!isMe) {
                     const isPinged = ChatClientHelpers.hasTrustedPing(data.text, myUsername, myDisplayName);
-                    const level = roomStateByCode.get(currentServerCode)?.notificationLevel || 'all';
-                    const sound = ChatClientHelpers.soundPolicy(level, isPinged, data.blocked === true);
-                    if (sound) playSound(sound);
+                    playSound(isPinged ? 'ping' : 'msg');
                 }
             }, msg);
         });
         
         activeSocket.on('system_message', (txt) => {
-            if (activeSocket !== socket) return;
             ChatClientHelpers.dispatchRoomEvent(currentServerCode, appendSystemMessage, txt);
         });
 
         activeSocket.on('global_role_updated', (data) => {
-            if (activeSocket !== socket) return;
             if (data.username === myUsername) {
                 myRole = data.role;
                 if (data.role !== 'admin') invalidatePrivilegedAccess();
@@ -3996,7 +2460,6 @@
         });
         
         activeSocket.on('room_role_updated', (data) => {
-            if (activeSocket !== socket) return;
             if (data.username === myUsername && data.targetServer === currentServerCode) {
                 myRoomRole = 'user';
                 invalidatePrivilegedAccess();
@@ -4005,7 +2468,6 @@
         });
 
         activeSocket.on('room_access_updated', (data) => {
-            if (activeSocket !== socket) return;
             if (!data || data.username !== myUsername) return;
             closeModerationPrompt();
             closeReportPrompt();
@@ -4016,13 +2478,11 @@
         });
 
         activeSocket.on('room_restriction_updated', (data) => {
-            if (activeSocket !== socket) return;
             if (data && data.serverCode === currentServerCode && data.banned) enterLobby();
             roomAccessCoordinator.handleRestrictionUpdate(data);
         });
 
         activeSocket.on('moderation_queue_updated', (data) => {
-            if (activeSocket !== socket) return;
             if (!data || data.serverCode !== moderatorCenterRoom ||
                 currentServerCode !== moderatorCenterRoom ||
                 !document.getElementById('moderator-center-modal').classList.contains('active')) return;
@@ -4030,7 +2490,6 @@
         });
 
         activeSocket.on('message_blocked', (data) => {
-            if (activeSocket !== socket) return;
             const context = compositionContextCoordinator.current();
             if (!ChatClientHelpers.shouldDisplayMessageBlocked({
                 data,
@@ -4041,7 +2500,6 @@
         });
         
         activeSocket.on('profile_updated', (data) => {
-            if (activeSocket !== socket) return;
             if (data.username === myUsername) { myColor = data.color; myAvatarUrl = data.avatarUrl; myDisplayName = data.displayName || data.username; }
             document.querySelectorAll(`.msg[data-author="${data.username}"]`).forEach(el => {
                 if (el.classList.contains('deleted-compact')) return;
@@ -4069,7 +2527,6 @@
         });
 
         activeSocket.on('message_edited', (data) => {
-            if (activeSocket !== socket) return;
             document.querySelectorAll(`.msg[data-id="${data.id}"]`).forEach(el => {
                 el.setAttribute('data-raw-text', data.text); 
                 el.classList.remove('pinged'); 
@@ -4106,12 +2563,7 @@
             });
         });
 
-        activeSocket.on('message_deleted', (data) => {
-            if (activeSocket !== socket) return;
-            if (!data || typeof data !== 'object' || Array.isArray(data) ||
-                data.serverCode !== currentServerCode ||
-                typeof data.id !== 'string' || !/^[a-f0-9]{24}$/i.test(data.id)) return;
-            const id = data.id;
+        activeSocket.on('message_deleted', (id) => {
             document.querySelectorAll(`.msg[data-id="${id}"]`).forEach(el => {
                 const authorName = el.getAttribute('data-display') || el.getAttribute('data-author') || 'Someone';
                 const isMe = el.getAttribute('data-author') === myUsername;
@@ -4138,7 +2590,6 @@
         });
 
         activeSocket.on('reaction_updated', (data) => {
-            if (activeSocket !== socket) return;
             const msgEl = document.querySelector(`.msg[data-id="${data.id}"]`);
             if (msgEl && !msgEl.classList.contains('deleted-compact')) {
                 let container = msgEl.querySelector('.msg-reactions');
@@ -4152,13 +2603,9 @@
             }
         });
         
-        activeSocket.on('admin_new_server', (srv) => {
-            if (activeSocket !== socket) return;
-            if (myRole === 'admin') addServerToList(srv.code, srv.name, srv.owner);
-        });
+        activeSocket.on('admin_new_server', (srv) => { if (myRole === 'admin') addServerToList(srv.code, srv.name, srv.owner); });
 
         activeSocket.on('server_deleted', (code) => {
-            if (activeSocket !== socket) return;
             myJoinedServers = myJoinedServers.filter(c => c !== code);
             const icon = document.getElementById(`srv-${code}`);
             if (icon) icon.remove();
@@ -4172,7 +2619,6 @@
 
         // --- ONLINE USERS RENDERER & ROLE SYNC ---
         activeSocket.on('online_users', (users) => {
-            if (activeSocket !== socket) return;
             ChatClientHelpers.dispatchRoomEvent(currentServerCode, roomUsers => {
             const list = document.getElementById('online-list');
             list.innerHTML = '';
@@ -4219,8 +2665,10 @@
             roomUsers.forEach((u, index) => {
                 usersCache[u.username] = u.displayName || u.username;
 
-                const li = createMemberMenuTrigger(u, index);
+                const li = document.createElement('li');
+                li.className = "user-item";
                 if (u.online === false && !isGlobal) li.classList.add('offline');
+                li.style.animationDelay = `${index * 30}ms`; 
                 
                 const cToUse = u.color || getUserColor(u.username);
                 const dotClass = u.online !== false ? 'online' : 'offline';
@@ -4263,13 +2711,14 @@
                     badge.style.marginLeft = '8px';
                 }
                 
+                li.onclick = (e) => { openRoleManager(e, u); };
+
                 list.appendChild(li);
             });
             }, users);
         });
 
         activeSocket.on('typing', (data) => {
-            if (activeSocket !== socket) return;
             ChatClientHelpers.dispatchRoomEvent(currentServerCode, typing => {
                 if (typing.isTyping) typingUsers.set(typing.username, ChatClientHelpers.typingDisplayName(typing));
                 else typingUsers.delete(typing.username);
@@ -4279,74 +2728,17 @@
     }
 
     // --- CONTEXT MENU MANAGER (PROFILES & ROLES) ---
-    function createMemberMenuTrigger(u, index) {
-        const trigger = document.createElement('button');
-        trigger.type = 'button';
-        trigger.className = 'user-item member-trigger';
-        trigger.style.animationDelay = `${index * 30}ms`;
-        trigger.setAttribute('aria-haspopup', 'menu');
-        trigger.setAttribute('aria-expanded', 'false');
-        trigger.setAttribute('aria-label', `Actions for ${u.displayName || u.username}`);
-        trigger.onclick = event => openRoleManager(event, u, trigger);
-        trigger.onkeydown = event => {
-            if (!['Enter', ' '].includes(event.key)) return;
-            event.preventDefault();
-            openRoleManager(event, u, trigger);
-        };
-        return trigger;
-    }
-
-    function createAuthorMenuTrigger(data, kind = 'author') {
-        const trigger = document.createElement('button');
-        trigger.type = 'button';
-        trigger.className = kind === 'avatar' ? 'msg-avatar author-trigger' : 'msg-author author-trigger';
-        trigger.setAttribute('aria-haspopup', 'menu');
-        trigger.setAttribute('aria-expanded', 'false');
-        trigger.setAttribute('aria-label', `Actions for ${data.displayName || data.username}`);
-        trigger.onclick = event => openRoleManager(event, data, trigger);
-        trigger.onkeydown = event => {
-            if (!['Enter', ' '].includes(event.key)) return;
-            event.preventDefault();
-            openRoleManager(event, data, trigger);
-        };
-        return trigger;
-    }
-
-    function createMessageMenuTrigger(actions, wrapper) {
-        const trigger = document.createElement('button');
-        trigger.type = 'button';
-        trigger.className = 'message-menu-trigger';
-        trigger.textContent = 'More';
-        trigger.setAttribute('aria-haspopup', 'menu');
-        trigger.setAttribute('aria-expanded', 'false');
-        trigger.setAttribute('aria-label', 'Message actions');
-        actions.setAttribute('role', 'menu');
-        actions.hidden = true;
-        const controller = ChatClientHelpers.createMenuController({
-            menu: actions,
-            documentTarget: document,
-            getItems: () => actions.querySelectorAll('.action-btn'),
-            onOpen: () => wrapper.classList.add('keyboard-actions-open'),
-            onClose: () => wrapper.classList.remove('keyboard-actions-open')
-        });
-        trigger.onclick = () => controller.toggle(trigger);
-        trigger.onkeydown = event => controller.handleTriggerKeydown(event, trigger);
-        return trigger;
-    }
-
-    function openRoleManager(e, u, suppliedTrigger = null) {
+    function openRoleManager(e, u) {
         e.stopPropagation();
-        closeRoleManager();
+        const existing = document.getElementById('user-context-menu');
+        if (existing) existing.remove();
         if (!currentServerCode || !u || !u.username) return;
         const requestedRoom = currentServerCode;
-        const trigger = suppliedTrigger || e.currentTarget;
 
         const menu = document.createElement('div');
         menu.id = 'user-context-menu';
         menu.className = 'context-menu';
-        menu.setAttribute('role', 'menu');
-        menu.setAttribute('aria-hidden', 'true');
-        menu.hidden = true;
+        menu.style.display = 'flex';
 
         // Profile Display Header
         const header = document.createElement('div');
@@ -4361,30 +2753,16 @@
 
         const createBtn = (text, onClick, isDanger=false) => {
             const btn = document.createElement('button');
-            btn.type = 'button';
-            btn.setAttribute('role', 'menuitem');
             btn.className = 'ctx-btn' + (isDanger ? ' danger' : '');
             btn.textContent = text;
             btn.style.display = 'block';
-            btn.onclick = () => { closeRoleManager(); onClick(); };
+            btn.onclick = () => { onClick(); menu.remove(); };
             return btn;
         };
         
         if (u.username !== myUsername) {
             menu.appendChild(createBtn('Report User', () => openReportPrompt(u.username)));
             optionsAdded = true;
-
-            const blockAction = ChatClientHelpers.blockActionFor({
-                username: u.username,
-                isSelf: false,
-                blocked: blockedUsersByKey.has(String(u.username).toLowerCase())
-            });
-            if (blockAction) {
-                menu.appendChild(createBtn(blockAction.label, () => {
-                    setUserBlocked(u.username, blockAction.blocked, trigger);
-                }, blockAction.blocked));
-                optionsAdded = true;
-            }
 
             // --- GLOBAL ADMIN ACTIONS ---
             if (isGlobalAdmin) {
@@ -4462,29 +2840,25 @@
 
         document.body.appendChild(menu);
         
-        const triggerRect = typeof trigger?.getBoundingClientRect === 'function'
-            ? trigger.getBoundingClientRect() : { left: 8, bottom: 8 };
-        let x = Number.isFinite(e.clientX) ? e.clientX : triggerRect.left;
-        let y = Number.isFinite(e.clientY) ? e.clientY : triggerRect.bottom;
+        let x = e.clientX;
+        let y = e.clientY;
         if (x + menu.offsetWidth > window.innerWidth) x -= menu.offsetWidth;
         if (y + menu.offsetHeight > window.innerHeight) y -= menu.offsetHeight;
         
         menu.style.left = x + 'px';
         menu.style.top = y + 'px';
-        activeRoleMenuElement = menu;
-        activeRoleMenuController = ChatClientHelpers.createMenuController({
-            menu,
-            documentTarget: document,
-            getItems: () => menu.querySelectorAll('.ctx-btn'),
-            onClose() {
-                ChatClientHelpers.removeAfterBaseMotion(setTimeout, () => menu.remove());
-                if (activeRoleMenuElement === menu) {
-                    activeRoleMenuElement = null;
-                    activeRoleMenuController = null;
+        
+        requestAnimationFrame(() => menu.classList.add('show'));
+        
+        setTimeout(() => {
+            document.addEventListener('click', function closeMenu(evt) {
+                if (!menu.contains(evt.target)) {
+                    menu.classList.remove('show');
+                    ChatClientHelpers.removeAfterBaseMotion(setTimeout, () => menu.remove());
+                    document.removeEventListener('click', closeMenu);
                 }
-            }
-        });
-        activeRoleMenuController.open(trigger);
+            });
+        }, 0);
     }
 
     // --- REACTION UI ENGINE ---
@@ -4499,9 +2873,7 @@
         for (const [emoji, users] of Object.entries(reactions)) {
             if (!users || users.length === 0) continue;
             
-            const bubble = document.createElement('button');
-            bubble.type = 'button';
-            configureActiveRoomMutation(bubble);
+            const bubble = document.createElement('div');
             const hasReacted = users.includes(myUsername);
             bubble.className = `reaction-bubble ${hasReacted ? 'reacted' : ''}`;
             bubble.textContent = `${emoji} ${users.length}`;
@@ -4511,7 +2883,7 @@
             bubble.title = tooltipNames;
 
             bubble.onclick = () => {
-                if (!currentServerCode || isCurrentRoomTimedOut()) return;
+                if (!currentServerCode) return;
                 const payload = compositionContextCoordinator.payload({ id: msgId, emoji });
                 if (payload) socket.emit('toggle_reaction', payload);
             };
@@ -4529,126 +2901,62 @@
         if (!servers || !Array.isArray(servers)) return; 
         document.getElementById('dynamic-servers').textContent = '';
         serversCache = { global: { code: 'global', name: 'Global Chat', owner: 'System' } };
-        servers.forEach(s => {
-            if (!s?.code) return;
-            if (s.code === 'global') serversCache.global = { ...serversCache.global, ...s };
-            else addServerToList(s.code, s.name, s.owner, s);
-        });
+        servers.forEach(s => { if (s && s.code && s.code !== 'global') addServerToList(s.code, s.name, s.owner); });
         renderServerAccess();
-        for (const code of Object.keys(serversCache)) renderRoomAttention(code);
     }
 
-    function addServerToList(code, name, owner, summary = {}) {
-        serversCache[code] = { code, name, owner, ...summary };
+    function addServerToList(code, name, owner) {
+        serversCache[code] = { code, name, owner };
         if(document.getElementById(`srv-${code}`)) return;
         
-        const icon = document.createElement('button');
-        icon.type = 'button';
+        const icon = document.createElement('div');
         icon.className = 'server-icon';
         icon.id = `srv-${code}`;
-        icon.setAttribute('aria-label', name || code);
         icon.style.background = getUserColor(code); 
         icon.textContent = name.substring(0, 2).toUpperCase();
-        ChatClientHelpers.appendTextElement(document, icon, 'span', 'tooltip', name);
+        ChatClientHelpers.appendTextElement(document, icon, 'div', 'tooltip', name);
         icon.onclick = () => switchServer(code);
         
         if (myRole === 'admin' && !myJoinedServers.includes(code) && code !== 'global') { icon.style.opacity = '0.4'; icon.style.border = '1px dashed #8e9297'; }
         document.getElementById('dynamic-servers').appendChild(icon);
         renderServerAccess();
-        renderRoomAttention(code);
     }
 
-    function requestServerSwitch(code, options = {}) {
+    function requestServerSwitch(code) {
         if (currentServerCode === code && chatWindow.innerHTML !== '' &&
-            !roomSwitchCoordinator.isPending() && options.forceRefresh !== true) return null;
-        return roomSwitchCoordinator.request(code, options);
+            !roomSwitchCoordinator.isPending()) return;
+        roomSwitchCoordinator.request(code);
     }
 
-    function supersedeJoinedRoomInfoIntent(roomCode, origin) {
-        if (origin === 'user' && pendingJoinedRoomInfoIntent) {
-            pendingJoinedRoomInfoIntent = null;
-        }
-    }
-
-    function switchServer(code, options = { origin: 'user' }) {
+    function switchServer(code) {
         if (!ChatClientHelpers.isRoomRailAccessible({
             serverCode: code,
             role: myRole,
             joinedServers: myJoinedServers,
             bannedRooms: [...myBannedRooms]
         })) return false;
-        supersedeJoinedRoomInfoIntent(code, options.origin);
-        return roomAccessCoordinator.requestRoom(code, options);
+        return roomAccessCoordinator.requestRoom(code);
     }
 
-    function queueJoinedRoomInfoIntent(roomCode, switchToken, trigger) {
-        if (!roomCode || !switchToken) return false;
-        pendingJoinedRoomInfoIntent = Object.freeze({ roomCode, switchToken, trigger });
-        return true;
-    }
-
-    function consumeJoinedRoomInfoIntent(roomCode, switchToken) {
-        const intent = pendingJoinedRoomInfoIntent;
-        if (!intent || intent.roomCode !== roomCode || intent.switchToken !== switchToken) return false;
-        pendingJoinedRoomInfoIntent = null;
-        openRoomInfo(intent.trigger);
-        return true;
-    }
-
-    function handleSwitchResult(code, res, switchToken, options = {}) {
-        let acceptedSuppressionToken = null;
-        const outcome = ChatClientHelpers.applySwitchResult({
+    function handleSwitchResult(code, res) {
+        return ChatClientHelpers.applySwitchResult({
             currentServerCode,
             targetServerCode: code,
             response: res,
-            acceptedBlockVersion,
             showAlert: showAppAlert,
             applySuccess(targetServerCode, response) {
                 const srv = serversCache[targetServerCode] || { name: 'Unknown', owner: '' };
                 const isStealth = myRole === 'admin' && !myJoinedServers.includes(targetServerCode) && targetServerCode !== 'global';
 
-                invalidateRoomScopedFeatureCallbacks();
                 closeModeratorCenter();
                 closeModerationPrompt();
                 closeReportPrompt();
-                closeRoomInfo();
-                closePins();
-                closeRoleManager();
                 currentServerCode = targetServerCode;
                 compositionContextCoordinator.activate(targetServerCode);
-                const activeRoomToken = featureGenerations.begin('active-room', targetServerCode);
-                currentRoomGeneration = activeRoomToken.generation;
-                if (readSuppressionToken?.roomCode === targetServerCode) {
-                    readSuppressionToken = ChatClientHelpers.rebindSuppressionToken(
-                        readSuppressionToken,
-                        targetServerCode,
-                        currentRoomGeneration
-                    );
-                }
-                if (options.suppressAutoRead === true && options.suppressionToken &&
-                    (!readSuppressionToken || ChatClientHelpers.sameSuppressionOwner(
-                        readSuppressionToken,
-                        options.suppressionToken
-                    ))) {
-                    readSuppressionToken = ChatClientHelpers.rebindSuppressionToken(
-                        options.suppressionToken,
-                        targetServerCode,
-                        currentRoomGeneration,
-                        response.pin?.blockVersion
-                    );
-                    acceptedSuppressionToken = readSuppressionToken;
-                }
                 myRoomRole = response.roomRole || 'user';
-                if (response.details) acceptRoomDetailsSnapshot({
-                    ...response.details,
-                    serverCode: targetServerCode
-                });
-                if (response.pin) acceptPinSnapshot(response.pin);
-                if (response.notification) acceptRoomStateSnapshot(response.notification);
                 applyRestrictionState(response.restriction, targetServerCode);
                 renderServerAccess();
                 updateModeratorCenterAccess();
-                updatePinsButton();
 
                 document.querySelectorAll('.server-icon').forEach(el => el.classList.remove('active'));
                 const activeIcon = document.getElementById(`srv-${targetServerCode}`);
@@ -4676,9 +2984,6 @@
                         leaveBtn.style.display = 'none'; joinBtn.style.display = 'block';
                     }
                 }
-                document.getElementById('room-info-btn').disabled = false;
-                document.getElementById('pins-btn').disabled = false;
-                syncHeaderOverflowActions();
 
                 chatWindow.textContent = '';
                 cancelAction();
@@ -4704,34 +3009,8 @@
                 }
 
                 if (response.history) loadHistory(response.history);
-                consumeJoinedRoomInfoIntent(targetServerCode, switchToken);
-                if (options.suppressAutoRead === true) {
-                    if (acceptedSuppressionToken) {
-                        ChatClientHelpers.scheduleAfterScrollFrame(
-                            scheduleAnimationFrame,
-                            () => {
-                                const ownedToken = ChatClientHelpers.sameSuppressionOwner(
-                                    readSuppressionToken,
-                                    acceptedSuppressionToken
-                                ) ? readSuppressionToken : null;
-                                disarmReadSuppression(ownedToken || acceptedSuppressionToken);
-                            }
-                        );
-                    }
-                } else {
-                    scheduleMaybeMarkCurrentRoomRead();
-                }
             }
         });
-        if (!outcome.accepted && options.suppressAutoRead === true) {
-            const ownedToken = ChatClientHelpers.sameSuppressionOwner(
-                readSuppressionToken,
-                options.suppressionToken
-            ) ? readSuppressionToken : null;
-            if (ownedToken) disarmReadSuppression(ownedToken);
-            else disarmReadSuppression(options.suppressionToken);
-        }
-        return outcome;
     }
 
     function copyCode() {
@@ -4778,25 +3057,20 @@
 
     function joinFromSnoop() {
         const serverCode = currentServerCode;
-        const joinSocket = socket;
-        joinSocket.emit('join_server', serverCode, (res) => {
-            if (joinSocket !== socket) return;
+        socket.emit('join_server', serverCode, (res) => {
             res = res || { error: 'No response from server.' };
             if (res.error) return showAppAlert("Error", res.error);
             if (!myJoinedServers.includes(res.server.code)) myJoinedServers.push(res.server.code);
             const icon = document.getElementById(`srv-${res.server.code}`);
             if (icon) { icon.style.opacity = '1'; icon.style.border = 'none'; }
-            const switchToken = switchServer(res.server.code, { origin: 'join', forceRefresh: true });
-            queueJoinedRoomInfoIntent(res.server.code, switchToken, document.getElementById('join-server-btn'));
+            switchServer(res.server.code);
         });
     }
 
     document.getElementById('submit-create-btn').onclick = () => {
         const name = document.getElementById('create-name').value.trim();
         if(!name) return;
-        const createSocket = socket;
-        createSocket.emit('create_server', name, (res) => {
-            if (createSocket !== socket) return;
+        socket.emit('create_server', name, (res) => {
             res = res || { error: 'No response from server.' };
             if (res.error) return showAppAlert("Error", res.error);
             document.getElementById('server-modal').classList.remove('active'); document.getElementById('create-name').value = '';
@@ -4806,17 +3080,14 @@
             if (existingIcon) { existingIcon.style.opacity = '1'; existingIcon.style.border = 'none'; }
             else { addServerToList(res.server.code, res.server.name, myUsername); } 
             
-            const switchToken = switchServer(res.server.code, { origin: 'join', forceRefresh: true });
-            queueJoinedRoomInfoIntent(res.server.code, switchToken, document.getElementById('submit-create-btn'));
+            switchServer(res.server.code);
         });
     };
 
     document.getElementById('submit-join-btn').onclick = () => {
         const code = document.getElementById('join-code').value.trim();
         if(!code) return;
-        const inviteSocket = socket;
-        inviteSocket.emit('join_server', code, (res) => {
-            if (inviteSocket !== socket) return;
+        socket.emit('join_server', code, (res) => {
             res = res || { error: 'No response from server.' };
             if (res.error) return showAppAlert("Error", res.error);
             document.getElementById('server-modal').classList.remove('active'); document.getElementById('join-code').value = '';
@@ -4826,8 +3097,7 @@
             if (existingIcon) { existingIcon.style.opacity = '1'; existingIcon.style.border = 'none'; }
             else { addServerToList(res.server.code, res.server.name, res.server.owner); }
             
-            const switchToken = switchServer(res.server.code, { origin: 'join', forceRefresh: true });
-            queueJoinedRoomInfoIntent(res.server.code, switchToken, document.getElementById('submit-join-btn'));
+            switchServer(res.server.code);
         });
     };
 
@@ -4893,7 +3163,7 @@
     });
 
     function initiateEdit(id, currentTextElement) {
-        if (!currentTextElement || !currentServerCode || isCurrentRoomTimedOut()) return;
+        if (!currentTextElement || !currentServerCode) return;
         cancelAction();
         editingMsgId = id; document.getElementById('info-bar').classList.add('show'); 
         
@@ -4908,7 +3178,7 @@
     }
 
     function initiateReply(id, displayname, currentTextElement) {
-        if (!currentTextElement || !currentServerCode || isCurrentRoomTimedOut()) return;
+        if (!currentTextElement || !currentServerCode) return;
         cancelAction(); 
         
         let rawText = document.querySelector(`.msg[data-id="${id}"]`).getAttribute('data-raw-text') || "";
@@ -4994,69 +3264,7 @@
         chatScrollCoordinator.request('auto');
     }
 
-    function renderBlockedMessage(data, { history = false } = {}) {
-        const renderPolicy = ChatClientHelpers.messageRenderPolicy({
-            history,
-            wasNearBottom: ChatClientHelpers.isNearScrollEnd(chatWindow)
-        });
-        const wrapper = document.createElement('article');
-        wrapper.className = 'msg blocked-row';
-        wrapper.dataset.id = String(data._id || '');
-        const show = document.createElement('button');
-        show.type = 'button';
-        show.className = 'blocked-message';
-        show.textContent = 'Blocked message — Show';
-        show.setAttribute('aria-expanded', 'false');
-        show.onclick = () => {
-            const context = compositionContextCoordinator.current();
-            const identity = `${context.roomCode}:${data._id}:${context.clientContextId}:${acceptedBlockVersion}`;
-            const token = featureGenerations.begin('reveal', identity);
-            socket.emit('get_blocked_message', {
-                serverCode: context.roomCode,
-                messageId: data._id,
-                clientContextId: context.clientContextId
-            }, response => {
-                if (!featureGenerations.isCurrent(token, identity)) return;
-                response = response || { error: 'No response from server.' };
-                if (response.error || response.serverCode !== context.roomCode ||
-                    response.messageId !== String(data._id) ||
-                    response.clientContextId !== context.clientContextId ||
-                    response.blockVersion !== acceptedBlockVersion) return;
-                const revealed = response.message || {};
-                const content = document.createElement('div');
-                content.className = 'blocked-message-reveal';
-                ChatClientHelpers.appendTextElement(
-                    document,
-                    content,
-                    'strong',
-                    '',
-                    revealed.displayName || revealed.username || 'Blocked user'
-                );
-                if (revealed.text) {
-                    ChatClientHelpers.appendTextElement(document, content, 'p', '', revealed.text);
-                }
-                const attachment = ChatClientHelpers.sanitizeAttachment(revealed.attachment);
-                if (attachment) {
-                    const image = document.createElement('img');
-                    image.className = 'chat-img';
-                    image.src = attachment;
-                    image.alt = 'Revealed blocked attachment';
-                    content.appendChild(image);
-                }
-                wrapper.appendChild(content);
-                show.setAttribute('aria-expanded', 'true');
-                show.disabled = true;
-                show.textContent = 'Blocked message — Shown';
-            });
-        };
-        wrapper.appendChild(show);
-        chatWindow.appendChild(wrapper);
-        if (renderPolicy.shouldScroll) chatScrollCoordinator.request(renderPolicy.behavior);
-        return wrapper;
-    }
-
     function appendMessage(data, isMe, { history = false } = {}) {
-        if (data && data.blocked === true) return renderBlockedMessage(data, { history });
         const renderPolicy = ChatClientHelpers.messageRenderPolicy({
             history,
             wasNearBottom: ChatClientHelpers.isNearScrollEnd(chatWindow)
@@ -5094,7 +3302,8 @@
         wrapper.className = `msg`; 
         if (!renderPolicy.animate) wrapper.classList.add('no-enter-animation');
 
-        const avatarDiv = createAuthorMenuTrigger(data, 'avatar');
+        const avatarDiv = document.createElement('div'); 
+        avatarDiv.className = 'msg-avatar';
         const colorToUse = data.color || getUserColor(data.username);
         
         if (data.avatarUrl) {
@@ -5124,7 +3333,7 @@
 
         const header = document.createElement('div'); header.className = 'msg-header';
         
-        const author = createAuthorMenuTrigger(data, 'author');
+        const author = document.createElement('div'); author.className = 'msg-author'; 
         author.textContent = displayAuthorName; author.style.color = colorToUse;
         header.appendChild(author);
 
@@ -5146,30 +3355,12 @@
         const textDiv = document.createElement('div'); textDiv.className = 'msg-text';
 
         const actions = document.createElement('div'); actions.className = 'msg-actions';
-        const pinManagementRoleAllowed = hasPinManagementRoleInCurrentRoom();
-        const pinSnapshot = pinsByRoom.get(currentServerCode);
-        const isPinned = Boolean(pinSnapshot?.pinsLoaded &&
-            pinSnapshot.pins.some(pin => pin.messageId === String(data._id)));
-        const allowedActions = new Set(ChatClientHelpers.messageActionsFor({
-            timedOut: isCurrentRoomTimedOut(),
-            isOwn: isMe,
-            canReply: true,
-            canReact: true,
-            canManagePins: pinManagementRoleAllowed,
-            pinned: isPinned,
-            canEdit: canManageMsg,
-            canReport: !isMe,
-            canDelete: canManageMsg
-        }));
         
-        const reactBtn = document.createElement('button'); reactBtn.type = 'button'; reactBtn.setAttribute('role', 'menuitem'); reactBtn.className = 'action-btn react'; reactBtn.textContent = '😀 React';
-        reactBtn.setAttribute('data-active-room-required', 'true');
-        configureActiveRoomMutation(reactBtn);
-        reactBtn.hidden = !allowedActions.has('react');
+        const reactBtn = document.createElement('button'); reactBtn.className = 'action-btn react'; reactBtn.textContent = '😀 React';
         reactBtn.title = "Add a reaction";
         reactBtn.onclick = (e) => {
             e.stopPropagation();
-            if (!currentServerCode || isCurrentRoomTimedOut()) return;
+            if (!currentServerCode) return;
             const picker = document.getElementById('reaction-picker');
             picker.style.left = Math.max(10, Math.min(e.clientX - 150, window.innerWidth - 300)) + 'px';
             picker.style.top = Math.min(e.clientY, window.innerHeight - 220) + 'px';
@@ -5179,42 +3370,18 @@
         };
         actions.appendChild(reactBtn);
 
-        const replyBtn = document.createElement('button'); replyBtn.type = 'button'; replyBtn.setAttribute('role', 'menuitem'); replyBtn.className = 'action-btn'; replyBtn.textContent = '↩️ Reply';
-        configureActiveRoomMutation(replyBtn);
-        replyBtn.hidden = !allowedActions.has('reply');
+        const replyBtn = document.createElement('button'); replyBtn.className = 'action-btn'; replyBtn.textContent = '↩️ Reply';
         replyBtn.onclick = () => initiateReply(data._id, displayAuthorName, textDiv.querySelector('.msg-text-content'));
         actions.appendChild(replyBtn);
 
-        if (pinManagementRoleAllowed) {
-            const pinBtn = document.createElement('button');
-            pinBtn.type = 'button';
-            pinBtn.setAttribute('role', 'menuitem');
-            pinBtn.className = 'action-btn message-pin-action';
-            pinBtn.dataset.messageId = String(data._id);
-            setMessagePinControlState(pinBtn, isPinned);
-            configureActiveRoomMutation(pinBtn);
-            pinBtn.hidden = !allowedActions.has(isPinned ? 'unpin' : 'pin');
-            pinBtn.onclick = () => setMessagePinned(
-                String(data._id),
-                pinBtn.dataset.pinned !== 'true',
-                pinBtn
-            );
-            actions.appendChild(pinBtn);
-        }
-
         if (canManageMsg) {
-            const editBtn = document.createElement('button'); editBtn.type = 'button'; editBtn.setAttribute('role', 'menuitem'); editBtn.className = 'action-btn'; editBtn.textContent = '✏️ Edit';
-            configureActiveRoomMutation(editBtn);
-            editBtn.hidden = !allowedActions.has('edit');
+            const editBtn = document.createElement('button'); editBtn.className = 'action-btn'; editBtn.textContent = '✏️ Edit';
             editBtn.onclick = () => initiateEdit(data._id, textDiv.querySelector('.msg-text-content'));
             actions.appendChild(editBtn);
             
-            const delBtn = document.createElement('button'); delBtn.type = 'button'; delBtn.setAttribute('role', 'menuitem'); delBtn.className = 'action-btn del'; delBtn.textContent = '🗑️ Delete';
-            const canDeleteNow = isMe || !isCurrentRoomTimedOut();
-            if (!isMe) configureActiveRoomMutation(delBtn);
-            delBtn.hidden = !allowedActions.has('delete') || !canDeleteNow;
+            const delBtn = document.createElement('button'); delBtn.className = 'action-btn del'; delBtn.textContent = '🗑️ Delete';
             delBtn.onclick = async () => {
-                if (!currentServerCode || (!isMe && isCurrentRoomTimedOut())) return;
+                if (!currentServerCode) return;
                 const payload = compositionContextCoordinator.payload({ id: data._id });
                 if (payload && await showAppConfirm("Delete Message", "Delete this message?", "Delete", true) &&
                     compositionContextCoordinator.matches(payload)) {
@@ -5225,14 +3392,11 @@
         }
         if (!isMe) {
             const reportBtn = document.createElement('button');
-            reportBtn.type = 'button';
-            reportBtn.setAttribute('role', 'menuitem');
             reportBtn.className = 'action-btn';
             reportBtn.textContent = '🚩 Report Message';
             reportBtn.onclick = () => openReportPrompt(data.username, data._id);
             actions.appendChild(reportBtn);
         }
-        header.appendChild(createMessageMenuTrigger(actions, wrapper));
         wrapper.appendChild(actions);
 
         if (data.text) {

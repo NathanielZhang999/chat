@@ -14,9 +14,6 @@ const {
   withAccountTransitionLocks,
   withAccountTransitionLock,
   canModerateTarget,
-  canEditRoomDetails,
-  canManagePins,
-  safeMessageForViewer,
   activeRestrictionState,
   applySessionAccessSnapshot,
   rejectAuditMutation,
@@ -27,37 +24,6 @@ const { FakeSocket, FakeIo, createMemoryModel, acknowledge, deferred } = require
 
 const VALID_MESSAGE_ID = '507f1f77bcf86cd799439011';
 
-test('complete pin permission matrix respects bans timeouts exact-room roles and Global policy', () => {
-  function access({
-    username = 'Actor', role = 'user', allowed = true, banned = false, timedOut = false,
-    owner = 'Owner', moderators = []
-  } = {}) {
-    return {
-      allowed,
-      user: { username, role },
-      room: { code: 'ABC123', owner, moderators },
-      restriction: { banned, timedOut }
-    };
-  }
-  const cases = [
-    ['private owner', 'ABC123', access({ username: 'Owner' }), true],
-    ['exact moderator', 'ABC123', access({ username: 'ExactMod', moderators: ['ExactMod'] }), true],
-    ['global admin in private room', 'ABC123', access({ role: 'admin' }), true],
-    ['ordinary member', 'ABC123', access(), false],
-    ['other-room moderator', 'ABC123', access({ username: 'OtherMod', moderators: ['ExactMod'] }), false],
-    ['banned admin', 'ABC123', access({ role: 'admin', banned: true }), false],
-    ['timed-out owner', 'ABC123', access({ username: 'Owner', timedOut: true }), false],
-    ['nonaccess admin', 'ABC123', access({ role: 'admin', allowed: false }), false],
-    ['Global admin', 'global', access({ role: 'admin' }), true],
-    ['Global owner-shaped user', 'global', access({ username: 'Owner' }), false],
-    ['Global moderator-shaped user', 'global', access({ username: 'ExactMod', moderators: ['ExactMod'] }), false]
-  ];
-  for (const [label, serverCode, candidate, expected] of cases) {
-    const exactRoomAccess = { ...candidate, room: { ...candidate.room, code: serverCode } };
-    assert.equal(canManagePins({ serverCode, access: exactRoomAccess }), expected, label);
-  }
-});
-
 function saveableDocument(value) {
   const document = { ...value };
   Object.defineProperties(document, {
@@ -65,25 +31,6 @@ function saveableDocument(value) {
     save: { value: async () => document, enumerable: false }
   });
   return document;
-}
-
-function preserveAttentionProjection(MessageModel) {
-  const find = MessageModel.find.bind(MessageModel);
-  MessageModel.find = (query = {}) => {
-    const result = find(query);
-    if (!Array.isArray(query.$and)) return result;
-    return {
-      async select() {
-        return (await result).map(row => ({
-          _id: row._id, serverCode: row.serverCode, timestamp: row.timestamp,
-          username: row.username, authorKey: row.authorKey,
-          notificationMentions: Array.isArray(row.notificationMentions)
-            ? [...row.notificationMentions] : row.notificationMentions,
-          deleted: row.deleted
-        }));
-      }
-    };
-  };
 }
 
 function userDocument(overrides = {}) {
@@ -256,8 +203,6 @@ function registerWithModels(seed = {}) {
     RoomRestrictionModel: seed.RoomRestrictionModel || createMemoryModel(seed.restrictions || []),
     ModerationAuditModel: seed.ModerationAuditModel || createMemoryModel(seed.audits || []),
     ModerationReportModel: seed.ModerationReportModel || createMemoryModel(seed.reports || []),
-    RoomMemberStateModel: seed.RoomMemberStateModel || createMemoryModel(seed.roomStates || []),
-    UserExperienceStateModel: seed.UserExperienceStateModel || createMemoryModel(seed.experienceStates || []),
     autoModTracker: seed.autoModTracker || createAutoModTracker()
   };
   for (const model of [setup.RoomRestrictionModel, setup.ModerationReportModel]) {
@@ -278,7 +223,6 @@ function registerWithModels(seed = {}) {
     resolvePingsFn: seed.resolvePingsFn || (async text => text),
     logger: seed.logger || { error() {} }
   })(socket);
-  ioInstance.sockets.push(socket);
   return setup;
 }
 
@@ -1670,17 +1614,16 @@ test('identical normalized messages share repeat state across same-account socke
   await secondAlice.trigger('chat_message', { text: 'same  repeat' });
 
   assert.equal(setup.MessageModel.rows.length, 4);
-  assert.deepEqual(setup.MessageModel.rows.map(item => item.text), [
+  assert.deepEqual(setup.ioInstance.outbound.map(item => item.payload.text), [
     repeatText.trim(), 'same repeat', 'same repeat', 'same  repeat'
   ]);
-  assert.equal(setup.ioInstance.outbound.some(item => item.event === 'chat_message'), false);
 
   await new Promise(resolve => setTimeout(resolve, 510));
   await setup.socket.trigger('chat_message', { text: 'same repeat' });
 
   assert.equal(setup.MessageModel.rows.length, 4);
-  assert.equal(setup.ioInstance.outbound.some(item => item.event === 'chat_message'), false);
-  assert.deepEqual(setup.socket.outbound.filter(item => item.event === 'message_blocked'), [{
+  assert.equal(setup.ioInstance.outbound.length, 4);
+  assert.deepEqual(setup.socket.outbound, [{
     target: 'self', event: 'message_blocked',
     payload: { rule: 'content_policy', serverCode: 'ABC123', clientContextId: 1 }
   }]);
@@ -1838,10 +1781,6 @@ test('global-banned lobby user can join an unbanned private room without joining
 
 test('timeout blocks send edit reaction and typing but allows own delete', async () => {
   const setup = timedOutAuthenticatedSocket('ABC123', 'Alice');
-  const metadataAck = acknowledge();
-  await setup.socket.trigger('update_room_details', {
-    serverCode: 'ABC123', description: 'timeout metadata', rules: ''
-  }, metadataAck.callback);
   await setup.socket.trigger('chat_message', { text: 'blocked message' });
   await setup.socket.trigger('edit_message', { id: VALID_MESSAGE_ID, text: 'blocked edit' });
   await setup.socket.trigger('toggle_reaction', { id: VALID_MESSAGE_ID, emoji: '👍' });
@@ -1852,7 +1791,6 @@ test('timeout blocks send edit reaction and typing but allows own delete', async
   assert.deepEqual(setup.message.reactions, {});
   assert.equal(setup.socket.outbound.some(item => item.event === 'typing'), false);
   assert.equal(setup.message.deleted, true);
-  assert.deepEqual(metadataAck.value(), { error: 'Permission denied.' });
 });
 
 test('timed-out room moderator cannot delete another user message', async () => {
@@ -3378,7 +3316,7 @@ for (const action of ['timeout', 'ban']) {
     assert.equal(targetSocket.serverCode, 'ABC123');
     await targetSocket.trigger('typing', true);
     assert.equal(targetSocket.outbound.some(item =>
-      item.target === 'self' && item.event === 'typing' && item.payload.isTyping === true
+      item.target === 'ABC123' && item.event === 'typing' && item.payload.isTyping === true
     ), true);
   });
 }
@@ -3702,549 +3640,6 @@ for (const transition of ['demotion', 'promotion']) {
       transition === 'demotion' ? { success: true } : { error: 'Permission denied.' }
     );
     assert.equal(setup.RoomRestrictionModel.rows.length, transition === 'demotion' ? 1 : 0);
-  });
-}
-
-test('absence-period messages never become unread after leave kick ban rejoin or restored Global access', async () => {
-  const newestAt = new Date('2026-08-10T13:00:00.000Z');
-  const newestId = '507f1f77bcf86cd799439071';
-
-  for (const scenario of [
-    { name: 'join', initialState: [], expectedVersion: 0 },
-    {
-      name: 'rejoin after leave from an initially empty room',
-      initialState: [{
-        usernameKey: 'alice', serverCode: 'ABC123', notificationLevel: 'none',
-        lastReadAt: null, lastReadMessageId: null, version: 0
-      }],
-      expectedVersion: 1
-    },
-    {
-      name: 'rejoin after kick',
-      initialState: [{
-        usernameKey: 'alice', serverCode: 'ABC123', notificationLevel: 'none',
-        lastReadAt: new Date('2026-08-10T12:00:00.000Z'),
-        lastReadMessageId: '507f1f77bcf86cd799439070', version: 4
-      }],
-      expectedVersion: 5
-    },
-    {
-      name: 'rejoin after ban and later unban',
-      initialState: [{
-        usernameKey: 'alice', serverCode: 'ABC123', notificationLevel: 'mentions',
-        lastReadAt: new Date('2026-08-10T12:00:00.000Z'),
-        lastReadMessageId: '507f1f77bcf86cd799439070', version: 6
-      }],
-      expectedVersion: 7
-    }
-  ]) {
-    const RoomMemberStateModel = createMemoryModel(scenario.initialState);
-    const persisted = { username: 'Alice', displayName: 'Alice', role: 'user', servers: ['global'] };
-    const UserModel = {
-      async findOne() {
-        const document = { ...persisted, servers: [...persisted.servers] };
-        document.save = async () => {
-          const state = RoomMemberStateModel.rows.find(row =>
-            row.usernameKey === 'alice' && row.serverCode === 'ABC123'
-          );
-          assert.equal(state.lastReadAt.getTime(), newestAt.getTime(), `${scenario.name} cursor before save`);
-          assert.equal(state.lastReadMessageId, newestId, `${scenario.name} id before save`);
-          assert.equal(state.version, scenario.expectedVersion, `${scenario.name} version before save`);
-          Object.assign(persisted, document, { servers: [...document.servers] });
-        };
-        return document;
-      }
-    };
-    const MessageModel = createMemoryModel([{
-      _id: newestId, serverCode: 'ABC123', username: 'Other', authorKey: 'other',
-      notificationMentions: ['alice'], timestamp: newestAt
-    }]);
-    preserveAttentionProjection(MessageModel);
-    const setup = registerWithModels({
-      UserModel,
-      ChatServerModel: createMemoryModel([
-        roomDocument('global'), roomDocument('ABC123')
-      ]),
-      MessageModel,
-      RoomMemberStateModel
-    });
-    Object.assign(setup.socket, {
-      username: 'Alice', displayName: 'Alice', role: 'user', serverCode: 'global',
-      joinedServers: ['global'], bannedRooms: []
-    });
-    setup.onlineUsersMap.set(setup.socket.id, {
-      username: 'Alice', displayName: 'Alice', role: 'user', serverCode: 'global',
-      joinedServers: ['global'], bannedRooms: []
-    });
-    const ack = acknowledge();
-    await setup.socket.trigger('join_server', 'ABC123', ack.callback);
-    assert.equal(ack.value().success, true, scenario.name);
-    MessageModel.rows.push({
-      _id: '507f1f77bcf86cd799439073', serverCode: 'ABC123', username: 'Other', authorKey: 'other',
-      notificationMentions: ['alice'], timestamp: new Date('2026-08-10T13:01:00.000Z')
-    });
-    const notificationAck = acknowledge();
-    await setup.socket.trigger('update_room_notification', {
-      serverCode: 'ABC123', level: scenario.initialState[0]?.notificationLevel || 'all'
-    }, notificationAck.callback);
-    assert.equal(notificationAck.value().unreadCount, 1, `${scenario.name} post-grant unread`);
-    assert.equal(notificationAck.value().mentionCount, 1, `${scenario.name} post-grant mention`);
-  }
-
-  const RoomMemberStateModel = createMemoryModel([{
-    usernameKey: 'targetuser', serverCode: 'global', notificationLevel: 'mentions',
-    lastReadAt: new Date('2026-08-10T12:00:00.000Z'),
-    lastReadMessageId: '507f1f77bcf86cd799439072', version: 8
-  }]);
-  const restrictions = createMemoryModel([restrictionDocument('global', 'TargetUser', {
-    bannedAt: new Date('2026-08-10T12:30:00.000Z'), bannedBy: 'Admin', banReason: 'existing ban'
-  })]);
-  const originalUpdate = restrictions.findOneAndUpdate.bind(restrictions);
-  restrictions.findOneAndUpdate = (query, update, options) => {
-    const state = RoomMemberStateModel.rows[0];
-    assert.equal(state.lastReadAt.getTime(), newestAt.getTime());
-    assert.equal(state.lastReadMessageId, newestId);
-    assert.equal(state.version, 9);
-    return originalUpdate(query, update, options);
-  };
-  const restoreSetup = registerWithModels({
-    users: [
-      userDocument({ username: 'Admin', role: 'admin', servers: ['global'] }),
-      userDocument({ username: 'TargetUser', servers: ['global'] })
-    ],
-    rooms: [roomDocument('global')],
-    MessageModel: createMemoryModel([{ _id: newestId, serverCode: 'global', timestamp: newestAt }]),
-    RoomRestrictionModel: restrictions,
-    RoomMemberStateModel
-  });
-  Object.assign(restoreSetup.socket, {
-    username: 'Admin', displayName: 'Admin', role: 'admin', serverCode: 'global',
-    joinedServers: ['global'], bannedRooms: []
-  });
-  const restoreAck = acknowledge();
-  await restoreSetup.socket.trigger('moderate_user', {
-    serverCode: 'global', targetUser: 'TargetUser', action: 'unban', reason: 'restore access'
-  }, restoreAck.callback);
-  assert.deepEqual(restoreAck.value(), { success: true });
-});
-
-test('a failed membership or access grant leaves only a harmless early cursor advance', async () => {
-  const newestAt = new Date('2026-08-10T14:00:00.000Z');
-  const newestId = '507f1f77bcf86cd799439081';
-  const failedJoinState = createMemoryModel([]);
-  const failedJoin = registerWithModels({
-    UserModel: {
-      async findOne() {
-        return {
-          username: 'Alice', displayName: 'Alice', role: 'user', servers: ['global'],
-          async save() { throw new Error('membership write failed'); }
-        };
-      }
-    },
-    ChatServerModel: createMemoryModel([roomDocument('global'), roomDocument('ABC123')]),
-    MessageModel: createMemoryModel([{ _id: newestId, serverCode: 'ABC123', timestamp: newestAt }]),
-    RoomMemberStateModel: failedJoinState,
-    logger: { error() {} }
-  });
-  Object.assign(failedJoin.socket, {
-    username: 'Alice', displayName: 'Alice', role: 'user', serverCode: 'global',
-    joinedServers: ['global'], bannedRooms: []
-  });
-  const joinAck = acknowledge();
-  await failedJoin.socket.trigger('join_server', 'ABC123', joinAck.callback);
-  assert.deepEqual(joinAck.value(), { error: 'Join failed.' });
-  assert.deepEqual(failedJoinState.rows.map(row => ({
-    usernameKey: row.usernameKey, serverCode: row.serverCode, notificationLevel: row.notificationLevel,
-    lastReadAt: row.lastReadAt, lastReadMessageId: row.lastReadMessageId, version: row.version
-  })), [{
-    usernameKey: 'alice', serverCode: 'ABC123', notificationLevel: 'all',
-    lastReadAt: newestAt, lastReadMessageId: newestId, version: 0
-  }]);
-
-  const failedRestoreState = createMemoryModel([{
-    usernameKey: 'targetuser', serverCode: 'global', notificationLevel: 'all',
-    lastReadAt: new Date('2026-08-10T13:00:00.000Z'),
-    lastReadMessageId: '507f1f77bcf86cd799439080', version: 2
-  }]);
-  const failedRestrictions = createMemoryModel([restrictionDocument('global', 'TargetUser', {
-    bannedAt: new Date('2026-08-10T13:30:00.000Z'), bannedBy: 'Admin', banReason: 'existing ban'
-  })]);
-  failedRestrictions.findOneAndUpdate = async () => { throw new Error('unban write failed'); };
-  const failedRestore = registerWithModels({
-    users: [
-      userDocument({ username: 'Admin', role: 'admin', servers: ['global'] }),
-      userDocument({ username: 'TargetUser', servers: ['global'] })
-    ],
-    rooms: [roomDocument('global')],
-    MessageModel: createMemoryModel([{ _id: newestId, serverCode: 'global', timestamp: newestAt }]),
-    RoomRestrictionModel: failedRestrictions,
-    RoomMemberStateModel: failedRestoreState,
-    logger: { error() {} }
-  });
-  const cursorMutationSessions = [];
-  const baseStateUpdate = failedRestore.RoomMemberStateModel.findOneAndUpdate
-    .bind(failedRestore.RoomMemberStateModel);
-  failedRestore.RoomMemberStateModel.findOneAndUpdate = (query, update, options = {}) => {
-    cursorMutationSessions.push(options.session || null);
-    return baseStateUpdate(query, update, options);
-  };
-  const rollbackSession = { id: 'rollback-session' };
-  const sharedConnection = {
-    async transaction(operation) {
-      return operation(rollbackSession);
-    }
-  };
-  failedRestore.UserModel.db = sharedConnection;
-  failedRestore.ChatServerModel.db = sharedConnection;
-  failedRestore.RoomRestrictionModel.db = sharedConnection;
-  Object.assign(failedRestore.socket, {
-    username: 'Admin', displayName: 'Admin', role: 'admin', serverCode: 'global',
-    joinedServers: ['global'], bannedRooms: []
-  });
-  const restoreAck = acknowledge();
-  await failedRestore.socket.trigger('moderate_user', {
-    serverCode: 'global', targetUser: 'TargetUser', action: 'unban', reason: 'restore access'
-  }, restoreAck.callback);
-  assert.deepEqual(restoreAck.value(), { error: 'Moderation failed.' });
-  assert.equal(failedRestoreState.rows[0].lastReadAt.getTime(), newestAt.getTime());
-  assert.equal(failedRestoreState.rows[0].lastReadMessageId, newestId);
-  assert.equal(failedRestoreState.rows[0].version, 3);
-  assert.deepEqual(cursorMutationSessions, [null], 'early cursor write is outside the failed grant transaction');
-  assert.notEqual(failedRestrictions.rows[0].bannedAt, null);
-  assert.equal(failedRestore.ModerationAuditModel.rows.length, 0);
-});
-
-test('complete attention policy matrix covers levels blocks memberships restrictions sessions and reconnects', async () => {
-  const cursorAt = new Date('2026-08-10T12:00:00.000Z');
-  const cursorId = '507f1f77bcf86cd799439091';
-  const newerId = '507f1f77bcf86cd799439092';
-  const names = ['AllUser', 'MentionsUser', 'NoneUser', 'BlockedUser', 'TimedUser', 'BannedUser'];
-  const RoomMemberStateModel = createMemoryModel(names.map((username, index) => ({
-    _id: (200 + index).toString(16).padStart(24, '0'),
-    usernameKey: username.toLowerCase(), serverCode: 'ABC123',
-    notificationLevel: username === 'MentionsUser' ? 'mentions' : (username === 'NoneUser' ? 'none' : 'all'),
-    lastReadAt: cursorAt, lastReadMessageId: cursorId, version: 0
-  })));
-  const setup = registerWithModels({
-    users: [
-      ...names.map(username => userDocument({ username, displayName: username, password: 'hash', servers: ['global', 'ABC123'] })),
-      userDocument({ username: 'GhostAdmin', displayName: 'GhostAdmin', password: 'hash', role: 'admin', servers: ['global'] })
-    ],
-    rooms: [roomDocument('global'), roomDocument('ABC123')],
-    messages: [
-      {
-        _id: cursorId, serverCode: 'ABC123', username: 'Author', authorKey: 'author',
-        notificationMentions: [], timestamp: cursorAt
-      },
-      {
-        _id: newerId, serverCode: 'ABC123', username: 'Author', authorKey: 'author',
-        notificationMentions: ['*'], timestamp: new Date('2026-08-10T12:01:00.000Z')
-      }
-    ],
-    restrictions: [
-      restrictionDocument('ABC123', 'TimedUser', { timeoutUntil: new Date(Date.now() + 60_000) }),
-      restrictionDocument('ABC123', 'BannedUser', { bannedAt: new Date() })
-    ],
-    roomStates: RoomMemberStateModel.rows,
-    experienceStates: [{
-      usernameKey: 'blockeduser',
-      blockedUsers: [{ usernameKey: 'author', username: 'Author', createdAt: new Date() }],
-      blockVersion: 3
-    }]
-  });
-  preserveAttentionProjection(setup.MessageModel);
-  const sockets = new Map();
-  function attach(id, username, role = 'user', joinedServers = ['global', 'ABC123']) {
-    const live = connectAdditionalSocket(setup, {
-      id, username, role, serverCode: 'global', joinedServers
-    });
-    sockets.set(username, live);
-    return live;
-  }
-  for (const username of names) attach(username.toLowerCase(), username);
-  const secondAll = attach('all-second', 'AllUser');
-  const ghost = attach('ghost', 'GhostAdmin', 'admin', ['global']);
-
-  async function notification(live, level) {
-    const ack = acknowledge();
-    await live.trigger('update_room_notification', { serverCode: 'ABC123', level }, ack.callback);
-    return ack.value();
-  }
-
-  for (const [username, level] of [
-    ['MentionsUser', 'mentions'], ['NoneUser', 'none'], ['TimedUser', 'all']
-  ]) {
-    const state = await notification(sockets.get(username), level);
-    assert.deepEqual({ unreadCount: state.unreadCount, mentionCount: state.mentionCount }, {
-      unreadCount: 1, mentionCount: 1
-    }, username);
-  }
-  const blocked = await notification(sockets.get('BlockedUser'), 'all');
-  assert.deepEqual({
-    unreadCount: blocked.unreadCount, mentionCount: blocked.mentionCount, blockVersion: blocked.blockVersion
-  }, { unreadCount: 0, mentionCount: 0, blockVersion: 3 });
-  assert.deepEqual(await notification(sockets.get('BannedUser'), 'all'), { error: 'Permission denied.' });
-  assert.deepEqual(await notification(ghost, 'all'), { error: 'Permission denied.' });
-
-  const synchronized = await notification(sockets.get('AllUser'), 'mentions');
-  assert.deepEqual(secondAll.outbound.filter(item => item.event === 'room_notification_updated').at(-1).payload, synchronized);
-
-  const reconnect = new FakeSocket();
-  reconnect.id = 'all-reconnect';
-  createConnectionHandler({
-    ioInstance: setup.ioInstance,
-    onlineUsersMap: setup.onlineUsersMap,
-    UserModel: setup.UserModel,
-    ChatServerModel: setup.ChatServerModel,
-    MessageModel: setup.MessageModel,
-    RoomRestrictionModel: setup.RoomRestrictionModel,
-    ModerationAuditModel: setup.ModerationAuditModel,
-    ModerationReportModel: setup.ModerationReportModel,
-    RoomMemberStateModel: setup.RoomMemberStateModel,
-    UserExperienceStateModel: setup.UserExperienceStateModel,
-    bcryptImpl: { async compare() { return true; } },
-    broadcastOnlineUsersFn: async () => {}, getRoomRoleFn: async () => 'user',
-    resolvePingsFn: async text => text, logger: { error() {} }
-  })(reconnect);
-  setup.ioInstance.sockets.push(reconnect);
-  const loginAck = acknowledge();
-  await reconnect.trigger('login', { username: 'AllUser', password: '123456' }, loginAck.callback);
-  const reconnectState = loginAck.value().roomStates.find(state => state.serverCode === 'ABC123');
-  assert.equal(reconnectState.notificationLevel, 'mentions');
-  assert.deepEqual({ unreadCount: reconnectState.unreadCount, mentionCount: reconnectState.mentionCount }, {
-    unreadCount: 1, mentionCount: 1
-  });
-});
-
-test('complete room experience backend policy matrix has no stale authority or content leak', async () => {
-  const rooms = ['global', 'ABC123'];
-  const actors = [
-    { label: 'admin', username: 'Admin', role: 'admin', member: true },
-    { label: 'owner', username: 'Owner', role: 'user', member: true },
-    { label: 'exact-mod', username: 'ExactMod', role: 'user', member: true },
-    { label: 'other-mod', username: 'OtherMod', role: 'user', member: true },
-    { label: 'member', username: 'Member', role: 'user', member: true },
-    { label: 'nonmember', username: 'Nonmember', role: 'user', member: false }
-  ];
-  const restrictions = [
-    { label: 'active', banned: false, timedOut: false },
-    { label: 'timeout', banned: false, timedOut: true },
-    { label: 'banned', banned: true, timedOut: false }
-  ];
-  let cases = 0;
-
-  for (const serverCode of rooms) {
-    for (const actor of actors) {
-      for (const restriction of restrictions) {
-        for (const blocked of [false, true]) {
-          const room = {
-            code: serverCode,
-            owner: 'Owner',
-            moderators: serverCode === 'global' ? [] : ['ExactMod']
-          };
-          const active = restriction.label === 'active';
-          const allowed = actor.member || actor.role === 'admin';
-          const access = {
-            allowed,
-            user: { username: actor.username, role: actor.role },
-            room,
-            restriction: { banned: restriction.banned, timedOut: restriction.timedOut }
-          };
-          const privileged = actor.role === 'admin';
-          const privateOwner = serverCode !== 'global' && actor.label === 'owner';
-          const exactModerator = serverCode !== 'global' && actor.label === 'exact-mod';
-          const prefix = `${serverCode}/${actor.label}/${restriction.label}/${blocked ? 'blocked' : 'unblocked'}`;
-
-          assert.equal(
-            canEditRoomDetails({ serverCode, access }),
-            active && allowed && (privileged || privateOwner),
-            `${prefix}: details`
-          );
-          assert.equal(
-            canManagePins({ serverCode, access }),
-            active && allowed && (privileged || privateOwner || exactModerator),
-            `${prefix}: pins`
-          );
-          const canModerate = active && allowed && canModerateTarget({
-            serverCode,
-            action: 'ban',
-            actorUser: access.user,
-            targetUser: { username: 'Target', role: 'user' },
-            room
-          });
-          assert.equal(
-            canModerate,
-            active && allowed && (privileged || exactModerator),
-            `${prefix}: moderation`
-          );
-
-          const secret = `secret-${prefix}`;
-          const safe = safeMessageForViewer({
-            _id: VALID_MESSAGE_ID,
-            serverCode,
-            username: 'Author',
-            authorKey: 'author',
-            displayName: 'Secret Author',
-            text: secret,
-            attachment: `data:image/png;base64,${secret}`,
-            replyTo: { id: VALID_MESSAGE_ID, text: secret },
-            reactions: { 'eyes': ['Author'] },
-            timestamp: new Date('2026-08-10T12:00:00.000Z')
-          }, { blockedUserKeys: blocked ? new Set(['author']) : new Set() });
-          if (blocked) {
-            assert.deepEqual(Object.keys(safe).sort(), [
-              '_id', 'authorKey', 'blocked', 'serverCode', 'timestamp', 'username'
-            ]);
-            assert.equal(JSON.stringify(safe).includes(secret), false, `${prefix}: blocked content`);
-          } else {
-            assert.equal(safe.text, secret, `${prefix}: visible content`);
-            assert.notEqual(safe.blocked, true, `${prefix}: visible marker`);
-          }
-          cases += 1;
-        }
-      }
-    }
-  }
-  assert.equal(cases, 72);
-});
-
-function sendTransitionFixture(kind, { gateCreate = false, gateTransitionWrite = false } = {}) {
-  const sendCreateStarted = deferred();
-  const releaseSendCreate = deferred();
-  const transitionWriteStarted = deferred();
-  const releaseTransitionWrite = deferred();
-  const senderIsAdmin = kind === 'global demotion';
-  const senderMemberships = senderIsAdmin ? ['global'] : ['global', 'ABC123'];
-  const MessageModel = createMemoryModel([]);
-  const persistMessage = MessageModel.create.bind(MessageModel);
-  let reachedCreate = false;
-  MessageModel.create = async value => {
-    reachedCreate = true;
-    sendCreateStarted.resolve();
-    if (gateCreate) await releaseSendCreate.promise;
-    return persistMessage({
-      _id: '507f1f77bcf86cd799439088',
-      timestamp: new Date('2026-08-10T14:00:00.000Z'),
-      deleted: false,
-      ...value
-    });
-  };
-
-  const UserModel = createMemoryModel([
-    userDocument({
-      username: 'Alice', displayName: 'Alice', role: senderIsAdmin ? 'admin' : 'user',
-      servers: senderMemberships
-    }),
-    userDocument({
-      username: 'RootAdmin', displayName: 'Root Admin', role: 'admin',
-      servers: ['global', 'ABC123']
-    })
-  ]);
-  let transitionWriteGated = false;
-  UserModel.saveHook = async ({ document }) => {
-    const isTransitionWrite = document.username === 'Alice' &&
-      ((kind === 'leave' && !document.servers.includes('ABC123')) ||
-       (kind === 'global demotion' && document.role === 'user'));
-    if (!gateTransitionWrite || transitionWriteGated || !isTransitionWrite) return;
-    transitionWriteGated = true;
-    transitionWriteStarted.resolve();
-    await releaseTransitionWrite.promise;
-  };
-
-  const setup = registerWithModels({
-    UserModel,
-    MessageModel,
-    rooms: [roomDocument('global', { owner: 'System' }), roomDocument('ABC123')]
-  });
-  Object.assign(setup.socket, {
-    username: 'Alice',
-    displayName: 'Alice',
-    role: senderIsAdmin ? 'admin' : 'user',
-    serverCode: 'ABC123',
-    joinedServers: [...senderMemberships],
-    bannedRooms: [],
-    blockedUserKeys: new Set(),
-    blockVersion: 0
-  });
-  setup.socket.joinedRooms.add('ABC123');
-  setup.onlineUsersMap.set(setup.socket.id, {
-    username: 'Alice',
-    displayName: 'Alice',
-    role: setup.socket.role,
-    serverCode: 'ABC123',
-    joinedServers: [...senderMemberships],
-    bannedRooms: [],
-    blockedUsers: [],
-    blockVersion: 0
-  });
-  const administrator = connectAdditionalSocket(setup, {
-    id: `root-${kind.replace(/\s+/g, '-')}`,
-    username: 'RootAdmin',
-    role: 'admin',
-    serverCode: 'global',
-    joinedServers: ['global', 'ABC123']
-  });
-
-  function startTransition(ack) {
-    return kind === 'leave'
-      ? setup.socket.trigger('leave_server', 'ABC123', ack.callback)
-      : administrator.trigger('manage_role', {
-        targetUser: 'Alice', action: 'demote_global_admin'
-      }, ack.callback);
-  }
-
-  return {
-    ...setup,
-    administrator,
-    sendCreateStarted,
-    releaseSendCreate,
-    transitionWriteStarted,
-    releaseTransitionWrite,
-    startTransition,
-    reachedCreate: () => reachedCreate
-  };
-}
-
-for (const kind of ['leave', 'global demotion']) {
-  test(`chat message mutation wins before a concurrent ${kind} and commits before the transition`, async () => {
-    const setup = sendTransitionFixture(kind, { gateCreate: true });
-    const sendPending = setup.socket.trigger('chat_message', {
-      serverCode: 'ABC123', clientContextId: 1, text: `message before ${kind}`
-    });
-    await setup.sendCreateStarted.promise;
-
-    const transitionAck = acknowledge();
-    const transitionPending = setup.startTransition(transitionAck);
-    await new Promise(resolve => setImmediate(resolve));
-    const transitionBeforeSendCommit = transitionAck.value();
-
-    setup.releaseSendCreate.resolve();
-    await Promise.all([sendPending, transitionPending]);
-
-    assert.equal(transitionBeforeSendCommit, undefined);
-    assert.deepEqual(transitionAck.value(), { success: true });
-    assert.equal(setup.MessageModel.rows.length, 1);
-  });
-
-  test(`a ${kind} holding the actor account lock wins before a queued chat message`, async () => {
-    const setup = sendTransitionFixture(kind, { gateTransitionWrite: true });
-    const transitionAck = acknowledge();
-    const transitionPending = setup.startTransition(transitionAck);
-    await setup.transitionWriteStarted.promise;
-
-    const sendPending = setup.socket.trigger('chat_message', {
-      serverCode: 'ABC123', clientContextId: 1, text: `message after ${kind}`
-    });
-    await new Promise(resolve => setImmediate(resolve));
-    await new Promise(resolve => setImmediate(resolve));
-    const reachedCreateBeforeTransitionCommit = setup.reachedCreate();
-
-    setup.releaseTransitionWrite.resolve();
-    await Promise.all([transitionPending, sendPending]);
-
-    assert.deepEqual(transitionAck.value(), { success: true });
-    assert.equal(reachedCreateBeforeTransitionCommit, false);
-    assert.equal(setup.MessageModel.rows.length, 0);
   });
 }
 

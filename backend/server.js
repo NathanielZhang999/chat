@@ -80,270 +80,6 @@ function normalizeAccountKey(value) {
   return String(value || '').normalize('NFKC').trim().toLowerCase();
 }
 
-function isPlainObject(value) {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-  const prototype = Object.getPrototypeOf(value);
-  return prototype === Object.prototype || prototype === null;
-}
-
-function normalizeRoomText(value, maxLength) {
-  if (typeof value !== 'string') return null;
-  const normalized = value.normalize('NFKC').trim();
-  return normalized.length <= maxLength ? normalized : null;
-}
-
-function normalizeNotificationLevel(value) {
-  return ['all', 'mentions', 'none'].includes(value) ? value : null;
-}
-
-function authorKeyForMessage(message) {
-  const direct = normalizeAccountKey(message && message.authorKey);
-  if (direct && normalizeUsername(direct)) return direct;
-  const legacy = normalizeUsername(message && message.username);
-  return legacy ? normalizeAccountKey(legacy) : null;
-}
-
-function extractNotificationMentions(text) {
-  if (typeof text !== 'string') return [];
-  const mentions = [];
-  const seen = new Set();
-  const tokenPattern = /\{\{PING:([^|{}]{1,20})\|([^|{}]{1,30})\}\}/g;
-  for (const match of text.matchAll(tokenPattern)) {
-    const [, usernameValue, displayValue] = match;
-    if (usernameValue === 'everyone' && displayValue === 'everyone') {
-      if (!seen.has('*')) {
-        seen.add('*');
-        mentions.push('*');
-      }
-      continue;
-    }
-    const username = normalizeUsername(usernameValue);
-    const displayName = normalizeDisplayName(displayValue);
-    if (!username || username !== usernameValue || !displayName || displayName !== displayValue) continue;
-    const key = normalizeAccountKey(username);
-    if (!seen.has(key)) {
-      seen.add(key);
-      mentions.push(key);
-    }
-  }
-  return mentions;
-}
-
-function isNotificationMention(message, usernameKey) {
-  const readerKey = normalizeAccountKey(usernameKey);
-  if (!readerKey || !normalizeUsername(readerKey) || !Array.isArray(message?.notificationMentions)) {
-    return false;
-  }
-  return message.notificationMentions.some(value => {
-    if (value === '*') return true;
-    return typeof value === 'string' && value === readerKey && normalizeUsername(value) === value;
-  });
-}
-
-function roomMessageQuery(serverCode) {
-  return serverCode === 'global'
-    ? { $or: [{ serverCode: 'global' }, { serverCode: { $exists: false } }, { serverCode: null }] }
-    : { serverCode };
-}
-
-async function newestRoomMessage(MessageModel, serverCode, { session = null } = {}) {
-  const query = MessageModel.find(roomMessageQuery(serverCode))
-    .sort({ timestamp: -1, _id: -1 })
-    .limit(1);
-  const rows = await applyQuerySession(query, session);
-  return Array.isArray(rows) && rows.length > 0 ? rows[0] : null;
-}
-
-function cursorFromMessage(message) {
-  if (!message || !isValidObjectId(String(message._id))) return null;
-  const lastReadAt = new Date(message.timestamp);
-  if (Number.isNaN(lastReadAt.getTime())) return null;
-  return { lastReadAt, lastReadMessageId: String(message._id) };
-}
-
-function compareCursor(left, right) {
-  const leftTime = left && left.lastReadAt instanceof Date ? left.lastReadAt.getTime() : NaN;
-  const rightTime = right && right.lastReadAt instanceof Date ? right.lastReadAt.getTime() : NaN;
-  const leftValid = !Number.isNaN(leftTime);
-  const rightValid = !Number.isNaN(rightTime);
-  if (!leftValid && !rightValid) return 0;
-  if (!leftValid) return -1;
-  if (!rightValid) return 1;
-  if (leftTime < rightTime) return -1;
-  if (leftTime > rightTime) return 1;
-  const leftId = String(left.lastReadMessageId || '').toLowerCase();
-  const rightId = String(right.lastReadMessageId || '').toLowerCase();
-  if (leftId < rightId) return -1;
-  if (leftId > rightId) return 1;
-  return 0;
-}
-
-function normalizedBlockedUserKeys(blockedUserKeys) {
-  const values = blockedUserKeys instanceof Set || Array.isArray(blockedUserKeys) ? blockedUserKeys : [];
-  const normalized = new Set();
-  for (const value of values) {
-    const key = normalizeAccountKey(value);
-    if (key && normalizeUsername(key)) normalized.add(key);
-  }
-  return normalized;
-}
-
-function safeReplyForViewer(reply, blockedUserKeys = new Set()) {
-  if (!reply || typeof reply !== 'object' || Array.isArray(reply)) return null;
-  const blocked = normalizedBlockedUserKeys(blockedUserKeys);
-  const authorKey = normalizeAccountKey(reply.authorKey);
-  if (!authorKey || !normalizeUsername(authorKey)) return blocked.size === 0 ? {
-    id: String(reply.id || ''), displayname: typeof reply.displayname === 'string' ? reply.displayname : '',
-    text: typeof reply.text === 'string' ? reply.text : ''
-  } : null;
-  if (blocked.has(authorKey)) return null;
-  return {
-    id: String(reply.id || ''), authorKey,
-    displayname: typeof reply.displayname === 'string' ? reply.displayname : '',
-    text: typeof reply.text === 'string' ? reply.text : ''
-  };
-}
-
-function safeReactionsForViewer(reactions, blockedUserKeys = new Set()) {
-  const blocked = normalizedBlockedUserKeys(blockedUserKeys);
-  const safe = {};
-  if (!reactions || typeof reactions !== 'object' || Array.isArray(reactions)) return safe;
-  for (const [reaction, users] of Object.entries(reactions)) {
-    if (!Array.isArray(users)) continue;
-    const allowed = users.filter(username => {
-      const key = normalizeAccountKey(username);
-      return key && normalizeUsername(key) && !blocked.has(key);
-    });
-    if (allowed.length > 0) Object.defineProperty(safe, reaction, {
-      value: allowed, enumerable: true, configurable: true, writable: true
-    });
-  }
-  return safe;
-}
-
-function safeMessageForViewer(message, { blockedUserKeys = new Set() } = {}) {
-  if (!message || typeof message !== 'object' || Array.isArray(message)) return null;
-  const authorKey = authorKeyForMessage(message);
-  if (!authorKey) return null;
-  const blocked = normalizedBlockedUserKeys(blockedUserKeys);
-  const username = normalizeUsername(message.username) || authorKey;
-  if (blocked.has(authorKey)) {
-    return {
-      _id: message._id,
-      serverCode: message.serverCode,
-      username,
-      authorKey,
-      timestamp: message.timestamp,
-      blocked: true
-    };
-  }
-  const deleted = Boolean(message.deleted);
-  return {
-    _id: message._id,
-    serverCode: message.serverCode,
-    username,
-    displayName: typeof message.displayName === 'string' ? message.displayName : '',
-    authorKey,
-    role: typeof message.role === 'string' ? message.role : 'user',
-    roomRole: typeof message.roomRole === 'string' ? message.roomRole : 'user',
-    color: typeof message.color === 'string' ? message.color : '',
-    avatarUrl: typeof message.avatarUrl === 'string' ? message.avatarUrl : '',
-    text: deleted ? '' : (typeof message.text === 'string' ? message.text : ''),
-    attachment: deleted ? null : sanitizeAttachment(message.attachment),
-    replyTo: deleted ? null : safeReplyForViewer(message.replyTo, blocked),
-    reactions: deleted ? {} : safeReactionsForViewer(message.reactions, blocked),
-    edited: Boolean(message.edited),
-    deleted,
-    timestamp: message.timestamp
-  };
-}
-
-function safeBlockedMessageReveal(message) {
-  if (!message || typeof message !== 'object' || Array.isArray(message)) return null;
-  const authorKey = authorKeyForMessage(message);
-  if (!authorKey) return null;
-  const deleted = Boolean(message.deleted);
-  return {
-    _id: message._id,
-    serverCode: message.serverCode,
-    username: normalizeUsername(message.username) || authorKey,
-    displayName: typeof message.displayName === 'string' ? message.displayName : '',
-    authorKey,
-    timestamp: message.timestamp,
-    text: deleted ? '' : (typeof message.text === 'string' ? message.text : ''),
-    attachment: deleted ? null : sanitizeAttachment(message.attachment),
-    edited: Boolean(message.edited),
-    deleted
-  };
-}
-
-function safeRoomDetails(room, canEdit) {
-  return {
-    serverCode: room && room.code,
-    description: room && typeof room.description === 'string' ? room.description : '',
-    rules: room && typeof room.rules === 'string' ? room.rules : '',
-    metadataVersion: Number.isInteger(room && room.metadataVersion) && room.metadataVersion >= 0
-      ? room.metadataVersion : 0,
-    canEdit: Boolean(canEdit)
-  };
-}
-
-function safeRoomState(row, counts = {}) {
-  const countedThroughAt = counts.countedThroughAt ? new Date(counts.countedThroughAt) : null;
-  const countedThroughMessageId = counts.countedThroughMessageId
-    ? String(counts.countedThroughMessageId) : null;
-  const hasCountedThrough = countedThroughAt && !Number.isNaN(countedThroughAt.getTime()) &&
-    isValidObjectId(countedThroughMessageId);
-  return {
-    serverCode: row && row.serverCode,
-    usernameKey: row && row.usernameKey,
-    notificationLevel: normalizeNotificationLevel(row && row.notificationLevel) || 'all',
-    lastReadAt: row && row.lastReadAt ? new Date(row.lastReadAt) : null,
-    lastReadMessageId: row && row.lastReadMessageId ? String(row.lastReadMessageId) : null,
-    unreadCount: Number.isInteger(counts.unreadCount) && counts.unreadCount >= 0 ? counts.unreadCount : 0,
-    mentionCount: Number.isInteger(counts.mentionCount) && counts.mentionCount >= 0 ? counts.mentionCount : 0,
-    version: Number.isInteger(row && row.version) && row.version >= 0 ? row.version : 0,
-    blockVersion: Number.isInteger(counts.blockVersion) && counts.blockVersion >= 0 ? counts.blockVersion : 0,
-    ...(hasCountedThrough ? { countedThroughAt, countedThroughMessageId } : {})
-  };
-}
-
-function safeBlockState(row) {
-  const blockedUsers = Array.isArray(row && row.blockedUsers) ? row.blockedUsers.reduce((safe, entry) => {
-    const usernameKey = normalizeAccountKey(entry && entry.usernameKey);
-    if (!usernameKey || !normalizeUsername(usernameKey)) return safe;
-    safe.push({
-      usernameKey,
-      username: normalizeUsername(entry.username) || usernameKey
-    });
-    return safe;
-  }, []) : [];
-  return {
-    blockedUsers,
-    blockVersion: Number.isInteger(row && row.blockVersion) && row.blockVersion >= 0 ? row.blockVersion : 0
-  };
-}
-
-function blockSetFromState(row) {
-  return new Set(safeBlockState(row).blockedUsers.map(item => item.usernameKey));
-}
-
-function replaceAccountBlockCaches(sockets, usernameKey, state, onlineUsersMap = onlineUsers) {
-  const accountKey = normalizeAccountKey(usernameKey);
-  const safeState = safeBlockState(state);
-  const blockedUsers = safeState.blockedUsers.map(item => item.usernameKey);
-  for (const live of Array.isArray(sockets) ? sockets : []) {
-    const session = onlineUsersMap.get(live.id);
-    if (normalizeAccountKey(live.username || session?.username) !== accountKey) continue;
-    live.blockedUserKeys = new Set(blockedUsers);
-    live.blockVersion = safeState.blockVersion;
-    if (session) {
-      session.blockedUsers = [...blockedUsers];
-      session.blockVersion = safeState.blockVersion;
-    }
-  }
-}
-
 function normalizeAutoModSettings(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value) || !Array.isArray(value.blockedKeywords)) return null;
   const boundedIntegers = [
@@ -636,12 +372,9 @@ function appendBoundedHistory(history, entry, limit = 20) {
 }
 
 function createReplySnapshot(message) {
-  const authorKey = authorKeyForMessage(message);
-  if (!authorKey) return null;
   const text = typeof message.text === 'string' ? message.text.slice(0, 100) : '';
   return {
     id: String(message._id),
-    authorKey,
     displayname: message.displayName || message.username,
     text: text || (message.attachment ? 'Image Attachment' : '')
   };
@@ -655,41 +388,6 @@ function escapeRegExp(string) {
 function applyQuerySession(query, session) {
   if (session && query && typeof query.session === 'function') return query.session(session);
   return query;
-}
-
-function sharedTransactionConnection(models) {
-  const candidates = Array.isArray(models) ? models : [];
-  if (candidates.length === 0) return null;
-  const connection = candidates[0] && candidates[0].db;
-  return connection && typeof connection.transaction === 'function' &&
-    candidates.every(model => model && model.db === connection)
-    ? connection
-    : null;
-}
-
-function isUnsupportedTransactionTopologyError(error) {
-  return Boolean(error && error.code === 20 &&
-    String(error.message || '').includes(
-      'Transaction numbers are only allowed on a replica set member or mongos'
-    ));
-}
-
-async function runPersistence(operation, connection, { unsupportedTopologyFallback = null } = {}) {
-  if (!connection) {
-    return typeof unsupportedTopologyFallback === 'function'
-      ? unsupportedTopologyFallback()
-      : operation(null);
-  }
-  try {
-    return await connection.transaction(session => operation(session));
-  } catch (error) {
-    // Code 20 with this server message rejects transaction topology before any write can commit.
-    if (typeof unsupportedTopologyFallback === 'function' &&
-        isUnsupportedTransactionTopologyError(error)) {
-      return unsupportedTopologyFallback();
-    }
-    throw error;
-  }
 }
 
 async function findUserByUsername(UserModel, value, { session = null } = {}) {
@@ -815,22 +513,6 @@ function isCurrentRoomModerator(room, username) {
     room.moderators.some(candidate => normalizeAccountKey(candidate) === key));
 }
 
-function canEditRoomDetails({ serverCode, access }) {
-  if (!access || !access.allowed || access.restriction?.banned || access.restriction?.timedOut ||
-    !access.user || !access.room) return false;
-  if (access.user.role === 'admin') return true;
-  return serverCode !== 'global' && normalizeAccountKey(access.room.owner) === normalizeAccountKey(access.user.username);
-}
-
-function canManagePins({ serverCode, access }) {
-  if (!access || !access.allowed || access.restriction?.banned || access.restriction?.timedOut ||
-    !access.user || !access.room || access.room.code !== serverCode) return false;
-  if (serverCode === 'global') return access.user.role === 'admin';
-  return access.user.role === 'admin' ||
-    normalizeAccountKey(access.room.owner) === normalizeAccountKey(access.user.username) ||
-    isCurrentRoomModerator(access.room, access.user.username);
-}
-
 function canModerateTarget({ serverCode, action, actorUser, targetUser, room }) {
   if (!actorUser || !targetUser || !room || room.code !== serverCode) return false;
   const normalizedAction = normalizeModerationAction(action);
@@ -942,25 +624,11 @@ const UserSchema = new mongoose.Schema({
 });
 const User = mongoose.model('User', UserSchema);
 
-const PinnedMessageSchema = new mongoose.Schema({
-  messageId: { type: mongoose.Schema.Types.ObjectId, required: true },
-  pinnedAt: { type: Date, required: true },
-  pinnedBy: { type: String, required: true, maxLength: 20 }
-}, { _id: false });
-
 const ChatServerSchema = new mongoose.Schema({
   code: { type: String, required: true, unique: true },
   name: { type: String, required: true, maxLength: 30 },
   owner: { type: String, required: true },
   moderators: { type: [String], default: [] },
-  description: { type: String, default: '', maxLength: 500 },
-  rules: { type: String, default: '', maxLength: 2000 },
-  metadataVersion: { type: Number, default: 0, min: 0 },
-  pinnedMessages: {
-    type: [PinnedMessageSchema], default: [],
-    validate: { validator: value => Array.isArray(value) && value.length <= 20 }
-  },
-  pinVersion: { type: Number, default: 0, min: 0 },
   autoMod: {
     blockedKeywords: {
       type: [{ type: String, maxLength: 40 }],
@@ -1057,63 +725,24 @@ ModerationReportSchema.index(
 );
 const ModerationReport = mongoose.model('ModerationReport', ModerationReportSchema);
 
-const ReplySnapshotSchema = new mongoose.Schema({
-  id: { type: String, required: true, maxLength: 24 },
-  authorKey: { type: String, default: '', maxLength: 20, immutable: true },
-  displayname: { type: String, required: true, maxLength: 30 },
-  text: { type: String, required: true, maxLength: 100 }
-}, { _id: false });
-
 const MessageSchema = new mongoose.Schema({
   serverCode: { type: String, required: true, default: 'global' },
   username: String,
   displayName: { type: String, default: '' },
-  authorKey: { type: String, default: '', maxLength: 20, immutable: true },
-  notificationMentions: { type: [String], default: [], immutable: true },
   role: { type: String, default: 'user' }, 
   roomRole: { type: String, default: 'user' },
   color: { type: String, default: '' },      
   avatarUrl: { type: String, default: '' },  
   text: { type: String, default: '' },
   attachment: { type: String, default: null },
-  replyTo: { type: ReplySnapshotSchema, default: null },
+  replyTo: { type: Object, default: null },
   reactions: { type: Object, default: {} }, 
   edited: { type: Boolean, default: false },
   deleted: { type: Boolean, default: false },
   history: [{ text: String, timestamp: Date }], 
   timestamp: { type: Date, default: Date.now }
 });
-MessageSchema.index({ serverCode: 1, timestamp: -1, _id: -1 });
 const Message = mongoose.model('Message', MessageSchema);
-
-const RoomMemberStateSchema = new mongoose.Schema({
-  usernameKey: { type: String, required: true, maxLength: 20 },
-  serverCode: { type: String, required: true, maxLength: 6 },
-  notificationLevel: { type: String, enum: ['all', 'mentions', 'none'], default: 'all' },
-  lastReadAt: { type: Date, default: null },
-  lastReadMessageId: { type: String, default: null, maxLength: 24 },
-  version: { type: Number, default: 0, min: 0 }
-}, { timestamps: true });
-RoomMemberStateSchema.index({ usernameKey: 1, serverCode: 1 }, { unique: true });
-RoomMemberStateSchema.index({ serverCode: 1, usernameKey: 1 });
-const RoomMemberState = mongoose.model('RoomMemberState', RoomMemberStateSchema);
-
-const BlockedUserSchema = new mongoose.Schema({
-  usernameKey: { type: String, required: true, maxLength: 20 },
-  username: { type: String, required: true, maxLength: 20 },
-  createdAt: { type: Date, required: true }
-}, { _id: false });
-
-const UserExperienceStateSchema = new mongoose.Schema({
-  usernameKey: { type: String, required: true, maxLength: 20 },
-  blockedUsers: {
-    type: [BlockedUserSchema], default: [],
-    validate: { validator: value => Array.isArray(value) && value.length <= 500 }
-  },
-  blockVersion: { type: Number, default: 0, min: 0 }
-}, { timestamps: true });
-UserExperienceStateSchema.index({ usernameKey: 1 }, { unique: true });
-const UserExperienceState = mongoose.model('UserExperienceState', UserExperienceStateSchema);
 
 // --- AUTO-SETUP SYSTEM ---
 async function seedSystem({
@@ -1147,7 +776,7 @@ async function getRoomRole(serverCode, username) {
     if (serverCode === 'global') return 'user';
     const srv = await ChatServer.findOne({ code: serverCode }).lean();
     if (!srv) return 'user';
-
+    
     // Moderators strictly based on the moderators list
     if (srv.moderators && srv.moderators.includes(username)) return 'mod';
     return 'user';
@@ -1265,8 +894,6 @@ function createConnectionHandler({
   RoomRestrictionModel = RoomRestriction,
   ModerationAuditModel = ModerationAudit,
   ModerationReportModel = ModerationReport,
-  RoomMemberStateModel = RoomMemberState,
-  UserExperienceStateModel = UserExperienceState,
   bcryptImpl = bcrypt,
   onlineUsersMap = onlineUsers,
   broadcastOnlineUsersFn = broadcastOnlineUsers,
@@ -1288,639 +915,6 @@ function createConnectionHandler({
     const byId = new Map((Array.isArray(fetched) ? fetched : []).map(live => [live.id, live]));
     byId.set(socket.id, socket);
     return [...byId.values()];
-  }
-
-  async function ensureBlockState(usernameKey, { session = null } = {}) {
-    const key = normalizeAccountKey(usernameKey);
-    let row = await applyQuerySession(UserExperienceStateModel.findOne({ usernameKey: key }), session);
-    if (!row) {
-      try {
-        row = await UserExperienceStateModel.findOneAndUpdate(
-          { usernameKey: key },
-          { $setOnInsert: { usernameKey: key, blockedUsers: [], blockVersion: 0 } },
-          { upsert: true, new: true, setDefaultsOnInsert: true, ...(session ? { session } : {}) }
-        );
-      } catch (err) {
-        if (!err || err.code !== 11000) throw err;
-      }
-    }
-    if (!row) row = await applyQuerySession(UserExperienceStateModel.findOne({ usernameKey: key }), session);
-    if (!row) throw new Error('Block state initialization failed.');
-    return safeBlockState(row);
-  }
-
-  async function loadDurableBlockState(usernameKey, { session = null } = {}) {
-    const snapshot = await ensureBlockState(usernameKey, { session });
-    const blockedUserKeys = blockSetFromState(snapshot);
-    blockedUserKeys.blockVersion = snapshot.blockVersion;
-    return { snapshot, blockedUserKeys };
-  }
-
-  async function countRoomAttention({ usernameKey, serverCode, cursor, blockedUserKeys } = {}) {
-    const readerKey = normalizeAccountKey(usernameKey);
-    const canonicalRoom = normalizeServerCode(serverCode);
-    if (!readerKey || !normalizeUsername(readerKey) || !canonicalRoom) {
-      return { unreadCount: 0, mentionCount: 0 };
-    }
-    const newer = cursor && cursor.lastReadAt
-      ? { $or: [
-        { timestamp: { $gt: cursor.lastReadAt } },
-        { timestamp: cursor.lastReadAt, _id: { $gt: cursor.lastReadMessageId } }
-      ] }
-      : {};
-    const rows = await MessageModel.find({ $and: [roomMessageQuery(canonicalRoom), newer] })
-      .select('_id serverCode timestamp username authorKey notificationMentions deleted');
-    const blocked = normalizedBlockedUserKeys(blockedUserKeys);
-    let unreadCount = 0;
-    let mentionCount = 0;
-    let countedThrough = null;
-    for (const storedMessage of Array.isArray(rows) ? rows : []) {
-      const authorKey = authorKeyForMessage(storedMessage);
-      if (!authorKey || authorKey === readerKey || blocked.has(authorKey)) continue;
-      const messageCursor = cursorFromMessage(storedMessage);
-      if (messageCursor && (!countedThrough || compareCursor(countedThrough, messageCursor) < 0)) {
-        countedThrough = messageCursor;
-      }
-      unreadCount += 1;
-      if (isNotificationMention(storedMessage, readerKey)) mentionCount += 1;
-    }
-    return {
-      unreadCount,
-      mentionCount,
-      ...(countedThrough ? {
-        countedThroughAt: countedThrough.lastReadAt,
-        countedThroughMessageId: countedThrough.lastReadMessageId
-      } : {})
-    };
-  }
-
-  async function ensureRoomState({ usernameKey, serverCode, session = null }) {
-    const key = normalizeAccountKey(usernameKey);
-    const query = { usernameKey: key, serverCode };
-    let row = await applyQuerySession(RoomMemberStateModel.findOne(query), session);
-    if (row) return row;
-
-    const newest = await newestRoomMessage(MessageModel, serverCode, { session });
-    const cursor = cursorFromMessage(newest) || { lastReadAt: null, lastReadMessageId: null };
-    try {
-      row = await RoomMemberStateModel.findOneAndUpdate(
-        query,
-        { $setOnInsert: {
-          ...query,
-          notificationLevel: 'all',
-          lastReadAt: cursor.lastReadAt,
-          lastReadMessageId: cursor.lastReadMessageId,
-          version: 0
-        } },
-        { upsert: true, new: true, setDefaultsOnInsert: true, ...(session ? { session } : {}) }
-      );
-      if (row) return row;
-    } catch (err) {
-      if (!err || err.code !== 11000) throw err;
-    }
-    row = await applyQuerySession(RoomMemberStateModel.findOne(query), session);
-    if (!row) throw new Error('Room state initialization failed.');
-    return row;
-  }
-
-  async function loadRoomStateSnapshot({ usernameKey, serverCode, blockedUserKeys, session = null }) {
-    const row = await ensureRoomState({ usernameKey, serverCode, session });
-    const counts = await countRoomAttention({
-      usernameKey: normalizeAccountKey(usernameKey),
-      serverCode,
-      cursor: {
-        lastReadAt: row.lastReadAt || null,
-        lastReadMessageId: row.lastReadMessageId || null
-      },
-      blockedUserKeys
-    });
-    return safeRoomState(row, {
-      ...counts,
-      blockVersion: Number.isInteger(blockedUserKeys && blockedUserKeys.blockVersion)
-        ? blockedUserKeys.blockVersion : 0
-    });
-  }
-
-  async function advanceRoomCursorToNewest({ usernameKey, serverCode, session = null }) {
-    const key = normalizeAccountKey(usernameKey);
-    let row = await ensureRoomState({ usernameKey: key, serverCode, session });
-    const newest = await newestRoomMessage(MessageModel, serverCode, { session });
-    const cursor = cursorFromMessage(newest);
-    if (!cursor || compareCursor({
-      lastReadAt: row.lastReadAt,
-      lastReadMessageId: row.lastReadMessageId
-    }, cursor) >= 0) return row;
-
-    const currentVersion = Number.isInteger(row.version) && row.version >= 0 ? row.version : 0;
-    const versionPredicate = currentVersion === 0
-      ? { $or: [{ version: 0 }, { version: { $exists: false } }] }
-      : { version: currentVersion };
-    const updated = await RoomMemberStateModel.findOneAndUpdate(
-      { usernameKey: key, serverCode, ...versionPredicate },
-      { $set: {
-        lastReadAt: cursor.lastReadAt,
-        lastReadMessageId: cursor.lastReadMessageId
-      }, $inc: { version: 1 } },
-      { new: true, ...(session ? { session } : {}) }
-    );
-    if (updated) return updated;
-    row = await applyQuerySession(RoomMemberStateModel.findOne({ usernameKey: key, serverCode }), session);
-    if (!row) throw new Error('Room cursor advance failed.');
-    return row;
-  }
-
-  function pinVersionForRoom(room) {
-    return Number.isInteger(room && room.pinVersion) && room.pinVersion >= 0 ? room.pinVersion : 0;
-  }
-
-  async function loadPinCandidates(room) {
-    const candidates = [];
-    for (const storedPin of Array.isArray(room && room.pinnedMessages) ? room.pinnedMessages : []) {
-      const messageId = String(storedPin && storedPin.messageId || '').toLowerCase();
-      if (!isValidObjectId(messageId)) continue;
-      const storedMessage = await MessageModel.findById(messageId);
-      if (!storedMessage || storedMessage.deleted || storedMessage.serverCode !== room.code) continue;
-      const authorKey = authorKeyForMessage(storedMessage);
-      if (!authorKey) continue;
-      const username = normalizeUsername(storedMessage.username) || authorKey;
-      const pinnedBy = normalizeUsername(storedPin.pinnedBy) || '';
-      const pinnedAt = storedPin.pinnedAt instanceof Date ? storedPin.pinnedAt : new Date(storedPin.pinnedAt);
-      const messageTimestamp = storedMessage.timestamp instanceof Date
-        ? storedMessage.timestamp : new Date(storedMessage.timestamp);
-      if (Number.isNaN(messageTimestamp.getTime())) continue;
-      candidates.push({
-        messageId,
-        authorKey,
-        username,
-        displayName: typeof storedMessage.displayName === 'string' ? storedMessage.displayName : '',
-        text: typeof storedMessage.text === 'string' ? storedMessage.text : '',
-        attachmentSummary: sanitizeAttachment(storedMessage.attachment) ? 'Image Attachment' : null,
-        messageTimestamp,
-        pinnedAt: Number.isNaN(pinnedAt.getTime()) ? null : pinnedAt,
-        pinnedBy
-      });
-    }
-    return candidates;
-  }
-
-  function visiblePinsFromCandidates(candidates, blockedUserKeys) {
-    const blocked = normalizedBlockedUserKeys(blockedUserKeys);
-    return candidates.filter(pin => !blocked.has(pin.authorKey));
-  }
-
-  async function loadVisiblePins({ room, blockedUserKeys }) {
-    return visiblePinsFromCandidates(await loadPinCandidates(room), blockedUserKeys);
-  }
-
-  async function visiblePinCountSnapshot({ room, blockedUserKeys, blockVersion }) {
-    const pins = await loadVisiblePins({ room, blockedUserKeys });
-    return {
-      serverCode: room.code,
-      pinCount: pins.length,
-      pinVersion: pinVersionForRoom(room),
-      blockVersion: Number.isInteger(blockVersion) && blockVersion >= 0 ? blockVersion : 0
-    };
-  }
-
-  async function visiblePinSnapshot({ room, blockedUserKeys, blockVersion }) {
-    const pins = await loadVisiblePins({ room, blockedUserKeys });
-    return {
-      serverCode: room.code,
-      pins,
-      pinCount: pins.length,
-      pinVersion: pinVersionForRoom(room),
-      blockVersion: Number.isInteger(blockVersion) && blockVersion >= 0 ? blockVersion : 0
-    };
-  }
-
-  function safeRoomSummary(room, pin) {
-    return {
-      code: room.code,
-      name: typeof room.name === 'string' ? room.name : '',
-      owner: typeof room.owner === 'string' ? room.owner : '',
-      metadataVersion: Number.isInteger(room.metadataVersion) && room.metadataVersion >= 0
-        ? room.metadataVersion : 0,
-      pin
-    };
-  }
-
-  function blockCacheForLiveSession(live, session) {
-    if (live && live.blockedUserKeys instanceof Set) return normalizedBlockedUserKeys(live.blockedUserKeys);
-    return normalizedBlockedUserKeys(Array.isArray(session && session.blockedUsers) ? session.blockedUsers : []);
-  }
-
-  function blockVersionForLiveSession(live, session) {
-    if (Number.isInteger(live?.blockVersion) && live.blockVersion >= 0) return live.blockVersion;
-    return Number.isInteger(session?.blockVersion) && session.blockVersion >= 0 ? session.blockVersion : 0;
-  }
-
-  async function emitPersonalizedRoomEvent({ serverCode, event, buildPayload }) {
-    const canonicalRoom = normalizeServerCode(serverCode);
-    if (!canonicalRoom || typeof event !== 'string' || typeof buildPayload !== 'function') return;
-    let liveSockets;
-    try {
-      liveSockets = await fetchLiveSockets();
-    } catch (err) {
-      logUnexpectedError(logger, 'personalized_socket_discovery', err);
-      return;
-    }
-    const accounts = new Map();
-    for (const live of liveSockets) {
-      if (normalizeServerCode(live.serverCode) !== canonicalRoom) continue;
-      const session = onlineUsersMap.get(live.id);
-      const username = normalizeUsername(live.username || session?.username);
-      const usernameKey = normalizeAccountKey(username);
-      if (!username || !usernameKey) continue;
-      if (!accounts.has(usernameKey)) accounts.set(usernameKey, { username, sockets: [] });
-      accounts.get(usernameKey).sockets.push(live);
-    }
-    for (const { username, sockets } of accounts.values()) {
-      let access;
-      try {
-        access = await loadRoomAccessState({
-          UserModel, ChatServerModel, RoomRestrictionModel, username, serverCode: canonicalRoom
-        });
-      } catch (err) {
-        logUnexpectedError(logger, 'personalized_room_access', err);
-        continue;
-      }
-      if (!access.allowed || access.restriction.banned || !access.user || !access.room) continue;
-      for (const live of sockets) {
-        if (normalizeServerCode(live.serverCode) !== canonicalRoom) continue;
-        const session = onlineUsersMap.get(live.id);
-        const blockedUserKeys = blockCacheForLiveSession(live, session);
-        const blockVersion = blockVersionForLiveSession(live, session);
-        let payload = buildPayload({ live, access, blockedUserKeys, blockVersion });
-        if (payload && typeof payload.then === 'function') {
-          payload = await payload;
-          if (blockVersionForLiveSession(live, onlineUsersMap.get(live.id)) !== blockVersion) {
-            const freshSession = onlineUsersMap.get(live.id);
-            payload = buildPayload({
-              live,
-              access,
-              blockedUserKeys: blockCacheForLiveSession(live, freshSession),
-              blockVersion: blockVersionForLiveSession(live, freshSession)
-            });
-            if (payload && typeof payload.then === 'function') payload = await payload;
-          }
-        }
-        if (payload === null || payload === undefined) continue;
-        if (normalizeServerCode(live.serverCode) !== canonicalRoom) continue;
-        const freshSession = onlineUsersMap.get(live.id);
-        const freshVersion = blockVersionForLiveSession(live, freshSession);
-        if (freshVersion !== blockVersion) {
-          payload = buildPayload({
-            live,
-            access,
-            blockedUserKeys: blockCacheForLiveSession(live, freshSession),
-            blockVersion: freshVersion
-          });
-          if (payload && typeof payload.then === 'function') payload = await payload;
-          if (payload === null || payload === undefined) continue;
-        }
-        live.emit(event, payload);
-      }
-    }
-  }
-
-  async function emitRoomActivity(message) {
-    const serverCode = normalizeServerCode(message?.serverCode);
-    const authorKey = authorKeyForMessage(message);
-    const messageCursor = cursorFromMessage(message);
-    if (!serverCode || !authorKey || !messageCursor) return;
-    let liveSockets;
-    try {
-      liveSockets = await fetchLiveSockets();
-    } catch (err) {
-      logUnexpectedError(logger, 'room_activity_socket_discovery', err);
-      return;
-    }
-    const accounts = new Map();
-    for (const live of liveSockets) {
-      const session = onlineUsersMap.get(live.id);
-      const username = normalizeUsername(live.username || session?.username);
-      const usernameKey = normalizeAccountKey(username);
-      if (!username || !usernameKey || usernameKey === authorKey) continue;
-      if (!accounts.has(usernameKey)) accounts.set(usernameKey, { username, sockets: [] });
-      accounts.get(usernameKey).sockets.push(live);
-    }
-    for (const [usernameKey, account] of accounts.entries()) {
-      let access;
-      try {
-        access = await loadRoomAccessState({
-          UserModel,
-          ChatServerModel,
-          RoomRestrictionModel,
-          username: account.username,
-          serverCode
-        });
-      } catch (err) {
-        logUnexpectedError(logger, 'room_activity_access', err);
-        continue;
-      }
-      const actualMember = Array.isArray(access.user?.servers) && access.user.servers.includes(serverCode);
-      if (!access.allowed || access.restriction.banned || !access.user || !access.room || !actualMember) continue;
-      try {
-        await withAccountTransitionLock(usernameKey, async () => {
-          const freshAccess = await loadRoomAccessState({
-            UserModel,
-            ChatServerModel,
-            RoomRestrictionModel,
-            username: account.username,
-            serverCode
-          });
-          const freshMember = Array.isArray(freshAccess.user?.servers) &&
-            freshAccess.user.servers.includes(serverCode);
-          if (!freshAccess.allowed || freshAccess.restriction.banned ||
-              !freshAccess.user || !freshAccess.room || !freshMember) return;
-          for (const live of account.sockets) {
-            const session = onlineUsersMap.get(live.id);
-            if (normalizeAccountKey(live.username || session?.username) !== usernameKey) continue;
-            const blockedUserKeys = blockCacheForLiveSession(live, session);
-            const blockVersion = blockVersionForLiveSession(live, session);
-            if (blockedUserKeys.has(authorKey)) continue;
-            live.emit('room_activity', {
-              serverCode,
-              messageId: String(message._id),
-              timestamp: messageCursor.lastReadAt,
-              authorKey,
-              mentioned: isNotificationMention(message, usernameKey),
-              blockVersion
-            });
-          }
-        });
-      } catch (err) {
-        logUnexpectedError(logger, 'room_activity_locked_access', err);
-      }
-    }
-  }
-
-  async function emitMessagePinUpdated({ serverCode, messageId, pinned, room, targetAuthorKey }) {
-    const candidates = await loadPinCandidates(room);
-    await emitPersonalizedRoomEvent({
-      serverCode,
-      event: 'message_pin_updated',
-      buildPayload: ({ blockedUserKeys, blockVersion }) => {
-        const pin = {
-          serverCode,
-          pinCount: visiblePinsFromCandidates(candidates, blockedUserKeys).length,
-          pinVersion: pinVersionForRoom(room),
-          blockVersion
-        };
-        if (!targetAuthorKey || blockedUserKeys.has(targetAuthorKey)) return { pin };
-        return { messageId, pinned, pin };
-      }
-    });
-  }
-
-  function clearBlockedTypingEntries(live, session, blockedUserKeys) {
-    for (const holder of [live, session]) {
-      const typing = holder?.typingUsers;
-      if (typing instanceof Set || typing instanceof Map) {
-        for (const username of [...typing.keys()]) {
-          if (blockedUserKeys.has(normalizeAccountKey(username))) typing.delete(username);
-        }
-      } else if (Array.isArray(typing)) {
-        holder.typingUsers = typing.filter(username => !blockedUserKeys.has(normalizeAccountKey(username)));
-      } else if (typing && typeof typing === 'object') {
-        for (const username of Object.keys(typing)) {
-          if (blockedUserKeys.has(normalizeAccountKey(username))) delete typing[username];
-        }
-      }
-    }
-  }
-
-  async function refreshBlockerSessions({ usernameKey, state, sockets }) {
-    const accountKey = normalizeAccountKey(usernameKey);
-    const safeState = safeBlockState(state);
-    const blockedUserKeys = blockSetFromState(safeState);
-    blockedUserKeys.blockVersion = safeState.blockVersion;
-    const actor = await findUserByUsername(UserModel, accountKey);
-    if (!actor) return;
-    const memberships = [...new Set(Array.isArray(actor.servers) ? actor.servers : [])];
-    const roomSnapshots = new Map();
-    for (const serverCode of memberships) {
-      const access = await loadRoomAccessState({
-        UserModel, ChatServerModel, RoomRestrictionModel, username: actor.username, serverCode
-      });
-      const actualMember = Array.isArray(access.user?.servers) && access.user.servers.includes(serverCode);
-      if (!access.allowed || access.restriction.banned || !access.room || !actualMember) continue;
-      roomSnapshots.set(serverCode, {
-        attention: await loadRoomStateSnapshot({
-          usernameKey: accountKey, serverCode, blockedUserKeys
-        }),
-        pin: await visiblePinCountSnapshot({
-          room: access.room, blockedUserKeys, blockVersion: safeState.blockVersion
-        })
-      });
-    }
-    for (const live of Array.isArray(sockets) ? sockets : []) {
-      const session = onlineUsersMap.get(live.id);
-      if (normalizeAccountKey(live.username || session?.username) !== accountKey) continue;
-      delete live.pinsCache;
-      delete live.pinCache;
-      if (session) {
-        delete session.pinsCache;
-        delete session.pinCache;
-      }
-      clearBlockedTypingEntries(live, session, blockedUserKeys);
-      for (const { attention, pin } of roomSnapshots.values()) {
-        live.emit('room_attention_updated', attention);
-        live.emit('message_pin_updated', { pin });
-      }
-      const activeRoom = normalizeServerCode(live.serverCode);
-      if (activeRoom && roomSnapshots.has(activeRoom)) {
-        live.emit('room_refresh_required', {
-          serverCode: activeRoom,
-          blockVersion: safeState.blockVersion
-        });
-      }
-    }
-  }
-
-  function publicBlockMutationState(target, state) {
-    const safeState = safeBlockState(state);
-    return {
-      success: true,
-      usernameKey: normalizeAccountKey(target.username),
-      username: normalizeUsername(target.username),
-      blockedUsers: safeState.blockedUsers,
-      blockVersion: safeState.blockVersion
-    };
-  }
-
-  async function applyBlockMutation({ usernameKey, target, blocked, sockets }) {
-    let observed = await ensureBlockState(usernameKey);
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      const currentKeys = blockSetFromState(observed);
-      const targetKey = normalizeAccountKey(target.username);
-      const alreadyDesired = currentKeys.has(targetKey) === blocked;
-      if (alreadyDesired) break;
-      if (blocked && observed.blockedUsers.length >= 500) return { error: 'Block limit reached.' };
-      const version = observed.blockVersion;
-      const versionPredicate = version === 0
-        ? { $or: [{ blockVersion: 0 }, { blockVersion: { $exists: false } }] }
-        : { blockVersion: version };
-      const statePredicate = blocked
-        ? { 'blockedUsers.usernameKey': { $ne: targetKey } }
-        : { 'blockedUsers.usernameKey': targetKey };
-      const update = blocked
-        ? { $push: { blockedUsers: {
-          usernameKey: targetKey,
-          username: normalizeUsername(target.username),
-          createdAt: new Date()
-        } }, $inc: { blockVersion: 1 } }
-        : { $pull: { blockedUsers: { usernameKey: targetKey } }, $inc: { blockVersion: 1 } };
-      const updated = await UserExperienceStateModel.findOneAndUpdate(
-        { usernameKey, ...versionPredicate, ...statePredicate },
-        update,
-        { new: true }
-      );
-      if (updated) {
-        observed = safeBlockState(updated);
-        break;
-      }
-      observed = await ensureBlockState(usernameKey);
-    }
-    if (blockSetFromState(observed).has(normalizeAccountKey(target.username)) !== blocked) {
-      return { error: 'Block state changed. Reload and try again.' };
-    }
-    replaceAccountBlockCaches(sockets, usernameKey, observed, onlineUsersMap);
-    const publication = publicBlockMutationState(target, observed);
-    for (const live of Array.isArray(sockets) ? sockets : []) {
-      const session = onlineUsersMap.get(live.id);
-      if (normalizeAccountKey(live.username || session?.username) !== usernameKey) continue;
-      live.emit('user_block_updated', publication);
-    }
-    await refreshBlockerSessions({ usernameKey, state: observed, sockets });
-    return publication;
-  }
-
-  function exactStoredPin(room, messageId) {
-    const normalizedMessageId = String(messageId || '').toLowerCase();
-    const storedPin = (Array.isArray(room && room.pinnedMessages) ? room.pinnedMessages : [])
-      .find(pin => String(pin && pin.messageId || '').toLowerCase() === normalizedMessageId);
-    if (!storedPin) return null;
-    return {
-      messageId: storedPin.messageId,
-      pinnedAt: storedPin.pinnedAt,
-      pinnedBy: storedPin.pinnedBy
-    };
-  }
-
-  function roomPinVersionPredicate(room) {
-    const storedVersion = room && room.pinVersion;
-    if (storedVersion === undefined || storedVersion === 0) {
-      return { $or: [{ pinVersion: 0 }, { pinVersion: { $exists: false } }] };
-    }
-    if (!Number.isInteger(storedVersion) || storedVersion < 0) {
-      throw new Error('Invalid pin version.');
-    }
-    return { pinVersion: storedVersion };
-  }
-
-  async function removePinBeforeFallbackDelete({ room, message, blockVersion }) {
-    const messageId = String(message && message._id || '').toLowerCase();
-    const priorPin = exactStoredPin(room, messageId);
-    if (!priorPin) return { room, priorPin: null, blockVersion };
-    const updatedRoom = await ChatServerModel.findOneAndUpdate(
-      {
-        code: room.code,
-        ...roomPinVersionPredicate(room),
-        'pinnedMessages.messageId': messageId
-      },
-      { $pull: { pinnedMessages: { messageId } }, $inc: { pinVersion: 1 } },
-      { new: true }
-    );
-    if (!updatedRoom) throw new Error('Pinned message removal lost its version race.');
-    return { room: updatedRoom, priorPin, blockVersion };
-  }
-
-  function pinsMatchExactPrior(pin, priorPin) {
-    if (!pin || !priorPin ||
-        String(pin.messageId || '').toLowerCase() !== String(priorPin.messageId || '').toLowerCase() ||
-        pin.pinnedBy !== priorPin.pinnedBy) return false;
-    const pinTime = pin.pinnedAt instanceof Date ? pin.pinnedAt.getTime() : new Date(pin.pinnedAt).getTime();
-    const priorTime = priorPin.pinnedAt instanceof Date
-      ? priorPin.pinnedAt.getTime()
-      : new Date(priorPin.pinnedAt).getTime();
-    return !Number.isNaN(pinTime) && pinTime === priorTime;
-  }
-
-  function priorPinState(room, priorPin) {
-    const messageId = String(priorPin && priorPin.messageId || '').toLowerCase();
-    const sameMessagePins = (Array.isArray(room && room.pinnedMessages) ? room.pinnedMessages : [])
-      .filter(pin => String(pin && pin.messageId || '').toLowerCase() === messageId);
-    if (sameMessagePins.some(pin => pinsMatchExactPrior(pin, priorPin))) return 'exact';
-    return sameMessagePins.length > 0 ? 'conflict' : 'absent';
-  }
-
-  async function restorePinAfterFailedDelete({ room, priorPin, blockVersion }) {
-    let observedRoom = room;
-    let lastError;
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      let attemptedMutation = null;
-      try {
-        if (!observedRoom) throw new Error('Pinned message room disappeared.');
-        const observedState = priorPinState(observedRoom, priorPin);
-        if (observedState === 'absent') {
-          attemptedMutation = 'restore';
-          const restoredRoom = await ChatServerModel.findOneAndUpdate(
-            {
-              code: observedRoom.code,
-              ...roomPinVersionPredicate(observedRoom),
-              'pinnedMessages.messageId': { $ne: String(priorPin.messageId).toLowerCase() }
-            },
-            { $push: { pinnedMessages: priorPin }, $inc: { pinVersion: 1 } },
-            { new: true }
-          );
-          if (!restoredRoom) throw new Error('Pinned message restoration lost its version race.');
-          observedRoom = restoredRoom;
-        } else if (observedState === 'conflict') {
-          attemptedMutation = 'remove_conflict';
-          const messageId = String(priorPin.messageId).toLowerCase();
-          const unpinnedRoom = await ChatServerModel.findOneAndUpdate(
-            {
-              code: observedRoom.code,
-              ...roomPinVersionPredicate(observedRoom),
-              'pinnedMessages.messageId': messageId
-            },
-            { $pull: { pinnedMessages: { messageId } }, $inc: { pinVersion: 1 } },
-            { new: true }
-          );
-          if (!unpinnedRoom) throw new Error('Conflicting pin removal lost its version race.');
-          observedRoom = unpinnedRoom;
-        }
-      } catch (err) {
-        lastError = err;
-      }
-
-      try {
-        const verifiedRoom = await ChatServerModel.findOne({ code: room.code });
-        observedRoom = verifiedRoom;
-        if (!verifiedRoom) throw new Error('Pinned message room disappeared during verification.');
-        const verifiedState = priorPinState(verifiedRoom, priorPin);
-        if (verifiedState === 'exact') {
-          return { restored: true, pinned: true, verified: true, room: verifiedRoom, blockVersion };
-        }
-        if (verifiedState === 'absent' && (attemptedMutation === 'remove_conflict' || attempt === 1)) {
-          return { restored: false, pinned: false, verified: true, room: verifiedRoom, blockVersion, error: lastError };
-        }
-        if (verifiedState === 'conflict' && attempt === 1) {
-          return { restored: false, pinned: true, verified: true, room: verifiedRoom, blockVersion, error: lastError };
-        }
-      } catch (err) {
-        lastError = err;
-      }
-    }
-    return {
-      restored: false,
-      pinned: null,
-      verified: false,
-      room: observedRoom,
-      blockVersion,
-      error: lastError
-    };
   }
 
   async function quarantineLiveSocket(live, session, roomCodes) {
@@ -2115,6 +1109,21 @@ function createConnectionHandler({
     }
     logUnexpectedError(logger, 'moderation_fail_closed_restriction', lastError);
     return false;
+  }
+
+  function moderationTransactionConnection() {
+    const connection = UserModel && UserModel.db;
+    const modelsShareConnection = connection &&
+      ChatServerModel && ChatServerModel.db === connection &&
+      RoomRestrictionModel && RoomRestrictionModel.db === connection;
+    return modelsShareConnection && typeof connection.transaction === 'function'
+      ? connection
+      : null;
+  }
+
+  async function runModerationPersistence(operation, connection) {
+    if (!connection) return operation(null);
+    return connection.transaction(session => operation(session));
   }
 
   async function reconcileAccountSessions({
@@ -2362,45 +1371,6 @@ function createConnectionHandler({
     }
   }
 
-  async function emitRoomDetailsUpdated(serverCode, room) {
-    let liveSockets;
-    try {
-      liveSockets = await fetchLiveSockets();
-    } catch (err) {
-      logUnexpectedError(logger, 'room_details_socket_discovery', err);
-      return;
-    }
-    const byAccount = new Map();
-    for (const live of liveSockets) {
-      const session = onlineUsersMap.get(live.id);
-      const username = live.username || session?.username;
-      const accountKey = normalizeAccountKey(username);
-      if (!normalizeUsername(username) || !accountKey) continue;
-      if (!byAccount.has(accountKey)) byAccount.set(accountKey, { username, sockets: [] });
-      byAccount.get(accountKey).sockets.push(live);
-    }
-    for (const { username, sockets } of byAccount.values()) {
-      try {
-        const access = await loadRoomAccessState({
-          UserModel, ChatServerModel, RoomRestrictionModel, username, serverCode
-        });
-        if (!access.allowed || access.restriction.banned || !access.user) continue;
-        const actualMember = serverCode === 'global' ||
-          (Array.isArray(access.user.servers) && access.user.servers.includes(serverCode));
-        const payload = safeRoomDetails(room, canEditRoomDetails({ serverCode, access }));
-        for (const live of sockets) {
-          const session = onlineUsersMap.get(live.id);
-          const liveUsername = live.username || session?.username;
-          if (normalizeAccountKey(liveUsername) !== normalizeAccountKey(access.user.username)) continue;
-          const adminInspecting = access.user.role === 'admin' && live.serverCode === serverCode;
-          if (actualMember || adminInspecting) live.emit('room_details_updated', payload);
-        }
-      } catch (err) {
-        logUnexpectedError(logger, 'room_details_notification', err);
-      }
-    }
-  }
-
   function paginationCursor(data) {
     if (data.before === undefined || data.before === null) return { cursor: null };
     const cursor = decodeCursor(data.before);
@@ -2602,12 +1572,11 @@ function createConnectionHandler({
         if (needsSave) await user.save();
 
         const role = user.role || 'user';
-        const [rooms, restrictionRows, durableBlockState] = await Promise.all([
+        const [rooms, restrictionRows] = await Promise.all([
           role === 'admin'
             ? ChatServerModel.find()
             : ChatServerModel.find({ code: { $in: user.servers } }),
-          RoomRestrictionModel.find({ username: normalizeAccountKey(user.username) }),
-          loadDurableBlockState(user.username)
+          RoomRestrictionModel.find({ username: normalizeAccountKey(user.username) })
         ]);
         const restrictions = (restrictionRows || []).map(row => ({
           serverCode: row.serverCode,
@@ -2615,62 +1584,15 @@ function createConnectionHandler({
         }));
         const bannedRooms = restrictions.filter(item => item.banned).map(item => item.serverCode);
         const blockedRooms = new Set(bannedRooms);
-        const { snapshot: blockState, blockedUserKeys } = durableBlockState;
-        const validatedRooms = [];
-        const actualMemberships = new Set();
-        const roomStateByCode = new Map();
-        const roomPinByCode = new Map();
-        for (const candidateRoom of (rooms || []).filter(room => !blockedRooms.has(room.code))) {
-          const validated = await withRoomMutationLock(candidateRoom.code, async () => {
-            const [freshRoom, freshUser] = await Promise.all([
-              ChatServerModel.findOne({ code: candidateRoom.code }),
-              findUserByUsername(UserModel, user.username)
-            ]);
-            if (!freshRoom || !freshUser) return null;
-            const actualMember = Array.isArray(freshUser.servers) &&
-              freshUser.servers.includes(candidateRoom.code);
-            if (!actualMember && role !== 'admin') return null;
-            return {
-              room: freshRoom,
-              actualMember,
-              state: actualMember ? await loadRoomStateSnapshot({
-                usernameKey: freshUser.username,
-                serverCode: candidateRoom.code,
-                blockedUserKeys
-              }) : null,
-              pin: await visiblePinCountSnapshot({
-                room: freshRoom,
-                blockedUserKeys,
-                blockVersion: blockState.blockVersion
-              })
-            };
-          });
-          if (!validated) continue;
-          validatedRooms.push(validated.room);
-          if (validated.actualMember) {
-            actualMemberships.add(candidateRoom.code);
-            roomStateByCode.set(candidateRoom.code, validated.state);
-          }
-          roomPinByCode.set(candidateRoom.code, validated.pin);
-        }
-        const joinedServers = user.servers.filter(code => actualMemberships.has(code));
-        const roomStates = joinedServers.map(code => roomStateByCode.get(code));
-        const visibleRoomCodes = new Set(validatedRooms.map(room => room.code));
-        const chosenServerCode = chooseAccessibleRoom({
-          user: { servers: joinedServers }, rooms: validatedRooms, restrictions
-        });
-        const defaultServerCode = visibleRoomCodes.has(chosenServerCode)
-          ? chosenServerCode
-          : (joinedServers.find(code => code !== 'global' && visibleRoomCodes.has(code)) || null);
+        const existingRoomCodes = new Set((rooms || []).map(room => room.code));
+        const joinedServers = user.servers.filter(code =>
+          (code === 'global' || existingRoomCodes.has(code)) && !blockedRooms.has(code)
+        );
+        const visibleRooms = (rooms || []).filter(room => !blockedRooms.has(room.code));
+        const defaultServerCode = chooseAccessibleRoom({ user, rooms, restrictions });
         const restriction = defaultServerCode
           ? (restrictions.find(item => item.serverCode === defaultServerCode) || activeRestrictionState(null))
           : activeRestrictionState(null);
-        const attentionSnapshots = roomStates.map(state => ({
-          serverCode: state.serverCode,
-          unreadCount: state.unreadCount,
-          mentionCount: state.mentionCount
-        }));
-        const roomSummaries = validatedRooms.map(room => safeRoomSummary(room, roomPinByCode.get(room.code)));
 
         socket.username = user.username;
         socket.displayName = user.displayName;
@@ -2680,9 +1602,8 @@ function createConnectionHandler({
         socket.serverCode = defaultServerCode;
         socket.joinedServers = [...joinedServers];
         socket.bannedRooms = [...bannedRooms];
-        socket.blockedUserKeys = new Set(blockedUserKeys);
-        socket.blockVersion = blockState.blockVersion;
 
+        if (defaultServerCode) await Promise.resolve(socket.join(defaultServerCode));
         onlineUsersMap.set(socket.id, {
           username: user.username,
           displayName: socket.displayName,
@@ -2691,11 +1612,8 @@ function createConnectionHandler({
           avatarUrl: socket.avatarUrl,
           serverCode: defaultServerCode,
           joinedServers: [...joinedServers],
-          bannedRooms: [...bannedRooms],
-          blockedUsers: [...blockedUserKeys],
-          blockVersion: blockState.blockVersion
+          bannedRooms: [...bannedRooms]
         });
-        if (defaultServerCode) await Promise.resolve(socket.join(defaultServerCode));
 
         const serversToUpdate = new Set(joinedServers);
         serversToUpdate.forEach(c => broadcastOnlineUsersFn(c));
@@ -2711,7 +1629,7 @@ function createConnectionHandler({
           role: socket.role,
           color: socket.color,
           avatarUrl: socket.avatarUrl,
-          servers: roomSummaries,
+          servers: visibleRooms,
           joinedServers: [...joinedServers],
           defaultServerCode,
           restriction: {
@@ -2719,10 +1637,7 @@ function createConnectionHandler({
             timedOut: restriction.timedOut,
             timeoutUntil: restriction.timeoutUntil
           },
-          bannedRooms: [...bannedRooms],
-          roomStates,
-          blockState,
-          attentionSnapshots
+          bannedRooms: [...bannedRooms]
         };
       });
 
@@ -2734,96 +1649,11 @@ function createConnectionHandler({
     }
   });
 
-  socket.on('set_user_block', async (data, callback) => {
-    callback = safeAck(callback);
-    if (!socket.username) return callback({ error: 'Not authenticated.' });
-    if (!isPlainObject(data) || typeof data.blocked !== 'boolean') {
-      return callback({ error: 'Invalid input format.' });
-    }
-    const requestedUsername = normalizeUsername(data.username);
-    if (!requestedUsername) return callback({ error: 'Invalid input format.' });
-    const actorUsername = socket.username;
-    try {
-      const result = await withAccountTransitionLock(actorUsername, async () => {
-        if (normalizeAccountKey(socket.username) !== normalizeAccountKey(actorUsername)) {
-          return { error: 'Unable to update block.' };
-        }
-        const target = await findUserByUsername(UserModel, requestedUsername);
-        if (!target || normalizeAccountKey(target.username) === normalizeAccountKey(actorUsername)) {
-          return { error: 'Unable to update block.' };
-        }
-        const sockets = await fetchLiveSockets();
-        return applyBlockMutation({
-          usernameKey: normalizeAccountKey(actorUsername), target, blocked: data.blocked, sockets
-        });
-      });
-      callback(result);
-    } catch (err) {
-      logUnexpectedError(logger, 'set_user_block', err);
-      callback({ error: 'Failed to update block.' });
-    }
-  });
-
-  socket.on('get_blocked_message', async (data, callback) => {
-    callback = safeAck(callback);
-    if (!socket.username) return callback({ error: 'Not authenticated.' });
-    if (!isPlainObject(data)) return callback({ error: 'Invalid input format.' });
-    const serverCode = normalizeServerCode(data.serverCode);
-    const rawMessageId = typeof data.messageId === 'string' ? data.messageId : '';
-    const messageId = rawMessageId.toLowerCase();
-    const clientContextId = normalizeClientContextId(data.clientContextId);
-    if (!serverCode || !isValidObjectId(rawMessageId) || clientContextId === null) {
-      return callback({ error: 'Invalid input format.' });
-    }
-    if (normalizeServerCode(socket.serverCode) !== serverCode) {
-      return callback({ error: 'Permission denied.' });
-    }
-    const actorUsername = socket.username;
-    try {
-      const result = await withAccountTransitionLock(actorUsername, () =>
-        withRoomMutationLock(serverCode, async () => {
-          if (normalizeAccountKey(socket.username) !== normalizeAccountKey(actorUsername) ||
-              normalizeServerCode(socket.serverCode) !== serverCode) {
-            return { error: 'Permission denied.' };
-          }
-          const access = await loadRoomAccessState({
-            UserModel, ChatServerModel, RoomRestrictionModel, username: actorUsername, serverCode
-          });
-          if (!access.allowed || access.restriction.banned || !access.user || !access.room) {
-            return { error: 'Permission denied.' };
-          }
-          const target = await MessageModel.findById(messageId);
-          const targetServerCode = normalizeServerCode(target?.serverCode || 'global');
-          const authorKey = authorKeyForMessage(target);
-          if (!target || targetServerCode !== serverCode || !authorKey) {
-            return { error: 'Permission denied.' };
-          }
-          const blockState = await ensureBlockState(access.user.username);
-          if (!blockSetFromState(blockState).has(authorKey)) return { error: 'Permission denied.' };
-          const safeTarget = safeBlockedMessageReveal(target);
-          if (!safeTarget) return { error: 'Permission denied.' };
-          return {
-            success: true,
-            serverCode,
-            messageId,
-            clientContextId,
-            blockVersion: blockState.blockVersion,
-            message: { ...safeTarget, serverCode }
-          };
-        })
-      );
-      callback(result);
-    } catch (err) {
-      logUnexpectedError(logger, 'get_blocked_message', err);
-      callback({ error: 'Failed to load blocked message.' });
-    }
-  });
-
   socket.on('change_password', async (data, callback) => {
     callback = safeAck(callback);
     if (!socket.username) return callback({ error: 'Not authenticated.' });
     if (!data || typeof data.oldPassword !== 'string' || typeof data.newPassword !== 'string') return callback({ error: 'Invalid input format.' });
-
+    
     const rateKey = authRateLimitKey(socket, 'change_password', socket.username);
     if (!rateLimiter.check(rateKey)) return callback({ error: 'Too many attempts. Try again later.' });
 
@@ -2923,376 +1753,6 @@ function createConnectionHandler({
           logUnexpectedError(logger, 'update_profile', err);
           callback({ error: 'Failed to update profile.' });
       }
-  });
-
-  socket.on('get_room_details', async (data, callback) => {
-    callback = safeAck(callback);
-    if (!socket.username) return callback({ error: 'Not authenticated.' });
-    if (!data || typeof data !== 'object' || Array.isArray(data)) return callback({ error: 'Invalid input format.' });
-    const serverCode = normalizeServerCode(data.serverCode);
-    if (!serverCode) return callback({ error: 'Invalid input format.' });
-    try {
-      const result = await withAccountTransitionLock(socket.username, () =>
-        withRoomMutationLock(serverCode, async () => {
-          const access = await loadRoomAccessState({
-            UserModel, ChatServerModel, RoomRestrictionModel, username: socket.username, serverCode
-          });
-          if (!access.allowed || access.restriction.banned) return { error: 'Permission denied.' };
-          return { success: true, ...safeRoomDetails(access.room, canEditRoomDetails({ serverCode, access })) };
-        })
-      );
-      callback(result);
-    } catch (err) {
-      logUnexpectedError(logger, 'get_room_details', err);
-      callback({ error: 'Failed to load room details.' });
-    }
-  });
-
-  socket.on('update_room_details', async (data, callback) => {
-    callback = safeAck(callback);
-    if (!socket.username) return callback({ error: 'Not authenticated.' });
-    if (!data || typeof data !== 'object' || Array.isArray(data)) return callback({ error: 'Invalid input format.' });
-    const serverCode = normalizeServerCode(data.serverCode);
-    const description = normalizeRoomText(data.description, 500);
-    const rules = normalizeRoomText(data.rules, 2000);
-    if (!serverCode || description === null || rules === null) return callback({ error: 'Invalid input format.' });
-    try {
-      const result = await withAccountTransitionLock(socket.username, () =>
-        withRoomMutationLock(serverCode, async () => {
-          const access = await loadRoomAccessState({
-            UserModel, ChatServerModel, RoomRestrictionModel, username: socket.username, serverCode
-          });
-          if (!access.allowed || access.restriction.banned || !canEditRoomDetails({ serverCode, access })) {
-            return { error: 'Permission denied.' };
-          }
-          const storedVersion = access.room.metadataVersion;
-          const currentVersion = storedVersion === undefined ? 0 :
-            (Number.isInteger(storedVersion) && storedVersion >= 0 ? storedVersion : null);
-          if (currentVersion === null) return { error: 'Room details changed. Reload and try again.' };
-          const currentDescription = typeof access.room.description === 'string' ? access.room.description : '';
-          const currentRules = typeof access.room.rules === 'string' ? access.room.rules : '';
-          if (description === currentDescription && rules === currentRules) {
-            return { success: true, ...safeRoomDetails(access.room, true) };
-          }
-          const versionPredicate = currentVersion === 0
-            ? { $or: [{ metadataVersion: 0 }, { metadataVersion: { $exists: false } }] }
-            : { metadataVersion: currentVersion };
-          const updated = await ChatServerModel.findOneAndUpdate(
-            { code: serverCode, ...versionPredicate },
-            { $set: { description, rules }, $inc: { metadataVersion: 1 } },
-            { new: true }
-          );
-          if (!updated) return { error: 'Room details changed. Reload and try again.' };
-          const descriptionChanged = description !== currentDescription;
-          const rulesChanged = rules !== currentRules;
-          await appendAuditReliably({
-            correlationId: new mongoose.Types.ObjectId().toString(),
-            action: 'room_details_update',
-            serverCode,
-            actorUsername: access.user.username,
-            actorRole: access.user.role || 'user',
-            actorRoomRole: currentRoomRole(access.room, access.user.username),
-            reason: 'Updated room details',
-            metadata: { descriptionChanged, rulesChanged, descriptionLength: description.length, rulesLength: rules.length }
-          });
-          await emitRoomDetailsUpdated(serverCode, updated);
-          return { success: true, ...safeRoomDetails(updated, true) };
-        })
-      );
-      callback(result);
-    } catch (err) {
-      logUnexpectedError(logger, 'update_room_details', err);
-      callback({ error: 'Failed to update room details.' });
-    }
-  });
-
-  socket.on('list_pinned_messages', async (data, callback) => {
-    callback = safeAck(callback);
-    if (!socket.username) return callback({ error: 'Not authenticated.' });
-    if (!data || typeof data !== 'object' || Array.isArray(data)) {
-      return callback({ error: 'Invalid input format.' });
-    }
-    const serverCode = normalizeServerCode(data.serverCode);
-    const clientContextId = normalizeClientContextId(data.clientContextId);
-    if (!serverCode || clientContextId === null) return callback({ error: 'Invalid input format.' });
-    if (serverCode !== socket.serverCode) return callback({ error: 'Permission denied.' });
-    try {
-      const result = await withAccountTransitionLock(socket.username, () =>
-        withRoomMutationLock(serverCode, async () => {
-          const access = await loadRoomAccessState({
-            UserModel, ChatServerModel, RoomRestrictionModel, username: socket.username, serverCode
-          });
-          if (socket.serverCode !== serverCode || !access.allowed || access.restriction.banned ||
-              !access.user || !access.room) {
-            return { error: 'Permission denied.' };
-          }
-          const { snapshot: blockState, blockedUserKeys } = await loadDurableBlockState(access.user.username);
-          const snapshot = await visiblePinSnapshot({
-            room: access.room, blockedUserKeys, blockVersion: blockState.blockVersion
-          });
-          return { success: true, ...snapshot };
-        })
-      );
-      callback(result);
-    } catch (err) {
-      logUnexpectedError(logger, 'list_pinned_messages', err);
-      callback({ error: 'Failed to load pinned messages.' });
-    }
-  });
-
-  socket.on('set_message_pin', async (data, callback) => {
-    callback = safeAck(callback);
-    if (!socket.username) return callback({ error: 'Not authenticated.' });
-    if (!data || typeof data !== 'object' || Array.isArray(data)) {
-      return callback({ error: 'Invalid input format.' });
-    }
-    const serverCode = normalizeServerCode(data.serverCode);
-    const rawMessageId = typeof data.messageId === 'string' ? data.messageId : '';
-    const messageId = rawMessageId.toLowerCase();
-    const clientContextId = normalizeClientContextId(data.clientContextId);
-    if (!serverCode || !isValidObjectId(rawMessageId) || typeof data.pinned !== 'boolean' ||
-        clientContextId === null) return callback({ error: 'Invalid input format.' });
-    if (serverCode !== socket.serverCode) return callback({ error: 'Permission denied.' });
-
-    try {
-      const result = await withAccountTransitionLock(socket.username, () =>
-        withRoomMutationLock(serverCode, async () => {
-          const access = await loadRoomAccessState({
-            UserModel, ChatServerModel, RoomRestrictionModel, username: socket.username, serverCode
-          });
-          if (socket.serverCode !== serverCode || !canManagePins({ serverCode, access })) {
-            return { error: 'Permission denied.' };
-          }
-          const target = await MessageModel.findById(messageId);
-          const targetAuthorKey = authorKeyForMessage(target);
-          if (!target || target.deleted || target.serverCode !== serverCode || !targetAuthorKey) {
-            return { error: 'Permission denied.' };
-          }
-
-          let observedRoom = access.room;
-          let updatedRoom = null;
-          let changed = false;
-          for (let attempt = 0; attempt < 2; attempt += 1) {
-            if (!observedRoom) return { error: 'Pin state changed. Reload and try again.' };
-            const pinnedMessages = Array.isArray(observedRoom.pinnedMessages) ? observedRoom.pinnedMessages : [];
-            const alreadyPinned = pinnedMessages.some(pin =>
-              String(pin && pin.messageId || '').toLowerCase() === messageId);
-            if (alreadyPinned === data.pinned) {
-              updatedRoom = observedRoom;
-              break;
-            }
-            if (data.pinned && pinnedMessages.length >= 20) return { error: 'Pin limit reached.' };
-            const storedVersion = observedRoom.pinVersion;
-            const pinVersion = storedVersion === undefined ? 0
-              : (Number.isInteger(storedVersion) && storedVersion >= 0 ? storedVersion : null);
-            if (pinVersion === null) return { error: 'Pin state changed. Reload and try again.' };
-            const versionPredicate = pinVersion === 0
-              ? { $or: [{ pinVersion: 0 }, { pinVersion: { $exists: false } }] }
-              : { pinVersion };
-            const statePredicate = data.pinned
-              ? { 'pinnedMessages.messageId': { $ne: messageId } }
-              : { 'pinnedMessages.messageId': messageId };
-            const update = data.pinned
-              ? { $push: { pinnedMessages: {
-                messageId, pinnedAt: new Date(), pinnedBy: access.user.username
-              } }, $inc: { pinVersion: 1 } }
-              : { $pull: { pinnedMessages: { messageId } }, $inc: { pinVersion: 1 } };
-            updatedRoom = await ChatServerModel.findOneAndUpdate(
-              { code: serverCode, ...versionPredicate, ...statePredicate },
-              update,
-              { new: true }
-            );
-            if (updatedRoom) {
-              changed = true;
-              break;
-            }
-            observedRoom = await ChatServerModel.findOne({ code: serverCode });
-          }
-          if (!updatedRoom) {
-            const alreadyPinned = Array.isArray(observedRoom && observedRoom.pinnedMessages) &&
-              observedRoom.pinnedMessages.some(pin =>
-                String(pin && pin.messageId || '').toLowerCase() === messageId);
-            if (alreadyPinned !== data.pinned) return { error: 'Pin state changed. Reload and try again.' };
-            updatedRoom = observedRoom;
-          }
-
-          if (changed) {
-            await appendAuditReliably({
-              correlationId: new mongoose.Types.ObjectId().toString(),
-              action: data.pinned ? 'pin_message' : 'unpin_message',
-              serverCode,
-              actorUsername: access.user.username,
-              actorRole: access.user.role || 'user',
-              actorRoomRole: currentRoomRole(access.room, access.user.username),
-              targetUsername: normalizeUsername(target.username) || targetAuthorKey,
-              targetRole: typeof target.role === 'string' ? target.role : 'user',
-              targetRoomRole: typeof target.roomRole === 'string' ? target.roomRole : 'user',
-              messageId,
-              reason: data.pinned ? 'Pinned message' : 'Unpinned message',
-              metadata: {}
-            });
-            await emitMessagePinUpdated({
-              serverCode, messageId, pinned: data.pinned, room: updatedRoom, targetAuthorKey
-            });
-          }
-          const { snapshot: blockState, blockedUserKeys } = await loadDurableBlockState(access.user.username);
-          const pin = await visiblePinCountSnapshot({
-            room: updatedRoom, blockedUserKeys, blockVersion: blockState.blockVersion
-          });
-          return { success: true, messageId, pinned: data.pinned, pin };
-        })
-      );
-      callback(result);
-    } catch (err) {
-      logUnexpectedError(logger, 'set_message_pin', err);
-      callback({ error: 'Failed to update pin.' });
-    }
-  });
-
-  socket.on('update_room_notification', async (data, callback) => {
-    callback = safeAck(callback);
-    if (!socket.username) return callback({ error: 'Not authenticated.' });
-    if (!data || typeof data !== 'object' || Array.isArray(data)) {
-      return callback({ error: 'Invalid input format.' });
-    }
-    const serverCode = normalizeServerCode(data.serverCode);
-    const level = normalizeNotificationLevel(data.level);
-    if (!serverCode || !level) return callback({ error: 'Invalid input format.' });
-
-    try {
-      await withAccountTransitionLock(socket.username, () =>
-        withRoomMutationLock(serverCode, async () => {
-          const access = await loadRoomAccessState({
-            UserModel, ChatServerModel, RoomRestrictionModel, username: socket.username, serverCode
-          });
-          const actualMember = Array.isArray(access.user?.servers) &&
-            access.user.servers.includes(serverCode);
-          if (!access.allowed || access.restriction.banned || !access.user || !actualMember) {
-            callback({ error: 'Permission denied.' });
-            return;
-          }
-
-          const usernameKey = normalizeAccountKey(access.user.username);
-          const { blockedUserKeys } = await loadDurableBlockState(usernameKey);
-          const current = await ensureRoomState({ usernameKey, serverCode });
-          const changed = normalizeNotificationLevel(current.notificationLevel) !== level;
-          if (changed) {
-            const currentVersion = Number.isInteger(current.version) && current.version >= 0
-              ? current.version : 0;
-            const versionPredicate = currentVersion === 0
-              ? { $or: [{ version: 0 }, { version: { $exists: false } }] }
-              : { version: currentVersion };
-            const updated = await RoomMemberStateModel.findOneAndUpdate(
-              { usernameKey, serverCode, ...versionPredicate },
-              { $set: { notificationLevel: level }, $inc: { version: 1 } },
-              { new: true }
-            );
-            if (!updated) throw new Error('Room notification compare-and-set failed.');
-          }
-
-          const snapshot = await loadRoomStateSnapshot({
-            usernameKey, serverCode, blockedUserKeys
-          });
-          if (changed) {
-            const liveSockets = await fetchLiveSockets();
-            for (const live of liveSockets) {
-              const session = onlineUsersMap.get(live.id);
-              if (normalizeAccountKey(live.username || session?.username) === usernameKey) {
-                live.emit('room_notification_updated', snapshot);
-              }
-            }
-          }
-          callback(snapshot);
-        })
-      );
-    } catch (err) {
-      logUnexpectedError(logger, 'update_room_notification', err);
-      callback({ error: 'Notification update failed.' });
-    }
-  });
-
-  socket.on('mark_room_read', async (data, callback) => {
-    callback = safeAck(callback);
-    if (!socket.username) return callback({ error: 'Not authenticated.' });
-    if (!data || typeof data !== 'object' || Array.isArray(data)) {
-      return callback({ error: 'Invalid input format.' });
-    }
-    const serverCode = normalizeServerCode(data.serverCode);
-    const rawMessageId = typeof data.messageId === 'string' ? data.messageId : '';
-    const messageId = rawMessageId.toLowerCase();
-    if (!serverCode || !isValidObjectId(rawMessageId)) {
-      return callback({ error: 'Invalid input format.' });
-    }
-    if (normalizeServerCode(socket.serverCode) !== serverCode) {
-      return callback({ error: 'Permission denied.' });
-    }
-
-    const actorUsername = socket.username;
-    try {
-      const snapshot = await withAccountTransitionLock(actorUsername, () =>
-        withRoomMutationLock(serverCode, async () => {
-          if (normalizeAccountKey(socket.username) !== normalizeAccountKey(actorUsername) ||
-              normalizeServerCode(socket.serverCode) !== serverCode) {
-            return { error: 'Permission denied.' };
-          }
-          const access = await loadRoomAccessState({
-            UserModel, ChatServerModel, RoomRestrictionModel, username: actorUsername, serverCode
-          });
-          const actualMember = Array.isArray(access.user?.servers) && access.user.servers.includes(serverCode);
-          if (!access.allowed || access.restriction.banned || !access.user || !access.room || !actualMember) {
-            return { error: 'Permission denied.' };
-          }
-
-          const target = await MessageModel.findById(messageId);
-          const storedServerCode = target?.serverCode;
-          const targetMatchesRoom = serverCode === 'global'
-            ? storedServerCode === 'global' || storedServerCode === null || storedServerCode === undefined
-            : storedServerCode === serverCode;
-          const targetCursor = cursorFromMessage(target);
-          if (!target || !targetMatchesRoom || !targetCursor || !authorKeyForMessage(target)) {
-            return { error: 'Permission denied.' };
-          }
-
-          const usernameKey = normalizeAccountKey(access.user.username);
-          const observed = await ensureRoomState({ usernameKey, serverCode });
-          const observedCursor = {
-            lastReadAt: observed.lastReadAt || null,
-            lastReadMessageId: observed.lastReadMessageId || null
-          };
-          if (compareCursor(observedCursor, targetCursor) < 0) {
-            const currentVersion = Number.isInteger(observed.version) && observed.version >= 0
-              ? observed.version : 0;
-            const versionPredicate = currentVersion === 0
-              ? { $or: [{ version: 0 }, { version: { $exists: false } }] }
-              : { version: currentVersion };
-            const updated = await RoomMemberStateModel.findOneAndUpdate(
-              { usernameKey, serverCode, ...versionPredicate },
-              { $set: {
-                lastReadAt: targetCursor.lastReadAt,
-                lastReadMessageId: targetCursor.lastReadMessageId
-              }, $inc: { version: 1 } },
-              { new: true }
-            );
-            if (!updated) throw new Error('Room read compare-and-set failed.');
-          }
-
-          const { blockedUserKeys } = await loadDurableBlockState(usernameKey);
-          const complete = await loadRoomStateSnapshot({ usernameKey, serverCode, blockedUserKeys });
-          const liveSockets = await fetchLiveSockets();
-          for (const live of liveSockets) {
-            const session = onlineUsersMap.get(live.id);
-            if (normalizeAccountKey(live.username || session?.username) === usernameKey) {
-              live.emit('room_read_updated', complete);
-            }
-          }
-          return complete;
-        })
-      );
-      callback(snapshot);
-    } catch (err) {
-      logUnexpectedError(logger, 'mark_room_read', err);
-      callback({ error: 'Read update failed.' });
-    }
   });
 
   socket.on('manage_role', async (data, callback) => {
@@ -3522,17 +1982,9 @@ function createConnectionHandler({
             (action === 'kick' || action === 'ban');
           const enforcesPrivateAbsence = removesPrivateMembership ||
             (serverCode !== 'global' && action === 'unban');
-          const transactionConnection = sharedTransactionConnection([
-            UserModel, ChatServerModel, RoomRestrictionModel
-          ]);
+          const transactionConnection = moderationTransactionConnection();
           try {
-            if (action === 'unban' && serverCode === 'global') {
-              await advanceRoomCursorToNewest({
-                usernameKey: targetUser.username,
-                serverCode
-              });
-            }
-            const persisted = await runPersistence(async session => {
+            const persisted = await runModerationPersistence(async session => {
               const restrictionOptions = extra => ({
                 ...extra,
                 ...(session ? { session } : {})
@@ -4145,16 +2597,12 @@ function createConnectionHandler({
           if (!err || err.code !== 11000 || attempt === 4) throw err;
         }
       }
-      await withAccountTransitionLock(socket.username, () => withRoomMutationLock(srv.code, async () => {
+      await withAccountTransitionLock(socket.username, async () => {
         const user = await UserModel.findOne({ username: socket.username });
         if (!user) throw new Error('User not found.');
         if (!Array.isArray(user.servers) || user.servers.length === 0) user.servers = ['global'];
 
         if (!user.servers.includes(srv.code)) {
-          await advanceRoomCursorToNewest({
-            usernameKey: user.username || socket.username,
-            serverCode: srv.code
-          });
           if (typeof user.servers.addToSet === 'function') user.servers.addToSet(srv.code);
           else user.servers.push(srv.code);
           await user.save();
@@ -4172,52 +2620,12 @@ function createConnectionHandler({
           });
           broadcastOnlineUsersFn(srv.code);
         }
-      }));
-      const creatorBlockState = await loadDurableBlockState(socket.username);
-      const creatorPin = await visiblePinCountSnapshot({
-        room: srv,
-        blockedUserKeys: creatorBlockState.blockedUserKeys,
-        blockVersion: creatorBlockState.snapshot.blockVersion
       });
-      callback({ success: true, server: safeRoomSummary(srv, creatorPin) });
-
+      callback({ success: true, server: srv });
+      
       try {
         const sockets = await ioInstance.fetchSockets();
-        const recipientsByAccount = new Map();
-        for (const live of sockets) {
-          const session = onlineUsersMap.get(live.id);
-          const username = normalizeUsername(live.username || session?.username);
-          const accountKey = normalizeAccountKey(username);
-          if (!session || !username || !accountKey) continue;
-          if (!recipientsByAccount.has(accountKey)) {
-            recipientsByAccount.set(accountKey, { username, sockets: [] });
-          }
-          recipientsByAccount.get(accountKey).sockets.push(live);
-        }
-        for (const [accountKey, recipient] of recipientsByAccount.entries()) {
-          await withAccountTransitionLock(accountKey, () =>
-            withRoomMutationLock(srv.code, async () => {
-              const [freshUser, freshRoom] = await Promise.all([
-                findUserByUsername(UserModel, recipient.username),
-                ChatServerModel.findOne({ code: srv.code })
-              ]);
-              if (!freshUser || freshUser.role !== 'admin' || !freshRoom || freshRoom.code !== srv.code) return;
-              for (const live of recipient.sockets) {
-                let session = onlineUsersMap.get(live.id);
-                if (!session || normalizeAccountKey(live.username || session.username) !== accountKey) continue;
-                const blockedUserKeys = blockCacheForLiveSession(live, session);
-                const pin = await visiblePinCountSnapshot({
-                  room: freshRoom,
-                  blockedUserKeys,
-                  blockVersion: blockVersionForLiveSession(live, session)
-                });
-                session = onlineUsersMap.get(live.id);
-                if (!session || normalizeAccountKey(live.username || session.username) !== accountKey) continue;
-                live.emit('admin_new_server', safeRoomSummary(freshRoom, pin));
-              }
-            })
-          );
-        }
+        sockets.forEach(s => { if (onlineUsersMap.has(s.id) && onlineUsersMap.get(s.id).role === 'admin') s.emit('admin_new_server', srv); });
       } catch (err) {
         logUnexpectedError(logger, 'create_server_admin_notification', err);
       }
@@ -4246,10 +2654,6 @@ function createConnectionHandler({
           if (restriction.banned) return { error: 'Permission denied.' };
           if (!Array.isArray(user.servers) || user.servers.length === 0) user.servers = ['global'];
           if (!user.servers.includes(srv.code)) {
-            await advanceRoomCursorToNewest({
-              usernameKey: user.username,
-              serverCode: srv.code
-            });
             if (typeof user.servers.addToSet === 'function') user.servers.addToSet(srv.code);
             else user.servers.push(srv.code);
             await user.save();
@@ -4272,11 +2676,7 @@ function createConnectionHandler({
                 socket.to(srv.code).emit('system_message', `${socket.displayName} joined.`);
             }
           }
-          const { snapshot: blockState, blockedUserKeys } = await loadDurableBlockState(user.username);
-          const pin = await visiblePinCountSnapshot({
-            room: srv, blockedUserKeys, blockVersion: blockState.blockVersion
-          });
-          return { success: true, server: safeRoomSummary(srv, pin) };
+          return { success: true, server: srv };
         });
       });
       callback(result);
@@ -4412,13 +2812,6 @@ function createConnectionHandler({
         await ChatServerModel.deleteOne({ code: serverCode });
 
         let cleanupFailed = false;
-        try {
-          await RoomMemberStateModel.deleteMany({ serverCode });
-        } catch (err) {
-          cleanupFailed = true;
-          logUnexpectedError(logger, 'delete_server_room_state_cleanup', err);
-        }
-
         const affectedSockets = [];
         for (const live of sockets) {
           const session = onlineUsersMap.get(live.id);
@@ -4574,71 +2967,44 @@ function createConnectionHandler({
     const serverCode = normalizeServerCode(code);
     if (!serverCode) return callback({ error: 'Invalid input format.' });
 
+    let safeHistory;
+    let roomRole;
+    try {
+      const access = await loadRoomAccessState({
+        UserModel, ChatServerModel, RoomRestrictionModel,
+        username: socket.username, serverCode
+      });
+      if (!access.room) return callback({ error: 'Server not found.' });
+      if (!access.allowed || !canAccessRoom(socket, serverCode)) return callback({ error: 'Permission denied.' });
+
+      let query = { serverCode };
+      if (serverCode === 'global') query = { $or: [{ serverCode: 'global' }, { serverCode: { $exists: false } }, { serverCode: null }] };
+
+      roomRole = await getRoomRoleFn(serverCode, socket.username);
+      const history = await MessageModel.find(query).sort({ timestamp: -1 }).limit(100).lean();
+
+      safeHistory = history.map(storedMessage => {
+          const msg = { ...storedMessage, attachment: sanitizeAttachment(storedMessage.attachment) };
+          if (msg.deleted && msg.username !== socket.username && socket.role !== 'admin' && roomRole !== 'mod') {
+              msg.text = ''; msg.attachment = null; msg.reactions = {};
+          }
+          if (!msg.reactions) msg.reactions = {};
+          return msg;
+      }).reverse();
+    } catch (err) {
+      logUnexpectedError(logger, 'switch_server_history', err);
+      return callback({ error: 'Failed to switch server.' });
+    }
+
     let result;
     try {
       result = await withAccountTransitionLock(socket.username, () => withRoomMutationLock(serverCode, async () => {
-        let access = await loadRoomAccessState({
+        const access = await loadRoomAccessState({
           UserModel, ChatServerModel, RoomRestrictionModel,
           username: socket.username, serverCode
         });
-        if (!access.room) {
-          const error = { error: 'Server not found.' };
-          callback(error);
-          return error;
-        }
-        if (!access.allowed || access.restriction.banned || !access.user) {
-          const error = { error: 'Permission denied.' };
-          callback(error);
-          return error;
-        }
-
-        const usernameKey = normalizeAccountKey(access.user.username);
-        const { snapshot: blockState, blockedUserKeys } = await loadDurableBlockState(usernameKey);
-        const roomRole = await getRoomRoleFn(serverCode, access.user.username);
-        const history = await MessageModel.find(roomMessageQuery(serverCode))
-          .sort({ timestamp: -1, _id: -1 })
-          .limit(100)
-          .lean();
-        const safeHistory = history
-          .map(storedMessage => {
-            const safeMessage = safeMessageForViewer(storedMessage, { blockedUserKeys });
-            return safeMessage ? { ...safeMessage, serverCode } : null;
-          })
-          .filter(Boolean)
-          .reverse();
-        access = await loadRoomAccessState({
-          UserModel, ChatServerModel, RoomRestrictionModel,
-          username: socket.username, serverCode
-        });
-        if (!access.room) {
-          const error = { error: 'Server not found.' };
-          callback(error);
-          return error;
-        }
-        if (!access.allowed || access.restriction.banned || !access.user) {
-          const error = { error: 'Permission denied.' };
-          callback(error);
-          return error;
-        }
-        const actualMember = Array.isArray(access.user.servers) && access.user.servers.includes(serverCode);
-        const notification = actualMember
-          ? await loadRoomStateSnapshot({ usernameKey, serverCode, blockedUserKeys })
-          : null;
-        const detailSnapshot = safeRoomDetails(
-          access.room,
-          canEditRoomDetails({ serverCode, access })
-        );
-        const details = {
-          description: detailSnapshot.description,
-          rules: detailSnapshot.rules,
-          metadataVersion: detailSnapshot.metadataVersion,
-          canEdit: detailSnapshot.canEdit
-        };
-        const pin = await visiblePinCountSnapshot({
-          room: access.room,
-          blockedUserKeys,
-          blockVersion: blockState.blockVersion
-        });
+        if (!access.room) return { error: 'Server not found.' };
+        if (!access.allowed || !canAccessRoom(socket, serverCode)) return { error: 'Permission denied.' };
 
         const oldCode = socket.serverCode;
         const session = onlineUsersMap.get(socket.id);
@@ -4676,37 +3042,24 @@ function createConnectionHandler({
           throw err;
         }
         socket.serverCode = serverCode;
-        socket.blockedUserKeys = new Set(blockedUserKeys);
-        socket.blockVersion = blockState.blockVersion;
-        if (session) {
-          session.serverCode = serverCode;
-          session.blockedUsers = [...blockedUserKeys];
-          session.blockVersion = blockState.blockVersion;
-        }
-        callback({
-          serverCode,
-          history: safeHistory,
-          roomRole,
-          restriction: {
-            banned: access.restriction.banned,
-            timedOut: access.restriction.timedOut,
-            timeoutUntil: access.restriction.timeoutUntil
-          },
-          details,
-          notification,
-          pin,
-          attention: notification ? {
-            unreadCount: notification.unreadCount,
-            mentionCount: notification.mentionCount
-          } : null
-        });
-        return { success: true, oldCode };
+        if (session) session.serverCode = serverCode;
+        return { success: true, oldCode, restriction: access.restriction };
       }));
     } catch (err) {
-      logUnexpectedError(logger, 'switch_server', err);
+      logUnexpectedError(logger, 'switch_server_recheck', err);
       return callback({ error: 'Failed to switch server.' });
     }
-    if (result.error) return;
+    if (result.error) return callback(result);
+
+    callback({
+      history: safeHistory,
+      roomRole,
+      restriction: {
+        banned: result.restriction.banned,
+        timedOut: result.restriction.timedOut,
+        timeoutUntil: result.restriction.timeoutUntil
+      }
+    });
 
     const broadcastCodes = [];
     if (result.oldCode && result.oldCode !== serverCode) broadcastCodes.push(result.oldCode);
@@ -4725,9 +3078,8 @@ function createConnectionHandler({
   socket.on('chat_message', async (payload) => {
     try {
       const serverCode = socket.serverCode;
-      const actorUsername = socket.username;
       const identity = { role: socket.role, joinedServers: socket.joinedServers || [] };
-      if (!actorUsername || !serverCode || !canAccessRoom(identity, serverCode)) return;
+      if (!socket.username || !serverCode || !canAccessRoom(identity, serverCode)) return;
       if (!payload || typeof payload !== 'object' || Array.isArray(payload) || typeof payload.text !== 'string') return;
       const intendedServerCode = normalizeServerCode(payload.serverCode);
       const clientContextId = normalizeClientContextId(payload.clientContextId);
@@ -4738,17 +3090,12 @@ function createConnectionHandler({
       const rawText = neutralizePingTokens(payload.text.trim().substring(0, 2000));
       if (!rawText && !attachment) return;
 
-      const createdMessage = await withAccountTransitionLock(actorUsername, () =>
-        withRoomMutationLock(serverCode, async () => {
-        if (normalizeAccountKey(socket.username) !== normalizeAccountKey(actorUsername) ||
-            socket.serverCode !== intendedServerCode) return;
+      await withRoomMutationLock(serverCode, async () => {
         const access = await loadRoomAccessState({
           UserModel, ChatServerModel, RoomRestrictionModel,
-          username: actorUsername, serverCode
+          username: socket.username, serverCode
         });
-        if (!access.allowed || access.restriction.timedOut || !access.user || !access.room ||
-            normalizeAccountKey(access.user.username) !== normalizeAccountKey(actorUsername) ||
-            !canAccessRoom(socket, serverCode)) return;
+        if (!access.allowed || access.restriction.timedOut || !canAccessRoom(socket, serverCode)) return;
         if (socket.serverCode !== intendedServerCode) return;
         const settings = roomAutoModSettings(access.room);
         if (!settings) return;
@@ -4780,8 +3127,7 @@ function createConnectionHandler({
         let replyTo = null;
         if (payload.replyTo && typeof payload.replyTo === 'object' && isValidObjectId(payload.replyTo.id)) {
           const referenced = await MessageModel.findById(payload.replyTo.id);
-          if (referenced && !referenced.deleted &&
-              normalizeServerCode(referenced.serverCode || 'global') === serverCode) {
+          if (referenced && !referenced.deleted && referenced.serverCode === serverCode) {
             replyTo = createReplySnapshot(referenced);
           }
         }
@@ -4817,189 +3163,144 @@ function createConnectionHandler({
           return;
         }
 
-        const authorKey = normalizeAccountKey(access.user.username);
-        const notificationMentions = extractNotificationMentions(cleanText);
         const msg = await MessageModel.create({
-            serverCode,
-            username: access.user.username,
-            displayName: access.user.displayName || socket.displayName || access.user.username,
-            authorKey, notificationMentions,
-            role: access.user.role,
-            roomRole: freshRoomRole,
-            color: access.user.color || socket.color,
-            avatarUrl: access.user.avatarUrl || socket.avatarUrl,
+            serverCode, username: socket.username, displayName: socket.displayName,
+            role: socket.role, roomRole: freshRoomRole, color: socket.color, avatarUrl: socket.avatarUrl,
             text: cleanText, attachment, replyTo, reactions: {}
         });
 
-        await emitPersonalizedRoomEvent({
-          serverCode: msg.serverCode || serverCode,
-          event: 'chat_message',
-          buildPayload: ({ blockedUserKeys }) => safeMessageForViewer(msg, { blockedUserKeys })
+        ioInstance.to(msg.serverCode || serverCode).emit('chat_message', {
+            _id: msg._id, username: msg.username, displayName: msg.displayName, role: msg.role, roomRole: msg.roomRole, color: msg.color, avatarUrl: msg.avatarUrl,
+            text: msg.text, attachment: sanitizeAttachment(msg.attachment), replyTo: msg.replyTo, reactions: {}, timestamp: msg.timestamp, edited: false, deleted: false
         });
-        return msg;
-      }));
-      if (createdMessage) await emitRoomActivity(createdMessage);
+      });
     } catch (err) {
       logUnexpectedError(logger, 'chat_message', err);
     }
   });
 
   socket.on('toggle_reaction', async (data) => {
-    try {
-      if (!socket.username || !data || typeof data !== 'object' || Array.isArray(data)) return;
-      const { id, emoji } = data;
-      const actorUsername = socket.username;
-      const intendedServerCode = normalizeServerCode(data.serverCode);
-      const clientContextId = normalizeClientContextId(data.clientContextId);
-      if (!isValidObjectId(id) || !isValidReaction(emoji) ||
-          intendedServerCode !== socket.serverCode || clientContextId === null) return;
+      try {
+          if (!socket.username || !data || typeof data !== 'object' || Array.isArray(data)) return;
+          const { id, emoji } = data;
+          const intendedServerCode = normalizeServerCode(data.serverCode);
+          const clientContextId = normalizeClientContextId(data.clientContextId);
+          if (!isValidObjectId(id) || !isValidReaction(emoji) ||
+              intendedServerCode !== socket.serverCode || clientContextId === null) return;
 
-      await withAccountTransitionLock(actorUsername, () =>
-        withRoomMutationLock(intendedServerCode, async () => {
-          if (normalizeAccountKey(socket.username) !== normalizeAccountKey(actorUsername) ||
-              socket.serverCode !== intendedServerCode) return;
-          const access = await loadRoomAccessState({
-            UserModel, ChatServerModel, RoomRestrictionModel,
-            username: actorUsername, serverCode: intendedServerCode
-          });
-          if (!access.allowed || access.restriction.timedOut || !access.user || !access.room ||
-              normalizeAccountKey(access.user.username) !== normalizeAccountKey(actorUsername) ||
-              !canAccessRoom(socket, intendedServerCode)) return;
           const msg = await MessageModel.findById(id);
           if (!msg || msg.deleted || msg.serverCode !== intendedServerCode) return;
+          const identity = { role: socket.role, joinedServers: socket.joinedServers || [] };
+          if (!canAccessRoom(identity, msg.serverCode)) return;
+          await withRoomMutationLock(msg.serverCode, async () => {
+            const access = await loadRoomAccessState({
+              UserModel, ChatServerModel, RoomRestrictionModel,
+              username: socket.username, serverCode: msg.serverCode
+            });
+            if (msg.deleted || socket.serverCode !== intendedServerCode || !access.allowed ||
+                access.restriction.timedOut || !canAccessRoom(socket, msg.serverCode)) return;
 
-          const actor = access.user.username;
-          let rx = msg.reactions || {};
-          let users = Array.isArray(rx[emoji]) ? rx[emoji] : [];
+            let rx = msg.reactions || {};
+            let users = Array.isArray(rx[emoji]) ? rx[emoji] : [];
 
-          if (users.includes(actor)) {
-            users = users.filter(username => username !== actor);
-            if (users.length === 0) delete rx[emoji];
-            else rx[emoji] = users;
-          } else {
-            const reactionKeys = Object.keys(rx);
-            if (!Object.prototype.hasOwnProperty.call(rx, emoji) && reactionKeys.length >= MAX_REACTION_KEYS) return;
-            if (users.length >= MAX_REACTION_USERS) return;
-            const reactionsByUser = Object.values(rx).filter(reactionUsers =>
-              Array.isArray(reactionUsers) && reactionUsers.includes(actor)
-            ).length;
-            if (reactionsByUser >= MAX_REACTIONS_PER_USER) return;
-            users.push(actor);
-            rx[emoji] = users;
-          }
-
-          msg.reactions = rx;
-          msg.markModified('reactions');
-          await msg.save();
-
-          const targetAuthorKey = authorKeyForMessage(msg);
-          await emitPersonalizedRoomEvent({
-            serverCode: msg.serverCode,
-            event: 'reaction_updated',
-            buildPayload: ({ blockedUserKeys }) => {
-              if (!targetAuthorKey || blockedUserKeys.has(targetAuthorKey)) return null;
-              return { id: msg._id, reactions: safeReactionsForViewer(msg.reactions, blockedUserKeys) };
+            if (users.includes(socket.username)) {
+                users = users.filter(u => u !== socket.username);
+                if (users.length === 0) delete rx[emoji];
+                else rx[emoji] = users;
+            } else {
+                const reactionKeys = Object.keys(rx);
+                if (!Object.prototype.hasOwnProperty.call(rx, emoji) && reactionKeys.length >= MAX_REACTION_KEYS) return;
+                if (users.length >= MAX_REACTION_USERS) return;
+                const reactionsByUser = Object.values(rx).filter(reactionUsers =>
+                  Array.isArray(reactionUsers) && reactionUsers.includes(socket.username)
+                ).length;
+                if (reactionsByUser >= MAX_REACTIONS_PER_USER) return;
+                users.push(socket.username);
+                rx[emoji] = users;
             }
+
+            msg.reactions = rx;
+            msg.markModified('reactions');
+            await msg.save();
+
+            ioInstance.to(msg.serverCode).emit('reaction_updated', { id: msg._id, reactions: msg.reactions });
           });
-        })
-      );
-    } catch (err) {
-      logUnexpectedError(logger, 'toggle_reaction', err);
-    }
+      } catch (err) {
+          logUnexpectedError(logger, 'toggle_reaction', err);
+      }
   });
 
   socket.on('edit_message', async (data) => {
     try {
       if (!socket.username || !data || typeof data !== 'object' || Array.isArray(data) ||
           !isValidObjectId(data.id) || typeof data.text !== 'string') return;
-      const actorUsername = socket.username;
       const intendedServerCode = normalizeServerCode(data.serverCode);
       const clientContextId = normalizeClientContextId(data.clientContextId);
       if (intendedServerCode !== socket.serverCode || clientContextId === null) return;
-      const rawText = neutralizePingTokens(data.text.trim().substring(0, 2000));
-      if (!rawText) return;
+      let cleanText = data.text.trim().substring(0, 2000);
+      if (!cleanText) return;
 
-      await withAccountTransitionLock(actorUsername, () =>
-        withRoomMutationLock(intendedServerCode, async () => {
-          if (normalizeAccountKey(socket.username) !== normalizeAccountKey(actorUsername) ||
-              socket.serverCode !== intendedServerCode) return;
-          const access = await loadRoomAccessState({
-            UserModel, ChatServerModel, RoomRestrictionModel,
-            username: actorUsername, serverCode: intendedServerCode
-          });
-          if (!access.allowed || access.restriction.timedOut || !access.user || !access.room ||
-              normalizeAccountKey(access.user.username) !== normalizeAccountKey(actorUsername) ||
-              !canAccessRoom(socket, intendedServerCode)) return;
-          const msg = await MessageModel.findById(data.id);
-          if (!msg || msg.deleted || msg.serverCode !== intendedServerCode) return;
-          const freshRoomRole = currentRoomRole(access.room, access.user.username);
-          const authorOwnsMessage = normalizeAccountKey(msg.username) ===
-            normalizeAccountKey(access.user.username);
-          if (!authorOwnsMessage && access.user.role !== 'admin' && freshRoomRole !== 'mod') return;
+      const msg = await MessageModel.findById(data.id);
+      if (msg && !msg.deleted && msg.serverCode === intendedServerCode) {
+        const identity = { role: socket.role, joinedServers: socket.joinedServers || [] };
+        if (!canAccessRoom(identity, msg.serverCode)) return;
+        const roomRole = await getRoomRoleFn(msg.serverCode, socket.username);
 
-          let cleanText = await resolvePingsFn(
-            rawText,
-            intendedServerCode,
-            access.user.role,
-            freshRoomRole,
-            access.user.username
-          );
+        // Edit allowed for Sender, Global Admin, or Room Mod
+        if (msg.username === socket.username || socket.role === 'admin' || roomRole === 'mod') {
+          
+          cleanText = neutralizePingTokens(cleanText);
+          const rawText = cleanText;
+          cleanText = await resolvePingsFn(cleanText, msg.serverCode, socket.role, roomRole, socket.username);
           if (typeof cleanText !== 'string' || cleanText.length > 2000) return;
-          const settings = roomAutoModSettings(access.room);
-          if (!settings) return;
-          const autoModResult = evaluateAutoMod({
-            text: rawText,
-            resolvedText: cleanText,
-            username: access.user.username,
-            serverCode: intendedServerCode,
-            role: access.user.role,
-            settings,
-            tracker: autoModTracker,
-            now: new Date()
-          });
-          if (!autoModResult.allowed) {
-            await rejectAutoModContent({
-              serverCode: intendedServerCode,
-              clientContextId,
-              access,
-              roomRole: freshRoomRole,
-              rawText,
-              result: autoModResult
+          await withRoomMutationLock(msg.serverCode, async () => {
+            const access = await loadRoomAccessState({
+              UserModel, ChatServerModel, RoomRestrictionModel,
+              username: socket.username, serverCode: msg.serverCode
             });
-            return;
-          }
+            if (msg.deleted || socket.serverCode !== intendedServerCode || !access.allowed ||
+                access.restriction.timedOut || !canAccessRoom(socket, msg.serverCode)) return;
+            const freshRoomRole = currentRoomRole(access.room, access.user.username);
+            if (msg.username !== socket.username && access.user.role !== 'admin' && freshRoomRole !== 'mod') return;
+            const settings = roomAutoModSettings(access.room);
+            if (!settings) return;
+            const autoModResult = evaluateAutoMod({
+              text: rawText,
+              resolvedText: cleanText,
+              username: access.user.username,
+              serverCode: msg.serverCode,
+              role: access.user.role,
+              settings,
+              tracker: autoModTracker,
+              now: new Date()
+            });
+            if (!autoModResult.allowed) {
+              await rejectAutoModContent({
+                serverCode: msg.serverCode,
+                clientContextId,
+                access,
+                roomRole: freshRoomRole,
+                rawText,
+                result: autoModResult
+              });
+              return;
+            }
 
-          if (msg.text !== cleanText) {
-            msg.history = appendBoundedHistory(msg.history, { text: msg.text, timestamp: new Date() });
-            msg.text = cleanText;
-            msg.edited = true;
-            msg.markModified('history');
-            await msg.save();
-            const targetAuthorKey = authorKeyForMessage(msg);
-            await emitPersonalizedRoomEvent({
-              serverCode: intendedServerCode,
-              event: 'message_edited',
-              buildPayload: ({ blockedUserKeys }) => {
-                if (!targetAuthorKey || blockedUserKeys.has(targetAuthorKey)) return null;
-                return {
-                  id: msg._id,
-                  username: normalizeUsername(msg.username) || targetAuthorKey,
-                  role: typeof msg.role === 'string' ? msg.role : 'user',
-                  roomRole: typeof msg.roomRole === 'string' ? msg.roomRole : 'user',
-                  text: typeof msg.text === 'string' ? msg.text : ''
-                };
-              }
-            });
-          }
-        })
-      );
+            if (msg.text !== cleanText) {
+                msg.history = appendBoundedHistory(msg.history, { text: msg.text, timestamp: new Date() });
+                msg.text = cleanText; msg.edited = true; msg.markModified('history');
+                await msg.save();
+                ioInstance.to(msg.serverCode).emit('message_edited', { id: msg._id, username: msg.username, role: msg.role, roomRole: msg.roomRole, text: cleanText });
+            }
+          });
+        }
+      }
     } catch (err) {
       logUnexpectedError(logger, 'edit_message', err);
     }
   });
 
-  socket.on('delete_message', async (data, callback) => {
-    callback = safeAck(callback);
+  socket.on('delete_message', async (data) => {
     try {
       if (!socket.username || !data || typeof data !== 'object' || Array.isArray(data)) return;
       const msgId = data.id;
@@ -5007,131 +3308,29 @@ function createConnectionHandler({
       const clientContextId = normalizeClientContextId(data.clientContextId);
       if (!isValidObjectId(msgId) || intendedServerCode !== socket.serverCode ||
           clientContextId === null) return;
-      const actorUsername = socket.username;
-      const result = await withAccountTransitionLock(actorUsername, () =>
-        withRoomMutationLock(intendedServerCode, async () => {
-          if (normalizeAccountKey(socket.username) !== normalizeAccountKey(actorUsername) ||
-              socket.serverCode !== intendedServerCode) return null;
+      const msg = await MessageModel.findById(msgId);
+      if (msg && !msg.deleted && msg.serverCode === intendedServerCode) {
+        const identity = { role: socket.role, joinedServers: socket.joinedServers || [] };
+        if (!canAccessRoom(identity, msg.serverCode)) return;
+        await withRoomMutationLock(msg.serverCode, async () => {
           const access = await loadRoomAccessState({
             UserModel, ChatServerModel, RoomRestrictionModel,
-            username: actorUsername, serverCode: intendedServerCode
+            username: socket.username, serverCode: msg.serverCode
           });
-          if (!access.allowed || access.restriction.banned || !access.user || !access.room ||
-              normalizeAccountKey(access.user.username) !== normalizeAccountKey(actorUsername)) return null;
-
-          const message = await MessageModel.findById(msgId);
-          if (!message || message.deleted || message.serverCode !== intendedServerCode) return null;
-          if (access.restriction.timedOut &&
-              normalizeAccountKey(message.username) !== normalizeAccountKey(access.user.username)) return null;
+          if (msg.deleted || socket.serverCode !== intendedServerCode || !access.allowed ||
+              !canAccessRoom(socket, msg.serverCode)) return;
+          if (access.restriction.timedOut && msg.username !== socket.username) return;
           const freshRoomRole = currentRoomRole(access.room, access.user.username);
-          const mayDelete = normalizeAccountKey(message.username) === normalizeAccountKey(access.user.username) ||
-            access.user.role === 'admin' || freshRoomRole === 'mod';
-          if (!mayDelete) return null;
 
-          const targetAuthorKey = authorKeyForMessage(message);
-          const { snapshot: blockState, blockedUserKeys } = await loadDurableBlockState(access.user.username);
-          const blockVersion = blockState.blockVersion;
-          const priorPin = exactStoredPin(access.room, msgId);
-          let persistedRoom = access.room;
-          let pinChanged = false;
-
-          if (priorPin) {
-            const transactionConnection = sharedTransactionConnection([MessageModel, ChatServerModel]);
-            const fallbackPinnedDelete = async () => {
-              const removed = await removePinBeforeFallbackDelete({
-                room: access.room, message, blockVersion
-              });
-              persistedRoom = removed.room;
-              message.deleted = true;
-              try {
-                await message.save();
-              } catch (deleteError) {
-                message.deleted = false;
-                const restored = await restorePinAfterFailedDelete({
-                  room: persistedRoom, priorPin: removed.priorPin, blockVersion
-                });
-                persistedRoom = restored.room || persistedRoom;
-                if (!restored.restored) {
-                  logUnexpectedError(logger, 'delete_message_pin_restore', restored.error || deleteError);
-                }
-                if (restored.verified) {
-                  await emitMessagePinUpdated({
-                    serverCode: intendedServerCode,
-                    messageId: msgId,
-                    pinned: restored.pinned,
-                    room: persistedRoom,
-                    targetAuthorKey
-                  });
-                }
-                throw deleteError;
-              }
-              return { message, room: persistedRoom };
-            };
-            const persisted = await runPersistence(async session => {
-                const [transactionMessage, transactionRoom] = await Promise.all([
-                  applyQuerySession(MessageModel.findById(msgId), session),
-                  applyQuerySession(ChatServerModel.findOne({ code: intendedServerCode }), session)
-                ]);
-                if (!transactionMessage || transactionMessage.deleted ||
-                    transactionMessage.serverCode !== intendedServerCode || !transactionRoom ||
-                    !exactStoredPin(transactionRoom, msgId)) {
-                  throw new Error('Pinned message transaction state changed.');
-                }
-                const transactionMayDelete =
-                  normalizeAccountKey(transactionMessage.username) === normalizeAccountKey(access.user.username) ||
-                  access.user.role === 'admin' || currentRoomRole(transactionRoom, access.user.username) === 'mod';
-                if (!transactionMayDelete) throw new Error('Pinned message transaction authority changed.');
-
-                transactionMessage.deleted = true;
-                await transactionMessage.save({ session });
-                const updatedRoom = await ChatServerModel.findOneAndUpdate(
-                  {
-                    code: intendedServerCode,
-                    ...roomPinVersionPredicate(transactionRoom),
-                    'pinnedMessages.messageId': msgId
-                  },
-                  { $pull: { pinnedMessages: { messageId: msgId } }, $inc: { pinVersion: 1 } },
-                  { new: true, session }
-                );
-                if (!updatedRoom) throw new Error('Pinned message transaction lost its version race.');
-                return { message: transactionMessage, room: updatedRoom };
-              }, transactionConnection, {
-                unsupportedTopologyFallback: fallbackPinnedDelete
-              });
-            persistedRoom = persisted.room;
-            pinChanged = true;
-          } else {
-            message.deleted = true;
-            await message.save();
+          // Sender, SysAdmin, or RoomMod can delete it
+          if (msg.username === socket.username || access.user.role === 'admin' || freshRoomRole === 'mod') {
+            msg.deleted = true; await msg.save();
+            ioInstance.to(msg.serverCode).emit('message_deleted', msgId);
           }
-
-          if (pinChanged) {
-            await emitMessagePinUpdated({
-              serverCode: intendedServerCode,
-              messageId: msgId,
-              pinned: false,
-              room: persistedRoom,
-              targetAuthorKey
-            });
-          }
-          await emitPersonalizedRoomEvent({
-            serverCode: intendedServerCode,
-            event: 'message_deleted',
-            buildPayload: ({ blockedUserKeys: recipientBlocks }) => {
-              if (!targetAuthorKey || recipientBlocks.has(targetAuthorKey)) return null;
-              return { id: msgId, serverCode: intendedServerCode };
-            }
-          });
-          const pin = await visiblePinCountSnapshot({
-            room: persistedRoom, blockedUserKeys, blockVersion
-          });
-          return { success: true, messageId: msgId, pin };
-        })
-      );
-      if (result) callback(result);
+        });
+      }
     } catch (err) {
       logUnexpectedError(logger, 'delete_message', err);
-      callback({ error: 'Failed to delete message.' });
     }
   });
 
@@ -5140,60 +3339,19 @@ function createConnectionHandler({
     if (!socket.username) return callback({ error: 'Not authenticated.' });
     try {
       if (!isValidObjectId(msgId)) return callback({ error: 'Invalid input format.' });
-      const actorUsername = socket.username;
-      const initialMessage = await MessageModel.findById(msgId);
-      const serverCode = normalizeServerCode(initialMessage?.serverCode || 'global');
-      let preflightAllowed = false;
-      if (initialMessage && serverCode) {
-        const authorKey = authorKeyForMessage(initialMessage);
-        const blockState = await ensureBlockState(actorUsername);
+      const msg = await MessageModel.findById(msgId);
+      if (msg) {
         const identity = { role: socket.role, joinedServers: socket.joinedServers || [] };
-        if (authorKey && !blockSetFromState(blockState).has(authorKey) && canAccessRoom(identity, serverCode)) {
-          const restriction = await getActiveRoomRestriction(RoomRestrictionModel, serverCode, actorUsername);
-          if (!restriction.banned && await roomExists(serverCode)) {
-            const roomRole = await getRoomRoleFn(serverCode, actorUsername);
-            preflightAllowed = normalizeAccountKey(initialMessage.username) === normalizeAccountKey(actorUsername) ||
-              socket.role === 'admin' || roomRole === 'mod';
-          }
+        if (!canAccessRoom(identity, msg.serverCode)) return callback({ error: 'Permission denied.' });
+        const restriction = await getActiveRoomRestriction(RoomRestrictionModel, msg.serverCode, socket.username);
+        if (restriction.banned) return callback({ error: 'Permission denied.' });
+        if (!(await roomExists(msg.serverCode))) return callback({ error: 'Permission denied.' });
+        const roomRole = await getRoomRoleFn(msg.serverCode, socket.username);
+        if (msg.username === socket.username || socket.role === 'admin' || roomRole === 'mod') {
+            return callback({ success: true, history: (Array.isArray(msg.history) ? msg.history : []).slice(-20) });
         }
       }
-      if (!initialMessage || !serverCode) return callback({ error: 'Permission denied.' });
-
-      await withAccountTransitionLock(actorUsername, () => withRoomMutationLock(serverCode, async () => {
-        if (!preflightAllowed || normalizeAccountKey(socket.username) !== normalizeAccountKey(actorUsername) ||
-            normalizeServerCode(socket.serverCode) !== serverCode) {
-          callback({ error: 'Permission denied.' });
-          return;
-        }
-        const access = await loadRoomAccessState({
-          UserModel, ChatServerModel, RoomRestrictionModel, username: actorUsername, serverCode
-        });
-        if (!access.allowed || access.restriction.banned || !access.user || !access.room) {
-          callback({ error: 'Permission denied.' });
-          return;
-        }
-        const message = await MessageModel.findById(msgId);
-        const authorKey = authorKeyForMessage(message);
-        if (!message || normalizeServerCode(message.serverCode || 'global') !== serverCode || !authorKey) {
-          callback({ error: 'Permission denied.' });
-          return;
-        }
-        const blockState = await ensureBlockState(access.user.username);
-        if (blockSetFromState(blockState).has(authorKey)) {
-          callback({ error: 'Permission denied.' });
-          return;
-        }
-        const mayRead = normalizeAccountKey(message.username) === normalizeAccountKey(access.user.username) ||
-          access.user.role === 'admin' || currentRoomRole(access.room, access.user.username) === 'mod';
-        if (!mayRead) {
-          callback({ error: 'Permission denied.' });
-          return;
-        }
-        callback({
-          success: true,
-          history: (Array.isArray(message.history) ? message.history : []).slice(-20)
-        });
-      }));
+      callback({ error: 'Permission denied.' });
     } catch (err) {
       logUnexpectedError(logger, 'get_edit_history', err);
       callback({ error: 'Failed to load history.' });
@@ -5205,61 +3363,19 @@ function createConnectionHandler({
     if (!socket.username) return callback({ error: 'Not authenticated.' });
     try {
       if (!isValidObjectId(msgId)) return callback({ error: 'Invalid input format.' });
-      const actorUsername = socket.username;
-      const initialMessage = await MessageModel.findById(msgId);
-      const serverCode = normalizeServerCode(initialMessage?.serverCode || 'global');
-      let preflightAllowed = false;
-      if (initialMessage?.deleted && serverCode) {
-        const authorKey = authorKeyForMessage(initialMessage);
-        const blockState = await ensureBlockState(actorUsername);
+      const msg = await MessageModel.findById(msgId);
+      if (msg && msg.deleted) {
         const identity = { role: socket.role, joinedServers: socket.joinedServers || [] };
-        if (authorKey && !blockSetFromState(blockState).has(authorKey) && canAccessRoom(identity, serverCode)) {
-          const restriction = await getActiveRoomRestriction(RoomRestrictionModel, serverCode, actorUsername);
-          if (!restriction.banned && await roomExists(serverCode)) {
-            const roomRole = await getRoomRoleFn(serverCode, actorUsername);
-            preflightAllowed = normalizeAccountKey(initialMessage.username) === normalizeAccountKey(actorUsername) ||
-              socket.role === 'admin' || roomRole === 'mod';
-          }
+        if (!canAccessRoom(identity, msg.serverCode)) return callback({ error: 'Permission denied.' });
+        const restriction = await getActiveRoomRestriction(RoomRestrictionModel, msg.serverCode, socket.username);
+        if (restriction.banned) return callback({ error: 'Permission denied.' });
+        if (!(await roomExists(msg.serverCode))) return callback({ error: 'Permission denied.' });
+        const roomRole = await getRoomRoleFn(msg.serverCode, socket.username);
+        if (msg.username === socket.username || socket.role === 'admin' || roomRole === 'mod') {
+            return callback({ success: true, text: msg.text, attachment: sanitizeAttachment(msg.attachment) });
         }
       }
-      if (!initialMessage || !serverCode) return callback({ error: 'Permission denied.' });
-
-      await withAccountTransitionLock(actorUsername, () => withRoomMutationLock(serverCode, async () => {
-        if (!preflightAllowed || normalizeAccountKey(socket.username) !== normalizeAccountKey(actorUsername) ||
-            normalizeServerCode(socket.serverCode) !== serverCode) {
-          callback({ error: 'Permission denied.' });
-          return;
-        }
-        const access = await loadRoomAccessState({
-          UserModel, ChatServerModel, RoomRestrictionModel, username: actorUsername, serverCode
-        });
-        if (!access.allowed || access.restriction.banned || !access.user || !access.room) {
-          callback({ error: 'Permission denied.' });
-          return;
-        }
-        const message = await MessageModel.findById(msgId);
-        const authorKey = authorKeyForMessage(message);
-        if (!message || !message.deleted || normalizeServerCode(message.serverCode || 'global') !== serverCode || !authorKey) {
-          callback({ error: 'Permission denied.' });
-          return;
-        }
-        const blockState = await ensureBlockState(access.user.username);
-        if (blockSetFromState(blockState).has(authorKey)) {
-          callback({ error: 'Permission denied.' });
-          return;
-        }
-        const mayRead = normalizeAccountKey(message.username) === normalizeAccountKey(access.user.username) ||
-          access.user.role === 'admin' || currentRoomRole(access.room, access.user.username) === 'mod';
-        if (!mayRead) {
-          callback({ error: 'Permission denied.' });
-          return;
-        }
-        callback({
-          success: true,
-          text: typeof message.text === 'string' ? message.text : '',
-          attachment: sanitizeAttachment(message.attachment)
-        });
-      }));
+      callback({ error: 'Permission denied.' });
     } catch (err) {
       logUnexpectedError(logger, 'get_deleted_message', err);
       callback({ error: 'Failed to load deleted message.' });
@@ -5283,18 +3399,10 @@ function createConnectionHandler({
         });
         if (socket.serverCode !== intendedServerCode || !access.allowed ||
             access.restriction.timedOut || !canAccessRoom(socket, serverCode)) return;
-        const typingAuthorKey = normalizeAccountKey(access.user.username);
-        await emitPersonalizedRoomEvent({
-          serverCode,
-          event: 'typing',
-          buildPayload: ({ blockedUserKeys }) => {
-            if (blockedUserKeys.has(typingAuthorKey)) return null;
-            return {
-              username: access.user.username,
-              displayName: socket.displayName || access.user.username,
-              isTyping
-            };
-          }
+        socket.to(serverCode).emit('typing', {
+          username: socket.username,
+          displayName: socket.displayName || socket.username,
+          isTyping
         });
       });
     } catch (err) {
@@ -5302,7 +3410,7 @@ function createConnectionHandler({
     }
   });
 
-  socket.on('disconnect', async () => {
+  socket.on('disconnect', () => {
     if (suppressDisconnectPresence) {
       onlineUsersMap.delete(socket.id);
       return;
@@ -5323,15 +3431,7 @@ function createConnectionHandler({
         const isVisible = socket.role !== 'admin' || (joinedServers && joinedServers.includes(serverCode)) || serverCode === 'global';
         if (isVisible) {
             ioInstance.to(serverCode).emit('system_message', `${dName} disconnected.`);
-            const typingAuthorKey = normalizeAccountKey(socket.username);
-            await emitPersonalizedRoomEvent({
-              serverCode,
-              event: 'typing',
-              buildPayload: ({ blockedUserKeys }) => {
-                if (blockedUserKeys.has(typingAuthorKey)) return null;
-                return { username: socket.username, displayName: dName, isTyping: false };
-              }
-            });
+            ioInstance.to(serverCode).emit('typing', { username: socket.username, isTyping: false });
         }
       }
     }
@@ -5377,8 +3477,6 @@ module.exports = {
   createConnectionHandler,
   withAccountTransitionLock,
   withAccountTransitionLocks,
-  sharedTransactionConnection,
-  runPersistence,
   safeAck,
   normalizeUsername,
   normalizeDisplayName,
@@ -5389,24 +3487,6 @@ module.exports = {
   normalizeAutoModSettings,
   normalizeStoredAutoModSettings,
   normalizeAccountKey,
-  normalizeRoomText,
-  normalizeNotificationLevel,
-  authorKeyForMessage,
-  extractNotificationMentions,
-  isNotificationMention,
-  roomMessageQuery,
-  newestRoomMessage,
-  cursorFromMessage,
-  compareCursor,
-  safeReplyForViewer,
-  safeReactionsForViewer,
-  safeMessageForViewer,
-  safeBlockedMessageReveal,
-  safeRoomDetails,
-  safeRoomState,
-  safeBlockState,
-  blockSetFromState,
-  replaceAccountBlockCaches,
   createAutoModTracker,
   evaluateAutoMod,
   evaluateMessageRate,
@@ -5417,17 +3497,11 @@ module.exports = {
   chooseAccessibleRoom,
   applySessionAccessSnapshot,
   loadRoomAccessState,
-  canEditRoomDetails,
-  canManagePins,
   rejectAuditMutation,
   MODERATION_DURATIONS,
   RoomRestriction,
   ModerationAudit,
   ModerationReport,
-  ChatServer,
-  Message,
-  RoomMemberState,
-  UserExperienceState,
   isValidPassword,
   normalizeColor,
   normalizeAvatarUrl,

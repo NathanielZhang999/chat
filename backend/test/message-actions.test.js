@@ -1,13 +1,11 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { createAutoModTracker, createConnectionHandler } = require('../server');
-const { FakeSocket, FakeIo, acknowledge, deferred, createMemoryModel } = require('./support/fakes');
+const { FakeSocket, FakeIo, acknowledge, deferred } = require('./support/fakes');
 
 function registerMessages(overrides = {}) {
   const socket = new FakeSocket();
   const ioInstance = new FakeIo();
-  const RoomMemberStateModel = overrides.RoomMemberStateModel || createMemoryModel([]);
-  const UserExperienceStateModel = overrides.UserExperienceStateModel || createMemoryModel([]);
   createConnectionHandler({
     ioInstance,
     UserModel: {
@@ -22,11 +20,9 @@ function registerMessages(overrides = {}) {
     getRoomRoleFn: async () => 'user',
     resolvePingsFn: async text => text,
     autoModTracker: createAutoModTracker(),
-    ...overrides,
-    RoomMemberStateModel,
-    UserExperienceStateModel
+    ...overrides
   })(socket);
-  return { socket, ioInstance, RoomMemberStateModel, UserExperienceStateModel };
+  return { socket, ioInstance };
 }
 
 function authenticate(socket, { serverCode = 'global', joinedServers = ['global'] } = {}) {
@@ -36,177 +32,6 @@ function authenticate(socket, { serverCode = 'global', joinedServers = ['global'
   socket.serverCode = serverCode;
   socket.joinedServers = joinedServers;
 }
-
-test('new messages store immutable normalized author and canonical send-time mentions', async () => {
-  const MessageModel = createMemoryModel([]);
-  const { socket } = registerMessages({
-    MessageModel,
-    resolvePingsFn: async () =>
-      '{{PING:Bob|Bob}} {{PING:BOB|Bob}} {{PING:everyone|everyone}}'
-  });
-  authenticate(socket, { serverCode: 'ABC123', joinedServers: ['global', 'ABC123'] });
-
-  await socket.trigger('chat_message', { text: '@Bob @BOB @everyone' });
-
-  assert.equal(MessageModel.rows.length, 1);
-  assert.equal(MessageModel.rows[0].serverCode, 'ABC123');
-  assert.equal(MessageModel.rows[0].authorKey, 'alice');
-  assert.deepEqual(MessageModel.rows[0].notificationMentions, ['bob', '*']);
-});
-
-test('everyone mention stores the reserved star exactly once', async () => {
-  const MessageModel = createMemoryModel([]);
-  const { socket } = registerMessages({
-    MessageModel,
-    resolvePingsFn: async () =>
-      '{{PING:everyone|everyone}} {{PING:everyone|everyone}}'
-  });
-  authenticate(socket, { serverCode: 'ABC123', joinedServers: ['global', 'ABC123'] });
-
-  await socket.trigger('chat_message', { text: '@everyone @everyone' });
-
-  assert.deepEqual(MessageModel.rows[0].notificationMentions, ['*']);
-});
-
-test('edits do not change mention metadata or create activity', async () => {
-  const MessageModel = createMemoryModel([]);
-  const { socket } = registerMessages({
-    MessageModel,
-    resolvePingsFn: async text => text === 'original'
-      ? '{{PING:bob|Bob}}'
-      : '{{PING:carol|Carol}}'
-  });
-  authenticate(socket, { serverCode: 'ABC123', joinedServers: ['global', 'ABC123'] });
-  await socket.trigger('chat_message', { text: 'original' });
-  const stored = MessageModel.rows[0];
-  assert.deepEqual(stored.notificationMentions, ['bob']);
-  const immutableBefore = {
-    authorKey: stored.authorKey,
-    notificationMentions: [...stored.notificationMentions]
-  };
-  socket.outbound.length = 0;
-
-  await socket.trigger('edit_message', { id: stored._id, text: 'edited' });
-
-  assert.deepEqual({
-    authorKey: MessageModel.rows[0].authorKey,
-    notificationMentions: MessageModel.rows[0].notificationMentions
-  }, immutableBefore);
-  assert.deepEqual(socket.outbound.filter(item => item.event === 'room_activity'), []);
-});
-
-test('pin mutation binds the live target to the requested room without exposing message content', async () => {
-  const messageId = '507f1f77bcf86cd799439011';
-  const secret = 'PIN_ACTION_SECRET';
-  const ChatServerModel = createMemoryModel([{
-    code: 'ABC123', owner: 'alice', moderators: [], pinnedMessages: [], pinVersion: 0
-  }]);
-  const MessageModel = createMemoryModel([{
-    _id: messageId, serverCode: 'BBB222', username: 'bob', displayName: 'Bob', authorKey: 'bob',
-    text: secret, attachment: 'data:image/png;base64,UElOU0VDUkVU', deleted: false,
-    timestamp: new Date()
-  }]);
-  const audits = createMemoryModel([]);
-  const { socket, ioInstance } = registerMessages({
-    ChatServerModel,
-    MessageModel,
-    ModerationAuditModel: audits,
-    UserModel: createMemoryModel([userDocumentForPinAction()])
-  });
-  authenticate(socket, { serverCode: 'ABC123', joinedServers: ['global', 'ABC123'] });
-  socket.role = 'admin';
-  const ack = acknowledge();
-
-  await socket.trigger('set_message_pin', {
-    serverCode: 'ABC123', messageId, pinned: true, clientContextId: 1
-  }, ack.callback);
-
-  assert.deepEqual(ack.value(), { error: 'Permission denied.' });
-  assert.deepEqual(ChatServerModel.rows[0].pinnedMessages, []);
-  assert.equal(ChatServerModel.rows[0].pinVersion, 0);
-  assert.deepEqual(audits.rows, []);
-  assert.equal(JSON.stringify(ioInstance.outbound).includes(secret), false);
-  assert.equal(JSON.stringify(ioInstance.outbound).includes('UElOU0VDUkVU'), false);
-});
-
-function userDocumentForPinAction() {
-  return { username: 'alice', displayName: 'Alice', role: 'admin', servers: ['global', 'ABC123'] };
-}
-
-test('unpinned deletion does not advance pinVersion', async () => {
-  const messageId = '507f1f77bcf86cd799439011';
-  const ChatServerModel = createMemoryModel([{
-    code: 'ABC123', owner: 'alice', moderators: [], pinnedMessages: [], pinVersion: 4
-  }]);
-  const MessageModel = createMemoryModel([{
-    _id: messageId, serverCode: 'ABC123', username: 'alice', displayName: 'Alice',
-    authorKey: 'alice', text: 'delete me', attachment: null, deleted: false,
-    timestamp: new Date(), history: [], reactions: {}
-  }]);
-  const { socket } = registerMessages({
-    ChatServerModel,
-    MessageModel,
-    UserModel: createMemoryModel([{
-      username: 'alice', displayName: 'Alice', role: 'user', servers: ['global', 'ABC123']
-    }]),
-    RoomRestrictionModel: createMemoryModel([])
-  });
-  authenticate(socket, { serverCode: 'ABC123', joinedServers: ['global', 'ABC123'] });
-  const ack = acknowledge();
-
-  await socket.trigger('delete_message', {
-    id: messageId, serverCode: 'ABC123', clientContextId: 1
-  }, ack.callback);
-
-  assert.equal(MessageModel.rows[0].deleted, true);
-  assert.equal(ChatServerModel.rows[0].pinVersion, 4);
-  assert.deepEqual(ChatServerModel.rows[0].pinnedMessages, []);
-  assert.deepEqual(ack.value(), {
-    success: true, messageId,
-    pin: { serverCode: 'ABC123', pinCount: 0, pinVersion: 4, blockVersion: 0 }
-  });
-  assert.equal(socket.outbound.some(item => item.event === 'message_pin_updated'), false);
-});
-
-test('edits preserve pin identity and are reflected by the next pin read', async () => {
-  const messageId = '507f1f77bcf86cd799439011';
-  const priorPin = { messageId, pinnedAt: new Date('2026-08-10T12:00:00.000Z'), pinnedBy: 'alice' };
-  const ChatServerModel = createMemoryModel([{
-    code: 'ABC123', owner: 'alice', moderators: [], pinnedMessages: [priorPin], pinVersion: 3,
-    autoMod: {
-      blockedKeywords: [], mentionLimit: 8, repeatLimit: 3, repeatWindowSeconds: 30,
-      messageLimit: 5, messageWindowSeconds: 5
-    }
-  }]);
-  const MessageModel = createMemoryModel([{
-    _id: messageId, serverCode: 'ABC123', username: 'alice', displayName: 'Alice',
-    authorKey: 'alice', role: 'user', roomRole: 'user', text: 'before', attachment: null,
-    deleted: false, edited: false, timestamp: new Date('2026-08-10T11:00:00.000Z'),
-    history: [], reactions: {}
-  }]);
-  const { socket } = registerMessages({
-    ChatServerModel,
-    MessageModel,
-    UserModel: createMemoryModel([{
-      username: 'alice', displayName: 'Alice', role: 'user', servers: ['global', 'ABC123']
-    }]),
-    RoomRestrictionModel: createMemoryModel([])
-  });
-  authenticate(socket, { serverCode: 'ABC123', joinedServers: ['global', 'ABC123'] });
-
-  await socket.trigger('edit_message', { id: messageId, text: 'after' });
-  const ack = acknowledge();
-  await socket.trigger('list_pinned_messages', {
-    serverCode: 'ABC123', clientContextId: 1
-  }, ack.callback);
-
-  assert.deepEqual(ChatServerModel.rows[0].pinnedMessages, [priorPin]);
-  assert.equal(ChatServerModel.rows[0].pinVersion, 3);
-  assert.equal(ack.value().pins[0].messageId, messageId);
-  assert.equal(ack.value().pins[0].text, 'after');
-  assert.equal(ack.value().pins[0].pinnedAt.getTime(), priorPin.pinnedAt.getTime());
-  assert.equal(ack.value().pins[0].pinnedBy, 'alice');
-});
 
 test('rate-limited messages skip reply lookup, ping resolution, persistence, and broadcast', async () => {
   let currentTime = 1_000;
@@ -252,7 +77,7 @@ test('rate-limited messages skip reply lookup, ping resolution, persistence, and
   assert.equal(creates, 2);
   assert.equal(replyLookups, 0);
   assert.equal(pingResolutions, 0);
-  assert.equal(socket.outbound.filter(item => item.event === 'chat_message').length, 2);
+  assert.equal(ioInstance.outbound.filter(item => item.event === 'chat_message').length, 2);
   assert.equal(socket.outbound.filter(item => item.event === 'message_blocked').length, 2);
   assert.equal(audits.filter(item => item.metadata?.rule === 'message_rate').length, 1);
   for (const [label, records] of [
@@ -289,7 +114,7 @@ test('default AutoMod accepts five immediate distinct sends and blocks the sixth
   }
   await socket.trigger('chat_message', { text: 'sixth distinct message' });
   assert.equal(creates, 5);
-  assert.equal(socket.outbound.filter(item => item.event === 'chat_message').length, 5);
+  assert.equal(ioInstance.outbound.filter(item => item.event === 'chat_message').length, 5);
   assert.equal(socket.outbound.filter(item => item.event === 'message_blocked').length, 1);
 });
 
@@ -482,8 +307,8 @@ test('editing emits only to the active stored message room', async () => {
   const { socket, ioInstance } = registerMessages({ MessageModel });
   authenticate(socket, { serverCode: 'ABC123', joinedServers: ['global', 'ABC123'] });
   await socket.trigger('edit_message', { id: message._id, text: 'after' });
-  assert.equal(socket.outbound.at(-1).target, 'self');
-  assert.equal(socket.outbound.at(-1).event, 'message_edited');
+  assert.equal(ioInstance.outbound.at(-1).room, 'ABC123');
+  assert.equal(ioInstance.outbound.at(-1).event, 'message_edited');
 });
 
 test('message reply snapshot comes from the stored same-room message', async () => {
@@ -507,124 +332,8 @@ test('message reply snapshot comes from the stored same-room message', async () 
   });
   assert.deepEqual(created.replyTo, {
     id: referenced._id,
-    authorKey: 'bob',
     displayname: 'Bob',
     text: 'trusted stored text'
-  });
-});
-
-test('new replies persist immutable authorKey from the exact-room source', async () => {
-  let created;
-  const referenced = {
-    _id: '507f1f77bcf86cd799439011', serverCode: 'ABC123', username: 'BoB', authorKey: 'bob',
-    displayName: 'Bob', text: 'trusted source', deleted: false
-  };
-  const { socket } = registerMessages({
-    MessageModel: {
-      async findById() { return referenced; },
-      async create(value) {
-        created = value;
-        return { ...value, _id: '507f191e810c19729de860ea', timestamp: new Date() };
-      }
-    }
-  });
-  authenticate(socket, { serverCode: 'ABC123', joinedServers: ['global', 'ABC123'] });
-
-  await socket.trigger('chat_message', {
-    text: 'reply', replyTo: {
-      id: referenced._id, authorKey: 'attacker', displayname: 'Attacker', text: 'forged'
-    }
-  });
-
-  assert.deepEqual(created.replyTo, {
-    id: referenced._id, authorKey: 'bob', displayname: 'Bob', text: 'trusted source'
-  });
-});
-
-test('reaction updates remove identities blocked by each recipient', async () => {
-  const message = {
-    _id: '507f1f77bcf86cd799439011', serverCode: 'ABC123', username: 'Carol', authorKey: 'carol',
-    deleted: false, reactions: { '👍': ['Bob'] }, markModified() {}, async save() {}
-  };
-  const sockets = ['alice', 'blocker', 'open'].map(id => {
-    const live = new FakeSocket();
-    live.id = id;
-    return live;
-  });
-  const ioInstance = new FakeIo(sockets);
-  const onlineUsersMap = new Map();
-  const users = createMemoryModel([
-    { username: 'Alice', role: 'user', servers: ['global', 'ABC123'] },
-    { username: 'Blocker', role: 'user', servers: ['global', 'ABC123'] },
-    { username: 'Open', role: 'user', servers: ['global', 'ABC123'] }
-  ]);
-  const deps = {
-    ioInstance, onlineUsersMap, UserModel: users,
-    ChatServerModel: createMemoryModel([{ code: 'ABC123', moderators: [] }]),
-    MessageModel: { async findById() { return message; } },
-    RoomRestrictionModel: createMemoryModel([]), UserExperienceStateModel: createMemoryModel([]),
-    broadcastOnlineUsersFn: async () => {}, getRoomRoleFn: async () => 'user',
-    resolvePingsFn: async text => text
-  };
-  for (const live of sockets) createConnectionHandler(deps)(live);
-  Object.assign(sockets[0], { username: 'Alice', displayName: 'Alice', role: 'user' });
-  Object.assign(sockets[1], { username: 'Blocker', displayName: 'Blocker', role: 'user', blockedUserKeys: new Set(['bob']), blockVersion: 2 });
-  Object.assign(sockets[2], { username: 'Open', displayName: 'Open', role: 'user', blockedUserKeys: new Set(), blockVersion: 0 });
-  for (const live of sockets) {
-    live.serverCode = 'ABC123';
-    live.joinedServers = ['global', 'ABC123'];
-    onlineUsersMap.set(live.id, {
-      username: live.username, serverCode: 'ABC123', joinedServers: [...live.joinedServers],
-      blockedUsers: [...(live.blockedUserKeys || [])], blockVersion: live.blockVersion || 0
-    });
-  }
-
-  await sockets[0].trigger('toggle_reaction', { id: message._id, emoji: '👍' });
-
-  assert.deepEqual(sockets[1].outbound.find(item => item.event === 'reaction_updated').payload.reactions, {
-    '👍': ['Alice']
-  });
-  assert.deepEqual(sockets[2].outbound.find(item => item.event === 'reaction_updated').payload.reactions, {
-    '👍': ['Bob', 'Alice']
-  });
-});
-
-test('typing from a blocked author is suppressed only for blocker sessions', async () => {
-  const author = new FakeSocket(); author.id = 'author';
-  const blocker = new FakeSocket(); blocker.id = 'blocker';
-  const open = new FakeSocket(); open.id = 'open';
-  const sockets = [author, blocker, open];
-  const ioInstance = new FakeIo(sockets);
-  const onlineUsersMap = new Map();
-  const deps = {
-    ioInstance, onlineUsersMap,
-    UserModel: createMemoryModel([
-      { username: 'Author', role: 'user', servers: ['global', 'ABC123'] },
-      { username: 'Blocker', role: 'user', servers: ['global', 'ABC123'] },
-      { username: 'Open', role: 'user', servers: ['global', 'ABC123'] }
-    ]),
-    ChatServerModel: createMemoryModel([{ code: 'ABC123', moderators: [] }]),
-    RoomRestrictionModel: createMemoryModel([]), UserExperienceStateModel: createMemoryModel([]),
-    broadcastOnlineUsersFn: async () => {}, getRoomRoleFn: async () => 'user',
-    resolvePingsFn: async text => text
-  };
-  for (const live of sockets) createConnectionHandler(deps)(live);
-  for (const [live, username] of [[author, 'Author'], [blocker, 'Blocker'], [open, 'Open']]) {
-    Object.assign(live, {
-      username, displayName: username, role: 'user', serverCode: 'ABC123',
-      joinedServers: ['global', 'ABC123'], blockedUserKeys: new Set(username === 'Blocker' ? ['author'] : [])
-    });
-    onlineUsersMap.set(live.id, {
-      username, serverCode: 'ABC123', joinedServers: ['global', 'ABC123'],
-      blockedUsers: [...live.blockedUserKeys], blockVersion: 1
-    });
-  }
-
-  await author.trigger('typing', true);
-
-  assert.equal(blocker.outbound.some(item => item.event === 'typing'), false);
-  assert.deepEqual(open.outbound.find(item => item.event === 'typing').payload, {
-    username: 'Author', displayName: 'Author', isTyping: true
   });
 });
 
@@ -656,7 +365,7 @@ test('chat message is rejected when its active room changes while mention resolu
   assert.deepEqual(ioInstance.outbound, []);
 });
 
-test('chat message stays bound to its stored room without leaking to a newly active room', async () => {
+test('chat message emits to its stored room when persistence is pending', async () => {
   const createStarted = deferred();
   const releaseCreate = deferred();
   let created;
@@ -679,8 +388,7 @@ test('chat message stays bound to its stored room without leaking to a newly act
   await pending;
 
   assert.equal(created.serverCode, 'ABC123');
-  assert.deepEqual(socket.outbound, []);
-  assert.deepEqual(ioInstance.outbound, []);
+  assert.equal(ioInstance.outbound.at(-1).room, 'ABC123');
 });
 
 test('chat message rechecks membership immediately before persistence', async () => {
@@ -872,34 +580,16 @@ test('edit history reads return only the newest twenty legacy entries', async ()
 
 test('room history strips unsafe legacy attachments before acknowledgement', async () => {
   const history = [
-    {
-      _id: '507f1f77bcf86cd799439011', serverCode: 'global', username: 'Alice', authorKey: 'alice',
-      displayName: 'Alice', role: 'user', roomRole: 'user', color: '', avatarUrl: '', text: 'unsafe',
-      attachment: 'javascript:alert(1)', replyTo: null, reactions: {}, edited: false, deleted: false,
-      timestamp: new Date('2026-08-10T12:01:00.000Z')
-    },
-    {
-      _id: '507f191e810c19729de860ea', serverCode: 'global', username: 'Alice', authorKey: 'alice',
-      displayName: 'Alice', role: 'user', roomRole: 'user', color: '', avatarUrl: '', text: 'safe',
-      attachment: 'data:image/png;base64,AAAA', replyTo: null, reactions: {}, edited: false, deleted: false,
-      timestamp: new Date('2026-08-10T12:00:00.000Z')
-    }
+    { _id: '507f1f77bcf86cd799439011', serverCode: 'global', attachment: 'javascript:alert(1)' },
+    { _id: '507f191e810c19729de860ea', serverCode: 'global', attachment: 'data:image/png;base64,AAAA' }
   ];
-  const { socket, RoomMemberStateModel } = registerMessages({
+  const { socket } = registerMessages({
     MessageModel: {
       find() {
         return {
           sort() { return this; },
           limit() { return this; },
-          async select() {
-            return history.map(row => ({
-              _id: row._id, serverCode: row.serverCode, timestamp: row.timestamp,
-              username: row.username, authorKey: row.authorKey,
-              notificationMentions: row.notificationMentions, deleted: row.deleted
-            }));
-          },
-          async lean() { return history; },
-          then(resolve, reject) { return Promise.resolve(history).then(resolve, reject); }
+          async lean() { return history; }
         };
       }
     }
@@ -909,13 +599,6 @@ test('room history strips unsafe legacy attachments before acknowledgement', asy
   await socket.trigger('switch_server', 'global', ack.callback);
   assert.equal(ack.value().history[0].attachment, 'data:image/png;base64,AAAA');
   assert.equal(ack.value().history[1].attachment, null);
-  assert.deepEqual(RoomMemberStateModel.rows.map(row => ({
-    usernameKey: row.usernameKey,
-    serverCode: row.serverCode,
-    lastReadMessageId: row.lastReadMessageId
-  })), [{
-    usernameKey: 'alice', serverCode: 'global', lastReadMessageId: '507f1f77bcf86cd799439011'
-  }]);
 });
 
 test('deleted-message reads strip unsafe legacy attachments', async () => {
@@ -1009,7 +692,7 @@ test('a persisted room ban blocks an administrator from deleting another user me
   assert.deepEqual(ioInstance.outbound, []);
 });
 
-test('typing validates accessible active rooms and boolean states with a complete personalized payload', async () => {
+test('typing emits a complete payload only for accessible active rooms and boolean states', async () => {
   const { socket } = registerMessages();
   authenticate(socket, { serverCode: 'ABC123', joinedServers: ['global'] });
   await socket.trigger('typing', true);
@@ -1020,7 +703,8 @@ test('typing validates accessible active rooms and boolean states with a complet
   await socket.trigger('typing', 'true');
   await socket.trigger('typing', true);
   assert.deepEqual(socket.outbound, [{
-    target: 'self', event: 'typing',
+    target: 'ABC123',
+    event: 'typing',
     payload: { username: 'alice', displayName: 'Alice', isTyping: true }
   }]);
 });
@@ -1271,8 +955,7 @@ test('room deletion cannot overtake an in-flight reaction persistence', async ()
   const releaseSave = deferred();
   const state = { roomExists: true, savedAfterDeletion: false };
   const message = {
-    _id: '507f1f77bcf86cd799439011', serverCode: 'ABC123', username: 'alice', authorKey: 'alice',
-    deleted: false, reactions: {},
+    _id: '507f1f77bcf86cd799439011', serverCode: 'ABC123', deleted: false, reactions: {},
     markModified() {},
     async save() {
       saveStarted.resolve();
@@ -1312,8 +995,10 @@ test('room deletion cannot overtake an in-flight reaction persistence', async ()
   await Promise.all([reactionPending, deletionPending]);
 
   assert.equal(state.savedAfterDeletion, false);
-  assert.equal(socket.outbound.some(item => item.event === 'reaction_updated'), true);
-  assert.equal(ioInstance.outbound.some(item => item.event === 'server_deleted'), true);
+  const reactionIndex = ioInstance.outbound.findIndex(item => item.event === 'reaction_updated');
+  const deletionIndex = ioInstance.outbound.findIndex(item => item.event === 'server_deleted');
+  assert.ok(reactionIndex >= 0);
+  assert.ok(deletionIndex > reactionIndex);
 });
 
 for (const action of [
@@ -1377,75 +1062,9 @@ for (const action of [
     await Promise.all([actionPending, deletionPending]);
 
     assert.equal(state.savedAfterDeletion, false);
-    assert.equal(socket.outbound.some(item => item.event === action.emittedEvent), true);
-    assert.equal(ioInstance.outbound.some(item => item.event === 'server_deleted'), true);
-  });
-}
-
-for (const mutation of [
-  {
-    name: 'edit',
-    event: 'edit_message',
-    payload: { id: '507f1f77bcf86cd799439011', text: 'must not resurrect' },
-    emittedEvent: 'message_edited'
-  },
-  {
-    name: 'reaction',
-    event: 'toggle_reaction',
-    payload: { id: '507f1f77bcf86cd799439011', emoji: '👍' },
-    emittedEvent: 'reaction_updated'
-  }
-]) {
-  test(`a committed delete cannot be overwritten by a stale preloaded ${mutation.name}`, async () => {
-    const messageId = '507f1f77bcf86cd799439011';
-    const deleteSaveStarted = deferred();
-    const releaseDeleteSave = deferred();
-    const MessageModel = createMemoryModel([{
-      _id: messageId, serverCode: 'ABC123', username: 'alice', displayName: 'Alice',
-      authorKey: 'alice', role: 'user', roomRole: 'user', text: 'before', attachment: null,
-      history: [], reactions: {}, edited: false, deleted: false, timestamp: new Date()
-    }]);
-    let gatedDelete = false;
-    MessageModel.saveHook = async ({ document }) => {
-      if (!document.deleted || gatedDelete) return;
-      gatedDelete = true;
-      deleteSaveStarted.resolve();
-      await releaseDeleteSave.promise;
-    };
-    const ChatServerModel = createMemoryModel([{
-      code: 'ABC123', name: 'Room', owner: 'alice', moderators: [],
-      pinnedMessages: [], pinVersion: 0,
-      autoMod: {
-        blockedKeywords: [], mentionLimit: 8, repeatLimit: 3, repeatWindowSeconds: 30,
-        messageLimit: 20, messageWindowSeconds: 60
-      }
-    }]);
-    const { socket } = registerMessages({
-      MessageModel,
-      ChatServerModel,
-      UserModel: createMemoryModel([{
-        username: 'alice', displayName: 'Alice', role: 'user', servers: ['global', 'ABC123']
-      }]),
-      RoomRestrictionModel: createMemoryModel([])
-    });
-    authenticate(socket, { serverCode: 'ABC123', joinedServers: ['global', 'ABC123'] });
-    const deleteAck = acknowledge();
-
-    const deletePending = socket.trigger('delete_message', {
-      id: messageId, serverCode: 'ABC123', clientContextId: 1
-    }, deleteAck.callback);
-    await deleteSaveStarted.promise;
-    const mutationPending = socket.trigger(mutation.event, {
-      ...mutation.payload, serverCode: 'ABC123', clientContextId: 1
-    });
-    await new Promise(resolve => setImmediate(resolve));
-    releaseDeleteSave.resolve();
-    await Promise.all([deletePending, mutationPending]);
-
-    assert.equal(deleteAck.value().success, true);
-    assert.equal(MessageModel.rows[0].deleted, true);
-    assert.equal(MessageModel.rows[0].text, 'before');
-    assert.deepEqual(MessageModel.rows[0].reactions, {});
-    assert.equal(socket.outbound.some(item => item.event === mutation.emittedEvent), false);
+    const actionIndex = ioInstance.outbound.findIndex(item => item.event === action.emittedEvent);
+    const deletionIndex = ioInstance.outbound.findIndex(item => item.event === 'server_deleted');
+    assert.ok(actionIndex >= 0);
+    assert.ok(deletionIndex > actionIndex);
   });
 }
