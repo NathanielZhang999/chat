@@ -59,6 +59,7 @@ function valuesMatch(value, expected) {
     if ('$lt' in expected) return value < expected.$lt;
     if ('$gt' in expected) return value > expected.$gt;
     if ('$regex' in expected) return valuesMatch(value, expected.$regex);
+    if ('$exists' in expected) return expected.$exists ? value !== undefined : value === undefined;
   }
   return value === expected;
 }
@@ -71,17 +72,22 @@ function matchesQuery(row, query = {}) {
 }
 
 function createMemoryModel(initialRows = []) {
-  const rows = initialRows.map(row => ({ ...row }));
+  const clone = value => value && typeof value === 'object'
+    ? (value instanceof Date ? new Date(value) :
+      value instanceof RegExp ? new RegExp(value) :
+      (Array.isArray(value) ? value.map(clone) : Object.fromEntries(Object.entries(value).map(([key, item]) => [key, clone(item)]))))
+    : value;
+  const rows = initialRows.map(clone);
 
   function documentFor(row) {
     if (!row) return null;
-    const document = { ...row };
+    const document = clone(row);
     Object.defineProperties(document, {
       markModified: { value: () => {}, enumerable: false },
       save: {
         value: async () => {
           const index = rows.indexOf(row);
-          if (index >= 0) Object.assign(row, document);
+          if (index >= 0) Object.assign(row, clone(document));
           return document;
         },
         enumerable: false
@@ -100,7 +106,7 @@ function createMemoryModel(initialRows = []) {
     findOne(query = {}) { return result(documentFor(rows.find(row => matchesQuery(row, query)))); },
     findById(id) { return result(documentFor(rows.find(row => String(row._id) === String(id)))); },
     async create(value) {
-      const row = { ...value };
+      const row = clone(value);
       rows.push(row);
       return documentFor(row);
     },
@@ -111,7 +117,9 @@ function createMemoryModel(initialRows = []) {
         rows.push(row);
       }
       if (!row) return null;
-      Object.assign(row, update.$set || update);
+      if (update.$set) Object.assign(row, clone(update.$set));
+      else if (!Object.keys(update).some(key => key.startsWith('$'))) Object.assign(row, clone(update));
+      for (const [key, value] of Object.entries(update.$inc || {})) row[key] = (row[key] || 0) + value;
       return documentFor(row);
     },
     async updateOne(query, update) {

@@ -131,6 +131,41 @@ function safePreferencesSnapshot(user) {
   };
 }
 
+async function readRawPreferencesVersion(UserModel, user) {
+  if (!user) return { exists: false, value: undefined };
+  const collection = UserModel && UserModel.collection;
+  if (collection && typeof collection.findOne === 'function') {
+    const raw = await collection.findOne(
+      { _id: user._id },
+      { projection: { preferencesVersion: 1 } }
+    );
+    return {
+      exists: Boolean(raw && Object.prototype.hasOwnProperty.call(raw, 'preferencesVersion')),
+      value: raw && raw.preferencesVersion
+    };
+  }
+  return {
+    exists: Object.prototype.hasOwnProperty.call(user, 'preferencesVersion'),
+    value: user.preferencesVersion
+  };
+}
+
+function applyPreferencesSnapshotToSessions(sockets, username, snapshot, logger = console) {
+  const accountKey = normalizeAccountKey(username);
+  const safeSnapshot = safePreferencesSnapshot({
+    preferences: snapshot && snapshot.preferences,
+    preferencesVersion: snapshot && snapshot.preferencesVersion
+  });
+  for (const live of sockets || []) {
+    if (normalizeAccountKey(live && live.username) !== accountKey) continue;
+    try {
+      live.emit('preferences_updated', safeSnapshot);
+    } catch (err) {
+      logUnexpectedError(logger, 'update_preferences_notification', err);
+    }
+  }
+}
+
 function normalizeAutoModSettings(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value) || !Array.isArray(value.blockedKeywords)) return null;
   const boundedIntegers = [
@@ -963,6 +998,7 @@ function createConnectionHandler({
   resolvePingsFn = resolvePings,
   rateLimiter = authRateLimiter,
   autoModTracker = serverAutoModTracker,
+  readRawPreferencesVersionFn = readRawPreferencesVersion,
   logger = console
 } = {}) {
   return socket => {
@@ -1739,6 +1775,66 @@ function createConnectionHandler({
     } catch (err) {
       logUnexpectedError(logger, 'change_password', err);
       callback({ error: 'Failed to update password.' });
+    }
+  });
+
+  socket.on('update_preferences', async (data, callback) => {
+    callback = safeAck(callback);
+    if (terminallyClosed) return callback({ error: 'Connection unavailable.' });
+    if (!socket.username) return callback({ error: 'Not authenticated.' });
+    const preferences = normalizeAppearancePreferences(data && data.preferences);
+    const expectedVersion = normalizePreferencesVersion(data && data.expectedVersion);
+    if (!preferences || expectedVersion === null) return callback({ error: 'Invalid input format.' });
+
+    let acknowledged = false;
+    const respond = payload => {
+      acknowledged = true;
+      callback(payload);
+    };
+    try {
+      await withAccountTransitionLock(socket.username, async () => {
+        const currentUser = await findUserByUsername(UserModel, socket.username);
+        if (!currentUser) return respond({ error: 'User not found.' });
+        const rawStoredVersion = await readRawPreferencesVersionFn(UserModel, currentUser);
+        const rawVersion = rawStoredVersion.exists ? rawStoredVersion.value : 0;
+        if (!Number.isSafeInteger(rawVersion) || rawVersion < 0 ||
+            rawVersion === Number.MAX_SAFE_INTEGER) {
+          logUnexpectedError(logger, 'update_preferences_stored_version', new Error('InvalidPreferenceVersion'));
+          return respond({ error: 'Appearance settings unavailable.' });
+        }
+        const current = safePreferencesSnapshot(currentUser);
+        if (current.preferencesVersion !== expectedVersion) {
+          return respond({ error: 'Settings changed on another device.', ...current });
+        }
+        let recipients;
+        try {
+          recipients = await fetchLiveSockets();
+        } catch (err) {
+          logUnexpectedError(logger, 'update_preferences_session_discovery', err);
+          return respond({ error: 'Failed to update appearance settings.' });
+        }
+        const versionFilter = expectedVersion === 0
+          ? { $or: [{ preferencesVersion: 0 }, { preferencesVersion: { $exists: false } }] }
+          : { preferencesVersion: expectedVersion };
+        const updated = await UserModel.findOneAndUpdate(
+          { username: currentUser.username, ...versionFilter },
+          { $set: { preferences }, $inc: { preferencesVersion: 1 } },
+          { new: true, runValidators: true }
+        );
+        if (!updated) {
+          const winner = await findUserByUsername(UserModel, currentUser.username);
+          return respond({
+            error: 'Settings changed on another device.',
+            ...safePreferencesSnapshot(winner)
+          });
+        }
+        const snapshot = safePreferencesSnapshot(updated);
+        applyPreferencesSnapshotToSessions(recipients, currentUser.username, snapshot, logger);
+        return respond({ success: true, ...snapshot });
+      });
+    } catch (err) {
+      logUnexpectedError(logger, 'update_preferences', err);
+      if (!acknowledged) callback({ error: 'Failed to update appearance settings.' });
     }
   });
 
@@ -3558,6 +3654,8 @@ module.exports = {
   normalizePreferencesVersion,
   storedPreferencesVersion,
   safePreferencesSnapshot,
+  readRawPreferencesVersion,
+  applyPreferencesSnapshotToSessions,
   UserSchema,
   createAutoModTracker,
   evaluateAutoMod,
