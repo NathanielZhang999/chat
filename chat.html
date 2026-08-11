@@ -149,7 +149,7 @@
         .close-btn { position: absolute; top: 15px; right: 20px; cursor: pointer; color: var(--text-muted); font-size: 1.5rem; background: none; border: none; transition: color var(--motion-fast) ease, transform var(--motion-fast) var(--ease-standard); }
         .close-btn:hover { color: var(--text-strong); transform: rotate(90deg); }
 
-        .auth-tabs { display: flex; margin-bottom: 1.5rem; border-bottom: 2px solid var(--surface-dark); }
+        .auth-tabs { display: flex; margin-bottom: 1.5rem; border-bottom: 2px solid var(--border-color); }
         .tab { flex: 1; text-align: center; padding: 0.5rem; cursor: pointer; color: var(--text-muted); font-weight: 600; text-transform: uppercase; font-size: 0.8rem; transition: color var(--motion-fast) ease, transform var(--motion-fast) var(--ease-standard), border-bottom-color var(--motion-base) ease; }
         .tab.active { color: var(--text-strong); border-bottom: 2px solid var(--primary-indicator); margin-bottom: -2px; }
         .tab:hover:not(.active) { color: var(--text-strong); transform: translateY(-2px); }
@@ -239,9 +239,9 @@
         /* Replies Context */
         .reply-context { font-size: 0.85rem; color: var(--text-muted); display: flex; align-items: center; gap: 5px; margin-bottom: 4px; cursor: pointer; user-select: none; transition: color 0.15s; }
         .reply-context:hover { color: var(--text); }
-        .reply-context::before { content: '┌──'; margin-right: 2px; font-weight: bold; font-family: monospace; color: var(--surface-dark); font-size: 1.2rem; line-height: 0.5;}
+        .reply-context::before { content: '┌──'; margin-right: 2px; font-weight: bold; font-family: monospace; color: var(--border-color); font-size: 1.2rem; line-height: 0.5;}
         .reply-author { font-weight: 600; color: var(--text-strong); }
-        .reply-text { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 60%; opacity: 0.8; }
+        .reply-text { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 60%; }
 
         /* Animated Hover Actions Menu */
         .msg-actions { 
@@ -265,7 +265,7 @@
         .msg-text u { text-decoration: underline; }
         .msg-text del { text-decoration: line-through; opacity: 0.7; }
         .msg-text code { background: var(--input-bg); padding: 2px 5px; border-radius: 3px; font-family: monospace; font-size: 0.9em; border: 1px solid var(--border-color); }
-        .chat-img { display: block; max-width: 100%; max-height: 300px; border-radius: 8px; margin-top: 8px; cursor: pointer; border: 1px solid var(--surface-dark); transition: transform 0.2s;}
+        .chat-img { display: block; max-width: 100%; max-height: 300px; border-radius: 8px; margin-top: 8px; cursor: pointer; border: 1px solid var(--border-color); transition: transform 0.2s;}
         .chat-img:hover { transform: scale(1.02); }
         .chat-link { color: var(--primary-text); text-decoration: none; word-break: break-all; }
         .chat-link:hover { text-decoration: underline; }
@@ -290,7 +290,7 @@
         .view-deleted-tag { cursor: pointer; font-size: 0.75rem; text-decoration: underline; color: var(--error-text); margin-left: 4px; }
 
         .system-msg { text-align: center; font-size: 0.85rem; color: var(--text-muted); margin: 1rem 0; font-weight: 600; display: flex; align-items: center; justify-content: center; gap: 10px; animation: fadePop var(--motion-base) var(--ease-standard);}
-        .system-msg::before, .system-msg::after { content: ""; flex: 1; border-bottom: 1px solid var(--surface-dark); max-width: 50px; }
+        .system-msg::before, .system-msg::after { content: ""; flex: 1; border-bottom: 1px solid var(--border-color); max-width: 50px; }
         
         /* Updated Hideable Typing Indicator */
         #typing-indicator { 
@@ -1039,7 +1039,8 @@
                 admin_new_server: entry('adminNewServer', () => ({})),
                 server_deleted: entry('serverDeleted', () => ({})),
                 online_users: entry('onlineUsers', () => ({})),
-                typing: entry('typing')
+                typing: entry('typing'),
+                force_logout: entry('forceLogout', () => ({}))
             };
         },
 
@@ -1097,6 +1098,61 @@
                     };
                 }
             };
+        },
+
+        createProductionUnauthenticatedOwners(dependencies = {}) {
+            const call = (name, ...args) => {
+                if (typeof dependencies[name] === 'function') dependencies[name](...args);
+            };
+            return Object.freeze({
+                clearHistory() {
+                    call('clearChatHistory');
+                    call('clearHistoryDetails');
+                },
+                clearMembers: () => call('clearMembers'),
+                clearRoomState: () => call('clearRoomState'),
+                clearServerState: () => call('clearServerState'),
+                resetRoles: () => call('resetRoles'),
+                resetTyping: () => call('resetTyping'),
+                resetComposition() {
+                    call('resetCompositionState');
+                    call('cancelAction');
+                },
+                resetAttachment: () => call('resetAttachment'),
+                closeRoomDialogs: () => call('closeRoomDialogs'),
+                invalidateRequests: () => call('invalidateRequestState'),
+                unbindAuthenticatedEvents: () => call('unbindAuthenticatedEvents'),
+                clearAudio: () => call('clearAudio'),
+                clearNavigation() {
+                    call('clearNavigationState');
+                    call('hideRoomControls');
+                },
+                showAuthentication: reason => call('showAuthentication', reason)
+            });
+        },
+
+        createAuthenticatedSurfaceGate({ showAuthentication = () => {}, showAuthenticated = () => {} } = {}) {
+            let pending = true;
+            return Object.freeze({
+                hold(reason) {
+                    pending = true;
+                    showAuthentication(reason);
+                    return true;
+                },
+                acceptRoom() {
+                    if (!pending) return false;
+                    pending = false;
+                    showAuthenticated('room');
+                    return true;
+                },
+                acceptLobby() {
+                    if (!pending) return false;
+                    pending = false;
+                    showAuthenticated('lobby');
+                    return true;
+                },
+                pending: () => pending
+            });
         },
 
         createUnauthenticatedStateSanitizer(dependencies = {}) {
@@ -1246,6 +1302,7 @@
             sessionCoordinator,
             appearanceController,
             getActiveSocket,
+            authenticatedSurfaceGate = null,
             enterSanitizedUnauthenticatedState = () => {},
             onAuthenticated = () => {},
             onAuthFailure = () => {}
@@ -1312,6 +1369,9 @@
                     }
                     const authenticated = sessionCoordinator.authenticate(authToken.session.socketReference);
                     if (!authenticated) return null;
+                    if (authenticatedSurfaceGate && typeof authenticatedSurfaceGate.hold === 'function') {
+                        authenticatedSurfaceGate.hold('initial-room');
+                    }
                     installPreferenceAuthority(authToken.session.socketReference, authenticated);
                     const result = appearanceController.acceptAuthoritative(
                         backendUrl, username, authoritativeSnapshot);
@@ -2087,6 +2147,24 @@
                     pendingBehavior = null;
                 }
             };
+        },
+
+        createReplyNavigationHandler({
+            findTarget = () => null,
+            prefersReducedMotion = () => false,
+            highlight = () => {},
+            clearHighlight = () => {},
+            schedule = (callback, delay) => setTimeout(callback, delay)
+        } = {}) {
+            return messageId => {
+                const target = findTarget(messageId);
+                if (!target || !target.classList || target.classList.contains('deleted-compact') ||
+                    typeof target.scrollIntoView !== 'function') return false;
+                target.scrollIntoView({ behavior: prefersReducedMotion() ? 'auto' : 'smooth', block: 'center' });
+                highlight(target);
+                schedule(() => clearHighlight(target), 1500);
+                return true;
+            };
         }
     };
     globalThis.ChatClientHelpers = ChatClientHelpers;
@@ -2346,8 +2424,14 @@
         current: () => appearanceControllerCore.current()
     };
 
-    const unauthenticatedStateSanitizer = ChatClientHelpers.createUnauthenticatedStateSanitizer({
-        clearHistory() { chatWindow.textContent = ''; },
+    const authenticatedSurfaceGate = ChatClientHelpers.createAuthenticatedSurfaceGate({
+        showAuthentication() { authModal.classList.add('active'); },
+        showAuthenticated() { authModal.classList.remove('active'); }
+    });
+
+    const unauthenticatedStateOwners = ChatClientHelpers.createProductionUnauthenticatedOwners({
+        clearChatHistory() { chatWindow.textContent = ''; },
+        clearHistoryDetails: closeMessageHistory,
         clearMembers() {
             usersCache = {};
             document.getElementById('online-list').textContent = '';
@@ -2376,13 +2460,14 @@
             typingUsers.clear();
             updateTypingUI();
         },
-        resetComposition() {
+        resetCompositionState() {
             compositionContextCoordinator.invalidate();
             editingMsgId = null;
             replyingToData = null;
             msgInput.value = '';
             setCompositionDisabled(true);
         },
+        cancelAction,
         resetAttachment() {
             attachmentLoadEpoch += 1;
             pendingAttachmentBase64 = null;
@@ -2402,7 +2487,7 @@
                 if (modal !== authModal) modal.classList.remove('active');
             });
         },
-        invalidateRequests() {
+        invalidateRequestState() {
             roomSwitchCoordinator.invalidate();
             restrictionCoordinator.clear();
             moderatorCenterCoordinator.close();
@@ -2422,16 +2507,23 @@
             authenticatedSocketBinding = null;
         },
         clearAudio() {},
-        clearNavigation() {
+        clearNavigationState() {
             chatScrollCoordinator.invalidate();
             document.querySelectorAll('.server-icon').forEach(icon => icon.classList.remove('active'));
         },
+        hideRoomControls() {
+            for (const id of ['invite-code-btn', 'leave-server-btn', 'delete-server-btn', 'join-server-btn', 'moderator-center-btn']) {
+                document.getElementById(id).style.display = 'none';
+            }
+        },
         showAuthentication(reason) {
-            authModal.classList.add('active');
+            authenticatedSurfaceGate.hold(reason);
             document.getElementById('appearance-status').textContent = '';
             if (reason === 'disconnect') showError('Connection lost. Please log in again.', false);
         }
     });
+    const unauthenticatedStateSanitizer = ChatClientHelpers.createUnauthenticatedStateSanitizer(
+        unauthenticatedStateOwners);
 
     function enterSanitizedUnauthenticatedState(reason) {
         return unauthenticatedStateSanitizer.sanitize(reason);
@@ -2441,6 +2533,7 @@
         sessionCoordinator: sessionContextCoordinator,
         appearanceController,
         getActiveSocket: () => socket,
+        authenticatedSurfaceGate,
         enterSanitizedUnauthenticatedState
     });
 
@@ -2548,6 +2641,7 @@
         }, true);
         fileUpload.disabled = true;
         compositionDisabled = true;
+        authenticatedSurfaceGate.acceptLobby();
     }
 
     function invalidatePrivilegedAccess() {
@@ -3391,7 +3485,6 @@
                     
                     if (audioCtx.state === 'suspended') audioCtx.resume();
                     
-                    document.getElementById('auth-modal').classList.remove('active');
                     renderServers(res.servers || []);
                     const initialCode = Object.prototype.hasOwnProperty.call(res, 'defaultServerCode')
                         ? res.defaultServerCode : 'global';
@@ -3430,11 +3523,6 @@
             showError
         });
         
-        activeSocket.on('force_logout', (msg) => {
-            if (activeSocket !== socket || !sessionContextCoordinator.snapshot().authenticated) return;
-            localStorage.removeItem('pro_chat_user'); alert(msg || "You have been logged out remotely."); location.reload(); 
-        });
-
         const listenerDependencyNames = {
             chat_message: 'chatMessage', system_message: 'systemMessage',
             global_role_updated: 'globalRoleUpdated', room_role_updated: 'roomRoleUpdated',
@@ -3443,7 +3531,7 @@
             profile_updated: 'profileUpdated', message_edited: 'messageEdited',
             message_deleted: 'messageDeleted', reaction_updated: 'reactionUpdated',
             admin_new_server: 'adminNewServer', server_deleted: 'serverDeleted',
-            online_users: 'onlineUsers', typing: 'typing'
+            online_users: 'onlineUsers', typing: 'typing', force_logout: 'forceLogout'
         };
         const listenerDependencies = {};
         const authenticatedEventTarget = {
@@ -3747,6 +3835,11 @@
                 updateTypingUI();
             }, data);
         });
+        authenticatedEventTarget.on('force_logout', (msg) => {
+            localStorage.removeItem('pro_chat_user');
+            alert(msg || "You have been logged out remotely.");
+            location.reload();
+        });
         authenticatedListenerTables.set(activeSocket,
             ChatClientHelpers.createAuthenticatedListenerTable(listenerDependencies));
     }
@@ -4037,6 +4130,7 @@
                 }
 
                 if (response.history) loadHistory(response.history);
+                authenticatedSurfaceGate.acceptRoom();
             }
         });
     }
@@ -4409,10 +4503,14 @@
             const replyText = String(data.replyTo.text || '').replace(/\{\{PING:(.*?)\|(.*?)\}\}/g, '@$2');
             ChatClientHelpers.appendTextElement(document, rb, 'span', 'reply-text', replyText);
             
-            rb.onclick = () => {
-                const target = document.querySelector(`.msg[data-id="${data.replyTo.id}"]`);
-                if (target && !target.classList.contains('deleted-compact')) { target.scrollIntoView({behavior: 'smooth', block: 'center'}); target.style.background = 'var(--primary-soft)'; setTimeout(()=>target.style.background='transparent', 1500); }
-            };
+            const navigateToReply = ChatClientHelpers.createReplyNavigationHandler({
+                findTarget: id => document.querySelector(`.msg[data-id="${id}"]`),
+                prefersReducedMotion,
+                highlight: target => { target.style.background = 'var(--primary-soft)'; },
+                clearHighlight: target => { target.style.background = 'transparent'; },
+                schedule: (callback, delay) => setTimeout(callback, delay)
+            });
+            rb.onclick = () => navigateToReply(data.replyTo.id);
             bodyDiv.appendChild(rb);
         }
 

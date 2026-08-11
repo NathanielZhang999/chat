@@ -532,6 +532,117 @@ test('disconnect and account change sanitize prior room state before another acc
   assert.match(source, /list_room_restrictions[\s\S]{0,500}guardedRequestAcknowledgement\('moderation'/);
 });
 
+test('production unauthenticated owners erase action history and room controls', () => {
+  const helpers = loadHelpers();
+  const state = {
+    chat: 'ALICE_PRIVATE_MESSAGE_SENTINEL', historyDetail: 'ALICE_PRIVATE_HISTORY_SENTINEL',
+    members: ['Alice'], room: 'SECRET1', servers: ['SECRET1'], role: 'admin', typing: ['Alice'],
+    composition: 'alice draft', attachment: 'data:alice', infoBarVisible: true, sendLabel: 'Save',
+    dialogs: ['history'], requests: ['switch'], bound: true, audio: ['ping'], navigation: ['SECRET1'],
+    controls: Object.fromEntries(['invite', 'leave', 'delete', 'join', 'moderate'].map(name => [name, 'block'])),
+    authVisible: false, authReason: null
+  };
+  const owners = helpers.createProductionUnauthenticatedOwners({
+    clearChatHistory: () => { state.chat = ''; },
+    clearHistoryDetails: () => { state.historyDetail = ''; },
+    clearMembers: () => { state.members = []; },
+    clearRoomState: () => { state.room = null; },
+    clearServerState: () => { state.servers = []; },
+    resetRoles: () => { state.role = 'user'; },
+    resetTyping: () => { state.typing = []; },
+    resetCompositionState: () => { state.composition = ''; },
+    cancelAction: () => { state.infoBarVisible = false; state.sendLabel = 'Send'; },
+    resetAttachment: () => { state.attachment = null; },
+    closeRoomDialogs: () => { state.dialogs = []; },
+    invalidateRequestState: () => { state.requests = []; },
+    unbindAuthenticatedEvents: () => { state.bound = false; },
+    clearAudio: () => { state.audio = []; },
+    clearNavigationState: () => { state.navigation = []; },
+    hideRoomControls: () => { for (const name of Object.keys(state.controls)) state.controls[name] = 'none'; },
+    showAuthentication: reason => { state.authVisible = true; state.authReason = reason; }
+  });
+  const sanitizer = helpers.createUnauthenticatedStateSanitizer(owners);
+  const socket = createClientSocket(true);
+  const session = helpers.createSessionContextCoordinator();
+  session.replace(socket);
+  session.connected(socket);
+  const bridge = helpers.createAppearanceRuntimeBridge({
+    sessionCoordinator: session,
+    appearanceController: {
+      applyProvisionalCache() {}, resetToDefaults() {},
+      acceptAuthoritative() { return { accepted: true }; }, handleEvent() {}, beginSave() {}
+    },
+    getActiveSocket: () => socket,
+    enterSanitizedUnauthenticatedState: reason => sanitizer.sanitize(reason)
+  });
+  bridge.bindSocket(socket);
+  const token = bridge.beginConnectedAuth(socket);
+  bridge.finishAuth(token, 'https://one.example', 'Alice', {
+    username: 'Alice',
+    preferences: { theme: 'dark', textScale: 100, compactMessages: false, motion: 'system' },
+    preferencesVersion: 1
+  });
+  socket.connected = false;
+  socket.deliver('disconnect');
+  assert.deepEqual(state, {
+    chat: '', historyDetail: '', members: [], room: null, servers: [], role: 'user', typing: [],
+    composition: '', attachment: null, infoBarVisible: false, sendLabel: 'Send', dialogs: [], requests: [],
+    bound: false, audio: [], navigation: [], controls: {
+      invite: 'none', leave: 'none', delete: 'none', join: 'none', moderate: 'none'
+    }, authVisible: true, authReason: 'disconnect'
+  });
+  const source = fs.readFileSync(chatPath, 'utf8');
+  assert.match(source, /createProductionUnauthenticatedOwners\(\{[\s\S]*clearHistoryDetails:\s*closeMessageHistory[\s\S]*cancelAction,[\s\S]*hideRoomControls\(\)/,
+    'production delegates history, action, and room-control cleanup into the executed owner factory');
+});
+
+test('authenticated surface stays covered until initial room or lobby is accepted', () => {
+  const helpers = loadHelpers();
+  const socket = createClientSocket(true);
+  const session = helpers.createSessionContextCoordinator();
+  session.replace(socket);
+  session.connected(socket);
+  let authVisible = true;
+  const gate = helpers.createAuthenticatedSurfaceGate({
+    showAuthentication: () => { authVisible = true; },
+    showAuthenticated: () => { authVisible = false; }
+  });
+  const preferences = { theme: 'dark', textScale: 100, compactMessages: false, motion: 'system' };
+  const bridge = helpers.createAppearanceRuntimeBridge({
+    sessionCoordinator: session,
+    appearanceController: {
+      applyProvisionalCache() {}, resetToDefaults() {},
+      acceptAuthoritative() { return { accepted: true }; }, handleEvent() {}, beginSave() {}
+    },
+    getActiveSocket: () => socket,
+    authenticatedSurfaceGate: gate
+  });
+  bridge.bindSocket(socket);
+  const token = bridge.beginConnectedAuth(socket);
+  bridge.finishAuth(token, 'https://one.example', 'Bob', {
+    username: 'Bob', preferences, preferencesVersion: 1
+  });
+  assert.equal(authVisible, true, 'successful auth remains covered while the initial room is unresolved');
+
+  helpers.applySwitchResult({
+    currentServerCode: null, targetServerCode: 'global', response: { error: 'switch failed' },
+    showAlert() {}, applySuccess() { gate.acceptRoom(); }
+  });
+  assert.equal(authVisible, true, 'failed initial switch cannot reveal the blank lobby');
+  helpers.applySwitchResult({
+    currentServerCode: null, targetServerCode: 'global', response: { history: [] },
+    showAlert() {}, applySuccess() { gate.acceptRoom(); }
+  });
+  assert.equal(authVisible, false, 'accepted initial room reveals the authenticated surface');
+  gate.hold('account-change');
+  gate.acceptLobby();
+  assert.equal(authVisible, false, 'explicit no-access lobby resolution reveals the neutral lobby');
+  const source = fs.readFileSync(chatPath, 'utf8');
+  assert.match(source, /createAppearanceRuntimeBridge\(\{[\s\S]{0,400}authenticatedSurfaceGate/);
+  assert.match(source, /function enterLobby\(\)[\s\S]*authenticatedSurfaceGate\.acceptLobby\(\)/);
+  assert.match(source, /applySuccess\([\s\S]*authenticatedSurfaceGate\.acceptRoom\(\)/);
+});
+
 test('sanitized sessions reject prior socket events and delayed room and detail callbacks', () => {
   const helpers = loadHelpers();
   let activeSocket = createClientSocket(true);
@@ -601,6 +712,56 @@ test('sanitized sessions reject prior socket events and delayed room and detail 
   assert.equal(guard.acceptSocket(sameObjectToken), false);
 });
 
+test('complete authenticated listener binding rejects retired force logout generations', () => {
+  const helpers = loadHelpers();
+  const socket = createClientSocket(true);
+  const session = helpers.createSessionContextCoordinator();
+  session.replace(socket);
+  session.connected(socket);
+  session.authenticate(socket);
+  const calls = [];
+  const dependencyNames = {
+    chatMessage: 'chat_message', systemMessage: 'system_message', globalRoleUpdated: 'global_role_updated',
+    roomRoleUpdated: 'room_role_updated', roomAccessUpdated: 'room_access_updated',
+    roomRestrictionUpdated: 'room_restriction_updated', moderationQueueUpdated: 'moderation_queue_updated',
+    messageBlocked: 'message_blocked', profileUpdated: 'profile_updated', messageEdited: 'message_edited',
+    messageDeleted: 'message_deleted', reactionUpdated: 'reaction_updated', adminNewServer: 'admin_new_server',
+    serverDeleted: 'server_deleted', onlineUsers: 'online_users', typing: 'typing', forceLogout: 'force_logout'
+  };
+  const dependencies = Object.fromEntries(Object.entries(dependencyNames).map(([name, event]) =>
+    [name, () => calls.push(event)]));
+  const guard = helpers.createSessionDispatchGuard({
+    sessionCoordinator: session, getActiveSocket: () => socket,
+    getCurrentRoomCode: () => 'global', getClientContextId: () => 1
+  });
+  const table = helpers.createAuthenticatedListenerTable(dependencies);
+  const firstToken = guard.capture(socket, {});
+  const firstBinding = helpers.createAuthenticatedSocketBinder({ socket, bindingToken: firstToken, dispatchGuard: guard, listenerTable: table });
+  const oldForceLogout = socket.listeners.get('force_logout')[0];
+  for (const event of Object.values(dependencyNames)) {
+    socket.deliver(event, event === 'message_deleted' ? 'm1' : {});
+  }
+  assert.deepEqual(calls, Object.values(dependencyNames), 'the production table binds every authenticated event');
+
+  session.disconnect(socket);
+  socket.connected = false;
+  socket.connected = true;
+  session.connected(socket);
+  session.authenticate(socket);
+  oldForceLogout('ALICE_FORCE_LOGOUT_SENTINEL');
+  assert.equal(calls.filter(value => value === 'force_logout').length, 1,
+    'a retired same-object generation cannot execute force logout');
+  firstBinding.unbind();
+  const currentToken = guard.capture(socket, {});
+  helpers.createAuthenticatedSocketBinder({ socket, bindingToken: currentToken, dispatchGuard: guard, listenerTable: table });
+  socket.deliver('force_logout', 'BOB_FORCE_LOGOUT_SENTINEL');
+  assert.equal(calls.filter(value => value === 'force_logout').length, 2,
+    'the current authenticated generation still receives force logout');
+  const source = fs.readFileSync(chatPath, 'utf8');
+  assert.doesNotMatch(source, /activeSocket\.on\(['"]force_logout['"]/);
+  assert.match(source, /authenticatedEventTarget\.on\(['"]force_logout['"]/);
+});
+
 test('light theme and compact mode expose semantic attributes tokens and touch-target rules', () => {
   const source = fs.readFileSync(chatPath, 'utf8');
   for (const selector of [':root,', ':root[data-theme="dark"]', ':root[data-theme="light"]',
@@ -658,10 +819,31 @@ test('dark and light semantic text colors meet WCAG contrast ratios', () => {
       assert.ok(ratio(tokens['--primary-indicator'], tokens[surface]) >= 3,
         `${theme} primary indicator on ${surface}`);
     }
+    for (const indicator of ['--border-color']) {
+      for (const surface of ['--panel-bg', '--panel-subtle']) {
+        assert.ok(ratio(tokens[indicator], tokens[surface]) >= 3,
+          `${theme} ${indicator} on ${surface}`);
+      }
+    }
+    const replyOpacityMatch = source.match(/\.reply-text\s*\{[^}]*opacity:\s*([\d.]+)/s);
+    const replyOpacity = replyOpacityMatch ? Number(replyOpacityMatch[1]) : 1;
+    const blend = (foreground, background, alpha) => {
+      const channels = [1, 3, 5].map(index => Math.round(
+        parseInt(foreground.slice(index, index + 2), 16) * alpha +
+        parseInt(background.slice(index, index + 2), 16) * (1 - alpha)
+      ));
+      return `#${channels.map(value => value.toString(16).padStart(2, '0')).join('')}`;
+    };
+    assert.ok(ratio(blend(tokens['--text-muted'], tokens['--panel-bg'], replyOpacity), tokens['--panel-bg']) >= 4.5,
+      `${theme} effective reply text on panel`);
   }
   for (const selector of ['.tab.active', '.compose-addon.show', '.hist-item', '.moderator-row']) {
     assert.match(source, new RegExp(`${selector.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&')}\\s*\\{[^}]*var\\(--primary-indicator\\)`, 's'),
       `${selector} uses the primary indicator token`);
+  }
+  for (const selector of ['.auth-tabs', '.reply-context::before', '.chat-img', '.system-msg::before, .system-msg::after']) {
+    assert.match(source, new RegExp(`${selector.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&')}\\s*\\{[^}]*var\\(--border-color\\)`, 's'),
+      `${selector} uses a contrast-safe divider or connector token`);
   }
 });
 
@@ -736,6 +918,40 @@ test('scroll coordinator makes smooth requests instant for reduced motion', () =
   frames.shift()();
 
   assert.deepEqual({ ...calls[0] }, { top: 900, behavior: 'auto' });
+});
+
+test('reply navigation uses the effective reduced-motion policy', () => {
+  const helpers = loadHelpers();
+  const calls = [];
+  const targets = {
+    normal: {
+      classList: { contains: () => false },
+      scrollIntoView: options => calls.push(['normal', options]), style: {}
+    },
+    reduced: {
+      classList: { contains: () => false },
+      scrollIntoView: options => calls.push(['reduced', options]), style: {}
+    }
+  };
+  let reduce = false;
+  const navigate = helpers.createReplyNavigationHandler({
+    findTarget: id => targets[id] || null,
+    prefersReducedMotion: () => reduce,
+    highlight: target => { target.style.background = 'highlight'; },
+    clearHighlight: target => { target.style.background = 'clear'; },
+    schedule: callback => { callback(); }
+  });
+  assert.equal(navigate('normal'), true);
+  reduce = true;
+  assert.equal(navigate('reduced'), true);
+  assert.deepEqual(calls.map(([name, options]) => [name, { ...options }]), [
+    ['normal', { behavior: 'smooth', block: 'center' }],
+    ['reduced', { behavior: 'auto', block: 'center' }]
+  ]);
+  assert.equal(targets.reduced.style.background, 'clear');
+  assert.equal(navigate('missing'), false);
+  const source = fs.readFileSync(chatPath, 'utf8');
+  assert.match(source, /createReplyNavigationHandler\(\{[\s\S]{0,300}prefersReducedMotion/);
 });
 
 test('backend URLs allow only HTTP and HTTPS', () => {
