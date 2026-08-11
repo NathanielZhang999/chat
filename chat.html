@@ -2,19 +2,131 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Chat v1.3.2</title>
     <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
     <style>
-        :root { --primary: #5865F2; --bg: #202225; --surface: #36393f; --surface-dark: #2f3136; --text: #dcddde; --text-muted: #8e9297; --border: #202225; --error: #ed4245; --warning: #faa61a; --success: #3ba55c; --motion-fast: 140ms; --motion-base: 220ms; --motion-slow: 280ms; --ease-standard: cubic-bezier(0.2, 0.8, 0.2, 1); }
+        :root,
+        :root[data-theme="dark"] {
+            --page-bg: #202225;
+            --panel-bg: #36393f;
+            --panel-subtle: #2f3136;
+            --input-bg: #202225;
+            --text-strong: #ffffff;
+            --text-normal: #dcddde;
+            --text-muted: #b5bac1;
+            --placeholder-text: #b5bac1;
+            --border-color: #8e9297;
+            --overlay-bg: #111214;
+            --hover-bg: #40444b;
+            --primary-text: #b8c0ff;
+            --primary-surface: #3f4cc7;
+            --primary-indicator: #9aa8ff;
+            --on-primary: #ffffff;
+            --error-text: #ffb3b8;
+            --error-surface: #a62932;
+            --on-error: #ffffff;
+            --success-text: #73e6a1;
+            --success-surface: #176b3a;
+            --on-success: #ffffff;
+            --warning-text: #ffd37a;
+            --warning-surface: #765000;
+            --on-warning: #ffffff;
+            --disabled-text: #b5bac1;
+            --badge-surface: #85242a;
+            --badge-text: #ffffff;
+            --focus-ring: #9aa8ff;
+            --shadow-color: #111214;
+            --primary-soft: #303765;
+            --primary-soft-hover: #414b8b;
+            --error-soft: #54282d;
+            --warning-soft: #4b3d22;
+            --tooltip-bg: #111214;
+            --tooltip-text: #ffffff;
+            --status-offline: #8e9297;
+            --avatar-text: #ffffff;
+            --primary: var(--primary-surface);
+            --bg: var(--page-bg);
+            --surface: var(--panel-bg);
+            --surface-dark: var(--panel-subtle);
+            --text: var(--text-normal);
+            --border: var(--border-color);
+            --error: var(--error-surface);
+            --warning: var(--warning-text);
+            --success: var(--success-surface);
+            --motion-fast: 140ms;
+            --motion-base: 220ms;
+            --motion-slow: 280ms;
+            --ease-standard: cubic-bezier(0.2, 0.8, 0.2, 1);
+        }
+        :root[data-theme="light"] {
+            --page-bg: #e3e5e8;
+            --panel-bg: #ffffff;
+            --panel-subtle: #f2f3f5;
+            --input-bg: #ebedef;
+            --text-strong: #1e1f22;
+            --text-normal: #2e3338;
+            --text-muted: #4e5965;
+            --placeholder-text: #4e5965;
+            --border-color: #68727d;
+            --overlay-bg: #575d66;
+            --hover-bg: #e1e4e8;
+            --primary-text: #3340a7;
+            --primary-surface: #3340a7;
+            --primary-indicator: #3340a7;
+            --on-primary: #ffffff;
+            --error-text: #a31522;
+            --error-surface: #a31522;
+            --on-error: #ffffff;
+            --success-text: #146c3a;
+            --success-surface: #146c3a;
+            --on-success: #ffffff;
+            --warning-text: #6b4600;
+            --warning-surface: #6b4600;
+            --on-warning: #ffffff;
+            --disabled-text: #5c6570;
+            --badge-surface: #7d2029;
+            --badge-text: #ffffff;
+            --focus-ring: #3b49d0;
+            --shadow-color: #4e5965;
+            --primary-soft: #dfe2ff;
+            --primary-soft-hover: #cdd2ff;
+            --error-soft: #f8dadd;
+            --warning-soft: #f4e4bf;
+            --tooltip-bg: #1e1f22;
+            --tooltip-text: #ffffff;
+            --status-offline: #68727d;
+            --avatar-text: #ffffff;
+            --primary: var(--primary-surface);
+            --bg: var(--page-bg);
+            --surface: var(--panel-bg);
+            --surface-dark: var(--panel-subtle);
+            --text: var(--text-normal);
+            --border: var(--border-color);
+            --error: var(--error-surface);
+            --warning: var(--warning-text);
+            --success: var(--success-surface);
+        }
+        :root[data-text-scale="112.5"] { font-size: 112.5%; }
+        :root[data-text-scale="125"] { font-size: 125%; }
+        :root[data-density="compact"] .msg { padding-block: 0.2rem; margin-top: 2px; gap: 10px; }
+        :root[data-density="compact"] .msg-avatar { width: 34px; height: 34px; }
+        :root[data-motion="reduce"] *,
+        :root[data-motion="reduce"] *::before,
+        :root[data-motion="reduce"] *::after {
+            animation-duration: 0.01ms !important;
+            animation-iteration-count: 1 !important;
+            transition-duration: 0.01ms !important;
+            transition-delay: 0s !important;
+        }
         * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
-        body { background: var(--bg); color: var(--text); height: 100vh; display: flex; align-items: center; justify-content: center; overflow: hidden; }
+        body { background: var(--page-bg); color: var(--text-normal); height: 100vh; display: flex; align-items: center; justify-content: center; overflow: hidden; }
         
-        #app { width: 100%; height: 100vh; background: var(--surface); display: flex; position: relative; }
+        #app { width: 100%; height: 100vh; background: var(--panel-bg); display: flex; position: relative; }
 
         /* --- SMOOTH MODALS --- */
         .modal { 
-            position: fixed; inset: 0; background: rgba(0,0,0,0.85); z-index: 100; 
+            position: fixed; inset: 0; background: var(--overlay-bg); z-index: 100;
             display: flex; flex-direction: column; align-items: center; justify-content: center; 
             padding: 2rem; backdrop-filter: blur(4px); 
             opacity: 0; visibility: hidden; pointer-events: none;
@@ -23,8 +135,8 @@
         .modal.active { opacity: 1; visibility: visible; pointer-events: auto; transition-delay: 0s; }
         
         .modal-box { 
-            width: 100%; max-width: 400px; background: var(--surface); padding: 2rem; 
-            border-radius: 8px; box-shadow: 0 10px 25px rgba(0,0,0,0.8); position: relative; 
+            width: 100%; max-width: 400px; background: var(--panel-bg); color: var(--text-normal); padding: 2rem;
+            border-radius: 8px; box-shadow: 0 10px 25px var(--shadow-color); position: relative;
             max-height: 90vh; overflow-y: auto;
             transform: scale(0.98) translateY(8px); opacity: 0;
             transition: transform var(--motion-slow) var(--ease-standard), opacity var(--motion-base) ease;
@@ -32,71 +144,75 @@
         .modal.active .modal-box { transform: scale(1) translateY(0); opacity: 1; }
         
         .modal-box::-webkit-scrollbar { width: 6px; }
-        .modal-box::-webkit-scrollbar-thumb { background: #202225; border-radius: 4px; }
-        .modal-box h2 { color: white; margin-bottom: 1.5rem; text-align: center; font-size: 1.4rem; }
+        .modal-box::-webkit-scrollbar-thumb { background: var(--border-color); border-radius: 4px; }
+        .modal-box h2 { color: var(--text-strong); margin-bottom: 1.5rem; text-align: center; font-size: 1.4rem; }
         .close-btn { position: absolute; top: 15px; right: 20px; cursor: pointer; color: var(--text-muted); font-size: 1.5rem; background: none; border: none; transition: color var(--motion-fast) ease, transform var(--motion-fast) var(--ease-standard); }
-        .close-btn:hover { color: white; transform: rotate(90deg); }
+        .close-btn:hover { color: var(--text-strong); transform: rotate(90deg); }
 
         .auth-tabs { display: flex; margin-bottom: 1.5rem; border-bottom: 2px solid var(--surface-dark); }
         .tab { flex: 1; text-align: center; padding: 0.5rem; cursor: pointer; color: var(--text-muted); font-weight: 600; text-transform: uppercase; font-size: 0.8rem; transition: color var(--motion-fast) ease, transform var(--motion-fast) var(--ease-standard), border-bottom-color var(--motion-base) ease; }
-        .tab.active { color: white; border-bottom: 2px solid var(--primary); margin-bottom: -2px; }
-        .tab:hover:not(.active) { color: white; transform: translateY(-2px); }
+        .tab.active { color: var(--text-strong); border-bottom: 2px solid var(--primary-indicator); margin-bottom: -2px; }
+        .tab:hover:not(.active) { color: var(--text-strong); transform: translateY(-2px); }
 
         .input-group { margin-bottom: 1rem; text-align: left; }
         .input-group label { display: block; font-size: 0.75rem; margin-bottom: 0.4rem; color: var(--text-muted); text-transform: uppercase; font-weight: 600; }
-        input.text-input { width: 100%; padding: 0.8rem; background: #202225; color: white; border: 1px solid var(--border); border-radius: 4px; outline: none; font-size: 1rem; transition: border-color 0.2s, box-shadow 0.2s;}
-        input.text-input:focus { border-color: var(--primary); box-shadow: 0 0 0 3px rgba(88, 101, 242, 0.2); }
+        input.text-input { width: 100%; padding: 0.8rem; background: var(--input-bg); color: var(--text-normal); border: 1px solid var(--border-color); border-radius: 4px; outline: none; font-size: 1rem; transition: border-color 0.2s, box-shadow 0.2s;}
+        input.text-input::placeholder, textarea.text-input::placeholder { color: var(--placeholder-text); }
+        input.text-input:focus { border-color: var(--focus-ring); box-shadow: 0 0 0 3px var(--focus-ring); }
         
-        button { transition: background-color var(--motion-base) ease, transform var(--motion-fast) var(--ease-standard), box-shadow var(--motion-base) ease, color var(--motion-base) ease; }
-        button.btn-primary { width: 100%; padding: 0.8rem; border: none; border-radius: 4px; font-weight: 600; font-size: 1rem; cursor: pointer; background: var(--primary); color: white; }
-        button.btn-primary:hover:not(:disabled) { background: #4752c4; transform: translateY(-1px); box-shadow: 0 4px 8px rgba(0,0,0,0.2); }
+        button { min-width: 44px; min-height: 44px; transition: background-color var(--motion-base) ease, transform var(--motion-fast) var(--ease-standard), box-shadow var(--motion-base) ease, color var(--motion-base) ease; }
+        input, select { min-height: 44px; }
+        button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 3px solid var(--focus-ring); outline-offset: 2px; }
+        button:disabled, input:disabled, select:disabled, textarea:disabled { color: var(--disabled-text); cursor: not-allowed; }
+        button.btn-primary { width: 100%; padding: 0.8rem; border: none; border-radius: 4px; font-weight: 600; font-size: 1rem; cursor: pointer; background: var(--primary-surface); color: var(--on-primary); }
+        button.btn-primary:hover:not(:disabled) { filter: brightness(1.12); transform: translateY(-1px); box-shadow: 0 4px 8px var(--shadow-color); }
         button.btn-primary:active:not(:disabled) { transform: scale(0.97); box-shadow: none; }
-        button.btn-secondary { background: #4f545c; }
-        button.btn-secondary:hover:not(:disabled) { background: #686d73; }
-        #auth-error { color: var(--error); font-size: 0.85rem; text-align: center; margin-top: 1rem; min-height: 20px; font-weight: 500; transition: color var(--motion-base) ease, opacity var(--motion-base) ease; }
+        button.btn-secondary { background: var(--panel-subtle); color: var(--text-normal); border: 1px solid var(--border-color); }
+        button.btn-secondary:hover:not(:disabled) { background: var(--hover-bg); }
+        #auth-error { color: var(--error-text); font-size: 0.85rem; text-align: center; margin-top: 1rem; min-height: 20px; font-weight: 500; transition: color var(--motion-base) ease, opacity var(--motion-base) ease; }
 
         /* --- SMOOTH TOOLTIPS & SIDEBAR --- */
-        #servers-sidebar { width: 72px; background: #202225; display: flex; flex-direction: column; align-items: center; padding: 12px 0; gap: 8px; overflow-y: auto; overflow-x: hidden; flex-shrink: 0; scrollbar-width: none; }
+        #servers-sidebar { width: 72px; background: var(--page-bg); color: var(--text-normal); display: flex; flex-direction: column; align-items: center; padding: 12px 0; gap: 8px; overflow-y: auto; overflow-x: hidden; flex-shrink: 0; scrollbar-width: none; }
         #servers-sidebar::-webkit-scrollbar { display: none; width: 0; height: 0; }
-        .server-icon { width: 48px; height: 48px; border-radius: 50%; background: #36393f; color: white; display: flex; justify-content: center; align-items: center; cursor: pointer; font-weight: bold; transition: border-radius var(--motion-base) var(--ease-standard), background-color var(--motion-base) ease, color var(--motion-fast) ease, transform var(--motion-fast) var(--ease-standard), opacity var(--motion-fast) ease; font-size: 1.2rem; position: relative; flex-shrink: 0; animation: popIn var(--motion-base) var(--ease-standard); }
+        .server-icon { width: 48px; height: 48px; border-radius: 50%; background: var(--panel-bg); color: var(--text-strong); display: flex; justify-content: center; align-items: center; cursor: pointer; font-weight: bold; transition: border-radius var(--motion-base) var(--ease-standard), background-color var(--motion-base) ease, color var(--motion-fast) ease, transform var(--motion-fast) var(--ease-standard), opacity var(--motion-fast) ease; font-size: 1.2rem; position: relative; flex-shrink: 0; animation: popIn var(--motion-base) var(--ease-standard); }
         .server-icon:hover, .server-icon.active { border-radius: 16px; background: var(--primary); opacity: 1 !important; transform: scale(1.05); }
-        .server-icon.add-btn { background: #36393f; color: #3ba55c; font-weight: 300; font-size: 1.5rem; }
-        .server-icon.add-btn:hover { background: #3ba55c; color: white; }
+        .server-icon.add-btn { background: var(--panel-bg); color: var(--success-text); font-weight: 300; font-size: 1.5rem; }
+        .server-icon.add-btn:hover { background: var(--success-surface); color: var(--on-success); }
         .server-icon[aria-disabled="true"] { opacity: 0.35 !important; cursor: not-allowed; filter: grayscale(0.8); }
-        .server-icon[aria-disabled="true"]:hover { border-radius: 50%; background: #36393f; transform: none; }
+        .server-icon[aria-disabled="true"]:hover { border-radius: 50%; background: var(--panel-bg); transform: none; }
         
         .tooltip { 
-            position: absolute; left: 70px; background: black; color: white; padding: 6px 12px; border-radius: 6px; 
+            position: absolute; left: 70px; background: var(--tooltip-bg); color: var(--tooltip-text); padding: 6px 12px; border-radius: 6px;
             font-size: 0.85rem; white-space: nowrap; pointer-events: none; z-index: 100; font-weight: 600; 
             opacity: 0; visibility: hidden; transform: translateX(-8px) scale(0.98);
             transition: opacity var(--motion-fast) ease, transform var(--motion-base) var(--ease-standard), visibility 0s linear var(--motion-base);
             will-change: opacity, transform;
             box-shadow: 0 2px 10px rgba(0,0,0,0.5);
         }
-        .tooltip::before { content: ''; position: absolute; top: 50%; left: -4px; transform: translateY(-50%); border-width: 5px 5px 5px 0; border-style: solid; border-color: transparent black transparent transparent; }
+        .tooltip::before { content: ''; position: absolute; top: 50%; left: -4px; transform: translateY(-50%); border-width: 5px 5px 5px 0; border-style: solid; border-color: transparent var(--tooltip-bg) transparent transparent; }
         .server-icon:hover .tooltip { opacity: 1; visibility: visible; transform: translateX(0) scale(1); transition-delay: 0s; }
 
         /* Chat Area */
         #chat-area { flex: 1; display: flex; flex-direction: column; position: relative; min-width: 0; }
-        header { padding: 0 1rem; height: 50px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; background: var(--surface); box-shadow: 0 1px 2px rgba(0,0,0,0.2); z-index: 10; }
-        #server-title { font-weight: 600; font-size: 1rem; color: white; display: flex; align-items: center; gap: 8px; }
+        header { padding: 0 1rem; height: 50px; border-bottom: 1px solid var(--border-color); display: flex; justify-content: space-between; align-items: center; background: var(--panel-bg); color: var(--text-normal); box-shadow: 0 1px 2px var(--shadow-color); z-index: 10; }
+        #server-title { font-weight: 600; font-size: 1rem; color: var(--text-strong); display: flex; align-items: center; gap: 8px; }
         
-        .admin-badge { background: #ed4245; color: white; font-size: 0.65rem; padding: 2px 6px; border-radius: 4px; font-weight: 700; text-transform: uppercase; margin-left: 2px; display: inline-flex; align-items: center; gap: 3px; border: 1px solid #202225; }
+        .admin-badge { background: var(--badge-surface); color: var(--badge-text); font-size: 0.65rem; padding: 2px 6px; border-radius: 4px; font-weight: 700; text-transform: uppercase; margin-left: 2px; display: inline-flex; align-items: center; gap: 3px; border: 1px solid var(--border-color); }
         .admin-badge::before { content: '👑'; font-size: 0.7rem; margin-right: 2px; }
-        .admin-badge.mod-badge { background: #faa61a; border-color: #d58512; }
+        .admin-badge.mod-badge { background: var(--warning-surface); color: var(--on-warning); border-color: var(--warning-text); }
         .admin-badge.mod-badge::before { content: '🛡️'; font-size: 0.7rem; margin-right: 2px; }
         
         .header-actions { display: flex; gap: 8px; align-items: center; }
-        .header-btn { font-size: 0.8rem; padding: 6px 12px; border-radius: 4px; color: white; cursor: pointer; transition: filter var(--motion-fast) ease, transform var(--motion-fast) var(--ease-standard), box-shadow var(--motion-base) ease; font-weight: 600; border: none; display: none; }
+        .header-btn { font-size: 0.8rem; padding: 6px 12px; border-radius: 4px; color: var(--on-primary); cursor: pointer; transition: filter var(--motion-fast) ease, transform var(--motion-fast) var(--ease-standard), box-shadow var(--motion-base) ease; font-weight: 600; border: none; display: none; }
         .header-btn.primary { background: var(--primary); }
-        .header-btn.delete, .header-btn.logout { background: var(--error); }
-        .header-btn.success { background: #3ba55c; }
-        .header-btn.danger { background: #4f545c; }
-        .header-btn.settings { background: #4f545c; display: block; }
+        .header-btn.delete, .header-btn.logout { background: var(--error-surface); color: var(--on-error); }
+        .header-btn.success { background: var(--success-surface); color: var(--on-success); }
+        .header-btn.danger, .header-btn.settings { background: var(--panel-subtle); color: var(--text-normal); border: 1px solid var(--border-color); }
+        .header-btn.settings { display: block; }
         .header-btn:hover { filter: brightness(1.15); transform: translateY(-1px); box-shadow: 0 2px 5px rgba(0,0,0,0.2); }
         .header-btn.logout { display: block; }
 
-        #chat-window { flex: 1; overflow-y: auto; padding: 1rem; display: flex; flex-direction: column; gap: 1rem; background: var(--surface); scroll-behavior: auto; }
+        #chat-window { flex: 1; overflow-y: auto; padding: 1rem; display: flex; flex-direction: column; gap: 1rem; background: var(--panel-bg); color: var(--text-normal); scroll-behavior: auto; }
         
         /* --- SMOOTH MESSAGES & PING HIGHLIGHTS --- */
         @keyframes messageSlideIn {
@@ -105,18 +221,18 @@
         }
         
         .msg { display: flex; flex-direction: row; gap: 14px; position: relative; padding: 0.4rem 1rem; border-left: 4px solid transparent; margin-top: 5px; animation: messageSlideIn var(--motion-base) var(--ease-standard) forwards; transition: background var(--motion-fast) ease, border-left-color var(--motion-fast) ease; }
-        .msg:hover { background: rgba(4, 4, 5, 0.07); }
+        .msg:hover { background: var(--hover-bg); }
         
         /* Message highlight specifically for YOU when pinged */
-        .msg.pinged { background: rgba(250, 166, 26, 0.1) !important; border-left-color: var(--warning) !important; }
+        .msg.pinged { background: var(--warning-soft) !important; border-left-color: var(--warning-text) !important; }
         
-        .msg-avatar { width: 40px; height: 40px; border-radius: 50%; flex-shrink: 0; overflow: hidden; display: flex; align-items: center; justify-content: center; font-weight: bold; font-size: 1.2rem; color: white; margin-top: 2px; cursor: pointer; transition: transform var(--motion-fast) var(--ease-standard); }
+        .msg-avatar { width: 40px; height: 40px; border-radius: 50%; flex-shrink: 0; overflow: hidden; display: flex; align-items: center; justify-content: center; font-weight: bold; font-size: 1.2rem; color: var(--avatar-text); margin-top: 2px; cursor: pointer; transition: transform var(--motion-fast) var(--ease-standard); }
         .msg-avatar:hover { transform: scale(1.05); }
         .msg-avatar img { width: 100%; height: 100%; object-fit: cover; }
         
         .msg-body { display: flex; flex-direction: column; flex: 1; min-width: 0; }
         .msg-header { display: flex; align-items: baseline; gap: 6px; margin-bottom: 0.25rem; }
-        .msg-author { font-size: 1rem; color: white; font-weight: 500; cursor: pointer; }
+        .msg-author { font-size: 1rem; color: var(--text-strong); font-weight: 500; cursor: pointer; }
         .msg-author:hover { text-decoration: underline; }
         .msg-time-header { font-size: 0.75rem; color: var(--text-muted); margin-left: 4px;}
 
@@ -124,7 +240,7 @@
         .reply-context { font-size: 0.85rem; color: var(--text-muted); display: flex; align-items: center; gap: 5px; margin-bottom: 4px; cursor: pointer; user-select: none; transition: color 0.15s; }
         .reply-context:hover { color: var(--text); }
         .reply-context::before { content: '┌──'; margin-right: 2px; font-weight: bold; font-family: monospace; color: var(--surface-dark); font-size: 1.2rem; line-height: 0.5;}
-        .reply-author { font-weight: 600; color: white; }
+        .reply-author { font-weight: 600; color: var(--text-strong); }
         .reply-text { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 60%; opacity: 0.8; }
 
         /* Animated Hover Actions Menu */
@@ -138,26 +254,26 @@
         }
         .msg:hover .msg-actions { opacity: 1; visibility: visible; transform: translateY(0); transition-delay: 0s; }
         .action-btn { background: none; border: none; padding: 6px 12px; color: var(--text-muted); font-size: 0.8rem; cursor: pointer; transition: background-color var(--motion-fast) ease, color var(--motion-fast) ease, transform var(--motion-fast) var(--ease-standard); display: flex; align-items: center; gap: 5px; font-weight: 500; }
-        .action-btn:hover { background: var(--surface-dark); color: white; }
+        .action-btn:hover { background: var(--panel-subtle); color: var(--text-strong); }
         .action-btn:active { transform: scale(0.95); }
-        .action-btn.del:hover { color: var(--error); background: rgba(237, 66, 69, 0.1); }
+        .action-btn.del:hover { color: var(--error-text); background: var(--error-soft); }
         .action-btn.react { font-size: 0.85rem; padding: 6px 10px; }
 
         .msg-text { font-size: 0.95rem; line-height: 1.4; word-break: break-word; color: var(--text); display: inline-block; width: 100%;}
-        .msg-text strong { font-weight: 700; color: white; }
+        .msg-text strong { font-weight: 700; color: var(--text-strong); }
         .msg-text em { font-style: italic; }
         .msg-text u { text-decoration: underline; }
         .msg-text del { text-decoration: line-through; opacity: 0.7; }
-        .msg-text code { background: #202225; padding: 2px 5px; border-radius: 3px; font-family: monospace; font-size: 0.9em; border: 1px solid #1a1c1e; }
+        .msg-text code { background: var(--input-bg); padding: 2px 5px; border-radius: 3px; font-family: monospace; font-size: 0.9em; border: 1px solid var(--border-color); }
         .chat-img { display: block; max-width: 100%; max-height: 300px; border-radius: 8px; margin-top: 8px; cursor: pointer; border: 1px solid var(--surface-dark); transition: transform 0.2s;}
         .chat-img:hover { transform: scale(1.02); }
-        .chat-link { color: #00b0f4; text-decoration: none; word-break: break-all; }
+        .chat-link { color: var(--primary-text); text-decoration: none; word-break: break-all; }
         .chat-link:hover { text-decoration: underline; }
 
         /* Ping Mentions Pill - Matches exact styling for EVERYONE viewing */
-        .ping-tag { background: rgba(88, 101, 242, 0.3); color: #c9cdfb; padding: 0 4px; border-radius: 3px; font-weight: 500; transition: background 0.15s; cursor: pointer; }
-        .ping-tag:hover { background: rgba(88, 101, 242, 0.6); color: white; text-decoration: none;}
-        .ping-tag.everyone { background: rgba(88, 101, 242, 0.3); color: #c9cdfb; }
+        .ping-tag { background: var(--primary-soft); color: var(--primary-text); padding: 0 4px; border-radius: 3px; font-weight: 500; transition: background 0.15s; cursor: pointer; }
+        .ping-tag:hover { background: var(--primary-soft-hover); color: var(--text-strong); text-decoration: none;}
+        .ping-tag.everyone { background: var(--primary-soft); color: var(--primary-text); }
         
         .edited-tag { font-size: 0.7rem; color: var(--text-muted); margin-left: 5px; cursor: pointer; user-select: none; }
         .edited-tag:hover { text-decoration: underline; }
@@ -165,13 +281,13 @@
         /* Emoji Reactions */
         .msg-reactions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
         .reaction-bubble { background: var(--surface-dark); border: 1px solid var(--border); border-radius: 6px; padding: 2px 6px; font-size: 0.85rem; color: var(--text); cursor: pointer; display: flex; align-items: center; gap: 4px; user-select: none; transition: background-color var(--motion-fast) ease, border-color var(--motion-fast) ease, color var(--motion-fast) ease, transform var(--motion-fast) var(--ease-standard); font-weight: 600; animation: popIn var(--motion-base) var(--ease-standard); }
-        .reaction-bubble:hover { background: #40444b; border-color: var(--text-muted); transform: scale(1.05); }
-        .reaction-bubble.reacted { background: rgba(88, 101, 242, 0.15); border-color: var(--primary); color: #eef; }
-        .reaction-bubble.reacted:hover { background: rgba(88, 101, 242, 0.25); }
+        .reaction-bubble:hover { background: var(--hover-bg); border-color: var(--text-muted); transform: scale(1.05); }
+        .reaction-bubble.reacted { background: var(--primary-soft); border-color: var(--primary-surface); color: var(--primary-text); }
+        .reaction-bubble.reacted:hover { background: var(--primary-soft-hover); }
         
         .msg.deleted-compact { padding: 4px 1rem; display: flex; flex-direction: row; align-items: center; gap: 6px; font-size: 0.85rem; color: var(--text-muted); background: transparent !important; margin-top: 0; border-left-color: transparent !important; transition: background-color var(--motion-base) ease, border-left-color var(--motion-base) ease, color var(--motion-base) ease; }
         .msg.deleted-compact .deleted-text { font-style: italic; }
-        .view-deleted-tag { cursor: pointer; font-size: 0.75rem; text-decoration: underline; color: var(--error); margin-left: 4px; }
+        .view-deleted-tag { cursor: pointer; font-size: 0.75rem; text-decoration: underline; color: var(--error-text); margin-left: 4px; }
 
         .system-msg { text-align: center; font-size: 0.85rem; color: var(--text-muted); margin: 1rem 0; font-weight: 600; display: flex; align-items: center; justify-content: center; gap: 10px; animation: fadePop var(--motion-base) var(--ease-standard);}
         .system-msg::before, .system-msg::after { content: ""; flex: 1; border-bottom: 1px solid var(--surface-dark); max-width: 50px; }
@@ -190,14 +306,14 @@
             background: var(--surface-dark); border-radius: 8px 8px 0 0;
             display: flex; align-items: center; justify-content: space-between; border-top: 1px solid transparent;
         }
-        .compose-addon.show { max-height: 120px; opacity: 1; padding: 10px 16px; border-top-color: var(--primary); }
+        .compose-addon.show { max-height: 120px; opacity: 1; padding: 10px 16px; border-top-color: var(--primary-indicator); }
         
         .info-bar-text { font-size: 0.85rem; color: var(--text); }
-        .info-bar-btn { background: none; border: none; color: var(--primary); cursor: pointer; font-weight: 500; font-size: 0.85rem; transition: color var(--motion-fast) ease; }
-        .info-bar-btn:hover { color: white; }
+        .info-bar-btn { background: none; border: none; color: var(--primary-text); cursor: pointer; font-weight: 500; font-size: 0.85rem; transition: color var(--motion-fast) ease; }
+        .info-bar-btn:hover { color: var(--text-strong); }
         
-        #attachment-preview img { max-height: 80px; border-radius: 4px; border: 1px solid #202225; }
-        #clear-attachment-btn { position: absolute; top: 5px; right: 5px; background: var(--error); color: white; border: none; border-radius: 50%; width: 20px; height: 20px; cursor: pointer; font-weight: bold; display: flex; align-items: center; justify-content: center; padding-bottom: 2px; transition: transform 0.2s;}
+        #attachment-preview img { max-height: 80px; border-radius: 4px; border: 1px solid var(--border-color); }
+        #clear-attachment-btn { position: absolute; top: 5px; right: 5px; background: var(--error-surface); color: var(--on-error); border: none; border-radius: 50%; width: 20px; height: 20px; cursor: pointer; font-weight: bold; display: flex; align-items: center; justify-content: center; padding-bottom: 2px; transition: transform 0.2s;}
         #clear-attachment-btn:hover { transform: scale(1.05); }
         
         /* --- SMOOTH FLOATING EMOJI PICKERS --- */
@@ -212,56 +328,56 @@
         
         .emoji-grid { display: grid; grid-template-columns: repeat(8, 1fr); gap: 5px; max-height: 180px; overflow-y: auto; padding-right: 5px;}
         .emoji-grid::-webkit-scrollbar { width: 6px; }
-        .emoji-grid::-webkit-scrollbar-thumb { background: #202225; border-radius: 4px; }
+        .emoji-grid::-webkit-scrollbar-thumb { background: var(--border-color); border-radius: 4px; }
         .emoji-item { font-size: 1.4rem; cursor: pointer; text-align: center; border-radius: 4px; padding: 4px 0; transition: background-color var(--motion-fast) ease, transform var(--motion-fast) var(--ease-standard); user-select: none; }
         .emoji-item:hover { background: var(--primary); transform: scale(1.05); }
         .emoji-item:active { transform: scale(0.9); }
 
-        form#compose { display: flex; padding: 0 16px 24px 16px; background: var(--surface); gap: 0.5rem; align-items: center; position: relative; z-index: 10; }
-        .input-wrapper { flex: 1; background: #40444b; border-radius: 8px; display: flex; align-items: center; padding: 0 8px; transition: border-color var(--motion-base) ease, box-shadow var(--motion-base) ease; border: 1px solid transparent; }
-        .input-wrapper:focus-within { border-color: var(--primary); box-shadow: 0 0 0 2px rgba(88, 101, 242, 0.2); }
+        form#compose { display: flex; padding: 0 16px 24px 16px; background: var(--panel-bg); gap: 0.5rem; align-items: center; position: relative; z-index: 10; }
+        .input-wrapper { flex: 1; background: var(--input-bg); border-radius: 8px; display: flex; align-items: center; padding: 0 8px; transition: border-color var(--motion-base) ease, box-shadow var(--motion-base) ease; border: 1px solid var(--border-color); }
+        .input-wrapper:focus-within { border-color: var(--focus-ring); box-shadow: 0 0 0 2px var(--focus-ring); }
         
         .chat-icon-btn { background: transparent; border: none; color: var(--text-muted); font-size: 1.2rem; cursor: pointer; padding: 8px; transition: color var(--motion-fast) ease, background-color var(--motion-fast) ease, transform var(--motion-fast) var(--ease-standard); display: flex; align-items: center; justify-content: center; border-radius: 50%; width: 36px; height: 36px; }
-        .chat-icon-btn:hover { color: white; background: #2f3136; transform: scale(1.05); }
-        .chat-icon-btn.plus { background: #b9bbbe; color: #40444b; width: 24px; height: 24px; font-size: 1rem; padding: 0; margin-right: 5px; }
-        .chat-icon-btn.plus:hover { background: white; transform: rotate(90deg); }
+        .chat-icon-btn:hover { color: var(--text-strong); background: var(--panel-subtle); transform: scale(1.05); }
+        .chat-icon-btn.plus { background: var(--text-muted); color: var(--page-bg); width: 24px; height: 24px; font-size: 1rem; padding: 0; margin-right: 5px; }
+        .chat-icon-btn.plus:hover { background: var(--text-strong); transform: rotate(90deg); }
 
         form#compose input[type="text"] { flex: 1; background: transparent; border: none; padding: 12px 8px; color: var(--text); outline: none; font-size: 1rem; }
         form#compose button.submit-btn { width: auto; padding: 8px 16px; border-radius: 4px; font-weight: 600; font-size: 0.9rem; transition: transform var(--motion-fast) var(--ease-standard), background-color var(--motion-base) ease; }
         form#compose button.submit-btn:hover:not(:disabled) { transform: scale(1.05); }
 
         /* --- ONLINE USERS SIDEBAR --- */
-        #online-sidebar { width: 240px; background: #2f3136; display: flex; flex-direction: column; flex-shrink: 0; }
+        #online-sidebar { width: 240px; background: var(--panel-subtle); color: var(--text-normal); display: flex; flex-direction: column; flex-shrink: 0; }
         @media (max-width: 800px) { #online-sidebar { display: none; } }
         .sidebar-header { padding: 1.2rem 1rem 0.5rem 1rem; font-weight: 600; color: var(--text-muted); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.5px; }
         #online-list { list-style: none; padding: 0.5rem; flex: 1; overflow-y: auto; overflow-x: hidden; }
         
         .user-item { display: flex; align-items: center; gap: 10px; padding: 8px; border-radius: 4px; color: var(--text-muted); font-weight: 500; cursor: pointer; transition: background-color var(--motion-fast) ease, color var(--motion-fast) ease, transform var(--motion-fast) var(--ease-standard); animation: slideInRight var(--motion-base) var(--ease-standard) forwards; opacity: 0; transform: translateX(8px); }
-        .user-item:hover { background: #393c43; color: var(--text); transform: translateX(4px); }
+        .user-item:hover { background: var(--hover-bg); color: var(--text-normal); transform: translateX(4px); }
         
         /* Offline status dimming & grayscale */
         .user-item.offline { opacity: 0.5; }
         .user-item.offline .avatar { filter: grayscale(100%); }
         .user-item.offline:hover { opacity: 0.8; }
 
-        .avatar { width: 32px; height: 32px; border-radius: 50%; background: var(--primary); display: flex; justify-content: center; align-items: center; color: white; font-weight: bold; position: relative; text-shadow: 0 1px 2px rgba(0,0,0,0.5); overflow: hidden;}
+        .avatar { width: 32px; height: 32px; border-radius: 50%; background: var(--primary); display: flex; justify-content: center; align-items: center; color: var(--avatar-text); font-weight: bold; position: relative; text-shadow: 0 1px 2px var(--shadow-color); overflow: hidden;}
         .avatar img { width: 100%; height: 100%; object-fit: cover; }
         
         /* Dynamic Green / Gray dot styling */
-        .status-dot { position: absolute; bottom: -2px; right: -2px; width: 12px; height: 12px; border-radius: 50%; border: 2px solid #2f3136; z-index: 2; transition: background-color var(--motion-base) ease; }
-        .status-dot.online { background: #3ba55c; }
-        .status-dot.offline { background: #747f8d; }
+        .status-dot { position: absolute; bottom: -2px; right: -2px; width: 12px; height: 12px; border-radius: 50%; border: 2px solid var(--panel-subtle); z-index: 2; transition: background-color var(--motion-base) ease; }
+        .status-dot.online { background: var(--success-surface); }
+        .status-dot.offline { background: var(--status-offline); }
         
-        .stealth-admin { color: var(--warning) !important; font-style: italic; }
+        .stealth-admin { color: var(--warning-text) !important; font-style: italic; }
 
         #history-list { max-height: 350px; overflow-y: auto; margin-top: 1rem; text-align: left; }
-        .hist-item { background: var(--surface-dark); padding: 1rem; border-radius: 4px; margin-bottom: 0.5rem; border-left: 3px solid var(--primary); }
+        .hist-item { background: var(--panel-subtle); color: var(--text-normal); padding: 1rem; border-radius: 4px; margin-bottom: 0.5rem; border-left: 3px solid var(--primary-indicator); }
         .hist-time { font-size: 0.75rem; color: var(--text-muted); margin-bottom: 0.5rem; font-weight: 600;}
         .hist-text { font-size: 0.95rem; white-space: pre-wrap; word-break: break-word; color: var(--text); }
         
         /* --- DYNAMIC CONTEXT MENU --- */
         .context-menu {
-            position: fixed; background: var(--surface-dark); border: 1px solid var(--border);
+            position: fixed; background: var(--panel-subtle); color: var(--text-normal); border: 1px solid var(--border-color);
             border-radius: 6px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); z-index: 9999;
             padding: 5px; display: flex; flex-direction: column; gap: 2px;
             opacity: 0; visibility: hidden; transform: scale(0.98); transition: opacity var(--motion-fast) ease, transform var(--motion-base) var(--ease-standard), visibility 0s linear var(--motion-base);
@@ -270,40 +386,40 @@
         .context-menu.show { opacity: 1; visibility: visible; transform: scale(1); pointer-events: auto; transition-delay: 0s; }
         
         .ctx-header { padding: 10px 12px; border-bottom: 1px solid var(--border); margin-bottom: 4px; pointer-events: none; display: flex; flex-direction: column; gap: 2px; }
-        .ctx-header .d-name { font-weight: bold; color: white; font-size: 0.95rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;}
+        .ctx-header .d-name { font-weight: bold; color: var(--text-strong); font-size: 0.95rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;}
         .ctx-header .u-name { font-size: 0.75rem; color: var(--text-muted); font-family: monospace;}
         
         .ctx-btn {
             background: transparent; border: none; color: var(--text); padding: 8px 12px;
             text-align: left; border-radius: 4px; cursor: pointer; font-size: 0.85rem; font-weight: 600; transition: background-color var(--motion-fast) ease, color var(--motion-fast) ease;
         }
-        .ctx-btn:hover { background: var(--surface); color: white; }
-        .ctx-btn.danger { color: var(--error); }
-        .ctx-btn.danger:hover { background: rgba(237, 66, 69, 0.1); }
+        .ctx-btn:hover { background: var(--panel-bg); color: var(--text-strong); }
+        .ctx-btn.danger { color: var(--error-text); }
+        .ctx-btn.danger:hover { background: var(--error-soft); }
 
         /* --- MODERATION CONTROLS --- */
         .moderation-context { color: var(--text-muted); font-size: 0.9rem; line-height: 1.45; margin-bottom: 1rem; text-align: center; white-space: pre-wrap; }
-        .moderation-error { color: var(--error); font-size: 0.82rem; min-height: 1.1rem; margin: 0.5rem 0; text-align: center; }
-        textarea.text-input, select.text-input { width: 100%; padding: 0.8rem; background: #202225; color: white; border: 1px solid var(--border); border-radius: 4px; outline: none; font-size: 0.95rem; }
+        .moderation-error { color: var(--error-text); font-size: 0.82rem; min-height: 1.1rem; margin: 0.5rem 0; text-align: center; }
+        textarea.text-input, select.text-input { width: 100%; padding: 0.8rem; background: var(--input-bg); color: var(--text-normal); border: 1px solid var(--border-color); border-radius: 4px; outline: none; font-size: 0.95rem; }
         textarea.text-input { resize: vertical; min-height: 90px; }
-        textarea.text-input:focus, select.text-input:focus { border-color: var(--primary); box-shadow: 0 0 0 3px rgba(88, 101, 242, 0.2); }
+        textarea.text-input:focus, select.text-input:focus { border-color: var(--focus-ring); box-shadow: 0 0 0 3px var(--focus-ring); }
         .moderator-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 1rem; }
         .moderator-tab { flex: 1; min-width: 90px; border: 1px solid var(--border); border-radius: 4px; padding: 8px; background: var(--surface-dark); color: var(--text-muted); cursor: pointer; font-weight: 600; }
-        .moderator-tab.active { background: var(--primary); color: white; }
+        .moderator-tab.active { background: var(--primary-surface); color: var(--on-primary); }
         .moderator-toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 0.75rem; }
         .moderator-toolbar label { color: var(--text-muted); font-size: 0.8rem; font-weight: 600; }
         .moderator-toolbar select { flex: 1; }
         .moderator-panel { display: none; }
         .moderator-panel.active { display: block; animation: fadePop var(--motion-base) var(--ease-standard) forwards; }
         .moderator-list { display: flex; flex-direction: column; gap: 8px; max-height: 48vh; overflow-y: auto; }
-        .moderator-row { background: var(--surface-dark); border-left: 3px solid var(--primary); border-radius: 4px; padding: 10px 12px; }
-        .moderator-row-title { color: white; font-size: 0.9rem; font-weight: 700; margin-bottom: 4px; }
+        .moderator-row { background: var(--panel-subtle); color: var(--text-normal); border-left: 3px solid var(--primary-indicator); border-radius: 4px; padding: 10px 12px; }
+        .moderator-row-title { color: var(--text-strong); font-size: 0.9rem; font-weight: 700; margin-bottom: 4px; }
         .moderator-row-detail { color: var(--text-muted); font-size: 0.8rem; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere; }
         .moderator-row-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
-        .moderator-row-actions button { border: 0; border-radius: 4px; background: #4f545c; color: white; cursor: pointer; padding: 6px 10px; font-size: 0.78rem; font-weight: 600; }
-        .moderator-row-actions button.danger { background: var(--error); }
+        .moderator-row-actions button { border: 1px solid var(--border-color); border-radius: 4px; background: var(--panel-bg); color: var(--text-normal); cursor: pointer; padding: 6px 10px; font-size: 0.78rem; font-weight: 600; }
+        .moderator-row-actions button.danger { background: var(--error-surface); color: var(--on-error); }
         .moderator-load-more { margin-top: 10px; }
-        #restriction-notice { min-height: 1.2rem; color: var(--warning); font-size: 0.82rem; font-weight: 600; padding: 0 1rem 6px; }
+        #restriction-notice { min-height: 1.2rem; color: var(--warning-text); font-size: 0.82rem; font-weight: 600; padding: 0 1rem 6px; }
         
         /* Animation Keyframes */
         @keyframes popIn { 0% { transform: scale(0.98); } 100% { transform: scale(1); } }
@@ -371,9 +487,45 @@
                 </div>
             </div>
             <button id="save-settings-btn" class="btn-primary" style="margin-top:10px;">Save Profile</button>
+
+            <hr style="border: 0; border-top: 1px solid var(--border-color); margin: 20px 0;">
+            <section id="appearance-settings-section" aria-labelledby="appearance-settings-heading">
+                <h3 id="appearance-settings-heading" style="color: var(--text-strong); margin-bottom: 1rem; font-size: 1.1rem; text-align: center;">Appearance</h3>
+                <div class="input-group">
+                    <label for="appearance-theme">Theme</label>
+                    <select id="appearance-theme" class="text-input">
+                        <option value="dark">Dark</option>
+                        <option value="light">Light</option>
+                    </select>
+                </div>
+                <div class="input-group">
+                    <label for="appearance-text-scale">Text size</label>
+                    <select id="appearance-text-scale" class="text-input">
+                        <option value="100">Normal</option>
+                        <option value="112.5">Large</option>
+                        <option value="125">Extra Large</option>
+                    </select>
+                </div>
+                <div class="input-group">
+                    <label for="appearance-compact">Compact messages</label>
+                    <select id="appearance-compact" class="text-input">
+                        <option value="false">Off</option>
+                        <option value="true">On</option>
+                    </select>
+                </div>
+                <div class="input-group">
+                    <label for="appearance-motion">Motion</label>
+                    <select id="appearance-motion" class="text-input">
+                        <option value="system">Follow device</option>
+                        <option value="reduce">Reduce motion</option>
+                    </select>
+                </div>
+                <button id="save-appearance-btn" class="btn-primary" type="button">Save Appearance</button>
+                <div id="appearance-status" role="status" aria-live="polite" style="min-height: 1.2rem; margin-top: 0.5rem; color: var(--text-muted);"></div>
+            </section>
             
-            <hr style="border: 0; border-top: 1px solid var(--surface-dark); margin: 20px 0;">
-            <h3 style="color: white; margin-bottom: 1rem; font-size: 1.1rem; text-align: center;">Security & Account</h3>
+            <hr style="border: 0; border-top: 1px solid var(--border-color); margin: 20px 0;">
+            <h3 style="color: var(--text-strong); margin-bottom: 1rem; font-size: 1.1rem; text-align: center;">Security & Account</h3>
             
             <div class="input-group">
                 <label>Current Password</label>
@@ -435,7 +587,7 @@
 
     <div id="history-modal" class="modal">
         <div class="modal-box" style="max-width: 500px;">
-            <button class="close-btn" onclick="document.getElementById('history-modal').classList.remove('active')">&times;</button>
+            <button class="close-btn" onclick="closeMessageHistory()">&times;</button>
             <h2 id="history-modal-title">Message Edit History</h2>
             <div id="history-list"></div>
         </div>
@@ -558,7 +710,7 @@
     <div id="servers-sidebar">
         <div class="server-icon active" id="srv-global" onclick="switchServer('global', 'Global Chat')">G<div class="tooltip">Global Chat</div></div>
         <div id="dynamic-servers" style="width: 100%; display: flex; flex-direction: column; align-items: center; gap: 8px;"></div>
-        <div style="width: 32px; height: 2px; background: #2f3136; border-radius: 1px; margin: 4px 0; flex-shrink: 0;"></div>
+        <div style="width: 32px; height: 2px; background: var(--panel-subtle); border-radius: 1px; margin: 4px 0; flex-shrink: 0;"></div>
         <div class="server-icon add-btn" onclick="document.getElementById('server-modal').classList.add('active'); toggleServerModal('join');">+<div class="tooltip">Add a Server</div></div>
     </div>
 
@@ -634,6 +786,577 @@
             } catch {
                 return null;
             }
+        },
+
+        defaultAppearancePreferences() {
+            return Object.freeze({
+                theme: 'dark',
+                textScale: 100,
+                compactMessages: false,
+                motion: 'system'
+            });
+        },
+
+        normalizeAppearancePreferences(value) {
+            const keys = ['theme', 'textScale', 'compactMessages', 'motion'];
+            if (!value || typeof value !== 'object' || Array.isArray(value) ||
+                Object.keys(value).length !== keys.length ||
+                keys.some(key => !Object.prototype.hasOwnProperty.call(value, key))) return null;
+            if (!['dark', 'light'].includes(value.theme) ||
+                ![100, 112.5, 125].includes(value.textScale) ||
+                typeof value.compactMessages !== 'boolean' ||
+                !['system', 'reduce'].includes(value.motion)) return null;
+            return Object.freeze({
+                theme: value.theme,
+                textScale: value.textScale,
+                compactMessages: value.compactMessages,
+                motion: value.motion
+            });
+        },
+
+        normalizeStoredAppearanceSnapshot(value) {
+            if (!value || typeof value !== 'object' || Array.isArray(value) ||
+                Object.keys(value).length !== 2 ||
+                !Object.prototype.hasOwnProperty.call(value, 'preferences') ||
+                !Object.prototype.hasOwnProperty.call(value, 'preferencesVersion')) return null;
+            const preferences = this.normalizeAppearancePreferences(value.preferences);
+            if (!preferences || !Number.isSafeInteger(value.preferencesVersion) || value.preferencesVersion < 0) return null;
+            return Object.freeze({ preferences, preferencesVersion: value.preferencesVersion });
+        },
+
+        appearanceCacheKey(backendUrl, username) {
+            const normalizedBackend = this.normalizeBackendUrl(backendUrl);
+            let origin;
+            try {
+                origin = normalizedBackend ? new URL(normalizedBackend).origin : null;
+            } catch {
+                origin = null;
+            }
+            const accountKey = typeof username === 'string'
+                ? username.normalize('NFKC').trim().toLowerCase()
+                : '';
+            if (!origin || !/^[a-z0-9_-]{1,20}$/.test(accountKey)) return null;
+            return `pro_chat_appearance:${encodeURIComponent(origin)}:${accountKey}`;
+        },
+
+        acceptVersionedPreferences(current, candidate) {
+            const normalizedCurrent = this.normalizeStoredAppearanceSnapshot(current) || Object.freeze({
+                preferences: this.defaultAppearancePreferences(), preferencesVersion: 0
+            });
+            const normalizedCandidate = this.normalizeStoredAppearanceSnapshot(candidate);
+            if (!normalizedCandidate || normalizedCandidate.preferencesVersion < normalizedCurrent.preferencesVersion) {
+                return { accepted: false, changed: false, snapshot: normalizedCurrent };
+            }
+            const samePreferences = ['theme', 'textScale', 'compactMessages', 'motion']
+                .every(key => normalizedCandidate.preferences[key] === normalizedCurrent.preferences[key]);
+            if (normalizedCandidate.preferencesVersion === normalizedCurrent.preferencesVersion) {
+                return { accepted: samePreferences, changed: false, snapshot: normalizedCurrent };
+            }
+            return { accepted: true, changed: true, snapshot: normalizedCandidate };
+        },
+
+        readAppearanceForm(elements) {
+            if (!elements) return null;
+            return this.normalizeAppearancePreferences({
+                theme: elements.theme && elements.theme.value,
+                textScale: Number(elements.textScale && elements.textScale.value),
+                compactMessages: (elements.compactMessages && elements.compactMessages.value) === 'true',
+                motion: elements.motion && elements.motion.value
+            });
+        },
+
+        applyAppearanceForm(elements, preferences) {
+            const normalized = this.normalizeAppearancePreferences(preferences);
+            if (!elements || !normalized) return false;
+            elements.theme.value = normalized.theme;
+            elements.textScale.value = String(normalized.textScale);
+            elements.compactMessages.value = String(normalized.compactMessages);
+            elements.motion.value = normalized.motion;
+            return true;
+        },
+
+        effectiveReducedMotion(preferences, deviceReducedMotion) {
+            return Boolean(preferences && (preferences.motion === 'reduce' ||
+                (preferences.motion === 'system' && deviceReducedMotion)));
+        },
+
+        createSessionContextCoordinator() {
+            let generation = 0;
+            let socketReference = null;
+            let connected = false;
+            let authenticated = false;
+            const advance = () => {
+                generation = generation >= Number.MAX_SAFE_INTEGER ? 1 : generation + 1;
+            };
+            const snapshot = () => Object.freeze({ socketReference, generation, connected, authenticated });
+            const controller = {
+                replace(socket) {
+                    advance();
+                    socketReference = socket || null;
+                    connected = false;
+                    authenticated = false;
+                    return snapshot();
+                },
+                connected(socket) {
+                    if (socket !== socketReference) return snapshot();
+                    advance();
+                    connected = true;
+                    authenticated = false;
+                    return snapshot();
+                },
+                disconnect(socket) {
+                    if (socket !== socketReference) return snapshot();
+                    advance();
+                    connected = false;
+                    authenticated = false;
+                    return snapshot();
+                },
+                authenticate(socket) {
+                    if (socket !== socketReference || !connected) return null;
+                    advance();
+                    authenticated = true;
+                    return snapshot();
+                },
+                invalidate() {
+                    advance();
+                    authenticated = false;
+                    return snapshot();
+                },
+                snapshot,
+                matches(candidate) {
+                    return Boolean(candidate && candidate.socketReference === socketReference &&
+                        candidate.generation === generation && connected && authenticated &&
+                        candidate.connected === true && candidate.authenticated === true);
+                }
+            };
+            return controller;
+        },
+
+        createSessionDispatchGuard({
+            sessionCoordinator,
+            getActiveSocket,
+            getCurrentRoomCode = () => null,
+            getClientContextId = () => null
+        } = {}) {
+            const canonicalRoom = value => {
+                if (typeof value !== 'string') return null;
+                const trimmed = value.trim();
+                if (trimmed.toLowerCase() === 'global') return 'global';
+                const upper = trimmed.toUpperCase();
+                return /^[A-Z0-9]{6}$/.test(upper) ? upper : null;
+            };
+            const positiveContext = value => Number.isSafeInteger(value) && value > 0 ? value : null;
+            const normalizedMessage = value => {
+                if (typeof value === 'string' && value.trim()) return value.trim();
+                if (Number.isSafeInteger(value) && value >= 0) return String(value);
+                return null;
+            };
+            const contextFields = context => {
+                const value = context && typeof context === 'object' ? context : {};
+                const result = {};
+                if (Object.prototype.hasOwnProperty.call(value, 'serverCode')) {
+                    const serverCode = canonicalRoom(value.serverCode);
+                    if (!serverCode) return null;
+                    result.serverCode = serverCode;
+                }
+                if (Object.prototype.hasOwnProperty.call(value, 'clientContextId')) {
+                    const clientContextId = positiveContext(value.clientContextId);
+                    if (!clientContextId) return null;
+                    result.clientContextId = clientContextId;
+                }
+                if (Object.prototype.hasOwnProperty.call(value, 'messageId') ||
+                    Object.prototype.hasOwnProperty.call(value, 'id')) {
+                    const messageId = normalizedMessage(value.messageId ?? value.id);
+                    if (!messageId) return null;
+                    result.messageId = messageId;
+                }
+                return result;
+            };
+            const sessionMatches = token => Boolean(token && token.session &&
+                getActiveSocket() === token.session.socketReference &&
+                sessionCoordinator.matches(token.session));
+            const contextMatches = (token, supplied) => {
+                const fields = contextFields(supplied);
+                if (!fields) return false;
+                if (Object.prototype.hasOwnProperty.call(fields, 'serverCode')) {
+                    if (token.serverCode && fields.serverCode !== token.serverCode) return false;
+                    if (canonicalRoom(getCurrentRoomCode()) !== fields.serverCode) return false;
+                }
+                if (Object.prototype.hasOwnProperty.call(fields, 'clientContextId')) {
+                    if (token.clientContextId && fields.clientContextId !== token.clientContextId) return false;
+                    if (positiveContext(getClientContextId()) !== fields.clientContextId) return false;
+                }
+                if (token.messageId && Object.prototype.hasOwnProperty.call(fields, 'messageId') && fields.messageId !== token.messageId) return false;
+                if (token.serverCode && canonicalRoom(getCurrentRoomCode()) !== token.serverCode) return false;
+                if (token.clientContextId && positiveContext(getClientContextId()) !== token.clientContextId) return false;
+                return true;
+            };
+            return {
+                capture(socketReference, context = {}) {
+                    const session = sessionCoordinator.snapshot();
+                    const fields = contextFields(context);
+                    if (socketReference !== getActiveSocket() || socketReference !== session.socketReference ||
+                        !sessionCoordinator.matches(session) || !fields) return null;
+                    return Object.freeze({ session, ...fields });
+                },
+                acceptSocket(bindingToken, payloadContext) {
+                    if (!sessionMatches(bindingToken)) return false;
+                    return contextMatches(bindingToken, payloadContext);
+                },
+                acceptCallback(requestToken, responseContext) {
+                    if (!sessionMatches(requestToken)) return false;
+                    return contextMatches(requestToken, responseContext);
+                }
+            };
+        },
+
+        createAuthenticatedListenerTable(dependencies = {}) {
+            const roomContext = payload => {
+                if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return {};
+                const context = {};
+                for (const key of ['serverCode', 'clientContextId', 'messageId', 'id']) {
+                    if (Object.prototype.hasOwnProperty.call(payload, key)) context[key] = payload[key];
+                }
+                return context;
+            };
+            const entry = (name, contextFromPayload = roomContext) => ({
+                contextFromPayload,
+                handle: typeof dependencies[name] === 'function' ? dependencies[name] : () => {}
+            });
+            return {
+                chat_message: entry('chatMessage'),
+                system_message: entry('systemMessage', () => ({})),
+                global_role_updated: entry('globalRoleUpdated', () => ({})),
+                room_role_updated: entry('roomRoleUpdated'),
+                room_access_updated: entry('roomAccessUpdated', () => ({})),
+                room_restriction_updated: entry('roomRestrictionUpdated', () => ({})),
+                moderation_queue_updated: entry('moderationQueueUpdated'),
+                message_blocked: entry('messageBlocked'),
+                profile_updated: entry('profileUpdated', () => ({})),
+                message_edited: entry('messageEdited'),
+                message_deleted: entry('messageDeleted', payload => ({ messageId: payload && payload.id ? payload.id : payload })),
+                reaction_updated: entry('reactionUpdated'),
+                admin_new_server: entry('adminNewServer', () => ({})),
+                server_deleted: entry('serverDeleted', () => ({})),
+                online_users: entry('onlineUsers', () => ({})),
+                typing: entry('typing')
+            };
+        },
+
+        createAuthenticatedSocketBinder({ socket, bindingToken, dispatchGuard, listenerTable } = {}) {
+            const wrappers = [];
+            for (const [eventName, entry] of Object.entries(listenerTable || {})) {
+                const wrapper = payload => {
+                    if (!dispatchGuard.acceptSocket(bindingToken)) return;
+                    const payloadContext = typeof entry.contextFromPayload === 'function'
+                        ? entry.contextFromPayload(payload) : {};
+                    if (!dispatchGuard.acceptSocket(bindingToken, payloadContext)) return;
+                    entry.handle(payload);
+                };
+                wrappers.push({ eventName, wrapper });
+                socket.on(eventName, wrapper);
+            }
+            let unbound = false;
+            return Object.freeze({
+                unbind() {
+                    if (unbound) return;
+                    unbound = true;
+                    for (const { eventName, wrapper } of wrappers) socket.off(eventName, wrapper);
+                }
+            });
+        },
+
+        createAcknowledgementHandlerMap(dependencies = {}) {
+            const kinds = ['switchHistory', 'editHistory', 'deletedMessage', 'moderation', 'settings', 'dialog', 'profile', 'roomOperation'];
+            return Object.freeze(Object.fromEntries(kinds.map(kind => [kind, Object.freeze({
+                success: typeof dependencies[`${kind}Success`] === 'function' ? dependencies[`${kind}Success`] : () => {},
+                error: typeof dependencies[`${kind}Error`] === 'function' ? dependencies[`${kind}Error`] : () => {}
+            })])));
+        },
+
+        createGuardedAcknowledgementAdapter({ dispatchGuard, handlers } = {}) {
+            return {
+                capture(kind, socketReference, context = {}) {
+                    const requestToken = dispatchGuard.capture(socketReference, context);
+                    if (!requestToken || !handlers || !handlers[kind]) return () => null;
+                    return response => {
+                        if (!dispatchGuard.acceptCallback(requestToken)) return null;
+                        const responseContext = {};
+                        if (response && typeof response === 'object') {
+                            for (const key of ['serverCode', 'clientContextId', 'messageId', 'id']) {
+                                if (Object.prototype.hasOwnProperty.call(response, key)) {
+                                    responseContext[key] = response[key];
+                                }
+                            }
+                        }
+                        if (!dispatchGuard.acceptCallback(requestToken, responseContext)) return null;
+                        const safeResponse = response || { error: 'No response from server.' };
+                        return safeResponse.error
+                            ? handlers[kind].error(safeResponse)
+                            : handlers[kind].success(safeResponse);
+                    };
+                }
+            };
+        },
+
+        createUnauthenticatedStateSanitizer(dependencies = {}) {
+            const sequence = [
+                'clearHistory', 'clearMembers', 'clearRoomState', 'clearServerState',
+                'resetRoles', 'resetTyping', 'resetComposition', 'resetAttachment',
+                'closeRoomDialogs', 'invalidateRequests', 'unbindAuthenticatedEvents',
+                'clearAudio', 'clearNavigation'
+            ];
+            return Object.freeze({
+                sanitize(reason) {
+                    for (const owner of sequence) {
+                        if (typeof dependencies[owner] === 'function') dependencies[owner]();
+                    }
+                    if (typeof dependencies.showAuthentication === 'function') dependencies.showAuthentication(reason);
+                    return reason;
+                }
+            });
+        },
+
+        createAppearanceController({
+            getSessionContext,
+            getBackendUrl,
+            getUsername,
+            storage,
+            rootElement,
+            formElements,
+            deviceReducedMotion = () => false,
+            onStatus = () => {},
+            onPendingChange = () => {},
+            emitUpdate = () => {}
+        } = {}) {
+            let appearanceSnapshot = Object.freeze({
+                preferences: this.defaultAppearancePreferences(), preferencesVersion: 0
+            });
+            let epoch = 0;
+            let nextSaveId = 0;
+            let pendingToken = null;
+            const applySnapshot = snapshot => {
+                appearanceSnapshot = Object.freeze({
+                    preferences: this.normalizeAppearancePreferences(snapshot.preferences),
+                    preferencesVersion: snapshot.preferencesVersion
+                });
+                if (rootElement && typeof rootElement.setAttribute === 'function') {
+                    rootElement.setAttribute('data-theme', appearanceSnapshot.preferences.theme);
+                    rootElement.setAttribute('data-text-scale', appearanceSnapshot.preferences.textScale);
+                    rootElement.setAttribute('data-density', appearanceSnapshot.preferences.compactMessages ? 'compact' : 'comfortable');
+                    rootElement.setAttribute('data-motion', this.effectiveReducedMotion(
+                        appearanceSnapshot.preferences, Boolean(deviceReducedMotion())) ? 'reduce' : 'system');
+                }
+                this.applyAppearanceForm(formElements, appearanceSnapshot.preferences);
+                return appearanceSnapshot;
+            };
+            const resetPending = () => {
+                if (pendingToken) onPendingChange(false);
+                pendingToken = null;
+            };
+            const sameSession = (left, right) => Boolean(left && right &&
+                left.socketReference === right.socketReference && left.generation === right.generation &&
+                right.connected === true && right.authenticated === true);
+            const writeSnapshot = (backendUrl, username, snapshot) => {
+                const key = this.appearanceCacheKey(backendUrl, username);
+                if (!key || !storage || typeof storage.setItem !== 'function') return;
+                try { storage.setItem(key, JSON.stringify(snapshot)); } catch {}
+            };
+            const acceptReduced = (backendUrl, username, candidate, authoritative = false) => {
+                const normalized = this.normalizeStoredAppearanceSnapshot(candidate);
+                if (!normalized) return { accepted: false, changed: false, snapshot: appearanceSnapshot };
+                const result = authoritative
+                    ? { accepted: true, changed: true, snapshot: normalized }
+                    : this.acceptVersionedPreferences(appearanceSnapshot, normalized);
+                if (result.accepted) {
+                    if (authoritative || result.changed) applySnapshot(result.snapshot);
+                    writeSnapshot(backendUrl, username, result.snapshot);
+                }
+                return result;
+            };
+            applySnapshot(appearanceSnapshot);
+            const controller = {
+                resetToDefaults: () => {
+                    epoch += 1;
+                    resetPending();
+                    return applySnapshot({ preferences: this.defaultAppearancePreferences(), preferencesVersion: 0 });
+                },
+                applyProvisionalCache: (backendUrl, username) => {
+                    epoch += 1;
+                    resetPending();
+                    let cached = null;
+                    const key = this.appearanceCacheKey(backendUrl, username);
+                    if (key && storage && typeof storage.getItem === 'function') {
+                        try {
+                            const raw = storage.getItem(key);
+                            cached = raw ? this.normalizeStoredAppearanceSnapshot(JSON.parse(raw)) : null;
+                        } catch {}
+                    }
+                    return applySnapshot(cached || { preferences: this.defaultAppearancePreferences(), preferencesVersion: 0 });
+                },
+                acceptAuthoritative: (backendUrl, username, candidate) => acceptReduced(backendUrl, username, candidate, true),
+                beginSave: preferences => {
+                    const normalized = this.normalizeAppearancePreferences(preferences);
+                    const session = typeof getSessionContext === 'function' ? getSessionContext() : null;
+                    if (!normalized || pendingToken || !session || !session.connected || !session.authenticated) return null;
+                    const token = Object.freeze({
+                        epoch,
+                        requestId: ++nextSaveId,
+                        session,
+                        socketReference: session.socketReference,
+                        backendUrl: getBackendUrl(),
+                        username: getUsername()
+                    });
+                    pendingToken = token;
+                    onPendingChange(true);
+                    const payload = Object.freeze({ preferences: normalized, expectedVersion: appearanceSnapshot.preferencesVersion });
+                    emitUpdate(payload, response => controller.finishSave(token, token.socketReference, response));
+                    return { token, payload };
+                },
+                finishSave: (token, socketReference, response) => {
+                    const currentSession = typeof getSessionContext === 'function' ? getSessionContext() : null;
+                    if (!token || token !== pendingToken || token.epoch !== epoch ||
+                        socketReference !== token.socketReference || !sameSession(token.session, currentSession)) return null;
+                    pendingToken = null;
+                    onPendingChange(false);
+                    const candidate = response && {
+                        preferences: response.preferences,
+                        preferencesVersion: response.preferencesVersion
+                    };
+                    if (response && response.error) {
+                        const result = acceptReduced(token.backendUrl, token.username, candidate, false);
+                        onStatus(response.error, false);
+                        return result;
+                    }
+                    const result = acceptReduced(token.backendUrl, token.username, candidate, false);
+                    if (result.accepted) onStatus('Appearance saved.', true);
+                    return result;
+                },
+                handleEvent: (socketReference, response) => {
+                    const session = typeof getSessionContext === 'function' ? getSessionContext() : null;
+                    if (!session || !session.connected || !session.authenticated || socketReference !== session.socketReference) return null;
+                    return acceptReduced(getBackendUrl(), getUsername(), response, false);
+                },
+                current: () => appearanceSnapshot
+            };
+            return controller;
+        },
+
+        createAppearanceRuntimeBridge({
+            sessionCoordinator,
+            appearanceController,
+            getActiveSocket,
+            enterSanitizedUnauthenticatedState = () => {},
+            onAuthenticated = () => {},
+            onAuthFailure = () => {}
+        } = {}) {
+            let selectedCandidate = null;
+            let authEpoch = 0;
+            const socketBindings = new Map();
+            const normalizedCandidateIdentity = (backendUrl, username) =>
+                this.appearanceCacheKey(backendUrl, username);
+            const normalizedAuthoritativeSnapshot = response => this.normalizeStoredAppearanceSnapshot({
+                preferences: response && response.preferences,
+                preferencesVersion: response && response.preferencesVersion
+            });
+            const installPreferenceAuthority = (socketReference, authority) => {
+                const binding = socketBindings.get(socketReference);
+                if (!binding) return;
+                if (binding.preferencesUpdated) {
+                    socketReference.off('preferences_updated', binding.preferencesUpdated);
+                }
+                const preferencesUpdated = response => {
+                    if (getActiveSocket() !== socketReference ||
+                        !sessionCoordinator.matches(authority)) return;
+                    appearanceController.handleEvent(socketReference, response);
+                };
+                binding.preferencesUpdated = preferencesUpdated;
+                socketReference.on('preferences_updated', preferencesUpdated);
+            };
+            const finishCurrent = token => {
+                const current = sessionCoordinator.snapshot();
+                return Boolean(token && token.epoch === authEpoch && token.session &&
+                    getActiveSocket() === token.session.socketReference &&
+                    current.socketReference === token.session.socketReference &&
+                    current.generation === token.session.generation && current.connected && !current.authenticated);
+            };
+            return {
+                selectAuthCandidate(backendUrl, username) {
+                    const identity = normalizedCandidateIdentity(backendUrl, username);
+                    if (selectedCandidate && selectedCandidate !== identity) {
+                        sessionCoordinator.invalidate();
+                        enterSanitizedUnauthenticatedState('account-change');
+                    }
+                    selectedCandidate = identity;
+                    authEpoch += 1;
+                    return appearanceController.applyProvisionalCache(backendUrl, username);
+                },
+                beginConnectedAuth(socketReference) {
+                    const session = sessionCoordinator.snapshot();
+                    if (socketReference !== getActiveSocket() || socketReference !== session.socketReference ||
+                        !session.connected || session.authenticated) return null;
+                    return Object.freeze({ epoch: ++authEpoch, session });
+                },
+                finishAuth(authToken, backendUrl, username, response) {
+                    if (!finishCurrent(authToken)) return null;
+                    if (!response || response.error) {
+                        appearanceController.resetToDefaults();
+                        onAuthFailure(response && response.error ? response.error : 'No response from server.');
+                        return { accepted: false };
+                    }
+                    const authoritativeSnapshot = normalizedAuthoritativeSnapshot(response);
+                    if (!authoritativeSnapshot) {
+                        appearanceController.resetToDefaults();
+                        onAuthFailure('Invalid appearance settings response.');
+                        return { accepted: false };
+                    }
+                    const authenticated = sessionCoordinator.authenticate(authToken.session.socketReference);
+                    if (!authenticated) return null;
+                    installPreferenceAuthority(authToken.session.socketReference, authenticated);
+                    const result = appearanceController.acceptAuthoritative(
+                        backendUrl, username, authoritativeSnapshot);
+                    onAuthenticated(response);
+                    return result;
+                },
+                save(preferences) {
+                    return appearanceController.beginSave(preferences);
+                },
+                bindSocket(socketReference) {
+                    const connect = () => {
+                        if (socketReference !== getActiveSocket()) return;
+                        sessionCoordinator.connected(socketReference);
+                    };
+                    const disconnect = () => {
+                        if (socketReference !== getActiveSocket()) return;
+                        authEpoch += 1;
+                        sessionCoordinator.disconnect(socketReference);
+                        installPreferenceAuthority(socketReference, sessionCoordinator.snapshot());
+                        appearanceController.resetToDefaults();
+                        enterSanitizedUnauthenticatedState('disconnect');
+                    };
+                    socketReference.on('connect', connect);
+                    socketReference.on('disconnect', disconnect);
+                    const binding = { connect, disconnect, preferencesUpdated: null };
+                    socketBindings.set(socketReference, binding);
+                    installPreferenceAuthority(socketReference, sessionCoordinator.snapshot());
+                    let unbound = false;
+                    return Object.freeze({ unbind() {
+                        if (unbound) return;
+                        unbound = true;
+                        socketReference.off('connect', connect);
+                        socketReference.off('disconnect', disconnect);
+                        if (binding.preferencesUpdated) {
+                            socketReference.off('preferences_updated', binding.preferencesUpdated);
+                        }
+                        socketBindings.delete(socketReference);
+                    } });
+                },
+                invalidate() {
+                    authEpoch += 1;
+                    sessionCoordinator.invalidate();
+                    appearanceController.resetToDefaults();
+                }
+            };
         },
 
         replaceSocket(oldSocket, oldUrl, newUrl, ioFactory) {
@@ -1188,14 +1911,19 @@
             socket,
             request,
             apply,
+            captureAcknowledgement,
             blockWhilePending = false
         }) {
             const token = coordinator.beginRequest(request, blockWhilePending);
             if (!token) return null;
-            socket.emit(request.event, request.payload, response => {
+            const acknowledgement = response => {
                 if (!coordinator.finishRequest(token)) return;
                 apply(response || { error: 'No response from server.' }, token);
-            });
+            };
+            socket.emit(request.event, request.payload,
+                typeof captureAcknowledgement === 'function'
+                    ? captureAcknowledgement(acknowledgement, request, token)
+                    : acknowledgement);
             return token;
         },
 
@@ -1265,10 +1993,13 @@
         createSwitchCoordinator(emitSwitch, handleResult) {
             let inFlightTarget = null;
             let queuedTarget = null;
+            let epoch = 0;
 
             const start = target => {
+                const requestEpoch = epoch;
                 inFlightTarget = target;
                 emitSwitch(target, result => {
+                    if (requestEpoch !== epoch) return;
                     try {
                         handleResult(target, result);
                     } finally {
@@ -1295,6 +2026,11 @@
                         return;
                     }
                     start(target);
+                },
+                invalidate() {
+                    epoch += 1;
+                    inFlightTarget = null;
+                    queuedTarget = null;
                 }
             };
         },
@@ -1324,13 +2060,16 @@
         createScrollCoordinator(scheduleFrame, getScroller, shouldReduceMotion = () => false) {
             let scheduled = false;
             let pendingBehavior = null;
+            let epoch = 0;
 
             return {
                 request(behavior = 'smooth') {
                     pendingBehavior = pendingBehavior === 'auto' || behavior === 'auto' ? 'auto' : 'smooth';
                     if (scheduled) return;
                     scheduled = true;
+                    const requestEpoch = epoch;
                     scheduleFrame(() => {
+                        if (requestEpoch !== epoch) return;
                         const requestedBehavior = pendingBehavior;
                         pendingBehavior = null;
                         scheduled = false;
@@ -1341,6 +2080,11 @@
                             : requestedBehavior;
                         scroller.scrollTo({ top: scroller.scrollHeight, behavior });
                     });
+                },
+                invalidate() {
+                    epoch += 1;
+                    scheduled = false;
+                    pendingBehavior = null;
                 }
             };
         }
@@ -1404,7 +2148,7 @@
 
     // --- AVATAR ENGINE ---
     function getUserColor(name) {
-        if(name.toLowerCase() === 'nyzhang1' || name === 'System') return '#ed4245'; 
+        if(name.toLowerCase() === 'nyzhang1' || name === 'System') return 'var(--error-surface)';
         let hash = 0; for (let i = 0; i < name.length; i++) hash = name.charCodeAt(i) + ((hash << 5) - hash);
         return `hsl(${Math.abs(hash % 360)}, 70%, 55%)`;
     }
@@ -1432,6 +2176,10 @@
     let myBannedRooms = new Set();
     let serversCache = { 'global': { name: 'Global Chat', owner: 'System' } }; 
     let usersCache = {}; 
+    let appearanceSnapshot = {
+        preferences: ChatClientHelpers.defaultAppearancePreferences(),
+        preferencesVersion: 0
+    };
     let compositionDisabled = true;
     let selectedModerationRequest = null;
     let selectedReportRequest = null;
@@ -1455,8 +2203,11 @@
     const scheduleAnimationFrame = window.requestAnimationFrame
         ? callback => window.requestAnimationFrame(callback)
         : callback => setTimeout(callback, 0);
-    const prefersReducedMotion = () =>
-        typeof window.matchMedia === 'function' && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const prefersReducedMotion = () => ChatClientHelpers.effectiveReducedMotion(
+        appearanceSnapshot.preferences,
+        typeof window.matchMedia === 'function' &&
+            window.matchMedia('(prefers-reduced-motion: reduce)').matches
+    );
     const chatScrollCoordinator = ChatClientHelpers.createScrollCoordinator(
         scheduleAnimationFrame,
         () => chatWindow,
@@ -1469,9 +2220,21 @@
     const fileUpload = document.getElementById('file-upload');
     const restrictionNotice = document.getElementById('restriction-notice');
     const roomSwitchCoordinator = ChatClientHelpers.createSwitchCoordinator(
-        (code, callback) => socket.emit('switch_server', code, callback),
+        emitGuardedSwitchRequest,
         handleSwitchResult
     );
+
+    function emitGuardedSwitchRequest(code, callback) {
+        const handlers = ChatClientHelpers.createAcknowledgementHandlerMap({
+            switchHistorySuccess: callback,
+            switchHistoryError: callback
+        });
+        const guarded = ChatClientHelpers.createGuardedAcknowledgementAdapter({
+            dispatchGuard: sessionDispatchGuard,
+            handlers
+        });
+        socket.emit('switch_server', code, guarded.capture('switchHistory', socket, {}));
+    }
     const restrictionCoordinator = ChatClientHelpers.createRestrictionCoordinator({
         schedule: (callback, delay) => setTimeout(callback, delay),
         cancel: timerId => clearTimeout(timerId),
@@ -1520,6 +2283,219 @@
             document.getElementById('resolution-confirm').disabled = pending;
         }
     });
+    const messageDetailCoordinator = ChatClientHelpers.createDialogRequestCoordinator();
+    const sessionContextCoordinator = ChatClientHelpers.createSessionContextCoordinator();
+    const authenticatedListenerTables = new Map();
+    let authenticatedSocketBinding = null;
+    let appearanceSocketBinding = null;
+    const sessionDispatchGuard = ChatClientHelpers.createSessionDispatchGuard({
+        sessionCoordinator: sessionContextCoordinator,
+        getActiveSocket: () => socket,
+        getCurrentRoomCode: () => currentServerCode,
+        getClientContextId: () => compositionContextCoordinator.current().clientContextId
+    });
+
+    function appearanceFormElements() {
+        return {
+            theme: document.getElementById('appearance-theme'),
+            textScale: document.getElementById('appearance-text-scale'),
+            compactMessages: document.getElementById('appearance-compact'),
+            motion: document.getElementById('appearance-motion')
+        };
+    }
+
+    const appearanceControllerCore = ChatClientHelpers.createAppearanceController({
+        getSessionContext: () => sessionContextCoordinator.snapshot(),
+        getBackendUrl: () => socketUrl,
+        getUsername: () => myUsername,
+        storage: localStorage,
+        rootElement: document.documentElement,
+        formElements: appearanceFormElements(),
+        deviceReducedMotion: () => typeof window.matchMedia === 'function' &&
+            window.matchMedia('(prefers-reduced-motion: reduce)').matches,
+        onStatus(message, success) {
+            appearanceSnapshot = appearanceControllerCore.current();
+            const status = document.getElementById('appearance-status');
+            status.textContent = message || '';
+            status.style.color = success ? 'var(--success-text)' : 'var(--error-text)';
+        },
+        onPendingChange(pending) {
+            const control = document.getElementById('save-appearance-btn');
+            control.disabled = pending;
+            control.textContent = pending ? 'Saving...' : 'Save Appearance';
+        },
+        emitUpdate(payload, callback) {
+            if (socket && socket.connected) socket.emit('update_preferences', payload, callback);
+        }
+    });
+    const synchronizeAppearance = result => {
+        appearanceSnapshot = appearanceControllerCore.current();
+        return result;
+    };
+    const appearanceController = {
+        resetToDefaults: () => synchronizeAppearance(appearanceControllerCore.resetToDefaults()),
+        applyProvisionalCache: (backendUrl, username) => synchronizeAppearance(
+            appearanceControllerCore.applyProvisionalCache(backendUrl, username)),
+        acceptAuthoritative: (backendUrl, username, candidate) => synchronizeAppearance(
+            appearanceControllerCore.acceptAuthoritative(backendUrl, username, candidate)),
+        beginSave: preferences => appearanceControllerCore.beginSave(preferences),
+        finishSave: (token, socketReference, response) => synchronizeAppearance(
+            appearanceControllerCore.finishSave(token, socketReference, response)),
+        handleEvent: (socketReference, response) => synchronizeAppearance(
+            appearanceControllerCore.handleEvent(socketReference, response)),
+        current: () => appearanceControllerCore.current()
+    };
+
+    const unauthenticatedStateSanitizer = ChatClientHelpers.createUnauthenticatedStateSanitizer({
+        clearHistory() { chatWindow.textContent = ''; },
+        clearMembers() {
+            usersCache = {};
+            document.getElementById('online-list').textContent = '';
+            document.getElementById('online-header').textContent = 'No active room';
+        },
+        clearRoomState() {
+            currentServerCode = null;
+            document.getElementById('server-title').textContent = 'Lobby';
+        },
+        clearServerState() {
+            myJoinedServers = [];
+            myBannedRooms = new Set();
+            serversCache = { global: { name: 'Global Chat', owner: 'System' } };
+            document.getElementById('dynamic-servers').textContent = '';
+        },
+        resetRoles() {
+            myUsername = '';
+            myDisplayName = '';
+            myAvatarUrl = '';
+            myColor = '';
+            myRole = 'user';
+            myRoomRole = 'user';
+        },
+        resetTyping() {
+            clearTimeout(typingTimeout);
+            typingUsers.clear();
+            updateTypingUI();
+        },
+        resetComposition() {
+            compositionContextCoordinator.invalidate();
+            editingMsgId = null;
+            replyingToData = null;
+            msgInput.value = '';
+            setCompositionDisabled(true);
+        },
+        resetAttachment() {
+            attachmentLoadEpoch += 1;
+            pendingAttachmentBase64 = null;
+            document.getElementById('attachment-preview').classList.remove('show');
+            document.getElementById('preview-img').src = '';
+            document.getElementById('file-upload').value = '';
+        },
+        closeRoomDialogs() {
+            closeModeratorCenter();
+            closeModerationPrompt();
+            closeReportPrompt();
+            closeResolutionPrompt();
+            document.getElementById('history-modal').classList.remove('active');
+            const contextMenu = document.getElementById('user-context-menu');
+            if (contextMenu) contextMenu.remove();
+            document.querySelectorAll('.modal').forEach(modal => {
+                if (modal !== authModal) modal.classList.remove('active');
+            });
+        },
+        invalidateRequests() {
+            roomSwitchCoordinator.invalidate();
+            restrictionCoordinator.clear();
+            moderatorCenterCoordinator.close();
+            moderationDialogCoordinator.invalidate();
+            reportDialogCoordinator.invalidate();
+            resolutionDialogCoordinator.invalidate();
+            messageDetailCoordinator.invalidate();
+            const profileSave = document.getElementById('save-settings-btn');
+            profileSave.disabled = false;
+            profileSave.textContent = 'Save Profile';
+            const passwordSave = document.getElementById('change-password-btn');
+            passwordSave.disabled = false;
+            passwordSave.textContent = 'Change Password';
+        },
+        unbindAuthenticatedEvents() {
+            if (authenticatedSocketBinding) authenticatedSocketBinding.unbind();
+            authenticatedSocketBinding = null;
+        },
+        clearAudio() {},
+        clearNavigation() {
+            chatScrollCoordinator.invalidate();
+            document.querySelectorAll('.server-icon').forEach(icon => icon.classList.remove('active'));
+        },
+        showAuthentication(reason) {
+            authModal.classList.add('active');
+            document.getElementById('appearance-status').textContent = '';
+            if (reason === 'disconnect') showError('Connection lost. Please log in again.', false);
+        }
+    });
+
+    function enterSanitizedUnauthenticatedState(reason) {
+        return unauthenticatedStateSanitizer.sanitize(reason);
+    }
+
+    const appearanceRuntimeBridge = ChatClientHelpers.createAppearanceRuntimeBridge({
+        sessionCoordinator: sessionContextCoordinator,
+        appearanceController,
+        getActiveSocket: () => socket,
+        enterSanitizedUnauthenticatedState
+    });
+
+    function applyAppearanceSnapshot(snapshot = appearanceController.current()) {
+        appearanceSnapshot = snapshot;
+        document.documentElement.setAttribute('data-motion',
+            ChatClientHelpers.effectiveReducedMotion(appearanceSnapshot.preferences,
+                typeof window.matchMedia === 'function' &&
+                    window.matchMedia('(prefers-reduced-motion: reduce)').matches)
+                ? 'reduce' : 'system');
+        return appearanceSnapshot;
+    }
+
+    if (typeof window.matchMedia === 'function') {
+        const deviceMotionPreference = window.matchMedia('(prefers-reduced-motion: reduce)');
+        const updateDeviceMotionPolicy = () => applyAppearanceSnapshot();
+        if (typeof deviceMotionPreference.addEventListener === 'function') {
+            deviceMotionPreference.addEventListener('change', updateDeviceMotionPolicy);
+        } else if (typeof deviceMotionPreference.addListener === 'function') {
+            deviceMotionPreference.addListener(updateDeviceMotionPolicy);
+        }
+    }
+
+    function saveAppearanceSettings() {
+        const preferences = ChatClientHelpers.readAppearanceForm(appearanceFormElements());
+        if (!preferences) return null;
+        document.getElementById('appearance-status').textContent = '';
+        return appearanceRuntimeBridge.save(preferences);
+    }
+
+    function bindAuthenticatedSocketEvents(socketReference, authenticatedSnapshot) {
+        if (authenticatedSocketBinding) authenticatedSocketBinding.unbind();
+        const listenerTable = authenticatedListenerTables.get(socketReference) ||
+            ChatClientHelpers.createAuthenticatedListenerTable();
+        const bindingToken = sessionDispatchGuard.capture(socketReference, {});
+        if (!bindingToken || authenticatedSnapshot.generation !== bindingToken.session.generation) return null;
+        authenticatedSocketBinding = ChatClientHelpers.createAuthenticatedSocketBinder({
+            socket: socketReference,
+            bindingToken,
+            dispatchGuard: sessionDispatchGuard,
+            listenerTable
+        });
+        return authenticatedSocketBinding;
+    }
+
+    function guardedRequestAcknowledgement(kind, context, handler) {
+        const handlers = ChatClientHelpers.createAcknowledgementHandlerMap({
+            [`${kind}Success`]: handler,
+            [`${kind}Error`]: handler
+        });
+        return ChatClientHelpers.createGuardedAcknowledgementAdapter({
+            dispatchGuard: sessionDispatchGuard,
+            handlers
+        }).capture(kind, socket, context);
+    }
 
     function setCompositionDisabled(disabled, notice = '') {
         compositionDisabled = Boolean(disabled);
@@ -1623,7 +2599,7 @@
             }
             if (code !== 'global' && myRole === 'admin' && !myJoinedServers.includes(code) && !banned) {
                 icon.style.opacity = '0.4';
-                icon.style.border = '1px dashed #8e9297';
+                icon.style.border = '1px dashed var(--border-color)';
             } else {
                 icon.style.opacity = '';
                 icon.style.border = '';
@@ -1705,7 +2681,7 @@
             action: normalized.action,
             duration: normalized.duration,
             reason: normalized.reason
-        }, response => {
+        }, guardedRequestAcknowledgement('moderation', { serverCode: request.roomCode }, response => {
             if (!moderationDialogCoordinator.finish(token)) return;
             const result = response || { error: 'No response from server.' };
             if (result.error) {
@@ -1715,7 +2691,7 @@
             closeModerationPrompt();
             showAppAlert('Moderation applied', 'The room restriction was updated.');
             if (typeof request.onSuccess === 'function') request.onSuccess();
-        });
+        }));
     }
 
     function closeReportPrompt() {
@@ -1763,13 +2739,14 @@
         }
         const token = reportDialogCoordinator.begin(request.identity);
         if (!token) return;
-        ChatClientHelpers.dispatchModerationReport(socket, payload, response => {
+        ChatClientHelpers.dispatchModerationReport(socket, payload,
+            guardedRequestAcknowledgement('moderation', { serverCode: request.roomCode }, response => {
             if (!reportDialogCoordinator.finish(token)) return;
             const result = response || { error: 'No response from server.' };
             if (result.error) return showAppAlert('Report failed', result.error);
             closeReportPrompt();
             showAppAlert('Report submitted', 'Moderators can now review this report.');
-        });
+        }));
     }
 
     document.getElementById('moderation-action-close').onclick = closeModerationPrompt;
@@ -1859,6 +2836,8 @@
             socket,
             request,
             blockWhilePending: append,
+            captureAcknowledgement: callback => guardedRequestAcknowledgement(
+                'moderation', { serverCode: requestedRoom }, callback),
             apply(response) {
                 renderers[tab](response, append);
             }
@@ -2027,6 +3006,8 @@
             coordinator: moderatorCenterCoordinator,
             socket,
             request: ChatClientHelpers.moderatorCenterMutationRequestFor('automod', payload),
+            captureAcknowledgement: callback => guardedRequestAcknowledgement(
+                'moderation', { serverCode: requestedRoom }, callback),
             apply(result) {
                 if (result.error) {
                     document.getElementById('automod-error').textContent = result.error;
@@ -2086,7 +3067,8 @@
         }
         const token = resolutionDialogCoordinator.begin(request.identity);
         if (!token) return;
-        socket.emit('resolve_moderation_report', payload, response => {
+        socket.emit('resolve_moderation_report', payload,
+            guardedRequestAcknowledgement('moderation', { serverCode: request.roomCode }, response => {
             if (!resolutionDialogCoordinator.finish(token)) return;
             const result = response || { error: 'No response from server.' };
             if (result.error) {
@@ -2095,7 +3077,7 @@
             }
             closeResolutionPrompt();
             loadModeratorCenterTab('reports');
-        });
+        }));
     }
 
     document.getElementById('moderator-center-close').onclick = closeModeratorCenter;
@@ -2232,7 +3214,7 @@
         if(e.target.value.length === 7 && e.target.value.startsWith('#')) document.getElementById('setting-color-picker').value = e.target.value;
     });
 
-    function openSettings() {
+    function openSettings(section = 'profile') {
         document.getElementById('setting-displayname').value = myDisplayName || "";
         document.getElementById('setting-avatar').value = myAvatarUrl || "";
         document.getElementById('setting-color-text').value = myColor || "";
@@ -2241,8 +3223,12 @@
 
         if(myColor && myColor.startsWith('#') && myColor.length === 7) { document.getElementById('setting-color-picker').value = myColor; } 
         else { document.getElementById('setting-color-picker').value = '#5865F2'; }
+        ChatClientHelpers.applyAppearanceForm(appearanceFormElements(), appearanceController.current().preferences);
         document.getElementById('settings-modal').classList.add('active');
+        if (section === 'appearance') document.getElementById('appearance-theme').focus();
     }
+
+    document.getElementById('save-appearance-btn').onclick = saveAppearanceSettings;
 
     document.getElementById('save-settings-btn').onclick = () => {
         const dName = document.getElementById('setting-displayname').value.trim();
@@ -2255,7 +3241,8 @@
         const btn = document.getElementById('save-settings-btn');
         btn.textContent = "Saving..."; btn.disabled = true;
 
-        socket.emit('update_profile', { displayName: dName, avatarUrl, color: color }, (res) => {
+        socket.emit('update_profile', { displayName: dName, avatarUrl, color: color },
+            guardedRequestAcknowledgement('profile', {}, res => {
             btn.textContent = "Save Profile"; btn.disabled = false;
             res = res || { error: 'No response from server.' };
             if(res.error) { showAppAlert("Error", res.error || "Failed to update profile."); } 
@@ -2265,7 +3252,7 @@
                 myColor = res.color;
                 showAppAlert("Success", "Profile updated! Your new look will apply immediately.");
             }
-        });
+        }));
     };
 
     document.getElementById('change-password-btn').onclick = () => {
@@ -2278,7 +3265,8 @@
         const btn = document.getElementById('change-password-btn');
         btn.textContent = "Changing..."; btn.disabled = true;
 
-        socket.emit('change_password', { oldPassword, newPassword }, (res) => {
+        socket.emit('change_password', { oldPassword, newPassword },
+            guardedRequestAcknowledgement('settings', {}, res => {
             btn.textContent = "Change Password"; btn.disabled = false;
             res = res || { error: 'No response from server.' };
             if(res.error) { showAppAlert("Error", res.error); } 
@@ -2287,16 +3275,16 @@
                 document.getElementById('setting-new-password').value = '';
                 showAppAlert("Success", "Password updated successfully!");
             }
-        });
+        }));
     };
 
     document.getElementById('logout-all-btn').onclick = async () => {
         if (await showAppConfirm("Logout Everywhere", "Are you sure you want to log out of all other devices you've signed into?", "Logout All", true)) {
-            socket.emit('logout_all_devices', (res) => {
+            socket.emit('logout_all_devices', guardedRequestAcknowledgement('settings', {}, res => {
                 res = res || { error: 'No response from server.' };
                 if (res.success) showAppAlert("Success", "Logged out of all other active sessions.");
                 else showAppAlert("Error", res.error || "Failed to execute request.");
-            });
+            }));
         }
     };
 
@@ -2327,6 +3315,8 @@
 
     async function logoutApp() {
         if (await showAppConfirm("Log Out", "Are you sure you want to log out of your account?", "Log Out", true)) {
+            appearanceRuntimeBridge.invalidate();
+            enterSanitizedUnauthenticatedState('logout');
             localStorage.removeItem('pro_chat_user'); location.reload(); 
         }
     }
@@ -2354,25 +3344,36 @@
         socket = replacement.socket;
         socketUrl = replacement.socketUrl;
         if (socket !== previousSocket) {
-            compositionContextCoordinator.invalidate();
-            closeModerationPrompt();
-            closeReportPrompt();
-            invalidatePrivilegedAccess();
+            if (appearanceSocketBinding) appearanceSocketBinding.unbind();
+            appearanceSocketBinding = null;
+            enterSanitizedUnauthenticatedState('socket-replacement');
+            sessionContextCoordinator.replace(socket);
             setupSocket(socket);
+            appearanceSocketBinding = appearanceRuntimeBridge.bindSocket(socket);
+            if (socket.connected) sessionContextCoordinator.connected(socket);
         }
+        appearanceRuntimeBridge.selectAuthCandidate(url, user);
         const authSocket = socket;
 
         const action = isLoginMode ? 'login' : 'register';
         const payload = isLoginMode ? { username: user, password: pass } : { username: user, password: pass, displayName: dName };
         
         const doAuth = () => {
+            const authToken = appearanceRuntimeBridge.beginConnectedAuth(authSocket);
+            if (!authToken) {
+                authBtn.disabled = false;
+                return showError('Connection changed. Please try again.', false);
+            }
             authSocket.emit(action, payload, (res) => {
-                if (authSocket !== socket) return;
+                const authResult = appearanceRuntimeBridge.finishAuth(authToken, url, user, res);
+                if (!authResult) return;
                 authBtn.disabled = false;
                 res = res || { error: 'No response from server.' };
                 if (res.error) return showError(res.error, false);
+                if (!authResult.accepted) return showError('Invalid appearance settings response.', false);
                 
                 if (action === 'register') {
+                    appearanceRuntimeBridge.invalidate();
                     showError("Registered! You can now log in.", true);
                     document.getElementById('password-input').value = "";
                     setTimeout(() => document.getElementById('tab-login').click(), 1000);
@@ -2385,6 +3386,8 @@
                     roomAccessCoordinator.replaceBannedRooms(res.bannedRooms || []);
                     myAvatarUrl = res.avatarUrl || ''; 
                     myColor = res.color || '';
+                    applyAppearanceSnapshot();
+                    bindAuthenticatedSocketEvents(authSocket, sessionContextCoordinator.snapshot());
                     
                     if (audioCtx.state === 'suspended') audioCtx.resume();
                     
@@ -2416,7 +3419,7 @@
         }
     });
 
-    function showError(msg, success) { authError.style.color = success ? "var(--success)" : "var(--error)"; authError.textContent = msg; }
+    function showError(msg, success) { authError.style.color = success ? "var(--success-text)" : "var(--error-text)"; authError.textContent = msg; }
 
     function setupSocket(activeSocket) {
         ChatClientHelpers.bindConnectErrorRecovery({
@@ -2428,10 +3431,29 @@
         });
         
         activeSocket.on('force_logout', (msg) => {
+            if (activeSocket !== socket || !sessionContextCoordinator.snapshot().authenticated) return;
             localStorage.removeItem('pro_chat_user'); alert(msg || "You have been logged out remotely."); location.reload(); 
         });
 
-        activeSocket.on('chat_message', (msg) => {
+        const listenerDependencyNames = {
+            chat_message: 'chatMessage', system_message: 'systemMessage',
+            global_role_updated: 'globalRoleUpdated', room_role_updated: 'roomRoleUpdated',
+            room_access_updated: 'roomAccessUpdated', room_restriction_updated: 'roomRestrictionUpdated',
+            moderation_queue_updated: 'moderationQueueUpdated', message_blocked: 'messageBlocked',
+            profile_updated: 'profileUpdated', message_edited: 'messageEdited',
+            message_deleted: 'messageDeleted', reaction_updated: 'reactionUpdated',
+            admin_new_server: 'adminNewServer', server_deleted: 'serverDeleted',
+            online_users: 'onlineUsers', typing: 'typing'
+        };
+        const listenerDependencies = {};
+        const authenticatedEventTarget = {
+            on(eventName, handler) {
+                const dependencyName = listenerDependencyNames[eventName];
+                if (dependencyName) listenerDependencies[dependencyName] = handler;
+            }
+        };
+
+        authenticatedEventTarget.on('chat_message', (msg) => {
             ChatClientHelpers.dispatchRoomEvent(currentServerCode, data => {
                 const isMe = data.username === myUsername;
                 appendMessage(data, isMe);
@@ -2444,11 +3466,11 @@
             }, msg);
         });
         
-        activeSocket.on('system_message', (txt) => {
+        authenticatedEventTarget.on('system_message', (txt) => {
             ChatClientHelpers.dispatchRoomEvent(currentServerCode, appendSystemMessage, txt);
         });
 
-        activeSocket.on('global_role_updated', (data) => {
+        authenticatedEventTarget.on('global_role_updated', (data) => {
             if (data.username === myUsername) {
                 myRole = data.role;
                 if (data.role !== 'admin') invalidatePrivilegedAccess();
@@ -2459,7 +3481,7 @@
             }
         });
         
-        activeSocket.on('room_role_updated', (data) => {
+        authenticatedEventTarget.on('room_role_updated', (data) => {
             if (data.username === myUsername && data.targetServer === currentServerCode) {
                 myRoomRole = 'user';
                 invalidatePrivilegedAccess();
@@ -2467,7 +3489,7 @@
             }
         });
 
-        activeSocket.on('room_access_updated', (data) => {
+        authenticatedEventTarget.on('room_access_updated', (data) => {
             if (!data || data.username !== myUsername) return;
             closeModerationPrompt();
             closeReportPrompt();
@@ -2477,19 +3499,19 @@
             roomAccessCoordinator.handleAccessUpdate(data);
         });
 
-        activeSocket.on('room_restriction_updated', (data) => {
+        authenticatedEventTarget.on('room_restriction_updated', (data) => {
             if (data && data.serverCode === currentServerCode && data.banned) enterLobby();
             roomAccessCoordinator.handleRestrictionUpdate(data);
         });
 
-        activeSocket.on('moderation_queue_updated', (data) => {
+        authenticatedEventTarget.on('moderation_queue_updated', (data) => {
             if (!data || data.serverCode !== moderatorCenterRoom ||
                 currentServerCode !== moderatorCenterRoom ||
                 !document.getElementById('moderator-center-modal').classList.contains('active')) return;
             loadModeratorCenterTab(moderatorCenterTab);
         });
 
-        activeSocket.on('message_blocked', (data) => {
+        authenticatedEventTarget.on('message_blocked', (data) => {
             const context = compositionContextCoordinator.current();
             if (!ChatClientHelpers.shouldDisplayMessageBlocked({
                 data,
@@ -2499,7 +3521,7 @@
             showAppAlert('Message blocked', "Your message was blocked by this room's content policy.");
         });
         
-        activeSocket.on('profile_updated', (data) => {
+        authenticatedEventTarget.on('profile_updated', (data) => {
             if (data.username === myUsername) { myColor = data.color; myAvatarUrl = data.avatarUrl; myDisplayName = data.displayName || data.username; }
             document.querySelectorAll(`.msg[data-author="${data.username}"]`).forEach(el => {
                 if (el.classList.contains('deleted-compact')) return;
@@ -2526,7 +3548,7 @@
             });
         });
 
-        activeSocket.on('message_edited', (data) => {
+        authenticatedEventTarget.on('message_edited', (data) => {
             document.querySelectorAll(`.msg[data-id="${data.id}"]`).forEach(el => {
                 el.setAttribute('data-raw-text', data.text); 
                 el.classList.remove('pinged'); 
@@ -2563,7 +3585,7 @@
             });
         });
 
-        activeSocket.on('message_deleted', (id) => {
+        authenticatedEventTarget.on('message_deleted', (id) => {
             document.querySelectorAll(`.msg[data-id="${id}"]`).forEach(el => {
                 const authorName = el.getAttribute('data-display') || el.getAttribute('data-author') || 'Someone';
                 const isMe = el.getAttribute('data-author') === myUsername;
@@ -2589,7 +3611,7 @@
             }); 
         });
 
-        activeSocket.on('reaction_updated', (data) => {
+        authenticatedEventTarget.on('reaction_updated', (data) => {
             const msgEl = document.querySelector(`.msg[data-id="${data.id}"]`);
             if (msgEl && !msgEl.classList.contains('deleted-compact')) {
                 let container = msgEl.querySelector('.msg-reactions');
@@ -2603,9 +3625,9 @@
             }
         });
         
-        activeSocket.on('admin_new_server', (srv) => { if (myRole === 'admin') addServerToList(srv.code, srv.name, srv.owner); });
+        authenticatedEventTarget.on('admin_new_server', (srv) => { if (myRole === 'admin') addServerToList(srv.code, srv.name, srv.owner); });
 
-        activeSocket.on('server_deleted', (code) => {
+        authenticatedEventTarget.on('server_deleted', (code) => {
             myJoinedServers = myJoinedServers.filter(c => c !== code);
             const icon = document.getElementById(`srv-${code}`);
             if (icon) icon.remove();
@@ -2618,7 +3640,7 @@
         });
 
         // --- ONLINE USERS RENDERER & ROLE SYNC ---
-        activeSocket.on('online_users', (users) => {
+        authenticatedEventTarget.on('online_users', (users) => {
             ChatClientHelpers.dispatchRoomEvent(currentServerCode, roomUsers => {
             const list = document.getElementById('online-list');
             list.innerHTML = '';
@@ -2654,9 +3676,9 @@
                 const avatar = ChatClientHelpers.appendTextElement(document, li, 'div', 'avatar', 'A');
                 avatar.style.background = 'var(--error)';
                 const statusDot = ChatClientHelpers.appendTextElement(document, avatar, 'div', 'status-dot online', '');
-                statusDot.style.background = 'var(--warning)';
+                statusDot.style.background = 'var(--warning-surface)';
                 const ghostLabel = ChatClientHelpers.appendTextElement(document, li, 'div', '', `${myDisplayName} (Ghost)`);
-                ghostLabel.style.color = 'var(--warning)';
+                ghostLabel.style.color = 'var(--warning-text)';
                 ghostLabel.style.fontStyle = 'italic';
                 list.appendChild(li);
                 usersCache[myUsername] = myDisplayName;
@@ -2701,8 +3723,8 @@
                 userLabel.style.fontWeight = '600';
                 if (u.role === 'admin') {
                     const badge = ChatClientHelpers.appendTextElement(document, userLabel, 'span', 'admin-badge', 'ADMIN');
-                    badge.style.background = '#ed4245';
-                    badge.style.borderColor = '#ed4245';
+                    badge.style.background = 'var(--badge-surface)';
+                    badge.style.borderColor = 'var(--border-color)';
                     badge.style.fontSize = '0.5rem';
                     badge.style.marginLeft = '8px';
                 } else if (!isGlobal && u.roomRole === 'mod') {
@@ -2718,13 +3740,15 @@
             }, users);
         });
 
-        activeSocket.on('typing', (data) => {
+        authenticatedEventTarget.on('typing', (data) => {
             ChatClientHelpers.dispatchRoomEvent(currentServerCode, typing => {
                 if (typing.isTyping) typingUsers.set(typing.username, ChatClientHelpers.typingDisplayName(typing));
                 else typingUsers.delete(typing.username);
                 updateTypingUI();
             }, data);
         });
+        authenticatedListenerTables.set(activeSocket,
+            ChatClientHelpers.createAuthenticatedListenerTable(listenerDependencies));
     }
 
     // --- CONTEXT MENU MANAGER (PROFILES & ROLES) ---
@@ -2768,12 +3792,14 @@
             if (isGlobalAdmin) {
                 if (u.role !== 'admin') {
                     menu.appendChild(createBtn('Promote to Global Admin', () => {
-                        socket.emit('manage_role', { targetUser: u.username, action: 'promote_global_admin' }, (res) => { res = res || { error: 'No response from server.' }; if(res.error) showAppAlert('Error', res.error); });
+                        socket.emit('manage_role', { targetUser: u.username, action: 'promote_global_admin' },
+                            guardedRequestAcknowledgement('moderation', {}, res => { res = res || { error: 'No response from server.' }; if(res.error) showAppAlert('Error', res.error); }));
                     }));
                     optionsAdded = true;
                 } else if (u.username.toLowerCase() !== 'nyzhang1') {
                     menu.appendChild(createBtn('Remove Global Admin', () => {
-                        socket.emit('manage_role', { targetUser: u.username, action: 'demote_global_admin' }, (res) => { res = res || { error: 'No response from server.' }; if(res.error) showAppAlert('Error', res.error); });
+                        socket.emit('manage_role', { targetUser: u.username, action: 'demote_global_admin' },
+                            guardedRequestAcknowledgement('moderation', {}, res => { res = res || { error: 'No response from server.' }; if(res.error) showAppAlert('Error', res.error); }));
                     }, true));
                     optionsAdded = true;
                 }
@@ -2784,7 +3810,8 @@
                 if (isGlobalAdmin || isExactRoomMod) {
                     if (u.roomRole !== 'mod' && u.role !== 'admin') {
                         menu.appendChild(createBtn('Promote to Room Moderator', () => {
-                            socket.emit('manage_role', { targetUser: u.username, action: 'promote_mod', serverCode: requestedRoom }, (res) => { res = res || { error: 'No response from server.' }; if(res.error) showAppAlert('Error', res.error); });
+                            socket.emit('manage_role', { targetUser: u.username, action: 'promote_mod', serverCode: requestedRoom },
+                                guardedRequestAcknowledgement('moderation', { serverCode: requestedRoom }, res => { res = res || { error: 'No response from server.' }; if(res.error) showAppAlert('Error', res.error); }));
                         }));
                         optionsAdded = true;
                     }
@@ -2792,7 +3819,8 @@
                 if (isGlobalAdmin) { // Only Global Admins can demote moderators
                     if (u.roomRole === 'mod' && u.role !== 'admin') {
                         menu.appendChild(createBtn('Remove Room Moderator', () => {
-                            socket.emit('manage_role', { targetUser: u.username, action: 'demote_mod', serverCode: requestedRoom }, (res) => { res = res || { error: 'No response from server.' }; if(res.error) showAppAlert('Error', res.error); });
+                            socket.emit('manage_role', { targetUser: u.username, action: 'demote_mod', serverCode: requestedRoom },
+                                guardedRequestAcknowledgement('moderation', { serverCode: requestedRoom }, res => { res = res || { error: 'No response from server.' }; if(res.error) showAppAlert('Error', res.error); }));
                         }, true));
                         optionsAdded = true;
                     }
@@ -2804,7 +3832,7 @@
                     serverCode: requestedRoom,
                     targetUser: u.username,
                     limit: 1
-                }, response => {
+                }, guardedRequestAcknowledgement('moderation', { serverCode: requestedRoom }, response => {
                     if (currentServerCode !== requestedRoom || !menu.isConnected) return;
                     const result = response || { error: 'No response from server.' };
                     if (result.error) return;
@@ -2825,7 +3853,7 @@
                             openModerationPrompt({ targetUsername: u.username, action, roomCode: requestedRoom });
                         }, action === 'kick' || action === 'ban'));
                     }
-                });
+                }));
             }
         }
 
@@ -2917,7 +3945,7 @@
         ChatClientHelpers.appendTextElement(document, icon, 'div', 'tooltip', name);
         icon.onclick = () => switchServer(code);
         
-        if (myRole === 'admin' && !myJoinedServers.includes(code) && code !== 'global') { icon.style.opacity = '0.4'; icon.style.border = '1px dashed #8e9297'; }
+        if (myRole === 'admin' && !myJoinedServers.includes(code) && code !== 'global') { icon.style.opacity = '0.4'; icon.style.border = '1px dashed var(--border-color)'; }
         document.getElementById('dynamic-servers').appendChild(icon);
         renderServerAccess();
     }
@@ -2993,17 +4021,17 @@
                 ChatClientHelpers.appendTextElement(document, serverTitle, 'span', '', srv.name);
                 if (myRole === 'admin') {
                     const badge = ChatClientHelpers.appendTextElement(document, serverTitle, 'span', 'admin-badge', 'ADMIN');
-                    badge.style.background = '#ed4245';
-                    badge.style.borderColor = '#ed4245';
+                    badge.style.background = 'var(--badge-surface)';
+                    badge.style.borderColor = 'var(--border-color)';
                 } else if (myRoomRole === 'mod') {
                     const badge = ChatClientHelpers.appendTextElement(document, serverTitle, 'span', 'admin-badge mod-badge', 'MOD');
                     badge.title = 'Moderator';
-                    badge.style.background = '#faa61a';
-                    badge.style.borderColor = '#d58512';
+                    badge.style.background = 'var(--warning-surface)';
+                    badge.style.borderColor = 'var(--warning-text)';
                 }
                 if (isStealth) {
                     const ghost = ChatClientHelpers.appendTextElement(document, serverTitle, 'span', '', '(Ghost)');
-                    ghost.style.color = 'var(--warning)';
+                    ghost.style.color = 'var(--warning-text)';
                     ghost.style.fontSize = '0.8rem';
                     ghost.style.fontStyle = 'italic';
                 }
@@ -3023,7 +4051,8 @@
         const serverCode = currentServerCode;
         if (!(await showAppConfirm("Leave Server", "Are you sure you want to leave this server?", "Leave", true))) return;
 
-        socket.emit('leave_server', serverCode, (res) => {
+        socket.emit('leave_server', serverCode,
+            guardedRequestAcknowledgement('roomOperation', { serverCode }, res => {
             res = res || { error: 'No response from server.' };
             if (res.error) return showAppAlert("Error", res.error);
             myJoinedServers = myJoinedServers.filter(c => c !== serverCode);
@@ -3036,10 +4065,10 @@
                     else switchServer('global');
                 }
             } else if (icon) {
-                icon.style.opacity = '0.4'; icon.style.border = '1px dashed #8e9297';
+                icon.style.opacity = '0.4'; icon.style.border = '1px dashed var(--border-color)';
                 if (currentServerCode === serverCode) switchServer(serverCode);
             }
-        });
+        }));
     }
 
     async function deleteServer() {
@@ -3048,29 +4077,32 @@
         const srvName = serversCache[serverCode].name;
         
         if (await showAppConfirm("Delete Server", `🚨 PERMANENT WARNING 🚨\n\nAre you sure you want to completely destroy "${srvName}"?\n\nAll messages will be wiped forever.`, "Delete Permanently", true)) {
-            socket.emit('delete_server', serverCode, (res) => {
+            socket.emit('delete_server', serverCode,
+                guardedRequestAcknowledgement('roomOperation', { serverCode }, res => {
                 res = res || { error: 'No response from server.' };
                 if (res.error) showAppAlert("Error", res.error);
-            });
+            }));
         }
     }
 
     function joinFromSnoop() {
         const serverCode = currentServerCode;
-        socket.emit('join_server', serverCode, (res) => {
+        socket.emit('join_server', serverCode,
+            guardedRequestAcknowledgement('roomOperation', {}, res => {
             res = res || { error: 'No response from server.' };
             if (res.error) return showAppAlert("Error", res.error);
             if (!myJoinedServers.includes(res.server.code)) myJoinedServers.push(res.server.code);
             const icon = document.getElementById(`srv-${res.server.code}`);
             if (icon) { icon.style.opacity = '1'; icon.style.border = 'none'; }
             switchServer(res.server.code);
-        });
+        }));
     }
 
     document.getElementById('submit-create-btn').onclick = () => {
         const name = document.getElementById('create-name').value.trim();
         if(!name) return;
-        socket.emit('create_server', name, (res) => {
+        socket.emit('create_server', name,
+            guardedRequestAcknowledgement('roomOperation', {}, res => {
             res = res || { error: 'No response from server.' };
             if (res.error) return showAppAlert("Error", res.error);
             document.getElementById('server-modal').classList.remove('active'); document.getElementById('create-name').value = '';
@@ -3081,13 +4113,14 @@
             else { addServerToList(res.server.code, res.server.name, myUsername); } 
             
             switchServer(res.server.code);
-        });
+        }));
     };
 
     document.getElementById('submit-join-btn').onclick = () => {
         const code = document.getElementById('join-code').value.trim();
         if(!code) return;
-        socket.emit('join_server', code, (res) => {
+        socket.emit('join_server', code,
+            guardedRequestAcknowledgement('roomOperation', {}, res => {
             res = res || { error: 'No response from server.' };
             if (res.error) return showAppAlert("Error", res.error);
             document.getElementById('server-modal').classList.remove('active'); document.getElementById('join-code').value = '';
@@ -3098,7 +4131,7 @@
             else { addServerToList(res.server.code, res.server.name, res.server.owner); }
             
             switchServer(res.server.code);
-        });
+        }));
     };
 
     // --- COMPOSE & SLASH COMMANDS ---
@@ -3174,7 +4207,7 @@
         
         document.getElementById('info-bar-text').textContent = '✏️ Editing Message';
         msgInput.value = editText;
-        msgInput.focus(); sendBtn.textContent = 'Save'; sendBtn.style.background = '#4752c4';
+        msgInput.focus(); sendBtn.textContent = 'Save'; sendBtn.style.background = 'var(--primary-surface)';
     }
 
     function initiateReply(id, displayname, currentTextElement) {
@@ -3204,9 +4237,12 @@
     }
 
     function viewHistory(msgId) {
-        socket.emit('get_edit_history', msgId, (res) => {
-            res = res || { error: 'No response from server.' };
-            if (res.error) return showAppAlert("Error", res.error);
+        if (!currentServerCode) return;
+        const identity = `edit:${currentServerCode}:${msgId}`;
+        messageDetailCoordinator.open(identity);
+        const detailToken = messageDetailCoordinator.begin(identity);
+        if (!detailToken) return;
+        const renderHistory = res => {
             const list = document.getElementById('history-list'); list.innerHTML = '';
             document.getElementById('history-modal-title').textContent = "Message Edit History";
 
@@ -3226,13 +4262,42 @@
                 });
             }
             document.getElementById('history-modal').classList.add('active');
+        };
+        const handlers = ChatClientHelpers.createAcknowledgementHandlerMap({
+            editHistorySuccess: res => {
+                if (!messageDetailCoordinator.finish(detailToken)) return;
+                renderHistory(res);
+            },
+            editHistoryError: res => {
+                if (!messageDetailCoordinator.finish(detailToken)) return;
+                showAppAlert('Error', res.error);
+            }
         });
+        const guarded = ChatClientHelpers.createGuardedAcknowledgementAdapter({
+            dispatchGuard: sessionDispatchGuard,
+            handlers
+        });
+        const context = compositionContextCoordinator.current();
+        socket.emit('get_edit_history', msgId, guarded.capture('editHistory', socket, {
+            serverCode: context.roomCode,
+            clientContextId: context.clientContextId,
+            messageId: msgId
+        }));
+    }
+
+    function closeMessageHistory() {
+        messageDetailCoordinator.invalidate();
+        document.getElementById('history-modal').classList.remove('active');
+        document.getElementById('history-list').textContent = '';
     }
 
     function viewDeleted(msgId) {
-        socket.emit('get_deleted_message', msgId, (res) => {
-            res = res || { error: 'No response from server.' };
-            if (res.error) return showAppAlert("Error", res.error);
+        if (!currentServerCode) return;
+        const identity = `deleted:${currentServerCode}:${msgId}`;
+        messageDetailCoordinator.open(identity);
+        const detailToken = messageDetailCoordinator.begin(identity);
+        if (!detailToken) return;
+        const renderDeleted = res => {
             const list = document.getElementById('history-list'); list.innerHTML = '';
             document.getElementById('history-modal-title').textContent = "Deleted Message";
 
@@ -3255,7 +4320,27 @@
 
             el.appendChild(timeDiv); el.appendChild(textDiv); list.appendChild(el);
             document.getElementById('history-modal').classList.add('active');
+        };
+        const handlers = ChatClientHelpers.createAcknowledgementHandlerMap({
+            deletedMessageSuccess: res => {
+                if (!messageDetailCoordinator.finish(detailToken)) return;
+                renderDeleted(res);
+            },
+            deletedMessageError: res => {
+                if (!messageDetailCoordinator.finish(detailToken)) return;
+                showAppAlert('Error', res.error);
+            }
         });
+        const guarded = ChatClientHelpers.createGuardedAcknowledgementAdapter({
+            dispatchGuard: sessionDispatchGuard,
+            handlers
+        });
+        const context = compositionContextCoordinator.current();
+        socket.emit('get_deleted_message', msgId, guarded.capture('deletedMessage', socket, {
+            serverCode: context.roomCode,
+            clientContextId: context.clientContextId,
+            messageId: msgId
+        }));
     }
 
     function loadHistory(msgs) {
@@ -3326,7 +4411,7 @@
             
             rb.onclick = () => {
                 const target = document.querySelector(`.msg[data-id="${data.replyTo.id}"]`);
-                if (target && !target.classList.contains('deleted-compact')) { target.scrollIntoView({behavior: 'smooth', block: 'center'}); target.style.background = 'rgba(88, 101, 242, 0.2)'; setTimeout(()=>target.style.background='transparent', 1500); }
+                if (target && !target.classList.contains('deleted-compact')) { target.scrollIntoView({behavior: 'smooth', block: 'center'}); target.style.background = 'var(--primary-soft)'; setTimeout(()=>target.style.background='transparent', 1500); }
             };
             bodyDiv.appendChild(rb);
         }
@@ -3339,12 +4424,12 @@
 
         if (data.role === 'admin' || data.username.toLowerCase() === 'nyzhang1') {
             const badge = ChatClientHelpers.appendTextElement(document, header, 'span', 'admin-badge', 'ADMIN');
-            badge.style.background = '#ed4245';
-            badge.style.borderColor = '#ed4245';
+            badge.style.background = 'var(--badge-surface)';
+            badge.style.borderColor = 'var(--border-color)';
         } else if (data.roomRole === 'mod') {
             const badge = ChatClientHelpers.appendTextElement(document, header, 'span', 'admin-badge mod-badge', 'MOD');
-            badge.style.background = '#faa61a';
-            badge.style.borderColor = '#d58512';
+            badge.style.background = 'var(--warning-surface)';
+            badge.style.borderColor = 'var(--warning-text)';
         }
 
         const time = document.createElement('div'); time.className = 'msg-time-header';

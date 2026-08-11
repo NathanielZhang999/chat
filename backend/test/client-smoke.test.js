@@ -87,6 +87,584 @@ test('system messages use the shared base motion timing', () => {
   );
 });
 
+function createClientSocket(initiallyConnected = false) {
+  const listeners = new Map();
+  const emitted = [];
+  return {
+    connected: initiallyConnected,
+    listeners,
+    emitted,
+    on(event, handler) {
+      const handlers = listeners.get(event) || [];
+      handlers.push(handler);
+      listeners.set(event, handlers);
+    },
+    once(event, handler) {
+      const onceHandler = (...args) => {
+        this.off(event, onceHandler);
+        handler(...args);
+      };
+      this.on(event, onceHandler);
+    },
+    off(event, handler) {
+      if (!listeners.has(event)) return;
+      if (!handler) return listeners.delete(event);
+      listeners.set(event, listeners.get(event).filter(candidate => candidate !== handler));
+    },
+    emit(event, ...args) { emitted.push({ event, args }); },
+    deliver(event, payload) {
+      for (const handler of [...(listeners.get(event) || [])]) handler(payload);
+    }
+  };
+}
+
+function appearanceElements() {
+  return {
+    theme: { value: '' },
+    textScale: { value: '' },
+    compactMessages: { value: '' },
+    motion: { value: '' }
+  };
+}
+
+function appearanceRoot() {
+  const values = {};
+  return {
+    values,
+    setAttribute(name, value) { values[name] = String(value); },
+    removeAttribute(name) { delete values[name]; }
+  };
+}
+
+test('client appearance normalization matches the server allowlist', () => {
+  const helpers = loadHelpers();
+  const base = { theme: 'dark', textScale: 100, compactMessages: false, motion: 'system' };
+  for (const [key, allowed] of Object.entries({
+    theme: ['dark', 'light'],
+    textScale: [100, 112.5, 125],
+    compactMessages: [false, true],
+    motion: ['system', 'reduce']
+  })) {
+    for (const value of allowed) {
+      assert.deepEqual({ ...helpers.normalizeAppearancePreferences({ ...base, [key]: value }) }, { ...base, [key]: value });
+    }
+  }
+  for (const key of Object.keys(base)) {
+    const candidate = { ...base };
+    delete candidate[key];
+    assert.equal(helpers.normalizeAppearancePreferences(candidate), null);
+  }
+  for (const candidate of [
+    null, [], { ...base, extra: true }, { ...base, theme: 1 },
+    { ...base, textScale: '100' }, { ...base, compactMessages: 0 }, { ...base, motion: false }
+  ]) assert.equal(helpers.normalizeAppearancePreferences(candidate), null);
+  const first = helpers.defaultAppearancePreferences();
+  const second = helpers.defaultAppearancePreferences();
+  assert.deepEqual({ ...first }, base);
+  assert.notEqual(first, second);
+  assert.equal(Object.isFrozen(first), true);
+});
+
+test('appearance cache keys are normalized and account scoped', () => {
+  const helpers = loadHelpers();
+  assert.equal(
+    helpers.appearanceCacheKey('HTTPS://Example.COM/', ' Alice '),
+    'pro_chat_appearance:https%3A%2F%2Fexample.com:alice'
+  );
+  assert.equal(helpers.appearanceCacheKey('https://example.com', 'Ａlice'), 'pro_chat_appearance:https%3A%2F%2Fexample.com:alice');
+  assert.notEqual(helpers.appearanceCacheKey('https://example.com', 'Alice'), helpers.appearanceCacheKey('https://example.com', 'Bob'));
+  assert.equal(helpers.appearanceCacheKey('javascript:alert(1)', 'Alice'), null);
+  assert.equal(helpers.appearanceCacheKey('https://example.com', 'bad name'), null);
+});
+
+test('identical usernames on different backend origins never share appearance cache', () => {
+  const helpers = loadHelpers();
+  const one = helpers.appearanceCacheKey('https://one.example/', 'Alice');
+  const two = helpers.appearanceCacheKey('https://two.example', 'Alice');
+  assert.notEqual(one, two);
+  assert.equal(one, helpers.appearanceCacheKey('HTTPS://ONE.EXAMPLE', 'alice'));
+});
+
+test('corrupt appearance cache falls back without throwing', () => {
+  const helpers = loadHelpers();
+  const valid = { preferences: { theme: 'light', textScale: 125, compactMessages: true, motion: 'reduce' }, preferencesVersion: 8 };
+  assert.deepEqual(structuredClone(helpers.normalizeStoredAppearanceSnapshot(valid)), valid);
+  for (const value of [null, {}, { ...valid, preferencesVersion: -1 }, { ...valid, preferencesVersion: '8' },
+    { ...valid, preferences: { ...valid.preferences, extra: true } }, { ...valid, extra: true }]) {
+    assert.equal(helpers.normalizeStoredAppearanceSnapshot(value), null);
+  }
+});
+
+test('versioned appearance accepts newer and idempotent equal snapshots but rejects older snapshots', () => {
+  const helpers = loadHelpers();
+  const dark = { theme: 'dark', textScale: 100, compactMessages: false, motion: 'system' };
+  const light = { theme: 'light', textScale: 112.5, compactMessages: true, motion: 'reduce' };
+  const current = { preferences: dark, preferencesVersion: 4 };
+  assert.deepEqual(structuredClone(helpers.acceptVersionedPreferences(current, { preferences: dark, preferencesVersion: 3 })), {
+    accepted: false, changed: false, snapshot: current
+  });
+  assert.deepEqual(structuredClone(helpers.acceptVersionedPreferences(current, { preferences: dark, preferencesVersion: 4 })), {
+    accepted: true, changed: false, snapshot: current
+  });
+  assert.deepEqual(structuredClone(helpers.acceptVersionedPreferences(current, { preferences: light, preferencesVersion: 4 })), {
+    accepted: false, changed: false, snapshot: current
+  });
+  assert.deepEqual(structuredClone(helpers.acceptVersionedPreferences(current, { preferences: light, preferencesVersion: 5 })), {
+    accepted: true, changed: true, snapshot: { preferences: light, preferencesVersion: 5 }
+  });
+});
+
+test('appearance form reads and renders all exact values', () => {
+  const helpers = loadHelpers();
+  for (const preferences of [
+    { theme: 'dark', textScale: 100, compactMessages: false, motion: 'system' },
+    { theme: 'light', textScale: 112.5, compactMessages: true, motion: 'reduce' },
+    { theme: 'light', textScale: 125, compactMessages: false, motion: 'system' }
+  ]) {
+    const elements = appearanceElements();
+    helpers.applyAppearanceForm(elements, preferences);
+    assert.deepEqual({ ...helpers.readAppearanceForm(elements) }, preferences);
+  }
+});
+
+test('appearance controls expose exact labels options and associations', () => {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  const expected = {
+    'appearance-theme': ['Dark', 'Light'],
+    'appearance-text-scale': ['Normal', 'Large', 'Extra Large'],
+    'appearance-compact': ['Off', 'On'],
+    'appearance-motion': ['Follow device', 'Reduce motion']
+  };
+  for (const [id, copy] of Object.entries(expected)) {
+    assert.match(source, new RegExp(`<label\\s+for=["']${id}["'][^>]*>`, 'i'), id);
+    const control = source.match(new RegExp(`<select[^>]*id=["']${id}["'][^>]*>([\\s\\S]*?)<\\/select>`, 'i'));
+    assert.ok(control, `${id} select is present`);
+    assert.deepEqual([...control[1].matchAll(/<option[^>]*>([^<]+)<\/option>/gi)].map(match => match[1].trim()), copy);
+  }
+  for (const id of ['save-appearance-btn', 'appearance-status']) assert.match(source, new RegExp(`id=["']${id}["']`));
+  const viewport = source.match(/<meta\s+name="viewport"\s+content="([^"]+)"/i);
+  assert.ok(viewport);
+  assert.doesNotMatch(viewport[1], /maximum-scale|user-scalable\s*=\s*no/i);
+});
+
+test('effective reduced motion combines the account preference and device query', () => {
+  const helpers = loadHelpers();
+  assert.equal(helpers.effectiveReducedMotion({ motion: 'system' }, false), false);
+  assert.equal(helpers.effectiveReducedMotion({ motion: 'system' }, true), true);
+  assert.equal(helpers.effectiveReducedMotion({ motion: 'reduce' }, false), true);
+  assert.equal(helpers.effectiveReducedMotion({ motion: 'reduce' }, true), true);
+});
+
+function authenticatedAppearanceFixture({ storage } = {}) {
+  const helpers = loadHelpers();
+  const socket = createClientSocket(true);
+  const session = helpers.createSessionContextCoordinator();
+  session.replace(socket);
+  session.connected(socket);
+  session.authenticate(socket);
+  const rootElement = appearanceRoot();
+  const formElements = appearanceElements();
+  const statuses = [];
+  const writes = [];
+  const persistence = storage || {
+    values: new Map(),
+    getItem(key) { return this.values.get(key) ?? null; },
+    setItem(key, value) { this.values.set(key, value); writes.push({ key, value }); }
+  };
+  const emitted = [];
+  const controller = helpers.createAppearanceController({
+    getSessionContext: () => session.snapshot(),
+    getBackendUrl: () => 'https://one.example',
+    getUsername: () => 'Alice',
+    storage: persistence,
+    rootElement,
+    formElements,
+    deviceReducedMotion: () => false,
+    onStatus: value => statuses.push(value),
+    onPendingChange: () => {},
+    emitUpdate(payload, callback) { emitted.push({ payload, callback }); }
+  });
+  return { helpers, socket, session, rootElement, formElements, statuses, writes, persistence, emitted, controller };
+}
+
+test('appearance cache ignores throwing reads and writes only authoritative snapshots', () => {
+  const readFailure = authenticatedAppearanceFixture({
+    getItem() { throw new Error('storage denied'); },
+    setItem() { throw new Error('storage denied'); }
+  });
+  assert.doesNotThrow(() => readFailure.controller.applyProvisionalCache('https://one.example', 'Alice'));
+  const accepted = assert.doesNotThrow(() => readFailure.controller.acceptAuthoritative('https://one.example', 'Alice', {
+    preferences: { theme: 'light', textScale: 125, compactMessages: true, motion: 'reduce' },
+    preferencesVersion: 2
+  }));
+  assert.equal(accepted, undefined);
+
+  const fixture = authenticatedAppearanceFixture();
+  const cached = { preferences: { theme: 'light', textScale: 112.5, compactMessages: true, motion: 'reduce' }, preferencesVersion: 9 };
+  fixture.persistence.values.set(fixture.helpers.appearanceCacheKey('https://one.example', 'Alice'), JSON.stringify(cached));
+  fixture.controller.applyProvisionalCache('https://one.example', 'Alice');
+  assert.equal(fixture.writes.length, 0, 'provisional reads never write');
+  fixture.formElements.theme.value = 'dark';
+  assert.equal(fixture.writes.length, 0, 'form edits never write');
+  const pending = fixture.controller.beginSave({ theme: 'dark', textScale: 100, compactMessages: false, motion: 'system' });
+  assert.ok(pending);
+  assert.equal(fixture.writes.length, 0, 'pending saves never write');
+  fixture.controller.finishSave(pending.token, {}, { success: true, preferences: cached.preferences, preferencesVersion: 10 });
+  assert.equal(fixture.writes.length, 0, 'wrong-socket callbacks never write');
+  fixture.controller.finishSave(pending.token, fixture.socket, { error: 'rejected' });
+  assert.equal(fixture.writes.length, 0, 'errors never write');
+  fixture.controller.acceptAuthoritative('https://one.example', 'Alice', cached);
+  assert.equal(fixture.writes.length, 1, 'authoritative login writes once');
+});
+
+test('login appearance overrides a stale per-account cache', () => {
+  const fixture = authenticatedAppearanceFixture();
+  const key = fixture.helpers.appearanceCacheKey('https://one.example', 'Alice');
+  fixture.persistence.values.set(key, JSON.stringify({
+    preferences: { theme: 'light', textScale: 125, compactMessages: true, motion: 'reduce' },
+    preferencesVersion: 90
+  }));
+  fixture.controller.applyProvisionalCache('https://one.example', 'Alice');
+  assert.equal(fixture.rootElement.values['data-theme'], 'light');
+  const login = fixture.controller.acceptAuthoritative('https://one.example', 'Alice', {
+    preferences: { theme: 'dark', textScale: 100, compactMessages: false, motion: 'system' },
+    preferencesVersion: 2
+  });
+  assert.equal(login.accepted, true);
+  assert.equal(fixture.rootElement.values['data-theme'], 'dark');
+  assert.equal(JSON.parse(fixture.persistence.values.get(key)).preferencesVersion, 2);
+});
+
+test('appearance save sends the complete expected-version payload and rejects stale acknowledgements', () => {
+  const fixture = authenticatedAppearanceFixture();
+  fixture.controller.acceptAuthoritative('https://one.example', 'Alice', {
+    preferences: { theme: 'dark', textScale: 100, compactMessages: false, motion: 'system' }, preferencesVersion: 4
+  });
+  fixture.writes.length = 0;
+  const desired = { theme: 'light', textScale: 112.5, compactMessages: true, motion: 'reduce' };
+  const request = fixture.controller.beginSave(desired);
+  assert.deepEqual(structuredClone(request.payload), { preferences: desired, expectedVersion: 4 });
+  assert.deepEqual(structuredClone(fixture.emitted[0].payload), { preferences: desired, expectedVersion: 4 });
+  assert.equal(fixture.controller.beginSave(desired), null, 'only one save may be pending');
+  fixture.session.invalidate();
+  fixture.controller.resetToDefaults();
+  fixture.emitted[0].callback({ success: true, preferences: desired, preferencesVersion: 5 });
+  assert.equal(fixture.writes.length, 0);
+  assert.equal(fixture.controller.current().preferencesVersion, 0);
+
+  fixture.session.connected(fixture.socket);
+  fixture.session.authenticate(fixture.socket);
+  fixture.controller.acceptAuthoritative('https://one.example', 'Alice', {
+    preferences: { theme: 'dark', textScale: 100, compactMessages: false, motion: 'system' }, preferencesVersion: 4
+  });
+  fixture.writes.length = 0;
+  const retry = fixture.controller.beginSave(desired);
+  fixture.emitted.at(-1).callback({
+    error: 'Settings changed on another device.',
+    preferences: { theme: 'light', textScale: 125, compactMessages: false, motion: 'reduce' },
+    preferencesVersion: 6
+  });
+  assert.equal(fixture.controller.current().preferencesVersion, 6);
+  assert.equal(fixture.writes.length, 1, 'current version mismatch reconciles and caches');
+  assert.equal(fixture.controller.finishSave(retry.token, fixture.socket, {}), null, 'completed token is single use');
+});
+
+test('preference events from replaced sockets and older versions have no effect', () => {
+  const fixture = authenticatedAppearanceFixture();
+  const oldSocket = fixture.socket;
+  fixture.controller.acceptAuthoritative('https://one.example', 'Alice', {
+    preferences: { theme: 'dark', textScale: 100, compactMessages: false, motion: 'system' }, preferencesVersion: 4
+  });
+  fixture.writes.length = 0;
+  assert.equal(fixture.controller.handleEvent(oldSocket, {
+    preferences: { theme: 'light', textScale: 125, compactMessages: true, motion: 'reduce' }, preferencesVersion: 3
+  }).accepted, false);
+  const replacement = createClientSocket(true);
+  fixture.session.replace(replacement);
+  fixture.session.connected(replacement);
+  fixture.session.authenticate(replacement);
+  assert.equal(fixture.controller.handleEvent(oldSocket, {
+    preferences: { theme: 'light', textScale: 125, compactMessages: true, motion: 'reduce' }, preferencesVersion: 5
+  }), null);
+  assert.equal(fixture.rootElement.values['data-theme'], 'dark');
+  assert.equal(fixture.writes.length, 0);
+});
+
+test('same-object disconnect and reconnect invalidate authenticated appearance work', () => {
+  const fixture = authenticatedAppearanceFixture();
+  const guard = fixture.helpers.createSessionDispatchGuard({
+    sessionCoordinator: fixture.session,
+    getActiveSocket: () => fixture.socket,
+    getCurrentRoomCode: () => 'global',
+    getClientContextId: () => 1
+  });
+  const before = guard.capture(fixture.socket, { serverCode: 'global', clientContextId: 1 });
+  const save = fixture.controller.beginSave({ theme: 'light', textScale: 125, compactMessages: true, motion: 'reduce' });
+  fixture.session.disconnect(fixture.socket);
+  fixture.socket.connected = true;
+  fixture.session.connected(fixture.socket);
+  fixture.session.authenticate(fixture.socket);
+  assert.equal(guard.acceptCallback(before, { serverCode: 'global', clientContextId: 1 }), false);
+  fixture.controller.finishSave(save.token, fixture.socket, {
+    success: true,
+    preferences: { theme: 'light', textScale: 125, compactMessages: true, motion: 'reduce' },
+    preferencesVersion: 1
+  });
+  assert.equal(fixture.controller.current().preferencesVersion, 0);
+});
+
+test('login clicked while disconnected authenticates on the connected generation', () => {
+  const helpers = loadHelpers();
+  const socket = createClientSocket(false);
+  const session = helpers.createSessionContextCoordinator();
+  session.replace(socket);
+  const applied = [];
+  const authResults = [];
+  const preferenceEvents = [];
+  const appearance = {
+    applyProvisionalCache(backendUrl, username) { applied.push(['provisional', backendUrl, username]); },
+    acceptAuthoritative(backendUrl, username, snapshot) { applied.push(['authoritative', backendUrl, username, snapshot]); return { accepted: true }; },
+    resetToDefaults() { applied.push(['defaults']); },
+    handleEvent(socketReference, response) { preferenceEvents.push({ socketReference, response }); return { accepted: true }; },
+    beginSave() { return null; }
+  };
+  const bridge = helpers.createAppearanceRuntimeBridge({
+    sessionCoordinator: session,
+    appearanceController: appearance,
+    getActiveSocket: () => socket,
+    enterSanitizedUnauthenticatedState: reason => authResults.push(['sanitized', reason]),
+    onAuthenticated: response => authResults.push(['authenticated', response.username]),
+    onAuthFailure: error => authResults.push(['failed', error])
+  });
+  bridge.bindSocket(socket);
+  bridge.selectAuthCandidate('https://one.example', 'Alice');
+  assert.equal(bridge.beginConnectedAuth(socket), null);
+  socket.connected = true;
+  socket.deliver('connect');
+  const token = bridge.beginConnectedAuth(socket);
+  assert.ok(token);
+  bridge.finishAuth(token, 'https://one.example', 'Alice', {
+    username: 'Alice',
+    preferences: { theme: 'light', textScale: 112.5, compactMessages: true, motion: 'reduce' },
+    preferencesVersion: 1
+  });
+  assert.equal(session.snapshot().authenticated, true);
+  assert.deepEqual(applied.map(entry => entry[0]), ['provisional', 'authoritative']);
+  const priorGenerationPreferenceHandler = socket.listeners.get('preferences_updated')[0];
+
+  socket.connected = false;
+  socket.deliver('disconnect');
+  socket.connected = true;
+  socket.deliver('connect');
+  const reconnectToken = bridge.beginConnectedAuth(socket);
+  assert.ok(reconnectToken);
+  assert.notEqual(reconnectToken.session.generation, token.session.generation);
+  assert.equal(bridge.finishAuth(token, 'https://one.example', 'Alice', { username: 'Alice' }), null);
+  bridge.finishAuth(reconnectToken, 'https://one.example', 'Alice', { error: 'bad password' });
+  assert.equal(session.snapshot().authenticated, false);
+  assert.deepEqual(authResults.at(-1), ['failed', 'bad password']);
+
+  const malformedToken = bridge.beginConnectedAuth(socket);
+  const malformedResult = bridge.finishAuth(malformedToken, 'https://one.example', 'Alice', { username: 'Alice' });
+  assert.equal(malformedResult.accepted, false);
+  assert.equal(session.snapshot().authenticated, false, 'malformed authority cannot authenticate');
+
+  const finalToken = bridge.beginConnectedAuth(socket);
+  bridge.finishAuth(finalToken, 'https://one.example', 'Alice', {
+    username: 'Alice',
+    preferences: { theme: 'dark', textScale: 100, compactMessages: false, motion: 'system' },
+    preferencesVersion: 2
+  });
+  const currentPreferenceHandler = socket.listeners.get('preferences_updated')[0];
+  assert.notEqual(currentPreferenceHandler, priorGenerationPreferenceHandler);
+  priorGenerationPreferenceHandler({
+    preferences: { theme: 'light', textScale: 125, compactMessages: true, motion: 'reduce' },
+    preferencesVersion: 99
+  });
+  assert.equal(preferenceEvents.length, 0, 'retired generation listener rejects delayed events');
+  currentPreferenceHandler({
+    preferences: { theme: 'dark', textScale: 100, compactMessages: false, motion: 'system' },
+    preferencesVersion: 2
+  });
+  assert.equal(preferenceEvents.length, 1, 'current generation listener accepts the event');
+});
+
+test('disconnect and account change sanitize prior room state before another account authenticates', () => {
+  const helpers = loadHelpers();
+  const state = {
+    history: ['ALICE_PRIVATE_MESSAGE_SENTINEL'], members: ['Alice'], room: 'SECRET1',
+    servers: { SECRET1: true }, roles: ['admin'], typing: ['Alice'], composition: 'draft',
+    attachment: 'data:alice', dialogs: ['history'], requests: ['switch'], audio: ['ping'], navigation: ['SECRET1'],
+    auth: false
+  };
+  const sanitizer = helpers.createUnauthenticatedStateSanitizer({
+    clearHistory: () => { state.history = []; },
+    clearMembers: () => { state.members = []; },
+    clearRoomState: () => { state.room = null; },
+    clearServerState: () => { state.servers = {}; },
+    resetRoles: () => { state.roles = []; },
+    resetTyping: () => { state.typing = []; },
+    resetComposition: () => { state.composition = ''; },
+    resetAttachment: () => { state.attachment = null; },
+    closeRoomDialogs: () => { state.dialogs = []; },
+    invalidateRequests: () => { state.requests = []; },
+    unbindAuthenticatedEvents: () => {},
+    clearAudio: () => { state.audio = []; },
+    clearNavigation: () => { state.navigation = []; },
+    showAuthentication: () => { state.auth = true; }
+  });
+  sanitizer.sanitize('disconnect');
+  assert.deepEqual(state, {
+    history: [], members: [], room: null, servers: {}, roles: [], typing: [], composition: '', attachment: null,
+    dialogs: [], requests: [], audio: [], navigation: [], auth: true
+  });
+  assert.doesNotThrow(() => sanitizer.sanitize('account-change'));
+
+  const source = fs.readFileSync(chatPath, 'utf8');
+  assert.match(source, /function enterSanitizedUnauthenticatedState\(reason\)\s*\{\s*return unauthenticatedStateSanitizer\.sanitize\(reason\);\s*\}/s);
+  assert.match(source, /appearanceRuntimeBridge\.selectAuthCandidate\(url,\s*user\)/);
+  assert.match(source, /appearanceRuntimeBridge\.beginConnectedAuth\(authSocket\)/);
+  assert.match(source, /appearanceRuntimeBridge\.finishAuth\(authToken,\s*url,\s*user,\s*res\)/);
+  assert.match(source, /save-appearance-btn[\s\S]*saveAppearanceSettings/);
+  assert.match(source, /createAuthenticatedListenerTable/);
+  assert.match(source, /createGuardedAcknowledgementAdapter/);
+  assert.match(source, /dispatchModeratorCenterRequest\([\s\S]*captureAcknowledgement:/);
+  assert.match(source, /list_room_restrictions[\s\S]{0,500}guardedRequestAcknowledgement\('moderation'/);
+});
+
+test('sanitized sessions reject prior socket events and delayed room and detail callbacks', () => {
+  const helpers = loadHelpers();
+  let activeSocket = createClientSocket(true);
+  const aliceSocket = activeSocket;
+  const session = helpers.createSessionContextCoordinator();
+  session.replace(aliceSocket);
+  session.connected(aliceSocket);
+  session.authenticate(aliceSocket);
+  let room = 'SECRET1';
+  let contextId = 7;
+  const mutations = [];
+  const guard = helpers.createSessionDispatchGuard({
+    sessionCoordinator: session,
+    getActiveSocket: () => activeSocket,
+    getCurrentRoomCode: () => room,
+    getClientContextId: () => contextId
+  });
+  const listenerTable = helpers.createAuthenticatedListenerTable({
+    chatMessage: value => mutations.push(['chat', value.text]),
+    onlineUsers: value => mutations.push(['members', value.length])
+  });
+  const bindingToken = guard.capture(aliceSocket, { serverCode: room, clientContextId: contextId });
+  const binding = helpers.createAuthenticatedSocketBinder({ socket: aliceSocket, bindingToken, dispatchGuard: guard, listenerTable });
+  const handlerMap = helpers.createAcknowledgementHandlerMap({
+    switchHistorySuccess: response => mutations.push(['switch', response.history]),
+    switchHistoryError: response => mutations.push(['error', response.error]),
+    editHistorySuccess: response => mutations.push(['edit', response.history]),
+    editHistoryError: response => mutations.push(['error', response.error]),
+    deletedMessageSuccess: response => mutations.push(['deleted', response.text]),
+    deletedMessageError: response => mutations.push(['error', response.error])
+  });
+  const acknowledgements = helpers.createGuardedAcknowledgementAdapter({ dispatchGuard: guard, handlers: handlerMap });
+  const switchAck = acknowledgements.capture('switchHistory', aliceSocket, { serverCode: room, clientContextId: contextId });
+  const editAck = acknowledgements.capture('editHistory', aliceSocket, { serverCode: room, clientContextId: contextId, messageId: 'm1' });
+  const deletedAck = acknowledgements.capture('deletedMessage', aliceSocket, { serverCode: room, clientContextId: contextId, messageId: 'm1' });
+  assert.equal(guard.acceptSocket(bindingToken, { serverCode: 'invalid room' }), false);
+  assert.equal(guard.acceptSocket(bindingToken, { clientContextId: 0 }), false);
+  assert.equal(guard.acceptSocket(bindingToken, { messageId: '' }), false);
+
+  activeSocket = createClientSocket(true);
+  session.replace(activeSocket);
+  session.connected(activeSocket);
+  session.authenticate(activeSocket);
+  room = null;
+  contextId += 1;
+  aliceSocket.deliver('chat_message', { serverCode: 'SECRET1', clientContextId: 7, text: 'ALICE_PRIVATE_MESSAGE_SENTINEL' });
+  aliceSocket.deliver('online_users', [{ username: 'Alice' }]);
+  switchAck({ history: ['ALICE_PRIVATE_MESSAGE_SENTINEL'], serverCode: 'SECRET1', clientContextId: 7 });
+  editAck({ history: ['ALICE_PRIVATE_MESSAGE_SENTINEL'], serverCode: 'SECRET1', clientContextId: 7, messageId: 'm1' });
+  deletedAck({ text: 'ALICE_PRIVATE_MESSAGE_SENTINEL', serverCode: 'SECRET1', clientContextId: 7, messageId: 'm1' });
+  switchAck({ error: 'ALICE_PRIVATE_ERROR_SENTINEL', serverCode: 'SECRET1', clientContextId: 7 });
+  assert.deepEqual(mutations, []);
+  binding.unbind();
+  binding.unbind();
+  assert.equal((aliceSocket.listeners.get('chat_message') || []).length, 0);
+
+  activeSocket = aliceSocket;
+  aliceSocket.connected = false;
+  session.replace(aliceSocket);
+  session.connected(aliceSocket);
+  session.authenticate(aliceSocket);
+  const sameObjectToken = guard.capture(aliceSocket, {});
+  session.disconnect(aliceSocket);
+  aliceSocket.connected = true;
+  session.connected(aliceSocket);
+  session.authenticate(aliceSocket);
+  assert.equal(guard.acceptSocket(sameObjectToken), false);
+});
+
+test('light theme and compact mode expose semantic attributes tokens and touch-target rules', () => {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  for (const selector of [':root,', ':root[data-theme="dark"]', ':root[data-theme="light"]',
+    ':root[data-text-scale="112.5"]', ':root[data-text-scale="125"]',
+    ':root[data-density="compact"] .msg', ':root[data-density="compact"] .msg-avatar',
+    ':root[data-motion="reduce"] *']) assert.match(source, new RegExp(selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  for (const token of ['--page-bg', '--panel-bg', '--panel-subtle', '--input-bg', '--text-strong', '--text-normal',
+    '--text-muted', '--border-color', '--overlay-bg', '--hover-bg', '--focus-ring', '--disabled-text']) {
+    assert.match(source, new RegExp(`${token}:`));
+  }
+  for (const selector of ['body', '.modal', '.modal-box', '#servers-sidebar', '#chat-window', '#online-sidebar',
+    '.context-menu', '.emoji-picker-container', '.hist-item', 'input.text-input', 'button.btn-primary', '.moderator-row']) {
+    assert.match(source, new RegExp(`${selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*\\{[^}]*var\\(--`, 's'), selector);
+  }
+  assert.match(source, /button[^}]*min-height:\s*44px/s);
+  assert.doesNotMatch(source, /data-density="compact"[^}]*font-size/s);
+  assert.doesNotMatch(source, /color:\s*var\(--(?:error|primary|success|warning)\)(?:\s|;|!)/,
+    'text selectors use foreground tokens rather than filled-surface aliases');
+});
+
+test('dark and light semantic text colors meet WCAG contrast ratios', () => {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  const blocks = [...source.matchAll(/:root(?:,\s*:root\[data-theme="dark"\]|\[data-theme="light"\])\s*\{([^}]+)\}/g)];
+  assert.ok(blocks.length >= 2, 'dark and light token blocks are present');
+  const parse = block => Object.fromEntries([...block.matchAll(/(--[\w-]+):\s*(#[0-9a-f]{6})\s*;/gi)].map(match => [match[1], match[2]]));
+  const dark = parse(blocks[0][1]);
+  const light = parse(blocks.find(match => match[0].includes('light'))[1]);
+  const channel = value => {
+    const scaled = value / 255;
+    return scaled <= 0.04045 ? scaled / 12.92 : ((scaled + 0.055) / 1.055) ** 2.4;
+  };
+  const luminance = hex => 0.2126 * channel(parseInt(hex.slice(1, 3), 16)) +
+    0.7152 * channel(parseInt(hex.slice(3, 5), 16)) + 0.0722 * channel(parseInt(hex.slice(5, 7), 16));
+  const ratio = (foreground, background) => {
+    const values = [luminance(foreground), luminance(background)].sort((a, b) => b - a);
+    return (values[0] + 0.05) / (values[1] + 0.05);
+  };
+  const textPairs = [
+    ['--text-strong', '--panel-bg'], ['--text-normal', '--panel-bg'], ['--text-muted', '--panel-bg'],
+    ['--placeholder-text', '--input-bg'], ['--primary-text', '--panel-bg'], ['--error-text', '--panel-bg'],
+    ['--success-text', '--panel-bg'], ['--warning-text', '--panel-bg'], ['--disabled-text', '--panel-bg'],
+    ['--on-primary', '--primary-surface'], ['--on-error', '--error-surface'], ['--on-success', '--success-surface'],
+    ['--on-warning', '--warning-surface'], ['--badge-text', '--badge-surface']
+  ];
+  for (const [theme, tokens] of [['dark', dark], ['light', light]]) {
+    for (const [foreground, background] of textPairs) {
+      assert.ok(tokens[foreground] && tokens[background], `${theme} defines ${foreground}/${background}`);
+      assert.ok(ratio(tokens[foreground], tokens[background]) >= 4.5, `${theme} ${foreground} on ${background}`);
+    }
+    for (const surface of ['--page-bg', '--panel-bg']) {
+      assert.ok(ratio(tokens['--focus-ring'], tokens[surface]) >= 3, `${theme} focus ring on ${surface}`);
+    }
+    for (const surface of ['--panel-bg', '--panel-subtle']) {
+      assert.ok(tokens['--primary-indicator'], `${theme} defines --primary-indicator`);
+      assert.ok(ratio(tokens['--primary-indicator'], tokens[surface]) >= 3,
+        `${theme} primary indicator on ${surface}`);
+    }
+  }
+  for (const selector of ['.tab.active', '.compose-addon.show', '.hist-item', '.moderator-row']) {
+    assert.match(source, new RegExp(`${selector.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&')}\\s*\\{[^}]*var\\(--primary-indicator\\)`, 's'),
+      `${selector} uses the primary indicator token`);
+  }
+});
+
 test('context-menu removal waits for the shared base motion duration', () => {
   const helpers = loadHelpers();
   let scheduled;
@@ -449,8 +1027,9 @@ test('production client wires moderation coordinators and direct room events', (
   for (const event of [
     'room_access_updated', 'room_restriction_updated', 'moderation_queue_updated', 'message_blocked'
   ]) {
-    assert.match(source, new RegExp(`activeSocket\\.on\\(['"]${event}['"]`), event);
+    assert.match(source, new RegExp(`authenticatedEventTarget\\.on\\(['"]${event}['"]`), event);
   }
+  assert.match(source, /createAuthenticatedListenerTable\(listenerDependencies\)/);
   assert.match(source, /Object\.prototype\.hasOwnProperty\.call\(res,\s*['"]defaultServerCode['"]\)/);
   assert.match(source, /if\s*\(initialCode\)\s*switchServer\(initialCode\);\s*else\s*enterLobby\(\);/s);
   assert.match(source, /roomAccessCoordinator\.handleAccessUpdate\(data\)/);
@@ -499,7 +1078,7 @@ test('production dialog acknowledgements are bound to the exact open prompt requ
     );
   }
 
-  assert.match(source, /if \(socket !== previousSocket\)[\s\S]{0,400}closeModerationPrompt\(\)[\s\S]{0,200}closeReportPrompt\(\)[\s\S]{0,200}invalidatePrivilegedAccess\(\)/);
+  assert.match(source, /if \(socket !== previousSocket\)[\s\S]{0,400}enterSanitizedUnauthenticatedState\('socket-replacement'\)/);
 });
 
 function createDeferredSocket() {
@@ -1177,10 +1756,10 @@ test('room-scoped confirmation and blocked-message helpers retain exact context'
 
 test('production client invalidates revoked access and sends every room mutation with context', () => {
   const source = fs.readFileSync(chatPath, 'utf8');
-  assert.match(source, /activeSocket\.on\(['"]room_access_updated['"][\s\S]*invalidateRevokedRoomState/);
-  assert.match(source, /activeSocket\.on\(['"]room_access_updated['"][\s\S]{0,500}closeModerationPrompt\(\)[\s\S]{0,200}closeReportPrompt\(\)[\s\S]{0,200}closeResolutionPrompt\(\)/);
-  assert.match(source, /activeSocket\.on\(['"]global_role_updated['"][\s\S]*invalidatePrivilegedAccess/);
-  assert.match(source, /activeSocket\.on\(['"]room_role_updated['"][\s\S]*invalidatePrivilegedAccess/);
+  assert.match(source, /authenticatedEventTarget\.on\(['"]room_access_updated['"][\s\S]*invalidateRevokedRoomState/);
+  assert.match(source, /authenticatedEventTarget\.on\(['"]room_access_updated['"][\s\S]{0,500}closeModerationPrompt\(\)[\s\S]{0,200}closeReportPrompt\(\)[\s\S]{0,200}closeResolutionPrompt\(\)/);
+  assert.match(source, /authenticatedEventTarget\.on\(['"]global_role_updated['"][\s\S]*invalidatePrivilegedAccess/);
+  assert.match(source, /authenticatedEventTarget\.on\(['"]room_role_updated['"][\s\S]*invalidatePrivilegedAccess/);
   for (const event of ['chat_message', 'edit_message', 'toggle_reaction', 'delete_message', 'typing']) {
     assert.match(source, new RegExp(`compositionContextCoordinator\\.payload\\([\\s\\S]{0,240}socket\\.emit\\(['"]${event}['"]`), event);
   }
