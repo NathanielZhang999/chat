@@ -108,10 +108,15 @@ test('layered authentication limits exact account pair and network boundaries wi
   });
 
   const pairLimiter = makeLimiter();
-  const pairResults = Array.from({ length: 7 }, () => pairLimiter.attempt({
+  const pairResults = Array.from({ length: 6 }, () => pairLimiter.attempt({
     action: 'login', account: 'Alice', address: '203.0.113.1'
   }).allowed);
-  assert.deepEqual(pairResults, [true, true, true, true, true, true, false]);
+  assert.deepEqual(pairResults, [true, true, true, true, true, true]);
+  now = 200;
+  const rejectedResults = Array.from({ length: 6 }, () => pairLimiter.attempt({
+    action: 'login', account: 'Alice', address: '203.0.113.1'
+  }).allowed);
+  assert.deepEqual(rejectedResults, [false, false, false, false, false, false]);
   now = 15 * 60 * 1000 + 100;
   assert.equal(pairLimiter.attempt({
     action: 'login', account: 'alice', address: '203.0.113.1'

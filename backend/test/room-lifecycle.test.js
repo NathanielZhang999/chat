@@ -5,6 +5,7 @@ const {
   createConnectionHandler,
   createDummyPasswordHash,
   createLayeredAuthLimiter,
+  hashNetworkAddress,
   seedSystem,
   withAccountTransitionLock
 } = require('../server');
@@ -475,6 +476,10 @@ test('one successful account does not reset aggregate network abuse state', asyn
     username: 'successful', password: 'valid-password'
   }, successfulAck.callback);
   assert.equal(successfulAck.value().success, true);
+  const networkBucket = hashNetworkAddress(address, 'aggregate-network-test-salt');
+  assert.equal(authLimiter.count('login:account:successful'), 0);
+  assert.equal(authLimiter.count(`login:pair:successful:${networkBucket}`), 0);
+  assert.equal(authLimiter.count(`login:network:${networkBucket}`), 3);
 
   const blocked = registerAuthenticationSocket({ id: 'blocked', address, authLimiter, UserModel, bcryptImpl });
   const blockedAck = acknowledge();
@@ -2902,8 +2907,15 @@ test('concurrent registrations allocate case-insensitive identity names only onc
       return value;
     }
   };
-  const first = register({ UserModel, bcryptImpl: { async hash() { return 'hash'; } } }).socket;
-  const second = register({ UserModel, bcryptImpl: { async hash() { return 'hash'; } } }).socket;
+  const hashCalls = [];
+  const bcryptImpl = {
+    async hash(password, cost) {
+      hashCalls.push([password, cost]);
+      return 'hash';
+    }
+  };
+  const first = register({ UserModel, bcryptImpl }).socket;
+  const second = register({ UserModel, bcryptImpl }).socket;
   first.handshake.address = '203.0.113.81';
   second.handshake.address = '203.0.113.82';
   const firstAck = acknowledge();
@@ -2921,6 +2933,7 @@ test('concurrent registrations allocate case-insensitive identity names only onc
   await Promise.all([firstPending, secondPending]);
 
   assert.equal(records.length, 1);
+  assert.deepEqual(hashCalls, [['123456', 11]]);
   assert.deepEqual([firstAck.value(), secondAck.value()], [
     {
       success: true,
