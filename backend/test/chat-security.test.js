@@ -303,16 +303,53 @@ test('connection admission releases counters on every disconnect path and bounds
 
 test('socket event policy covers every registered client event exactly once', () => {
   const source = fs.readFileSync(require.resolve('../server'), 'utf8');
-  const registeredEvents = [...source.matchAll(/(?:socket\.on|onProtected)\('([^']+)'/g)]
+  const protectedEvents = [...source.matchAll(/onProtected\('([^']+)'/g)]
     .map(match => match[1]);
-  const applicationEvents = registeredEvents.filter(event => event !== 'disconnect');
+  const directEvents = [...source.matchAll(/socket\.on\('([^']+)'/g)]
+    .map(match => match[1]);
 
-  assert.equal(new Set(applicationEvents).size, applicationEvents.length);
+  assert.equal(new Set(protectedEvents).size, protectedEvents.length);
   assert.deepEqual(
-    [...applicationEvents].sort(),
+    [...protectedEvents].sort(),
     Object.keys(security.SOCKET_EVENT_POLICIES).sort()
   );
-  assert.deepEqual(registeredEvents.filter(event => event === 'disconnect'), ['disconnect']);
+  assert.deepEqual(directEvents, ['disconnect']);
+});
+
+test('production protected registration routes every application event through the dispatcher', async () => {
+  const socket = new FakeSocket();
+  const ioInstance = new FakeIo();
+  const dispatched = [];
+  security.createConnectionHandler({
+    socketEventDispatcher: {
+      dispatch(packet) {
+        dispatched.push(packet);
+        return `admitted:${packet.event}`;
+      }
+    },
+    ioInstance,
+    onlineUsersMap: new Map(),
+    broadcastOnlineUsersFn: () => {}
+  })(socket);
+
+  assert.deepEqual(
+    [...socket.handlers.keys()].sort(),
+    [...Object.keys(security.SOCKET_EVENT_POLICIES), 'disconnect'].sort()
+  );
+  for (const event of Object.keys(security.SOCKET_EVENT_POLICIES)) {
+    assert.equal(await socket.trigger(event), `admitted:${event}`, event);
+  }
+  const dispatchCountBeforeDisconnect = dispatched.length;
+  await socket.trigger('disconnect');
+
+  assert.equal(dispatchCountBeforeDisconnect, 27);
+  assert.equal(dispatched.length, dispatchCountBeforeDisconnect);
+  assert.deepEqual(dispatched.map(packet => packet.event), Object.keys(security.SOCKET_EVENT_POLICIES));
+  for (const packet of dispatched) {
+    assert.equal(packet.socket, socket);
+    assert.equal(Array.isArray(packet.args), true);
+    assert.equal(typeof packet.handler, 'function');
+  }
 });
 
 test('event byte budgets accept exact boundaries and reject one byte over', () => {
@@ -325,6 +362,53 @@ test('event byte budgets accept exact boundaries and reject one byte over', () =
   );
   assert.equal(
     security.validateSocketEventEnvelope('create_server', ['x'.repeat(8_193)], security.SOCKET_EVENT_POLICIES).allowed,
+    false
+  );
+
+  const editEnvelopeFixedBytes = 62; // id 26 + text key 4 + serverCode 16 + clientContextId 16.
+  const exactEditEnvelope = {
+    id: '507f1f77bcf86cd799439011',
+    text: 'x'.repeat(16_384 - editEnvelopeFixedBytes),
+    serverCode: 'global',
+    clientContextId: 1
+  };
+  assert.equal(
+    security.measurePayloadBytes(exactEditEnvelope, { maxBytes: 16_384 }),
+    16_384
+  );
+  assert.equal(
+    security.validateSocketEventEnvelope('edit_message', [exactEditEnvelope], security.SOCKET_EVENT_POLICIES).allowed,
+    true
+  );
+  assert.equal(
+    security.validateSocketEventEnvelope('edit_message', [{
+      ...exactEditEnvelope,
+      text: `${exactEditEnvelope.text}x`
+    }], security.SOCKET_EVENT_POLICIES).allowed,
+    false
+  );
+
+  const chatEnvelopeFixedBytes = 57; // serverCode 16 + clientContextId 16 + text key 4 + attachment key 10 + replyTo 11.
+  const exactChatEnvelope = {
+    serverCode: 'global',
+    clientContextId: 1,
+    text: '',
+    attachment: 'x'.repeat(8_100_000 - chatEnvelopeFixedBytes),
+    replyTo: null
+  };
+  assert.equal(
+    security.measurePayloadBytes(exactChatEnvelope, { maxBytes: 8_100_000 }),
+    8_100_000
+  );
+  assert.equal(
+    security.validateSocketEventEnvelope('chat_message', [exactChatEnvelope], security.SOCKET_EVENT_POLICIES).allowed,
+    true
+  );
+  assert.equal(
+    security.validateSocketEventEnvelope('chat_message', [{
+      ...exactChatEnvelope,
+      attachment: `${exactChatEnvelope.attachment}x`
+    }], security.SOCKET_EVENT_POLICIES).allowed,
     false
   );
 });

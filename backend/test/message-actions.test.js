@@ -3,7 +3,8 @@ const assert = require('node:assert/strict');
 const {
   createAutoModTracker,
   createConnectionHandler,
-  createSocketEventDispatcher
+  createSocketEventDispatcher,
+  measurePayloadBytes
 } = require('../server');
 const { FakeSocket, FakeIo, acknowledge, deferred } = require('./support/fakes');
 
@@ -90,6 +91,55 @@ test('socket envelopes reject unknown events extra fields cycles depth and item 
 
   assert.equal(handlerCalls, 0);
   assert.deepEqual(results, Array.from({ length: 5 }, () => ({ error: 'Invalid input format.' })));
+});
+
+test('socket proxy traps fail closed with one generic callback and bounded telemetry', async () => {
+  const logs = [];
+  const dispatcher = createSocketEventDispatcher({
+    securityLogger: { warn(...args) { logs.push(args); } }
+  });
+  const socket = new FakeSocket({ dispatchPacket: dispatcher.dispatch });
+  let handlerCalls = 0;
+  socket.on('login', () => { handlerCalls += 1; });
+  const privateSentinel = 'PrivateProxyPayloadSentinel';
+  const hostilePayloads = [
+    ['prototype', new Proxy({ username: privateSentinel, password: 'private-password' }, {
+      getPrototypeOf() { throw new Error(`prototype-${privateSentinel}`); }
+    })],
+    ['ownKeys', new Proxy({ username: privateSentinel, password: 'private-password' }, {
+      ownKeys() { throw new Error(`ownKeys-${privateSentinel}`); }
+    })],
+    ['descriptor', new Proxy({ username: privateSentinel, password: 'private-password' }, {
+      getOwnPropertyDescriptor() { throw new Error(`descriptor-${privateSentinel}`); }
+    })]
+  ];
+  const callbackCounts = new Map();
+  const callbackValues = new Map();
+
+  for (const [label, payload] of hostilePayloads) {
+    callbackCounts.set(label, 0);
+    assert.equal(measurePayloadBytes(payload, { maxBytes: 8_192 }), null, label);
+    await assert.doesNotReject(socket.trigger('login', payload, value => {
+      callbackCounts.set(label, callbackCounts.get(label) + 1);
+      callbackValues.set(label, value);
+    }), label);
+  }
+
+  assert.equal(handlerCalls, 0);
+  assert.deepEqual([...callbackCounts.values()], [1, 1, 1]);
+  assert.deepEqual([...callbackValues.values()], Array.from({ length: 3 }, () => ({
+    error: 'Invalid input format.'
+  })));
+  assert.equal(logs.length, 3);
+  for (const [message, metadata] of logs) {
+    assert.equal(message, 'payload_rejected');
+    assert.deepEqual(Object.keys(metadata).sort(), ['category', 'event', 'networkBucket']);
+    assert.equal(metadata.event, 'login');
+    assert.equal(metadata.category, 'auth');
+    assert.match(metadata.networkBucket, /^[0-9a-f]{16}$/);
+  }
+  assert.equal(JSON.stringify(logs).includes(privateSentinel), false);
+  assert.equal(JSON.stringify([...callbackValues.values()]).includes(privateSentinel), false);
 });
 
 test('maximum valid chat attachment still reaches existing validation while oversized control data does no work', async () => {

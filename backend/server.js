@@ -698,8 +698,9 @@ function measurePayloadBytes(value, { maxBytes, maxDepth = 4, maxItems = 100 } =
     if (typeof candidate !== 'object') return null;
 
     const isArray = Array.isArray(candidate);
+    const prototype = isArray ? null : Object.getPrototypeOf(candidate);
     const isPlainObject = !isArray &&
-      (Object.getPrototypeOf(candidate) === Object.prototype || Object.getPrototypeOf(candidate) === null);
+      (prototype === Object.prototype || prototype === null);
     if (!isArray && !isPlainObject) return null;
     if (activeObjects.has(candidate)) return null;
     activeObjects.add(candidate);
@@ -727,7 +728,11 @@ function measurePayloadBytes(value, { maxBytes, maxDepth = 4, maxItems = 100 } =
     }
   }
 
-  return walk(value, 0);
+  try {
+    return walk(value, 0);
+  } catch {
+    return null;
+  }
 }
 
 function validateSocketEventEnvelope(event, args, policies = SOCKET_EVENT_POLICIES) {
@@ -735,45 +740,49 @@ function validateSocketEventEnvelope(event, args, policies = SOCKET_EVENT_POLICI
   const callback = typeof suppliedArgs[suppliedArgs.length - 1] === 'function'
     ? suppliedArgs.pop()
     : null;
-  const policy = policies && Object.prototype.hasOwnProperty.call(policies, event)
-    ? policies[event]
-    : null;
+  let policy = null;
   const rejected = () => ({
     allowed: false,
     error: 'Invalid input format.',
     policy: policy || null,
     callback
   });
-  if (!policy) return rejected();
+  try {
+    policy = policies && Object.prototype.hasOwnProperty.call(policies, event)
+      ? policies[event]
+      : null;
+    if (!policy) return rejected();
 
-  if (policy.kind === 'none') {
-    return suppliedArgs.length === 0
+    if (policy.kind === 'none') {
+      return suppliedArgs.length === 0
+        ? { allowed: true, error: null, policy, callback }
+        : rejected();
+    }
+    if (suppliedArgs.length !== 1) return rejected();
+
+    const payload = suppliedArgs[0];
+    if (policy.kind === 'object') {
+      if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return rejected();
+      const prototype = Object.getPrototypeOf(payload);
+      if (prototype !== Object.prototype && prototype !== null) return rejected();
+      const allowedKeys = new Set(policy.allowedKeys);
+      if (Reflect.ownKeys(payload).some(key => typeof key !== 'string' || !allowedKeys.has(key))) {
+        return rejected();
+      }
+    } else if (policy.kind === 'scalar') {
+      if ((typeof payload === 'object' && payload !== null) ||
+          ['function', 'symbol', 'bigint'].includes(typeof payload)) return rejected();
+    } else {
+      return rejected();
+    }
+
+    const measuredBytes = measurePayloadBytes(payload, { maxBytes: policy.maxBytes });
+    return measuredBytes !== null && measuredBytes <= policy.maxBytes
       ? { allowed: true, error: null, policy, callback }
       : rejected();
-  }
-  if (suppliedArgs.length !== 1) return rejected();
-
-  const payload = suppliedArgs[0];
-  if (policy.kind === 'object') {
-    if (!payload || typeof payload !== 'object' || Array.isArray(payload) ||
-        (Object.getPrototypeOf(payload) !== Object.prototype && Object.getPrototypeOf(payload) !== null)) {
-      return rejected();
-    }
-    const allowedKeys = new Set(policy.allowedKeys);
-    if (Reflect.ownKeys(payload).some(key => typeof key !== 'string' || !allowedKeys.has(key))) {
-      return rejected();
-    }
-  } else if (policy.kind === 'scalar') {
-    if ((typeof payload === 'object' && payload !== null) ||
-        ['function', 'symbol', 'bigint'].includes(typeof payload)) return rejected();
-  } else {
+  } catch {
     return rejected();
   }
-
-  const measuredBytes = measurePayloadBytes(payload, { maxBytes: policy.maxBytes });
-  return measuredBytes !== null && measuredBytes <= policy.maxBytes
-    ? { allowed: true, error: null, policy, callback }
-    : rejected();
 }
 
 function createConnectionAdmission({
