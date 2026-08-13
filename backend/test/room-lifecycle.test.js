@@ -5,6 +5,7 @@ const {
   createConnectionAdmission,
   createConnectionHandler,
   createDummyPasswordHash,
+  createInFlightRequestCoordinator,
   createLayeredAuthLimiter,
   createSocketEventDispatcher,
   hashNetworkAddress,
@@ -3655,6 +3656,208 @@ test('security failures disclose no credential payload attachment or network sen
       credentialMarker, hashMarker, payloadMarker, attachmentMarker, networkMarker
     ]) {
       assert.equal(serialized.includes(marker), false, marker);
+    }
+  });
+
+  await t.test('all denial families redact distinct private sentinels before private work', async () => {
+    const passwordSentinel = 'matrix-denial-password-private';
+    const hashSentinel = '$2b$11$matrix-denial-hash-private';
+    const networkSentinel = '203.0.113.252';
+    const payloadSentinel = 'matrix-denial-payload-private';
+    const attachmentSentinel =
+      'data:image/png;base64,bWF0cml4LWRlbmlhbC1hdHRhY2htZW50LXByaXZhdGU=';
+    const serializedFamilies = {};
+
+    {
+      const logs = [];
+      let modelCalls = 0;
+      let comparisons = 0;
+      let writes = 0;
+      let broadcasts = 0;
+      const socket = registerAuthenticationSocket({
+        id: 'matrix-private-layered-auth',
+        address: networkSentinel,
+        authLimiter: { attempt() { return { allowed: false }; }, success() {} },
+        dummyPasswordHash: hashSentinel,
+        UserModel: {
+          async findOne() {
+            modelCalls += 1;
+            return { password: hashSentinel, async save() { writes += 1; } };
+          }
+        },
+        bcryptImpl: {
+          async compare() { comparisons += 1; return true; },
+          getRounds() { return 11; },
+          async hash() { writes += 1; return hashSentinel; }
+        },
+        broadcastOnlineUsersFn() { broadcasts += 1; },
+        logger: { error(...args) { logs.push(args); } }
+      });
+      const ack = acknowledge();
+      await socket.trigger('login', {
+        username: 'PrivateAuth', password: passwordSentinel
+      }, ack.callback);
+      assert.deepEqual(ack.value(), { error: 'Too many requests. Try again later.' });
+      assert.equal(modelCalls, 0);
+      assert.equal(comparisons, 0);
+      assert.equal(writes, 0);
+      assert.equal(broadcasts, 0);
+      assert.deepEqual(socket.outbound, []);
+      serializedFamilies.layeredAuth = { ack: ack.value(), logs, outbound: socket.outbound };
+    }
+
+    {
+      const logs = [];
+      let handlerEntries = 0;
+      let writes = 0;
+      let broadcasts = 0;
+      const dispatcher = createSocketEventDispatcher({
+        eventBudgetController: { consume() { return { allowed: false }; } },
+        securityLogger: { warn(...args) { logs.push(args); } }
+      });
+      const socket = new FakeSocket({ dispatchPacket: dispatcher.dispatch });
+      socket.username = 'PrivateBudget';
+      socket.handshake.address = networkSentinel;
+      socket.on('update_profile', () => {
+        handlerEntries += 1;
+        writes += 1;
+        broadcasts += 1;
+      });
+      const ack = acknowledge();
+      await socket.trigger('update_profile', {
+        displayName: payloadSentinel,
+        color: '#112233',
+        avatarUrl: attachmentSentinel
+      }, ack.callback);
+      assert.deepEqual(ack.value(), { error: 'Too many requests. Try again later.' });
+      assert.equal(handlerEntries, 0);
+      assert.equal(writes, 0);
+      assert.equal(broadcasts, 0);
+      assert.deepEqual(socket.outbound, []);
+      serializedFamilies.eventBudget = { ack: ack.value(), logs, outbound: socket.outbound };
+    }
+
+    {
+      const logs = [];
+      const started = deferred();
+      const release = deferred();
+      let handlerEntries = 0;
+      const dispatcher = createSocketEventDispatcher({
+        inFlightCoordinator: createInFlightRequestCoordinator(),
+        securityLogger: { warn(...args) { logs.push(args); } }
+      });
+      const socket = new FakeSocket({ dispatchPacket: dispatcher.dispatch });
+      socket.username = 'PrivateDuplicate';
+      socket.handshake.address = networkSentinel;
+      socket.on('update_profile', async () => {
+        handlerEntries += 1;
+        started.resolve();
+        await release.promise;
+      });
+      const payload = {
+        displayName: payloadSentinel,
+        color: '#112233',
+        avatarUrl: attachmentSentinel
+      };
+      const first = socket.trigger('update_profile', payload, () => {});
+      await started.promise;
+      const duplicateAck = acknowledge();
+      await socket.trigger('update_profile', payload, duplicateAck.callback);
+      assert.deepEqual(duplicateAck.value(), { error: 'Request already in progress.' });
+      assert.equal(handlerEntries, 1);
+      assert.deepEqual(socket.outbound, []);
+      serializedFamilies.duplicate = {
+        ack: duplicateAck.value(), logs, outbound: socket.outbound
+      };
+      release.resolve();
+      await first;
+    }
+
+    {
+      const logs = [];
+      const admission = createConnectionAdmission({
+        salt: 'matrix-private-connection',
+        maxAttemptsPerMinute: 10,
+        maxConcurrentPerNetwork: 1
+      });
+      const first = admission.open({ handshake: { address: networkSentinel } });
+      assert.equal(first.allowed, true);
+      const socket = new FakeSocket();
+      socket.handshake.address = networkSentinel;
+      createConnectionHandler({
+        connectionAdmission: admission,
+        ioInstance: new FakeIo(),
+        onlineUsersMap: new Map(),
+        broadcastOnlineUsersFn() {},
+        logger: { error(...args) { logs.push(args); } }
+      })(socket);
+      assert.equal(socket.disconnected, true);
+      assert.equal(socket.handlers.size, 0);
+      assert.deepEqual(socket.outbound, []);
+      serializedFamilies.connection = { logs, outbound: socket.outbound };
+      admission.release(first.token);
+    }
+
+    {
+      const logs = [];
+      const ioInstance = new FakeIo();
+      ioInstance.sockets = Array.from({ length: 8 }, (_, index) => {
+        const live = new FakeSocket();
+        live.id = `matrix-private-session-${index}`;
+        live.username = index % 2 ? 'privateuser' : 'PrivateUser';
+        return live;
+      });
+      const onlineUsersMap = new Map(ioInstance.sockets.map(live => [live.id, {
+        username: live.username, serverCode: 'global', joinedServers: ['global']
+      }]));
+      let writes = 0;
+      let broadcasts = 0;
+      let roomReads = 0;
+      const user = {
+        username: 'PrivateUser', displayName: 'Private User', password: hashSentinel,
+        role: 'user', color: '', avatarUrl: '', servers: ['global'],
+        async save() { writes += 1; }
+      };
+      const socket = registerAuthenticationSocket({
+        id: 'matrix-private-session-next',
+        address: networkSentinel,
+        ioInstance,
+        onlineUsersMap,
+        UserModel: { async findOne() { return user; } },
+        ChatServerModel: {
+          async find() { roomReads += 1; return [{ code: 'global', moderators: [] }]; },
+          async findOne() { roomReads += 1; return null; }
+        },
+        bcryptImpl: {
+          async compare(password, hash) {
+            assert.equal(password, passwordSentinel);
+            assert.equal(hash, hashSentinel);
+            return true;
+          },
+          getRounds() { return 11; },
+          async hash() { writes += 1; return hashSentinel; }
+        },
+        broadcastOnlineUsersFn() { broadcasts += 1; },
+        logger: { error(...args) { logs.push(args); } }
+      });
+      const ack = acknowledge();
+      await socket.trigger('login', {
+        username: 'PrivateUser', password: passwordSentinel
+      }, ack.callback);
+      assert.deepEqual(ack.value(), { error: 'Too many active sessions.' });
+      assert.equal(writes, 0);
+      assert.equal(broadcasts, 0);
+      assert.equal(roomReads, 0);
+      assert.equal(socket.username, undefined);
+      assert.deepEqual(socket.outbound, []);
+      serializedFamilies.accountSession = { ack: ack.value(), logs, outbound: socket.outbound };
+    }
+
+    const serialized = JSON.stringify(serializedFamilies);
+    for (const sentinel of [
+      passwordSentinel, hashSentinel, networkSentinel, payloadSentinel, attachmentSentinel
+    ]) {
+      assert.equal(serialized.includes(sentinel), false, sentinel);
     }
   });
 });

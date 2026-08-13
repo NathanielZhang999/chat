@@ -966,11 +966,11 @@ function createInFlightRequestCoordinator({
     }
   }
 
-  function begin(socketId, event) {
+  function begin(socketId, event, ownerToken) {
     const key = `${socketId}\0${event}`;
     if (requestsByKey.has(key)) return null;
     const token = Object.freeze({ key });
-    const entry = { socketId, token, timer: null };
+    const entry = { socketId, ownerToken, token, timer: null };
     requestsByKey.set(key, entry);
     try {
       entry.timer = schedule(() => finish(token), 10_000);
@@ -982,9 +982,11 @@ function createInFlightRequestCoordinator({
     return token;
   }
 
-  function cancelSocket(socketId) {
+  function cancelSocket(socketId, ownerToken) {
+    const requiresExactOwner = arguments.length >= 2;
     for (const entry of [...requestsByKey.values()]) {
-      if (entry.socketId === socketId) finish(entry.token);
+      if (entry.socketId === socketId &&
+          (!requiresExactOwner || entry.ownerToken === ownerToken)) finish(entry.token);
     }
   }
 
@@ -1012,7 +1014,7 @@ function createSocketEventDispatcher({
     try { securityLogger.warn(message, { event, category }); } catch {}
   }
 
-  async function dispatch({ socket, event, args, handler }) {
+  async function dispatch({ socket, ownerToken, event, args, handler }) {
     const validation = validateSocketEventEnvelope(event, args, SOCKET_EVENT_POLICIES);
     const acknowledgement = validation.callback ? safeAck(validation.callback) : null;
     if (!validation.allowed) {
@@ -1049,7 +1051,7 @@ function createSocketEventDispatcher({
     let inFlightToken = null;
     if (policy.inFlight && inFlightCoordinator &&
         typeof inFlightCoordinator.begin === 'function') {
-      inFlightToken = inFlightCoordinator.begin(socket && socket.id, event);
+      inFlightToken = inFlightCoordinator.begin(socket && socket.id, event, ownerToken);
       if (!inFlightToken) {
         logSecurityEvent('duplicate_request', event, policy.category);
         if (acknowledgement) acknowledgement({ error: 'Request already in progress.' });
@@ -1069,9 +1071,10 @@ function createSocketEventDispatcher({
     }
   }
 
-  function cancelSocket(socketId) {
+  function cancelSocket(socketId, ownerToken) {
     if (inFlightCoordinator && typeof inFlightCoordinator.cancelSocket === 'function') {
-      inFlightCoordinator.cancelSocket(socketId);
+      if (arguments.length >= 2) inFlightCoordinator.cancelSocket(socketId, ownerToken);
+      else inFlightCoordinator.cancelSocket(socketId);
     }
   }
 
@@ -1736,6 +1739,7 @@ function createConnectionHandler({
   maxAuthenticatedSockets = 8
 } = {}) {
   return socket => {
+  const socketEventOwner = Object.freeze({ socketId: socket && socket.id });
   let connectionAdmissionToken = null;
   if (connectionAdmission && typeof connectionAdmission.open === 'function') {
     const admission = connectionAdmission.open(socket);
@@ -1768,7 +1772,9 @@ function createConnectionHandler({
       socket.on(event, handler);
       return;
     }
-    socket.on(event, (...args) => socketEventDispatcher.dispatch({ socket, event, args, handler }));
+    socket.on(event, (...args) => socketEventDispatcher.dispatch({
+      socket, ownerToken: socketEventOwner, event, args, handler
+    }));
   }
 
   socket.on('disconnect', handleDisconnect);
@@ -4388,7 +4394,7 @@ function createConnectionHandler({
     releaseConnectionAdmission();
     if (socketEventDispatcher && typeof socketEventDispatcher.cancelSocket === 'function') {
       try {
-        socketEventDispatcher.cancelSocket(socket.id);
+        socketEventDispatcher.cancelSocket(socket.id, socketEventOwner);
       } catch (err) {
         logUnexpectedError(logger, 'in_flight_disconnect_cleanup', err);
       }

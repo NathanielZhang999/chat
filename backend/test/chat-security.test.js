@@ -3,7 +3,464 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 
 const security = require('../server');
-const { FakeSocket, FakeIo, deferred } = require('./support/fakes');
+const { FakeSocket, FakeIo, deferred, createMemoryModel } = require('./support/fakes');
+
+const MATRIX_ACTIVE_MESSAGE_ID = '507f1f77bcf86cd799439011';
+const MATRIX_DELETED_MESSAGE_ID = '507f1f77bcf86cd799439012';
+const MATRIX_REPORT_ID = '507f1f77bcf86cd799439013';
+
+function deepFreezeFixture(value) {
+  if (!value || typeof value !== 'object' || Object.isFrozen(value)) return value;
+  for (const item of Object.values(value)) deepFreezeFixture(item);
+  return Object.freeze(value);
+}
+
+function matrixSuccessAck(acknowledgements, event) {
+  assert.equal(acknowledgements.length, 1, `${event}: acknowledgement count`);
+  assert.equal(acknowledgements[0] && acknowledgements[0].success, true,
+    `${event}: success ${JSON.stringify(acknowledgements[0])}`);
+}
+
+const REGISTERED_HANDLER_FIXTURES = Object.freeze([
+  {
+    event: 'register', shape: 'object', authenticated: false,
+    args: [{ username: 'MatrixNew', displayName: 'Matrix New', password: 'new-password' }],
+    verify({ acknowledgements, models }) {
+      matrixSuccessAck(acknowledgements, 'register');
+      assert.equal(models.UserModel.rows.some(user => user.username === 'MatrixNew'), true);
+    }
+  },
+  {
+    event: 'login', shape: 'object', authenticated: false,
+    args: [{ username: 'Actor', password: 'correct-password' }],
+    verify({ acknowledgements, socket }) {
+      matrixSuccessAck(acknowledgements, 'login');
+      assert.equal(socket.username, 'Actor');
+    }
+  },
+  {
+    event: 'change_password', shape: 'object',
+    args: [{ oldPassword: 'correct-password', newPassword: 'new-password' }],
+    verify({ acknowledgements, models }) {
+      matrixSuccessAck(acknowledgements, 'change_password');
+      assert.equal(models.UserModel.rows.find(user => user.username === 'Actor').password,
+        '$2b$11$new-password');
+    }
+  },
+  {
+    event: 'update_preferences', shape: 'object',
+    args: [{
+      preferences: { theme: 'light', textScale: 112.5, compactMessages: true, motion: 'reduce' },
+      expectedVersion: 0
+    }],
+    verify({ acknowledgements, models }) {
+      matrixSuccessAck(acknowledgements, 'update_preferences');
+      assert.equal(models.UserModel.rows.find(user => user.username === 'Actor').preferencesVersion, 1);
+    }
+  },
+  {
+    event: 'logout_all_devices', shape: 'none', args: [],
+    verify({ acknowledgements, remoteActor }) {
+      matrixSuccessAck(acknowledgements, 'logout_all_devices');
+      assert.equal(remoteActor.disconnected, true);
+      assert.equal(remoteActor.outbound.some(item => item.event === 'force_logout'), true);
+    }
+  },
+  {
+    event: 'update_profile', shape: 'object',
+    args: [{ displayName: 'Matrix Actor', color: '#112233', avatarUrl: 'https://example.com/a.png' }],
+    verify({ acknowledgements, models }) {
+      matrixSuccessAck(acknowledgements, 'update_profile');
+      assert.equal(models.UserModel.rows.find(user => user.username === 'Actor').displayName,
+        'Matrix Actor');
+    }
+  },
+  {
+    event: 'manage_role', shape: 'object',
+    args: [{ action: 'promote_global_admin', targetUser: 'Target' }],
+    verify({ acknowledgements, models }) {
+      matrixSuccessAck(acknowledgements, 'manage_role');
+      assert.equal(models.UserModel.rows.find(user => user.username === 'Target').role, 'admin');
+    }
+  },
+  {
+    event: 'moderate_user', shape: 'object',
+    args: [{ serverCode: 'ABC123', targetUser: 'Target', action: 'timeout', reason: 'matrix reason', duration: '10m' }],
+    verify({ acknowledgements, models }) {
+      matrixSuccessAck(acknowledgements, 'moderate_user');
+      assert.equal(models.RoomRestrictionModel.rows.some(row =>
+        row.serverCode === 'ABC123' && row.username === 'target' && row.timeoutUntil instanceof Date), true);
+    }
+  },
+  {
+    event: 'report_moderation_target', shape: 'object',
+    args: [{ serverCode: 'ABC123', targetUser: 'Target', reason: 'matrix report', messageId: null }],
+    verify({ acknowledgements, models }) {
+      matrixSuccessAck(acknowledgements, 'report_moderation_target');
+      assert.equal(models.ModerationReportModel.rows.some(row => row.reason === 'matrix report'), true);
+    }
+  },
+  {
+    event: 'list_moderation_reports', shape: 'object',
+    args: [{ serverCode: 'ABC123', status: 'open', limit: 10 }],
+    verify({ acknowledgements, trace }) {
+      assert.equal(acknowledgements.length, 1);
+      assert.equal(Array.isArray(acknowledgements[0].items), true);
+      assert.equal(acknowledgements[0].items[0]._id, MATRIX_REPORT_ID);
+      assert.equal(trace.modelCalls > 0, true);
+    }
+  },
+  {
+    event: 'resolve_moderation_report', shape: 'object',
+    args: [{ serverCode: 'ABC123', reportId: MATRIX_REPORT_ID, status: 'resolved', resolution: 'matrix resolution' }],
+    verify({ acknowledgements, models }) {
+      matrixSuccessAck(acknowledgements, 'resolve_moderation_report');
+      assert.equal(models.ModerationReportModel.rows.find(row => row._id === MATRIX_REPORT_ID).status,
+        'resolved');
+    }
+  },
+  {
+    event: 'list_room_restrictions', shape: 'object',
+    args: [{ serverCode: 'JOIN12', limit: 10 }],
+    verify({ acknowledgements, trace }) {
+      assert.equal(acknowledgements.length, 1);
+      assert.equal(Array.isArray(acknowledgements[0].items), true);
+      assert.equal(trace.modelCalls > 0, true);
+    }
+  },
+  {
+    event: 'get_moderation_audit', shape: 'object',
+    args: [{ serverCode: 'ABC123', limit: 10 }],
+    verify({ acknowledgements, trace }) {
+      assert.equal(acknowledgements.length, 1);
+      assert.equal(Array.isArray(acknowledgements[0].items), true);
+      assert.equal(trace.modelCalls > 0, true);
+    }
+  },
+  {
+    event: 'get_automod', shape: 'object', args: [{ serverCode: 'ABC123' }],
+    verify({ acknowledgements }) {
+      assert.equal(acknowledgements.length, 1);
+      assert.deepEqual(acknowledgements[0].autoMod.blockedKeywords, []);
+    }
+  },
+  {
+    event: 'update_automod', shape: 'object',
+    args: [{
+      serverCode: 'ABC123', blockedKeywords: ['matrixword'], mentionLimit: 7,
+      repeatLimit: 3, repeatWindowSeconds: 30, messageLimit: 6, messageWindowSeconds: 10
+    }],
+    verify({ acknowledgements, models }) {
+      matrixSuccessAck(acknowledgements, 'update_automod');
+      assert.deepEqual(models.ChatServerModel.rows.find(room => room.code === 'ABC123').autoMod.blockedKeywords,
+        ['matrixword']);
+    }
+  },
+  {
+    event: 'create_server', shape: 'scalar', args: ['Matrix Room'],
+    verify({ acknowledgements, models }) {
+      matrixSuccessAck(acknowledgements, 'create_server');
+      assert.equal(models.ChatServerModel.rows.some(room => room.name === 'Matrix Room'), true);
+    }
+  },
+  {
+    event: 'join_server', shape: 'scalar', args: ['JOIN12'],
+    verify({ acknowledgements, models }) {
+      matrixSuccessAck(acknowledgements, 'join_server');
+      assert.equal(models.UserModel.rows.find(user => user.username === 'Actor').servers.includes('JOIN12'), true);
+    }
+  },
+  {
+    event: 'leave_server', shape: 'scalar', args: ['DEL123'],
+    verify({ acknowledgements, models }) {
+      matrixSuccessAck(acknowledgements, 'leave_server');
+      assert.equal(models.UserModel.rows.find(user => user.username === 'Actor').servers.includes('DEL123'), false);
+    }
+  },
+  {
+    event: 'delete_server', shape: 'scalar', args: ['DEL123'],
+    verify({ acknowledgements, models }) {
+      matrixSuccessAck(acknowledgements, 'delete_server');
+      assert.equal(models.ChatServerModel.rows.some(room => room.code === 'DEL123'), false);
+    }
+  },
+  {
+    event: 'switch_server', shape: 'scalar', args: ['global'],
+    verify({ acknowledgements, socket }) {
+      assert.equal(acknowledgements.length, 1);
+      assert.equal(Array.isArray(acknowledgements[0].history), true);
+      assert.equal(socket.serverCode, 'global');
+    }
+  },
+  {
+    event: 'chat_message', shape: 'object',
+    args: [{ serverCode: 'ABC123', clientContextId: 1, text: 'matrix chat', attachment: null, replyTo: null }],
+    verify({ models, ioInstance, trace, socket }) {
+      assert.equal(models.MessageModel.rows.some(message => message.text === 'matrix chat'), true,
+        JSON.stringify({
+          modelCalls: trace.modelCalls,
+          modelWrites: trace.modelWrites,
+          logs: trace.logs.map(args => args.map(String)),
+          socket: { username: socket.username, role: socket.role, serverCode: socket.serverCode,
+            joinedServers: socket.joinedServers },
+          user: models.UserModel.rows.find(user => user.username === 'Actor'),
+          room: models.ChatServerModel.rows.find(room => room.code === 'ABC123')
+        }));
+      assert.equal(ioInstance.outbound.some(item => item.event === 'chat_message'), true);
+    }
+  },
+  {
+    event: 'toggle_reaction', shape: 'object',
+    args: [{ id: MATRIX_ACTIVE_MESSAGE_ID, emoji: '👍', serverCode: 'ABC123', clientContextId: 1 }],
+    verify({ models, ioInstance }) {
+      assert.deepEqual(models.MessageModel.rows.find(message => message._id === MATRIX_ACTIVE_MESSAGE_ID).reactions,
+        { '👍': ['Actor'] });
+      assert.equal(ioInstance.outbound.some(item => item.event === 'reaction_updated'), true);
+    }
+  },
+  {
+    event: 'edit_message', shape: 'object',
+    args: [{ id: MATRIX_ACTIVE_MESSAGE_ID, text: 'matrix edited', serverCode: 'ABC123', clientContextId: 1 }],
+    verify({ models, ioInstance }) {
+      assert.equal(models.MessageModel.rows.find(message => message._id === MATRIX_ACTIVE_MESSAGE_ID).text,
+        'matrix edited');
+      assert.equal(ioInstance.outbound.some(item => item.event === 'message_edited'), true);
+    }
+  },
+  {
+    event: 'delete_message', shape: 'object',
+    args: [{ id: MATRIX_ACTIVE_MESSAGE_ID, serverCode: 'ABC123', clientContextId: 1 }],
+    verify({ models, ioInstance }) {
+      assert.equal(models.MessageModel.rows.find(message => message._id === MATRIX_ACTIVE_MESSAGE_ID).deleted, true);
+      assert.equal(ioInstance.outbound.some(item => item.event === 'message_deleted'), true);
+    }
+  },
+  {
+    event: 'get_edit_history', shape: 'scalar', args: [MATRIX_ACTIVE_MESSAGE_ID],
+    verify({ acknowledgements }) {
+      matrixSuccessAck(acknowledgements, 'get_edit_history');
+      assert.deepEqual(acknowledgements[0].history, [{ text: 'matrix previous' }]);
+    }
+  },
+  {
+    event: 'get_deleted_message', shape: 'scalar', args: [MATRIX_DELETED_MESSAGE_ID],
+    verify({ acknowledgements }) {
+      matrixSuccessAck(acknowledgements, 'get_deleted_message');
+      assert.equal(acknowledgements[0].text, 'matrix deleted');
+    }
+  },
+  {
+    event: 'typing', shape: 'object',
+    args: [{ serverCode: 'ABC123', clientContextId: 1, isTyping: true }],
+    verify({ socket }) {
+      assert.equal(socket.outbound.some(item => item.event === 'typing' && item.payload.isTyping === true), true);
+    }
+  }
+].map(deepFreezeFixture));
+
+function addMatrixMutationMethods(model) {
+  if (typeof model.updateMany !== 'function') {
+    model.updateMany = async (_query, update) => {
+      for (const row of model.rows) {
+        if (update.$set) Object.assign(row, update.$set);
+        if (update.$pull && update.$pull.servers) {
+          row.servers = (Array.isArray(row.servers) ? row.servers : [])
+            .filter(code => code !== update.$pull.servers);
+        }
+      }
+      return { matchedCount: model.rows.length, modifiedCount: model.rows.length };
+    };
+  }
+  if (typeof model.deleteOne !== 'function') {
+    model.deleteOne = async query => {
+      const index = model.rows.findIndex(row => Object.entries(query).every(([key, value]) => row[key] === value));
+      if (index >= 0) model.rows.splice(index, 1);
+    };
+  }
+  if (typeof model.deleteMany !== 'function') {
+    model.deleteMany = async query => {
+      for (let index = model.rows.length - 1; index >= 0; index -= 1) {
+        if (Object.entries(query).every(([key, value]) => model.rows[index][key] === value)) {
+          model.rows.splice(index, 1);
+        }
+      }
+    };
+  }
+}
+
+function createRegisteredHandlerFixture(row) {
+  const trace = {
+    handlerEntries: 0, modelCalls: 0, modelWrites: 0, broadcasts: 0, fetches: 0, logs: []
+  };
+  const automod = {
+    blockedKeywords: [], mentionLimit: 8, repeatLimit: 3, repeatWindowSeconds: 30,
+    messageLimit: 6, messageWindowSeconds: 10
+  };
+  const users = [
+    {
+      username: 'Actor', displayName: 'Actor', password: '$2b$11$actor-hash', role: 'admin',
+      color: '', avatarUrl: '', servers: ['global', 'ABC123', 'DEL123'],
+      preferences: { theme: 'dark', textScale: 100, compactMessages: false, motion: 'system' },
+      preferencesVersion: 0
+    },
+    {
+      username: 'Target', displayName: 'Target', password: '$2b$11$target-hash', role: 'user',
+      color: '', avatarUrl: '', servers: ['global', 'ABC123'], preferencesVersion: 0
+    }
+  ];
+  const rooms = [
+    { code: 'global', name: 'Global Chat', owner: 'System', moderators: [], autoMod: automod },
+    { code: 'ABC123', name: 'Matrix Room', owner: 'Actor', moderators: ['Actor'], autoMod: automod },
+    { code: 'JOIN12', name: 'Join Room', owner: 'Target', moderators: [], autoMod: automod },
+    { code: 'DEL123', name: 'Delete Room', owner: 'Actor', moderators: ['Actor'], autoMod: automod }
+  ];
+  const messages = [
+    {
+      _id: MATRIX_ACTIVE_MESSAGE_ID, serverCode: 'ABC123', username: 'Actor', displayName: 'Actor',
+      role: 'admin', roomRole: 'mod', text: 'matrix original', attachment: null,
+      history: [{ text: 'matrix previous' }], reactions: {}, deleted: false,
+      timestamp: new Date('2026-08-13T12:00:00.000Z')
+    },
+    {
+      _id: MATRIX_DELETED_MESSAGE_ID, serverCode: 'ABC123', username: 'Actor', displayName: 'Actor',
+      role: 'admin', roomRole: 'mod', text: 'matrix deleted', attachment: null,
+      history: [], reactions: {}, deleted: true, timestamp: new Date('2026-08-13T12:01:00.000Z')
+    }
+  ];
+  const models = {
+    UserModel: createMemoryModel(users),
+    ChatServerModel: createMemoryModel(rooms),
+    MessageModel: createMemoryModel(messages),
+    RoomRestrictionModel: createMemoryModel([{
+      _id: '507f1f77bcf86cd799439014', serverCode: 'JOIN12', username: 'target',
+      bannedAt: new Date('2026-08-13T11:00:00.000Z'), timeoutUntil: null,
+      createdAt: new Date('2026-08-13T11:00:00.000Z')
+    }]),
+    ModerationAuditModel: createMemoryModel([{
+      _id: '507f1f77bcf86cd799439015', correlationId: 'matrix-audit', action: 'timeout',
+      serverCode: 'ABC123', actorUsername: 'Actor', actorRole: 'admin', actorRoomRole: 'mod',
+      targetUsername: 'Target', targetRole: 'user', targetRoomRole: 'user', reason: 'matrix audit',
+      createdAt: new Date('2026-08-13T11:30:00.000Z')
+    }]),
+    ModerationReportModel: createMemoryModel([{
+      _id: MATRIX_REPORT_ID, serverCode: 'ABC123', reporterUsername: 'Other', targetUsername: 'Target',
+      messageId: null, reason: 'existing report', status: 'open',
+      createdAt: new Date('2026-08-13T11:45:00.000Z')
+    }])
+  };
+  for (const model of Object.values(models)) addMatrixMutationMethods(model);
+  for (const model of Object.values(models)) {
+    for (const method of ['find', 'findOne', 'findById', 'countDocuments']) {
+      if (typeof model[method] !== 'function') continue;
+      const original = model[method].bind(model);
+      model[method] = (...args) => {
+        trace.modelCalls += 1;
+        return original(...args);
+      };
+    }
+    for (const method of ['create', 'findOneAndUpdate', 'updateOne', 'updateMany', 'deleteOne', 'deleteMany']) {
+      if (typeof model[method] !== 'function') continue;
+      const original = model[method].bind(model);
+      model[method] = (...args) => {
+        trace.modelCalls += 1;
+        trace.modelWrites += 1;
+        return original(...args);
+      };
+    }
+  }
+
+  const ioInstance = new FakeIo();
+  const originalFetchSockets = ioInstance.fetchSockets.bind(ioInstance);
+  ioInstance.fetchSockets = async () => {
+    trace.fetches += 1;
+    return originalFetchSockets();
+  };
+  const socket = new FakeSocket();
+  socket.id = 'matrix-actor';
+  Object.assign(socket, {
+    username: 'Actor', displayName: 'Actor', role: 'admin', serverCode: 'ABC123',
+    joinedServers: ['global', 'ABC123', 'DEL123'], bannedRooms: [], clientContextId: 1
+  });
+  socket.joinedRooms.add('ABC123');
+  const remoteActor = new FakeSocket();
+  Object.assign(remoteActor, {
+    id: 'matrix-actor-remote', username: 'Actor', displayName: 'Actor', role: 'admin',
+    serverCode: 'global', joinedServers: ['global', 'ABC123'], bannedRooms: []
+  });
+  const targetSocket = new FakeSocket();
+  Object.assign(targetSocket, {
+    id: 'matrix-target', username: 'Target', displayName: 'Target', role: 'user',
+    serverCode: 'ABC123', joinedServers: ['global', 'ABC123'], bannedRooms: []
+  });
+  ioInstance.sockets = [socket, remoteActor, targetSocket];
+  const onlineUsersMap = new Map([
+    [socket.id, {
+      username: 'Actor', displayName: 'Actor', role: 'admin', serverCode: 'ABC123',
+      joinedServers: ['global', 'ABC123', 'DEL123'], bannedRooms: []
+    }],
+    [remoteActor.id, {
+      username: 'Actor', displayName: 'Actor', role: 'admin', serverCode: 'global',
+      joinedServers: ['global', 'ABC123'], bannedRooms: []
+    }],
+    [targetSocket.id, {
+      username: 'Target', displayName: 'Target', role: 'user', serverCode: 'ABC123',
+      joinedServers: ['global', 'ABC123'], bannedRooms: []
+    }]
+  ]);
+  const productionDispatcher = security.createSocketEventDispatcher({
+    inFlightCoordinator: security.createInFlightRequestCoordinator(),
+    securityLogger: { warn(...args) { trace.logs.push(args); } }
+  });
+  const socketEventDispatcher = {
+    dispatch(packet) {
+      return productionDispatcher.dispatch({
+        ...packet,
+        handler: (...args) => {
+          trace.handlerEntries += 1;
+          return packet.handler(...args);
+        }
+      });
+    },
+    cancelSocket(...args) { return productionDispatcher.cancelSocket(...args); }
+  };
+  security.createConnectionHandler({
+    ioInstance,
+    ...models,
+    onlineUsersMap,
+    socketEventDispatcher,
+    authLimiter: { attempt() { return { allowed: true, token: Object.freeze({}) }; }, success() {} },
+    rateLimiter: { check() { return true; }, clear() {} },
+    bcryptImpl: {
+      async compare() { return true; },
+      getRounds() { return 11; },
+      async hash(value) { return `$2b$11$${value}`; }
+    },
+    dummyPasswordHash: '$2b$11$matrix-dummy-hash',
+    readRawPreferencesVersionFn: async () => ({ exists: true, value: 0 }),
+    autoModTracker: security.createAutoModTracker(),
+    broadcastOnlineUsersFn() { trace.broadcasts += 1; },
+    getRoomRoleFn: async () => 'mod',
+    resolvePingsFn: async text => text,
+    logger: { error(...args) { trace.logs.push(args); } }
+  })(socket);
+  if (row.authenticated === false) {
+    delete socket.username;
+    delete socket.displayName;
+    delete socket.role;
+    socket.serverCode = null;
+    socket.joinedServers = [];
+    onlineUsersMap.delete(socket.id);
+  } else {
+    Object.assign(socket, {
+      username: 'Actor', displayName: 'Actor', role: 'admin', serverCode: 'ABC123',
+      joinedServers: ['global', 'ABC123', 'DEL123'], bannedRooms: [], clientContextId: 1
+    });
+    socket.joinedRooms.add('ABC123');
+  }
+  return {
+    row, trace, models, socket, ioInstance, onlineUsersMap, remoteActor, targetSocket
+  };
+}
 
 test('requiring server.js does not start the HTTP server', () => {
   assert.equal(typeof security.app, 'function');
@@ -837,89 +1294,75 @@ test('complete invisible-security matrix uses registered handlers and shared pro
     }
   });
 
-  await t.test('all registered event envelopes admit a handler and reject unexpected fields before work', async () => {
-    const capturedPackets = new Map();
-    let modelCalls = 0;
-    let broadcasts = 0;
-    const noWorkModel = Object.freeze({
-      async findOne() { modelCalls += 1; throw new Error('unexpected matrix model read'); },
-      async find() { modelCalls += 1; throw new Error('unexpected matrix model read'); },
-      async findById() { modelCalls += 1; throw new Error('unexpected matrix model read'); },
-      async create() { modelCalls += 1; throw new Error('unexpected matrix model write'); },
-      async updateOne() { modelCalls += 1; throw new Error('unexpected matrix model write'); },
-      async findOneAndUpdate() { modelCalls += 1; throw new Error('unexpected matrix model write'); }
-    });
-    const socket = new FakeSocket();
-    socket.handshake.address = '192.0.2.240';
-    security.createConnectionHandler({
-      socketEventDispatcher: {
-        dispatch(packet) {
-          capturedPackets.set(packet.event, packet);
-        },
-        cancelSocket() {}
-      },
-      ioInstance: new FakeIo(),
-      UserModel: noWorkModel,
-      ChatServerModel: noWorkModel,
-      MessageModel: noWorkModel,
-      RoomRestrictionModel: noWorkModel,
-      ModerationAuditModel: noWorkModel,
-      ModerationReportModel: noWorkModel,
-      onlineUsersMap: new Map(),
-      broadcastOnlineUsersFn() { broadcasts += 1; },
-      logger: { error() {} }
-    })(socket);
-
-    const eventNames = Object.keys(security.SOCKET_EVENT_POLICIES);
-    for (const event of eventNames) await socket.trigger(event);
-    assert.deepEqual([...capturedPackets.keys()], eventNames);
-
-    const securityLogs = [];
-    const dispatcher = security.createSocketEventDispatcher({
-      securityLogger: { warn(...args) { securityLogs.push(args); } }
-    });
-    const privateMarker = 'matrix-private-payload-marker';
-    let admittedHandlerEntries = 0;
-    let rejectedHandlerEntries = 0;
-    const rejectionAcks = [];
-
-    for (const event of eventNames) {
-      const policy = security.SOCKET_EVENT_POLICIES[event];
-      const packet = capturedPackets.get(event);
-      const acknowledgement = () => {};
-      const validArgs = policy.kind === 'none'
-        ? [acknowledgement]
-        : [policy.kind === 'object' ? {} : '', acknowledgement];
-      await dispatcher.dispatch({
-        socket,
-        event,
-        args: validArgs,
-        handler: async (...args) => {
-          admittedHandlerEntries += 1;
-          return packet.handler(...args);
-        }
-      });
-
-      const invalidPayload = policy.kind === 'object'
-        ? { [privateMarker]: true }
-        : (policy.kind === 'none' ? privateMarker : { [privateMarker]: true });
-      await dispatcher.dispatch({
-        socket,
-        event,
-        args: [invalidPayload, value => rejectionAcks.push([event, value])],
-        handler: () => { rejectedHandlerEntries += 1; }
-      });
+  await t.test('exported Socket.IO boundary executes the production allowRequest policy', () => {
+    const allowRequest = security.io && security.io.opts && security.io.opts.allowRequest;
+    assert.equal(typeof allowRequest, 'function');
+    assert.equal(allowRequest, security.originPolicy.allowSocketRequest);
+    const exactOrigin = security.originPolicy.origins[0];
+    assert.equal(typeof exactOrigin, 'string');
+    const rows = [
+      { name: 'exact', headers: { origin: exactOrigin }, allowed: true },
+      { name: 'hostile', headers: { origin: `${exactOrigin}.evil.invalid` }, allowed: false },
+      { name: 'missing', headers: {}, allowed: false }
+    ];
+    for (const row of rows) {
+      const calls = [];
+      allowRequest({ headers: row.headers }, (...args) => calls.push(args));
+      assert.deepEqual(calls, [[null, row.allowed]], row.name);
     }
+  });
 
-    assert.equal(admittedHandlerEntries, eventNames.length);
-    assert.equal(rejectedHandlerEntries, 0);
-    assert.equal(modelCalls, 0);
-    assert.equal(broadcasts, 0);
-    assert.equal(rejectionAcks.length, eventNames.length);
-    for (const [event, value] of rejectionAcks) {
-      assert.deepEqual(value, { error: 'Invalid input format.' }, event);
+  await t.test('literal all-27 fixtures reach real registered handlers and reject before private work', async () => {
+    const literalEventNames = [
+      'register', 'login', 'change_password', 'update_preferences', 'logout_all_devices',
+      'update_profile', 'manage_role', 'moderate_user', 'report_moderation_target',
+      'list_moderation_reports', 'resolve_moderation_report', 'list_room_restrictions',
+      'get_moderation_audit', 'get_automod', 'update_automod', 'create_server', 'join_server',
+      'leave_server', 'delete_server', 'switch_server', 'chat_message', 'toggle_reaction',
+      'edit_message', 'delete_message', 'get_edit_history', 'get_deleted_message', 'typing'
+    ];
+    assert.deepEqual(REGISTERED_HANDLER_FIXTURES.map(row => row.event), literalEventNames);
+    assert.equal(Object.isFrozen(REGISTERED_HANDLER_FIXTURES), true);
+    assert.equal(REGISTERED_HANDLER_FIXTURES.every(row => Object.isFrozen(row) && Object.isFrozen(row.args)), true);
+
+    for (const row of REGISTERED_HANDLER_FIXTURES) {
+      const admitted = createRegisteredHandlerFixture(row);
+      assert.equal(admitted.socket.handlers.has(row.event), true, `${row.event}: registered`);
+      const acknowledgements = [];
+      await admitted.socket.trigger(
+        row.event,
+        ...row.args,
+        value => acknowledgements.push(value)
+      );
+      assert.equal(admitted.trace.handlerEntries, 1, `${row.event}: real handler entry`);
+      row.verify({ ...admitted, acknowledgements });
+
+      const denied = createRegisteredHandlerFixture(row);
+      assert.equal(denied.socket.handlers.has(row.event), true, `${row.event}: denial registered`);
+      const privateMarker = `matrix-private-${row.event}`;
+      const invalidPayload = row.shape === 'object'
+        ? { ...row.args[0], unexpectedPrivateField: privateMarker }
+        : (row.shape === 'scalar' ? { unexpectedPrivateField: privateMarker } : privateMarker);
+      const deniedAcks = [];
+      const beforeRows = JSON.stringify(Object.fromEntries(
+        Object.entries(denied.models).map(([name, model]) => [name, model.rows])
+      ));
+      await denied.socket.trigger(row.event, invalidPayload, value => deniedAcks.push(value));
+      assert.equal(denied.trace.handlerEntries, 0, `${row.event}: denied handler entry`);
+      assert.equal(denied.trace.modelCalls, 0, `${row.event}: denied model work`);
+      assert.equal(denied.trace.modelWrites, 0, `${row.event}: denied model writes`);
+      assert.equal(denied.trace.broadcasts, 0, `${row.event}: denied broadcasts`);
+      assert.equal(denied.trace.fetches, 0, `${row.event}: denied socket discovery`);
+      assert.deepEqual(deniedAcks, [{ error: 'Invalid input format.' }], `${row.event}: generic denial`);
+      assert.equal(JSON.stringify(Object.fromEntries(
+        Object.entries(denied.models).map(([name, model]) => [name, model.rows])
+      )), beforeRows, `${row.event}: denied persistence`);
+      assert.deepEqual(denied.socket.outbound, [], `${row.event}: denied socket events`);
+      assert.deepEqual(denied.ioInstance.outbound, [], `${row.event}: denied room events`);
+      assert.deepEqual(denied.remoteActor.outbound, [], `${row.event}: denied remote events`);
+      assert.equal(JSON.stringify({ logs: denied.trace.logs, acks: deniedAcks }).includes(privateMarker),
+        false, `${row.event}: private marker`);
     }
-    assert.equal(JSON.stringify({ securityLogs, rejectionAcks }).includes(privateMarker), false);
   });
 
   await t.test('every payload byte class accepts the exact limit and rejects one byte over', () => {
@@ -1169,51 +1612,113 @@ test('complete invisible-security matrix uses registered handlers and shared pro
     exactCoordinator.finish(currentToken);
     assert.equal(exactCoordinator.size(), 0);
 
-    const disconnectCoordinator = security.createInFlightRequestCoordinator();
-    const disconnectDispatcher = security.createSocketEventDispatcher({
-      inFlightCoordinator: disconnectCoordinator,
+  });
+
+  await t.test('stale same-ID disconnect cleanup cannot release the newer in-flight owner', async () => {
+    const timers = [];
+    const coordinator = security.createInFlightRequestCoordinator({
+      schedule(callback) {
+        const timer = { callback, unref() {} };
+        timers.push(timer);
+        return timer;
+      },
+      clearSchedule() {}
+    });
+    const productionDispatcher = security.createSocketEventDispatcher({
+      inFlightCoordinator: coordinator,
       securityLogger: { warn() {} }
     });
-    const reconnectSocket = new FakeSocket();
-    reconnectSocket.id = 'reused-socket-id';
-    security.createConnectionHandler({
-      socketEventDispatcher: disconnectDispatcher,
+    const owners = new Map();
+    const connectionDispatcher = {
+      dispatch(packet) {
+        owners.set(packet.socket, packet.ownerToken);
+        return productionDispatcher.dispatch(packet);
+      },
+      cancelSocket(...args) { return productionDispatcher.cancelSocket(...args); }
+    };
+    const connect = socket => security.createConnectionHandler({
+      socketEventDispatcher: connectionDispatcher,
       ioInstance: new FakeIo(),
       onlineUsersMap: new Map(),
       broadcastOnlineUsersFn() {},
       logger: { error() {} }
-    })(reconnectSocket);
+    })(socket);
+
+    const oldSocket = new FakeSocket();
+    const newerSocket = new FakeSocket();
+    oldSocket.id = 'matrix-reused-id';
+    newerSocket.id = 'matrix-reused-id';
+    connect(oldSocket);
+    connect(newerSocket);
+    await oldSocket.trigger('login', {}, () => {});
+    await newerSocket.trigger('login', {}, () => {});
+
     const oldStarted = deferred();
     const releaseOld = deferred();
-    const oldRequest = disconnectDispatcher.dispatch({
-      socket: reconnectSocket,
+    const oldRequest = productionDispatcher.dispatch({
+      socket: oldSocket,
+      ownerToken: owners.get(oldSocket),
       event: 'switch_server',
       args: ['global'],
       handler: async () => { oldStarted.resolve(); await releaseOld.promise; }
     });
     await oldStarted.promise;
-    await reconnectSocket.trigger('disconnect');
-    const newStarted = deferred();
-    const releaseNew = deferred();
-    const newRequest = disconnectDispatcher.dispatch({
-      socket: reconnectSocket,
+    assert.equal(coordinator.size(), 1);
+    timers[0].callback();
+    assert.equal(coordinator.size(), 0, 'safety timeout releases only the old token');
+
+    const newerStarted = deferred();
+    const releaseNewer = deferred();
+    const newerRequest = productionDispatcher.dispatch({
+      socket: newerSocket,
+      ownerToken: owners.get(newerSocket),
       event: 'switch_server',
       args: ['global'],
-      handler: async () => { newStarted.resolve(); await releaseNew.promise; }
+      handler: async () => { newerStarted.resolve(); await releaseNewer.promise; }
     });
-    await newStarted.promise;
+    await newerStarted.promise;
+    assert.equal(coordinator.size(), 1);
+
+    await oldSocket.trigger('disconnect');
+    let staleDuplicateEntries = 0;
+    const staleDuplicateAcks = [];
+    await productionDispatcher.dispatch({
+      socket: newerSocket,
+      ownerToken: owners.get(newerSocket),
+      event: 'switch_server',
+      args: ['global', value => staleDuplicateAcks.push(value)],
+      handler: async () => { staleDuplicateEntries += 1; }
+    });
+    assert.equal(staleDuplicateEntries, 0);
+    assert.deepEqual(staleDuplicateAcks, [{ error: 'Request already in progress.' }]);
+    assert.equal(coordinator.size(), 1);
+
     releaseOld.resolve();
     await oldRequest;
-    const reconnectDuplicateAck = [];
-    await disconnectDispatcher.dispatch({
-      socket: reconnectSocket,
+    assert.equal(coordinator.size(), 1, 'old completion cannot finish the newer token');
+    releaseNewer.resolve();
+    await newerRequest;
+    assert.equal(coordinator.size(), 0);
+
+    const normalSocket = new FakeSocket();
+    normalSocket.id = 'matrix-normal-disconnect';
+    connect(normalSocket);
+    await normalSocket.trigger('login', {}, () => {});
+    const normalStarted = deferred();
+    const releaseNormal = deferred();
+    const normalRequest = productionDispatcher.dispatch({
+      socket: normalSocket,
+      ownerToken: owners.get(normalSocket),
       event: 'switch_server',
-      args: ['global', value => reconnectDuplicateAck.push(value)],
-      handler: async () => {}
+      args: ['global'],
+      handler: async () => { normalStarted.resolve(); await releaseNormal.promise; }
     });
-    assert.deepEqual(reconnectDuplicateAck, [{ error: 'Request already in progress.' }]);
-    releaseNew.resolve();
-    await newRequest;
+    await normalStarted.promise;
+    assert.equal(coordinator.size(), 1);
+    await normalSocket.trigger('disconnect');
+    assert.equal(coordinator.size(), 0, 'normal disconnect releases its exact owner');
+    releaseNormal.resolve();
+    await normalRequest;
   });
 
   await t.test('connection attempt and concurrency edges reject without releasing newer tokens', () => {

@@ -1,8 +1,8 @@
 # Invisible Security Hardening Design
 
-**Date:** 2026-08-13  
-**Status:** Approved direction; implementation pending plan review  
-**Base:** `fb84aab648a363f2ca05116727910d756df1795e`  
+**Date:** 2026-08-13
+**Status:** Approved direction; implementation pending plan review
+**Base:** `fb84aab648a363f2ca05116727910d756df1795e`
 **Deployment target:** GitHub branch `deploy-chat`, Render backend, MongoDB, one Node process
 
 ## Goal
