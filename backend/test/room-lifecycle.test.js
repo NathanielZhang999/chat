@@ -6,6 +6,7 @@ const {
   createConnectionHandler,
   createDummyPasswordHash,
   createLayeredAuthLimiter,
+  createSocketEventDispatcher,
   hashNetworkAddress,
   seedSystem,
   withAccountTransitionLock
@@ -3236,6 +3237,426 @@ test('malformed acknowledgement inputs use the standard protocol error', async (
     await socket.trigger(event, ...args, ack.callback);
     assert.deepEqual(ack.value(), { error: 'Invalid input format.' }, event);
   }
+});
+
+test('security failures disclose no credential payload attachment or network sentinels', async (t) => {
+  await t.test('registered login matrix enforces pair account and network layers before model work', async () => {
+    const dimensions = ['pair', 'account', 'network'];
+    const boundaries = ['below', 'at'];
+    const accountKinds = ['unknown', 'existing'];
+    const passwordKinds = ['correct', 'wrong'];
+    let rowNumber = 0;
+
+    for (const dimension of dimensions) {
+      for (const boundary of boundaries) {
+        for (const accountKind of accountKinds) {
+          for (const passwordKind of passwordKinds) {
+            rowNumber += 1;
+            const username = `${accountKind === 'existing' ? 'user' : 'missing'}${rowNumber}`;
+            const address = '198.51.100.180';
+            const storedHash = `$2b$11$matrix-${rowNumber}-hash`;
+            const dummyHash = `$2b$11$matrix-${rowNumber}-dummy`;
+            const policies = {
+              login: {
+                account: dimension === 'account' ? 2 : 100,
+                pair: dimension === 'pair' ? 2 : 100,
+                network: dimension === 'network' ? 2 : 100
+              },
+              register: { account: 20, pair: 6, network: 300 }
+            };
+            const authLimiter = createLayeredAuthLimiter({
+              salt: `login-matrix-${rowNumber}`,
+              policies
+            });
+            const prefills = boundary === 'below' ? 1 : 2;
+            for (let index = 0; index < prefills; index += 1) {
+              const prefill = authLimiter.attempt({
+                action: 'login',
+                account: dimension === 'network' ? `prefill-${rowNumber}-${index}` : username,
+                address: dimension === 'account' ? `192.0.2.${index + 1}` : address
+              });
+              assert.equal(prefill.allowed, true, `${dimension} ${boundary} prefill ${index + 1}`);
+            }
+
+            let modelQueries = 0;
+            let writes = 0;
+            let broadcasts = 0;
+            const comparisons = [];
+            const user = {
+              username,
+              displayName: username,
+              password: storedHash,
+              role: 'user',
+              color: '',
+              avatarUrl: '',
+              servers: ['global'],
+              preferencesVersion: 0,
+              async save() { writes += 1; }
+            };
+            const UserModel = {
+              async findOne(query) {
+                modelQueries += 1;
+                const matcher = query && query.username && query.username.$regex;
+                return accountKind === 'existing' && matcher && matcher.test(username) ? user : null;
+              }
+            };
+            const ChatServerModel = {
+              async find() {
+                modelQueries += 1;
+                return [{ code: 'global', moderators: [] }];
+              },
+              async findOne() {
+                modelQueries += 1;
+                return null;
+              }
+            };
+            const RoomRestrictionModel = {
+              async find() { modelQueries += 1; return []; },
+              async findOne() { modelQueries += 1; return null; }
+            };
+            const bcryptImpl = {
+              async compare(password, hash) {
+                comparisons.push([password, hash]);
+                return accountKind === 'existing' && passwordKind === 'correct' &&
+                  password === 'correct-password' && hash === storedHash;
+              },
+              getRounds() { return 11; },
+              async hash() { writes += 1; return '$2b$11$unexpected'; }
+            };
+            const socket = registerAuthenticationSocket({
+              id: `login-matrix-${rowNumber}`,
+              address,
+              authLimiter,
+              dummyPasswordHash: dummyHash,
+              UserModel,
+              ChatServerModel,
+              RoomRestrictionModel,
+              bcryptImpl,
+              broadcastOnlineUsersFn() { broadcasts += 1; }
+            });
+            const ack = acknowledge();
+            await socket.trigger('login', {
+              username,
+              password: passwordKind === 'correct' ? 'correct-password' : 'wrong-password'
+            }, ack.callback);
+            const label = `${dimension} ${boundary} ${accountKind} ${passwordKind}`;
+
+            if (boundary === 'at') {
+              assert.deepEqual(ack.value(), { error: 'Too many requests. Try again later.' }, label);
+              assert.equal(modelQueries, 0, label);
+              assert.equal(comparisons.length, 0, label);
+              assert.equal(writes, 0, label);
+              assert.equal(broadcasts, 0, label);
+              assert.deepEqual(socket.outbound, [], label);
+              continue;
+            }
+
+            assert.equal(modelQueries > 0, true, label);
+            assert.equal(comparisons.length > 0, true, label);
+            if (accountKind === 'unknown') {
+              assert.equal(comparisons[0][1], dummyHash, label);
+            } else {
+              assert.equal(comparisons[0][1], storedHash, label);
+            }
+            if (accountKind === 'existing' && passwordKind === 'correct') {
+              assert.equal(ack.value().success, true, label);
+              assert.equal(socket.username, username, label);
+              assert.equal(broadcasts > 0, true, label);
+            } else {
+              assert.deepEqual(ack.value(), { error: 'Invalid username or password.' }, label);
+              assert.equal(socket.username, undefined, label);
+              assert.equal(broadcasts, 0, label);
+            }
+            assert.equal(writes, 0, label);
+          }
+        }
+      }
+    }
+  });
+
+  await t.test('default layered authentication storage never exceeds ten thousand union keys', () => {
+    const limiter = createLayeredAuthLimiter({
+      salt: 'matrix-default-auth-storage-cap',
+      policies: {
+        login: { account: 100_000, pair: 100_000, network: 100_000 },
+        register: { account: 100_000, pair: 100_000, network: 100_000 }
+      }
+    });
+    for (let index = 0; index < 5_001; index += 1) {
+      assert.equal(limiter.attempt({
+        action: 'login',
+        account: `cap${index}`,
+        address: '198.51.100.230'
+      }).allowed, true, `default-cap attempt ${index + 1}`);
+    }
+    assert.equal(limiter.size(), 10_000);
+  });
+
+  await t.test('bcrypt costs ten eleven and twelve preserve migration save outcomes', async () => {
+    for (const cost of [10, 11, 12]) {
+      for (const saveOutcome of ['success', 'failure']) {
+        let saves = 0;
+        let hashes = 0;
+        const onlineUsersMap = new Map();
+        const broadcasts = [];
+        const user = {
+          username: `Cost${cost}${saveOutcome}`,
+          displayName: `Cost ${cost} ${saveOutcome}`,
+          password: `$2b$${cost}$matrix-cost-hash`,
+          role: 'user',
+          color: '',
+          avatarUrl: '',
+          servers: ['global'],
+          async save() {
+            saves += 1;
+            if (saveOutcome === 'failure') throw new Error('matrix migration save failure');
+          }
+        };
+        const socket = registerAuthenticationSocket({
+          id: `cost-${cost}-${saveOutcome}`,
+          address: `203.0.113.${cost + (saveOutcome === 'failure' ? 30 : 0)}`,
+          UserModel: { async findOne() { return user; } },
+          bcryptImpl: {
+            async compare() { return true; },
+            getRounds() { return cost; },
+            async hash(password, requestedCost) {
+              hashes += 1;
+              assert.equal(password, 'correct-password');
+              assert.equal(requestedCost, 11);
+              return '$2b$11$matrix-upgraded-hash';
+            }
+          },
+          onlineUsersMap,
+          broadcastOnlineUsersFn(code) { broadcasts.push(code); },
+          logger: { error() {} }
+        });
+        const ack = acknowledge();
+        await socket.trigger('login', {
+          username: user.username,
+          password: 'correct-password'
+        }, ack.callback);
+        const label = `cost ${cost} save ${saveOutcome}`;
+
+        if (cost === 10 && saveOutcome === 'failure') {
+          assert.deepEqual(ack.value(), { error: 'Login failed.' }, label);
+          assert.equal(onlineUsersMap.size, 0, label);
+          assert.equal(socket.username, undefined, label);
+          assert.deepEqual(broadcasts, [], label);
+        } else {
+          assert.equal(ack.value().success, true, label);
+          assert.equal(onlineUsersMap.size, 1, label);
+        }
+        assert.equal(hashes, cost === 10 ? 1 : 0, label);
+        assert.equal(saves, cost === 10 ? 1 : 0, label);
+      }
+    }
+  });
+
+  await t.test('forty shared-network accounts and one attacked account remain independent', async () => {
+    const authLimiter = createLayeredAuthLimiter({ salt: 'complete-matrix-shared-network' });
+    const records = new Map();
+    for (let index = 0; index < 42; index += 1) {
+      const username = `matrixuser${index}`;
+      records.set(username, {
+        username,
+        displayName: `Matrix User ${index}`,
+        password: `$2b$11$matrix-user-${index}`,
+        role: 'user',
+        color: '',
+        avatarUrl: '',
+        servers: ['global']
+      });
+    }
+    const UserModel = createAuthUserModel(records);
+    const bcryptImpl = {
+      async compare(password) { return password === 'valid-password'; },
+      getRounds() { return 11; },
+      async hash() { throw new Error('must not hash current-cost accounts'); }
+    };
+    const address = '198.51.100.200';
+    let successes = 0;
+    for (let index = 0; index < 40; index += 1) {
+      const socket = registerAuthenticationSocket({
+        id: `matrix-shared-${index}`,
+        address,
+        authLimiter,
+        UserModel,
+        bcryptImpl
+      });
+      const ack = acknowledge();
+      await socket.trigger('login', {
+        username: `matrixuser${index}`,
+        password: 'valid-password'
+      }, ack.callback);
+      assert.equal(ack.value().success, true, `shared account ${index + 1}`);
+      successes += 1;
+    }
+    assert.equal(successes, 40);
+
+    const attackedAcks = [];
+    for (let attempt = 0; attempt < 7; attempt += 1) {
+      const socket = registerAuthenticationSocket({
+        id: `matrix-attacked-${attempt}`,
+        address,
+        authLimiter,
+        UserModel,
+        bcryptImpl
+      });
+      await socket.trigger('login', {
+        username: 'matrixuser40',
+        password: 'wrong-password'
+      }, value => attackedAcks.push(value));
+    }
+    assert.deepEqual(attackedAcks.slice(0, 6), Array.from({ length: 6 }, () => ({
+      error: 'Invalid username or password.'
+    })));
+    assert.deepEqual(attackedAcks[6], { error: 'Too many requests. Try again later.' });
+
+    const unaffected = registerAuthenticationSocket({
+      id: 'matrix-shared-unaffected',
+      address,
+      authLimiter,
+      UserModel,
+      bcryptImpl
+    });
+    const unaffectedAck = acknowledge();
+    await unaffected.trigger('login', {
+      username: 'matrixuser41',
+      password: 'valid-password'
+    }, unaffectedAck.callback);
+    assert.equal(unaffectedAck.value().success, true);
+  });
+
+  await t.test('seven existing sessions admit the eighth and eight reject the ninth', async () => {
+    for (const existingCount of [7, 8]) {
+      const ioInstance = new FakeIo();
+      ioInstance.sockets = Array.from({ length: existingCount }, (_, index) => {
+        const live = new FakeSocket();
+        live.id = `matrix-existing-${existingCount}-${index}`;
+        live.username = index % 2 === 0 ? 'Alice' : 'alice';
+        return live;
+      });
+      const onlineUsersMap = new Map(ioInstance.sockets.map(live => [live.id, {
+        username: live.username,
+        serverCode: 'global',
+        joinedServers: ['global']
+      }]));
+      let roomReads = 0;
+      const user = {
+        username: 'Alice', displayName: 'Alice', password: '$2b$11$matrix-session-hash', role: 'user',
+        color: '', avatarUrl: '', servers: ['global']
+      };
+      const socket = registerAuthenticationSocket({
+        id: `matrix-next-${existingCount}`,
+        address: `192.0.2.${existingCount}`,
+        ioInstance,
+        onlineUsersMap,
+        UserModel: { async findOne() { return user; } },
+        ChatServerModel: {
+          async find() { roomReads += 1; return [{ code: 'global', moderators: [] }]; },
+          async findOne() { return null; }
+        },
+        bcryptImpl: {
+          async compare() { return true; },
+          getRounds() { return 11; },
+          async hash() { throw new Error('must not hash'); }
+        }
+      });
+      const ack = acknowledge();
+      await socket.trigger('login', {
+        username: 'alice',
+        password: 'correct-password'
+      }, ack.callback);
+
+      if (existingCount === 7) {
+        assert.equal(ack.value().success, true);
+        assert.equal(onlineUsersMap.size, 8);
+        assert.equal(roomReads, 1);
+      } else {
+        assert.deepEqual(ack.value(), { error: 'Too many active sessions.' });
+        assert.equal(onlineUsersMap.size, 8);
+        assert.equal(roomReads, 0);
+        assert.equal(socket.username, undefined);
+      }
+    }
+  });
+
+  await t.test('generic failures serialize no credential payload attachment or network markers', async () => {
+    const credentialMarker = 'matrix-credential-private-marker';
+    const hashMarker = '$2b$10$matrix-hash-private-marker';
+    const payloadMarker = 'matrix-payload-private-marker';
+    const attachmentMarker = 'data:image/png;base64,bWF0cml4LWF0dGFjaG1lbnQtcHJpdmF0ZS1tYXJrZXI=';
+    const networkMarker = '203.0.113.251';
+    const logs = [];
+    const user = {
+      username: 'PrivacyUser',
+      displayName: 'Privacy User',
+      password: hashMarker,
+      role: 'user',
+      color: '',
+      avatarUrl: '',
+      servers: ['global'],
+      async save() {}
+    };
+    const loginSocket = registerAuthenticationSocket({
+      id: 'matrix-privacy-login',
+      address: networkMarker,
+      UserModel: { async findOne() { return user; } },
+      bcryptImpl: {
+        async compare() { return true; },
+        getRounds() { return 10; },
+        async hash() {
+          throw new Error(`${credentialMarker} ${hashMarker} ${payloadMarker} ${networkMarker}`);
+        }
+      },
+      logger: { error(...args) { logs.push(args); } }
+    });
+    const loginAck = acknowledge();
+    await loginSocket.trigger('login', {
+      username: 'PrivacyUser',
+      password: credentialMarker
+    }, loginAck.callback);
+    assert.deepEqual(loginAck.value(), { error: 'Login failed.' });
+
+    let handlerEntries = 0;
+    let writes = 0;
+    let broadcasts = 0;
+    const dispatcher = createSocketEventDispatcher({
+      securityLogger: { warn(...args) { logs.push(args); } }
+    });
+    const packetSocket = new FakeSocket({ dispatchPacket: dispatcher.dispatch });
+    packetSocket.handshake.address = networkMarker;
+    packetSocket.on('chat_message', () => {
+      handlerEntries += 1;
+      writes += 1;
+      broadcasts += 1;
+    });
+    const packetAck = acknowledge();
+    await packetSocket.trigger('chat_message', {
+      serverCode: 'global',
+      clientContextId: 1,
+      text: payloadMarker,
+      attachment: attachmentMarker,
+      replyTo: null,
+      unexpectedPrivateField: credentialMarker
+    }, packetAck.callback);
+    assert.deepEqual(packetAck.value(), { error: 'Invalid input format.' });
+    assert.equal(handlerEntries, 0);
+    assert.equal(writes, 0);
+    assert.equal(broadcasts, 0);
+
+    const serialized = JSON.stringify({
+      loginAck: loginAck.value(),
+      packetAck: packetAck.value(),
+      logs,
+      outbound: [...loginSocket.outbound, ...packetSocket.outbound]
+    });
+    for (const marker of [
+      credentialMarker, hashMarker, payloadMarker, attachmentMarker, networkMarker
+    ]) {
+      assert.equal(serialized.includes(marker), false, marker);
+    }
+  });
 });
 
 const acknowledgementEvents = [

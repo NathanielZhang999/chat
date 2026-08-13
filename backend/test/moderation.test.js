@@ -366,7 +366,7 @@ function reportingScenario({ reporter = 'Alice', room = 'ABC123', target = 'Bob'
 
 function moderationScenario({
   room = 'ABC123', actor = 'admin', action = 'kick', logger,
-  ModerationAuditModel, RoomRestrictionModel, broadcastOnlineUsersFn
+  ModerationAuditModel, RoomRestrictionModel, broadcastOnlineUsersFn, socketEventDispatcher
 } = {}) {
   const actorProfiles = {
     admin: { username: 'Admin', role: 'admin' },
@@ -405,7 +405,8 @@ function moderationScenario({
     logger,
     ModerationAuditModel,
     RoomRestrictionModel,
-    broadcastOnlineUsersFn
+    broadcastOnlineUsersFn,
+    socketEventDispatcher
   });
   Object.assign(setup.socket, {
     username: actorProfile.username,
@@ -3986,6 +3987,281 @@ for (const transition of ['demotion', 'promotion']) {
     assert.equal(setup.RoomRestrictionModel.rows.length, transition === 'demotion' ? 1 : 0);
   });
 }
+
+test('security boundaries preserve current chat moderation appearance image and shortcut contracts', async (t) => {
+  const createDispatcher = () => createSocketEventDispatcher({
+    inFlightCoordinator: createInFlightRequestCoordinator(),
+    securityLogger: { warn() {} }
+  });
+
+  await t.test('registered message reads retain member moderator administrator ban and timeout authorization', async () => {
+    const rows = [
+      {
+        name: 'room member reads own history', role: 'user', joinedServers: ['global', 'ABC123'],
+        messageOwner: 'Actor', roomRole: 'user', restriction: null, allowed: true
+      },
+      {
+        name: 'nonmember cannot read room history', role: 'user', joinedServers: ['global'],
+        messageOwner: 'Actor', roomRole: 'user', restriction: null, allowed: false
+      },
+      {
+        name: 'room moderator reads member history', role: 'user', joinedServers: ['global', 'ABC123'],
+        messageOwner: 'Other', roomRole: 'mod', restriction: null, allowed: true
+      },
+      {
+        name: 'global administrator reads room history', role: 'admin', joinedServers: ['global'],
+        messageOwner: 'Other', roomRole: 'user', restriction: null, allowed: true
+      },
+      {
+        name: 'banned member cannot read own history', role: 'user', joinedServers: ['global', 'ABC123'],
+        messageOwner: 'Actor', roomRole: 'user',
+        restriction: { bannedAt: new Date(), banReason: 'matrix private ban' }, allowed: false
+      },
+      {
+        name: 'timed-out member retains read access', role: 'user', joinedServers: ['global', 'ABC123'],
+        messageOwner: 'Actor', roomRole: 'user',
+        restriction: { timeoutUntil: new Date(Date.now() + 60_000), timeoutReason: 'matrix private timeout' },
+        allowed: true
+      }
+    ];
+
+    for (const row of rows) {
+      const MessageModel = createMemoryModel([{
+        _id: VALID_MESSAGE_ID,
+        serverCode: 'ABC123',
+        username: row.messageOwner,
+        displayName: row.messageOwner,
+        text: 'stored message',
+        attachment: null,
+        history: [{ text: 'previous version' }],
+        deleted: false
+      }]);
+      let messageReads = 0;
+      const findById = MessageModel.findById.bind(MessageModel);
+      MessageModel.findById = id => {
+        messageReads += 1;
+        return findById(id);
+      };
+      const restrictions = row.restriction
+        ? [restrictionDocument('ABC123', 'Actor', row.restriction)]
+        : [];
+      const setup = registerWithModels({
+        UserModel: createMemoryModel([userDocument({
+          username: 'Actor', displayName: 'Actor', role: row.role,
+          servers: ['global', 'ABC123']
+        })]),
+        ChatServerModel: createMemoryModel([
+          roomDocument('global'), roomDocument('ABC123', {
+            moderators: row.roomRole === 'mod' ? ['Actor'] : []
+          })
+        ]),
+        MessageModel,
+        RoomRestrictionModel: createMemoryModel(restrictions),
+        socketEventDispatcher: createDispatcher(),
+        getRoomRoleFn: async () => row.roomRole
+      });
+      Object.assign(setup.socket, {
+        username: 'Actor', displayName: 'Actor', role: row.role, serverCode: 'ABC123',
+        joinedServers: [...row.joinedServers], bannedRooms: []
+      });
+      const ack = acknowledge();
+      await setup.socket.trigger('get_edit_history', VALID_MESSAGE_ID, ack.callback);
+
+      assert.equal(messageReads, 1, row.name);
+      if (row.allowed) {
+        assert.deepEqual(ack.value(), {
+          success: true,
+          history: [{ text: 'previous version' }]
+        }, row.name);
+      } else {
+        assert.deepEqual(ack.value(), { error: 'Permission denied.' }, row.name);
+      }
+      assert.equal(MessageModel.rows[0].text, 'stored message', row.name);
+      assert.deepEqual(setup.ioInstance.outbound, [], row.name);
+    }
+  });
+
+  await t.test('moderation authorization remains inside registered handlers after admission', async () => {
+    const rows = [
+      { name: 'administrator timeout', room: 'global', actor: 'admin', action: 'timeout', allowed: true },
+      { name: 'room moderator kick', room: 'ABC123', actor: 'mod', action: 'kick', allowed: true },
+      { name: 'other-room moderator ban', room: 'XYZ789', actor: 'mod-from-ABC123', action: 'ban', allowed: false }
+    ];
+    for (const row of rows) {
+      const setup = moderationScenario({ ...row, socketEventDispatcher: createDispatcher() });
+      const ack = acknowledge();
+      await setup.socket.trigger('moderate_user', {
+        serverCode: row.room,
+        targetUser: setup.target.username,
+        action: row.action,
+        duration: row.action === 'timeout' ? '10m' : undefined,
+        reason: `matrix ${row.name}`
+      }, ack.callback);
+      assert.equal(Boolean(ack.value().success), row.allowed, row.name);
+      assert.equal(Boolean(ack.value().error), !row.allowed, row.name);
+      assert.equal(setup.ModerationAuditModel.rows.length, row.allowed ? 1 : 0, row.name);
+    }
+  });
+
+  await t.test('appearance image and shortcut-shaped payloads still execute their registered contracts', async () => {
+    const UserModel = createMemoryModel([userDocument({
+      username: 'Alice', displayName: 'Alice', servers: ['global'],
+      preferences: { theme: 'dark', textScale: 100, compactMessages: false, motion: 'system' },
+      preferencesVersion: 3
+    })]);
+    const MessageModel = createMemoryModel([{
+      _id: VALID_MESSAGE_ID,
+      serverCode: 'global',
+      username: 'Alice',
+      displayName: 'Alice',
+      role: 'user',
+      roomRole: 'user',
+      text: 'delete through shortcut-shaped payload',
+      attachment: null,
+      history: [],
+      reactions: {},
+      deleted: false
+    }]);
+    const setup = registerWithModels({
+      UserModel,
+      ChatServerModel: createMemoryModel([roomDocument('global')]),
+      MessageModel,
+      RoomRestrictionModel: createMemoryModel([]),
+      socketEventDispatcher: createDispatcher(),
+      getRoomRoleFn: async () => 'user'
+    });
+    Object.assign(setup.socket, {
+      username: 'Alice', displayName: 'Alice', role: 'user', serverCode: 'global',
+      joinedServers: ['global'], bannedRooms: [], clientContextId: 17
+    });
+    setup.onlineUsersMap.set(setup.socket.id, {
+      username: 'Alice', displayName: 'Alice', role: 'user', serverCode: 'global',
+      joinedServers: ['global'], bannedRooms: []
+    });
+
+    const appearanceAck = acknowledge();
+    const desiredAppearance = {
+      theme: 'light', textScale: 112.5, compactMessages: true, motion: 'reduce'
+    };
+    await setup.socket.trigger('update_preferences', {
+      preferences: desiredAppearance,
+      expectedVersion: 3
+    }, appearanceAck.callback);
+    assert.deepEqual(appearanceAck.value(), {
+      success: true,
+      preferences: desiredAppearance,
+      preferencesVersion: 4
+    });
+    assert.deepEqual(UserModel.rows[0].preferences, desiredAppearance);
+
+    const imageAttachment = 'data:image/png;base64,AA==';
+    await setup.socket.trigger('chat_message', { text: '', attachment: imageAttachment });
+    assert.equal(MessageModel.created.length, 1);
+    assert.equal(MessageModel.created[0].attachment, imageAttachment);
+    assert.equal(
+      setup.ioInstance.outbound.some(event =>
+        event.event === 'chat_message' && event.payload.attachment === imageAttachment),
+      true
+    );
+
+    await setup.socket.trigger('typing', true);
+    assert.equal(
+      setup.socket.outbound.some(event =>
+        event.event === 'typing' && event.payload.isTyping === true),
+      true
+    );
+
+    await setup.socket.trigger('delete_message', VALID_MESSAGE_ID);
+    assert.equal(MessageModel.rows.find(message => message._id === VALID_MESSAGE_ID).deleted, true);
+    assert.equal(
+      setup.ioInstance.outbound.some(event =>
+        event.event === 'message_deleted' && event.payload === VALID_MESSAGE_ID),
+      true
+    );
+  });
+
+  await t.test('all six read-heavy registered query adapters receive the exact deadline', async () => {
+    const observed = [];
+    const track = (event, query) => {
+      const original = query.maxTimeMS.bind(query);
+      query.maxTimeMS = milliseconds => {
+        observed.push([event, milliseconds]);
+        return original(milliseconds);
+      };
+      return query;
+    };
+    const message = {
+      _id: VALID_MESSAGE_ID,
+      serverCode: 'ABC123',
+      username: 'ExactMod',
+      text: 'deleted',
+      attachment: null,
+      history: [],
+      reactions: {},
+      deleted: true,
+      timestamp: new Date()
+    };
+    const MessageModel = createMemoryModel([message]);
+    const messageFind = MessageModel.find.bind(MessageModel);
+    const messageFindById = MessageModel.findById.bind(MessageModel);
+    let messageLookup = 0;
+    MessageModel.find = query => track('switch_server', messageFind(query));
+    MessageModel.findById = id => {
+      messageLookup += 1;
+      return track(messageLookup === 1 ? 'get_edit_history' : 'get_deleted_message', messageFindById(id));
+    };
+    const ModerationReportModel = createMemoryModel([]);
+    const reportFind = ModerationReportModel.find.bind(ModerationReportModel);
+    ModerationReportModel.find = query => track('list_moderation_reports', reportFind(query));
+    const RoomRestrictionModel = createMemoryModel([]);
+    const restrictionFind = RoomRestrictionModel.find.bind(RoomRestrictionModel);
+    RoomRestrictionModel.find = query => track('list_room_restrictions', restrictionFind(query));
+    const ModerationAuditModel = createMemoryModel([]);
+    const auditFind = ModerationAuditModel.find.bind(ModerationAuditModel);
+    ModerationAuditModel.find = query => track('get_moderation_audit', auditFind(query));
+
+    const setup = registerWithModels({
+      UserModel: createMemoryModel([userDocument({
+        username: 'ExactMod', displayName: 'ExactMod', servers: ['global', 'ABC123']
+      })]),
+      ChatServerModel: createMemoryModel([
+        roomDocument('global'), roomDocument('ABC123', { moderators: ['ExactMod'] })
+      ]),
+      MessageModel,
+      RoomRestrictionModel,
+      ModerationReportModel,
+      ModerationAuditModel,
+      socketEventDispatcher: createDispatcher(),
+      getRoomRoleFn: async () => 'mod'
+    });
+    Object.assign(setup.socket, {
+      username: 'ExactMod', displayName: 'ExactMod', role: 'user', serverCode: 'ABC123',
+      joinedServers: ['global', 'ABC123'], bannedRooms: []
+    });
+    setup.onlineUsersMap.set(setup.socket.id, {
+      username: 'ExactMod', displayName: 'ExactMod', role: 'user', serverCode: 'ABC123',
+      joinedServers: ['global', 'ABC123'], bannedRooms: []
+    });
+
+    await setup.socket.trigger('switch_server', 'ABC123', () => {});
+    await setup.socket.trigger('get_edit_history', VALID_MESSAGE_ID, () => {});
+    await setup.socket.trigger('get_deleted_message', VALID_MESSAGE_ID, () => {});
+    await setup.socket.trigger('list_moderation_reports', {
+      serverCode: 'ABC123', status: 'open'
+    }, () => {});
+    await setup.socket.trigger('list_room_restrictions', { serverCode: 'ABC123' }, () => {});
+    await setup.socket.trigger('get_moderation_audit', { serverCode: 'ABC123' }, () => {});
+
+    assert.deepEqual(observed, [
+      ['switch_server', 2_000],
+      ['get_edit_history', 2_000],
+      ['get_deleted_message', 2_000],
+      ['list_moderation_reports', 2_000],
+      ['list_room_restrictions', 2_000],
+      ['get_moderation_audit', 2_000]
+    ]);
+  });
+});
 
 module.exports = {
   VALID_MESSAGE_ID,
