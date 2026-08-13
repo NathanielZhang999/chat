@@ -1,6 +1,8 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const http = require('node:http');
+const { Server: SocketIoServer } = require('socket.io');
 
 const security = require('../server');
 const { FakeSocket, FakeIo, deferred, createMemoryModel } = require('./support/fakes');
@@ -559,6 +561,234 @@ test('transport addresses are canonicalized and bounded independently of forward
   assert.equal(security.normalizeTransportAddress('x'.repeat(200)).length, 128);
 });
 
+test('client address resolver trusts only explicitly enabled valid leftmost forwarding', () => {
+  assert.equal(typeof security.createClientAddressResolver, 'function');
+  const peer = '192.0.2.200';
+  const socketFor = forwarded => ({
+    handshake: { address: peer, headers: { 'x-forwarded-for': forwarded } },
+    request: { headers: { 'x-forwarded-for': forwarded }, socket: { remoteAddress: peer } }
+  });
+  const trusted = security.createClientAddressResolver({ trustProxy: true });
+  const untrusted = security.createClientAddressResolver({ trustProxy: false });
+
+  assert.equal(trusted(socketFor(' 203.0.113.8 , 198.51.100.2, 198.51.100.3 ')), '203.0.113.8');
+  assert.equal(trusted(socketFor('::ffff:203.0.113.9, 198.51.100.2')), '203.0.113.9');
+  assert.equal(trusted(socketFor('2001:db8::8, 198.51.100.2')), '2001:db8::8');
+  assert.equal(untrusted(socketFor('203.0.113.8')), peer);
+
+  for (const forwarded of [
+    '', ' , 203.0.113.8', 'not-an-ip, 203.0.113.8',
+    '::ffff:not-an-ip, 203.0.113.8', ['203.0.113.8'], 'x'.repeat(1_025)
+  ]) {
+    assert.equal(trusted(socketFor(forwarded)), peer, JSON.stringify(forwarded));
+  }
+});
+
+test('Render runtime proxy trust requires the exact platform marker', () => {
+  assert.equal(typeof security.isTrustedRenderRuntime, 'function');
+  assert.equal(security.isTrustedRenderRuntime({ RENDER: 'true' }), true);
+  for (const value of [undefined, '', 'false', 'TRUE', true, '1']) {
+    assert.equal(security.isTrustedRenderRuntime({ RENDER: value }), false, String(value));
+  }
+});
+
+test('deployment network composition injects one Render-aware resolver into every network owner', () => {
+  assert.equal(typeof security.createDeploymentNetworkSecurity, 'function');
+  const eventBudgetController = {};
+  const inFlightCoordinator = {};
+  const captured = {};
+  const connectionAdmission = {};
+  const socketEventDispatcher = {};
+  const composition = security.createDeploymentNetworkSecurity({
+    environment: { RENDER: 'true' },
+    eventBudgetController,
+    inFlightCoordinator,
+    createConnectionAdmissionFn(options) {
+      captured.admission = options;
+      return connectionAdmission;
+    },
+    createSocketEventDispatcherFn(options) {
+      captured.dispatcher = options;
+      return socketEventDispatcher;
+    }
+  });
+
+  assert.equal(composition.connectionAdmission, connectionAdmission);
+  assert.equal(composition.socketEventDispatcher, socketEventDispatcher);
+  assert.equal(captured.admission.clientAddressResolver, composition.clientAddressResolver);
+  assert.equal(captured.dispatcher.clientAddressResolver, composition.clientAddressResolver);
+  assert.equal(captured.dispatcher.eventBudgetController, eventBudgetController);
+  assert.equal(captured.dispatcher.inFlightCoordinator, inFlightCoordinator);
+  const renderSocket = {
+    handshake: { address: '10.0.0.7', headers: { 'x-forwarded-for': '203.0.113.44' } },
+    request: { headers: { 'x-forwarded-for': '203.0.113.44' } }
+  };
+  assert.equal(composition.clientAddressResolver(renderSocket), '203.0.113.44');
+
+  const direct = security.createDeploymentNetworkSecurity({
+    environment: { RENDER: 'false' },
+    createConnectionAdmissionFn: () => ({}),
+    createSocketEventDispatcherFn: () => ({})
+  });
+  assert.equal(direct.clientAddressResolver(renderSocket), '10.0.0.7');
+
+  const source = fs.readFileSync(require.resolve('../server'), 'utf8');
+  const productionOwners = source.slice(
+    source.indexOf('const authNetworkSalt'),
+    source.indexOf('// --- DATABASE SCHEMAS ---')
+  );
+  assert.match(productionOwners,
+    /createDeploymentNetworkSecurity\(\{[\s\S]*environment:\s*process\.env[\s\S]*eventBudgetController:\s*serverEventBudgetController[\s\S]*inFlightCoordinator:\s*serverInFlightCoordinator/);
+  assert.match(productionOwners,
+    /productionNetworkSecurity\.connectionAdmission\.prune\(\)/,
+    'periodic cleanup targets the composed admission owner');
+  assert.doesNotMatch(productionOwners,
+    /serverConnectionAdmission|serverSocketEventDispatcher|productionClientAddressResolver/);
+  const installation = source.slice(
+    source.indexOf('function installDefaultConnectionHandler'),
+    source.indexOf('const PORT')
+  );
+  assert.match(installation,
+    /connectionAdmission:\s*productionNetworkSecurity\.connectionAdmission/);
+  assert.match(installation,
+    /socketEventDispatcher:\s*productionNetworkSecurity\.socketEventDispatcher/);
+  assert.match(installation,
+    /clientAddressResolver:\s*productionNetworkSecurity\.clientAddressResolver/);
+});
+
+test('trusted proxy network limits separate clients and preserve shared NAT boundaries', () => {
+  const resolver = security.createClientAddressResolver({ trustProxy: true });
+  const socketFor = (peer, forwarded) => ({
+    handshake: { address: peer, headers: { 'x-forwarded-for': forwarded } },
+    request: { headers: { 'x-forwarded-for': forwarded }, socket: { remoteAddress: peer } }
+  });
+
+  let now = 0;
+  const attempts = security.createConnectionAdmission({
+    now: () => now,
+    salt: 'trusted-proxy-attempt-boundary',
+    clientAddressResolver: resolver
+  });
+  for (let index = 0; index < 60; index += 1) {
+    const admitted = attempts.open(socketFor('10.0.0.7', '203.0.113.10, 10.0.0.6'));
+    assert.equal(admitted.allowed, true, `client A attempt ${index + 1}`);
+    attempts.release(admitted.token);
+  }
+  assert.equal(attempts.open(socketFor('10.0.0.7', '203.0.113.10')).allowed, false);
+  const independent = attempts.open(socketFor('10.0.0.7', '203.0.113.11'));
+  assert.equal(independent.allowed, true, 'distinct clients behind one Render peer stay independent');
+  attempts.release(independent.token);
+
+  const concurrent = security.createConnectionAdmission({
+    now: () => now,
+    salt: 'trusted-proxy-concurrent-boundary',
+    clientAddressResolver: resolver
+  });
+  const sharedNatTokens = [];
+  for (let index = 0; index < 100; index += 1) {
+    if (index === 60) now = 60_000;
+    const admitted = concurrent.open(socketFor(`10.0.1.${index + 1}`, '198.51.100.44'));
+    assert.equal(admitted.allowed, true, `shared NAT socket ${index + 1}`);
+    sharedNatTokens.push(admitted.token);
+  }
+  assert.equal(concurrent.open(socketFor('10.0.2.250', '198.51.100.44')).allowed, false);
+  assert.equal(concurrent.open(socketFor('10.0.2.250', '198.51.100.45')).allowed, true);
+
+  const auth = security.createLayeredAuthLimiter({ salt: 'trusted-proxy-auth-boundary' });
+  for (let index = 0; index < 6; index += 1) {
+    assert.equal(auth.attempt({
+      action: 'login', account: 'Alice',
+      address: resolver(socketFor(`10.1.0.${index + 1}`, '192.0.2.88'))
+    }).allowed, true, `pair attempt ${index + 1}`);
+  }
+  assert.equal(auth.attempt({
+    action: 'login', account: 'Alice',
+    address: resolver(socketFor('10.1.0.250', '192.0.2.88'))
+  }).allowed, false);
+
+  const aggregate = security.createLayeredAuthLimiter({ salt: 'trusted-proxy-aggregate-boundary' });
+  for (let index = 0; index < 300; index += 1) {
+    assert.equal(aggregate.attempt({
+      action: 'login', account: `account-${index}`,
+      address: resolver(socketFor('10.2.0.9', '192.0.2.99'))
+    }).allowed, true, `aggregate attempt ${index + 1}`);
+  }
+  assert.equal(aggregate.attempt({
+    action: 'login', account: 'account-300',
+    address: resolver(socketFor('10.2.0.9', '192.0.2.99'))
+  }).allowed, false);
+});
+
+test('network consumers receive one resolved address and telemetry never exposes raw sentinels', async () => {
+  const forwardedSentinel = '203.0.113.252';
+  const peerSentinel = '192.0.2.252';
+  const socket = new FakeSocket();
+  socket.handshake.address = peerSentinel;
+  socket.handshake.headers['x-forwarded-for'] = forwardedSentinel;
+  const resolverCalls = [];
+  const resolver = candidate => {
+    resolverCalls.push(candidate);
+    return forwardedSentinel;
+  };
+  const authAttempts = [];
+  const rateKeys = [];
+  const logs = [];
+  const dispatcher = security.createSocketEventDispatcher({
+    clientAddressResolver: resolver,
+    securityLogger: { warn(...args) { logs.push(args); } }
+  });
+  security.createConnectionHandler({
+    clientAddressResolver: resolver,
+    authLimiter: {
+      attempt(value) {
+        authAttempts.push(value);
+        return value.action === 'login'
+          ? { allowed: false }
+          : { allowed: true, token: {} };
+      },
+      success() {}
+    },
+    rateLimiter: {
+      check(value) { rateKeys.push(value); return false; },
+      clear() {}
+    },
+    socketEventDispatcher: dispatcher,
+    ioInstance: new FakeIo(),
+    onlineUsersMap: new Map(),
+    broadcastOnlineUsersFn() {}
+  })(socket);
+
+  const registerAck = [];
+  await socket.trigger('register', {
+    username: 'NYZhang1', displayName: 'Owner', password: '123456'
+  }, value => registerAck.push(value));
+  socket.username = 'Alice';
+  const passwordAck = [];
+  await socket.trigger('change_password', {
+    oldPassword: 'old-password', newPassword: 'new-password'
+  }, value => passwordAck.push(value));
+  socket.username = null;
+  const loginAck = [];
+  await socket.trigger('login', {
+    username: 'Alice', password: 'private-password'
+  }, value => loginAck.push(value));
+  await socket.trigger('login', {
+    username: 'Alice', password: 'private-password', unexpected: true
+  }, () => {});
+
+  assert.deepEqual(authAttempts.map(attempt => [attempt.action, attempt.address]), [
+    ['register', forwardedSentinel],
+    ['login', forwardedSentinel]
+  ]);
+  assert.equal(rateKeys.length, 1);
+  assert.match(rateKeys[0], /^change_password:alice:[0-9a-f]{16}$/);
+  assert.equal(resolverCalls.every(candidate => candidate === socket), true);
+  const serialized = JSON.stringify({ registerAck, passwordAck, loginAck, logs, rateKeys });
+  assert.equal(serialized.includes(forwardedSentinel), false);
+  assert.equal(serialized.includes(peerSentinel), false);
+  assert.match(logs[0][1].networkBucket, /^[0-9a-f]{16}$/);
+});
+
 test('layered authentication limits exact account pair and network boundaries without extending rejection', () => {
   let now = 100;
   const makeLimiter = () => security.createLayeredAuthLimiter({
@@ -1099,6 +1329,39 @@ test('origin policy accepts exact deployed and configured origins only', () => {
   }
 });
 
+test('configured origins reject forbidden lexical syntax before URL canonicalization', () => {
+  const accepted = [
+    ['https://chat.example.com', 'https://chat.example.com'],
+    ['https://chat.example.com/', 'https://chat.example.com'],
+    ['https://chat.example.com:8443/', 'https://chat.example.com:8443'],
+    ['http://[2001:db8::1]:8080', 'http://[2001:db8::1]:8080'],
+    ['HTTPS://CHAT.EXAMPLE.COM', 'https://chat.example.com']
+  ];
+  for (const [raw, canonical] of accepted) {
+    assert.equal(security.normalizeConfiguredOrigin(raw), canonical, raw);
+  }
+
+  const rejected = [
+    'https://example.com?',
+    'https://example.com#',
+    'https://@example.com',
+    'https://:@example.com',
+    'https://example.com\\',
+    'https:\\example.com',
+    'https://example.com/.',
+    'https://example.com/..',
+    'https://example.com/a/..',
+    'https://example.com/%2e',
+    'https://example.com//',
+    'https://exa\tmple.com',
+    'https://exa\nmple.com',
+    'https://exa\rmple.com'
+  ];
+  for (const raw of rejected) {
+    assert.equal(security.normalizeConfiguredOrigin(raw), null, JSON.stringify(raw));
+  }
+});
+
 test('origin policy does not reflect rejected origins to callbacks or logs', () => {
   const policy = security.createOriginPolicy({ production: true });
   const hostileOrigins = [
@@ -1153,6 +1416,77 @@ test('origin policy permits loopback only outside production and rejects missing
   const socketCallbackValues = [];
   developmentPolicy.allowSocketRequest({ headers: {} }, (...values) => socketCallbackValues.push(values));
   assert.deepEqual(socketCallbackValues, [[null, false]]);
+});
+
+test('production loopback origins fail configuration and remain defensively rejected at runtime', async () => {
+  const loopbackOrigins = [
+    'http://localhost:3000',
+    'http://127.0.0.1:5173',
+    'http://127.42.9.8:8080',
+    'http://[::1]:3000',
+    'http://[::ffff:127.0.0.1]:3000',
+    'http://[::ffff:127.42.9.8]:8080',
+    'http://[::ffff:7f00:1]:3000'
+  ];
+
+  for (const origin of loopbackOrigins) {
+    const policy = security.createOriginPolicy({
+      allowedOriginsValue: origin,
+      production: true
+    });
+    assert.throws(policy.assertValid, /ALLOWED_ORIGINS/i, origin);
+    assert.equal(policy.allows(origin), false, `${origin} runtime`);
+
+    const events = [];
+    await assert.rejects(
+      security.start({
+        mongoUri: 'mongodb://database/chat',
+        mongooseImpl: { async connect() { events.push('connect'); } },
+        seedSystemFn: async () => { events.push('seed'); },
+        serverInstance: { listen() { events.push('listen'); } },
+        validateSecurityConfigurationFn: policy.assertValid
+      }),
+      /ALLOWED_ORIGINS/i,
+      origin
+    );
+    assert.deepEqual(events, [], origin);
+  }
+
+  const defensiveRuntimePolicy = security.createOriginPolicy({
+    allowedOriginsValue: 'https://chat.example.com',
+    production: true
+  });
+  defensiveRuntimePolicy.assertValid();
+  for (const origin of loopbackOrigins) {
+    defensiveRuntimePolicy.origins.push(security.normalizeConfiguredOrigin(origin));
+    assert.equal(defensiveRuntimePolicy.allows(origin), false, `${origin} defensive runtime`);
+  }
+
+  const development = security.createOriginPolicy({
+    allowedOriginsValue: loopbackOrigins.join(','),
+    production: false
+  });
+  development.assertValid();
+  for (const origin of loopbackOrigins) assert.equal(development.allows(origin), true, origin);
+
+  const publicIpv6 = security.createOriginPolicy({
+    allowedOriginsValue: 'https://[2001:db8::8]:8443',
+    production: true
+  });
+  publicIpv6.assertValid();
+  assert.equal(publicIpv6.allows('https://[2001:db8::8]:8443'), true);
+
+  const source = fs.readFileSync(require.resolve('../server'), 'utf8');
+  const startComposition = source.slice(
+    source.indexOf('async function start'),
+    source.indexOf('if (require.main === module)')
+  );
+  assert.match(startComposition,
+    /validateSecurityConfigurationFn\s*=\s*originPolicy\.assertValid/,
+    'deployed startup defaults to the configured production origin policy');
+  assert.match(startComposition,
+    /validateSecurityConfigurationFn\(\);[\s\S]*mongooseImpl\.connect/,
+    'default validation remains before Mongo connection');
 });
 
 test('malformed origin configuration fails before Mongo connection and listen', async () => {
@@ -1219,6 +1553,166 @@ test('security headers are exact and HSTS is production only', () => {
     () => {}
   );
   assert.equal(productionHeaders['Strict-Transport-Security'], 'max-age=31536000; includeSubDomains');
+});
+
+const REQUIRED_ENGINE_SECURITY_HEADERS = Object.freeze({
+  'x-content-type-options': 'nosniff',
+  'referrer-policy': 'no-referrer',
+  'x-frame-options': 'DENY',
+  'permissions-policy': 'camera=(), microphone=(), geolocation=()',
+  'cross-origin-resource-policy': 'same-site'
+});
+
+function listenOnLoopback(serverInstance) {
+  return new Promise((resolve, reject) => {
+    serverInstance.once('error', reject);
+    serverInstance.listen(0, '127.0.0.1', () => {
+      serverInstance.removeListener('error', reject);
+      resolve(serverInstance.address().port);
+    });
+  });
+}
+
+function requestEnginePolling(port, origin) {
+  return new Promise((resolve, reject) => {
+    const request = http.request({
+      host: '127.0.0.1',
+      port,
+      path: `/socket.io/?EIO=4&transport=polling&t=${Date.now()}`,
+      headers: { Origin: origin }
+    }, response => {
+      response.resume();
+      response.once('end', () => resolve({
+        statusCode: response.statusCode,
+        headers: response.headers
+      }));
+    });
+    request.setTimeout(2_000, () => request.destroy(new Error('polling handshake timed out')));
+    request.once('error', reject);
+    request.end();
+  });
+}
+
+function requestEngineWebSocketUpgrade(port, origin) {
+  return new Promise((resolve, reject) => {
+    const request = http.request({
+      host: '127.0.0.1',
+      port,
+      path: '/socket.io/?EIO=4&transport=websocket',
+      headers: {
+        Origin: origin,
+        Connection: 'Upgrade',
+        Upgrade: 'websocket',
+        'Sec-WebSocket-Key': Buffer.from('engine-security!').toString('base64'),
+        'Sec-WebSocket-Version': '13'
+      }
+    });
+    request.setTimeout(2_000, () => request.destroy(new Error('WebSocket upgrade timed out')));
+    request.once('upgrade', (response, socket) => {
+      const result = { statusCode: response.statusCode, headers: response.headers };
+      socket.destroy();
+      resolve(result);
+    });
+    request.once('response', response => {
+      response.resume();
+      response.once('end', () => reject(new Error(`expected WebSocket 101, received ${response.statusCode}`)));
+    });
+    request.once('error', reject);
+    request.end();
+  });
+}
+
+test('Engine.IO security configuration attaches both supported response header hooks', () => {
+  const hooks = new Map();
+  security.configureEngineSecurity({
+    ioInstance: {
+      engine: {
+        on(name, handler) {
+          assert.equal(hooks.has(name), false, name);
+          hooks.set(name, handler);
+        }
+      }
+    },
+    production: true
+  });
+  assert.deepEqual([...hooks.keys()], ['initial_headers', 'headers']);
+  for (const [name, handler] of hooks) {
+    const headers = {};
+    handler(headers);
+    assert.equal(headers['X-Content-Type-Options'], 'nosniff', name);
+    assert.equal(
+      headers['Strict-Transport-Security'],
+      'max-age=31536000; includeSubDomains',
+      name
+    );
+  }
+});
+
+test('deployed Engine.IO instance carries the shared security header hooks', () => {
+  for (const name of ['initial_headers', 'headers']) {
+    const listeners = security.io.engine.listeners(name);
+    assert.equal(listeners.length, 1, name);
+    const headers = {};
+    listeners[0](headers);
+    assert.equal(headers['X-Content-Type-Options'], 'nosniff', name);
+    assert.equal(headers['Referrer-Policy'], 'no-referrer', name);
+    assert.equal(headers['X-Frame-Options'], 'DENY', name);
+    assert.equal(headers['Permissions-Policy'], 'camera=(), microphone=(), geolocation=()', name);
+    assert.equal(headers['Cross-Origin-Resource-Policy'], 'same-site', name);
+    assert.equal(Object.prototype.hasOwnProperty.call(headers, 'Content-Security-Policy'), false);
+  }
+  const source = fs.readFileSync(require.resolve('../server'), 'utf8');
+  assert.match(source,
+    /configureEngineSecurity\(\{\s*ioInstance:\s*io,\s*production:\s*isProduction\s*\}\)/);
+});
+
+test('Engine.IO polling and WebSocket upgrades receive exact security headers in development and production', async (t) => {
+  assert.equal(typeof security.configureEngineSecurity, 'function');
+
+  for (const production of [false, true]) {
+    await t.test(production ? 'production' : 'development', async t => {
+      const allowedOrigin = 'https://transport.example.test';
+      const observedOrigins = [];
+      const serverInstance = http.createServer();
+      const ioInstance = new SocketIoServer(serverInstance, {
+        cors: { origin: allowedOrigin },
+        allowRequest(request, callback) {
+          observedOrigins.push(request.headers.origin);
+          callback(null, request.headers.origin === allowedOrigin);
+        }
+      });
+      security.configureEngineSecurity({ ioInstance, production });
+      const port = await listenOnLoopback(serverInstance);
+      t.after(async () => {
+        await new Promise(resolve => ioInstance.close(resolve));
+        if (serverInstance.listening) {
+          await new Promise(resolve => serverInstance.close(resolve));
+        }
+      });
+
+      const polling = await requestEnginePolling(port, allowedOrigin);
+      const websocket = await requestEngineWebSocketUpgrade(port, allowedOrigin);
+
+      assert.equal(polling.statusCode, 200);
+      assert.equal(websocket.statusCode, 101);
+      assert.deepEqual(observedOrigins, [allowedOrigin, allowedOrigin]);
+      for (const response of [polling, websocket]) {
+        assert.equal(response.headers['access-control-allow-origin'], allowedOrigin);
+        for (const [name, value] of Object.entries(REQUIRED_ENGINE_SECURITY_HEADERS)) {
+          assert.equal(response.headers[name], value, `${name} on ${response.statusCode}`);
+        }
+        assert.equal(Object.prototype.hasOwnProperty.call(response.headers, 'content-security-policy'), false);
+        if (production) {
+          assert.equal(
+            response.headers['strict-transport-security'],
+            'max-age=31536000; includeSubDomains'
+          );
+        } else {
+          assert.equal(Object.prototype.hasOwnProperty.call(response.headers, 'strict-transport-security'), false);
+        }
+      }
+    });
+  }
 });
 
 test('start fails before listening when MONGO_URI is missing', async () => {

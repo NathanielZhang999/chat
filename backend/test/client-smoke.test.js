@@ -144,6 +144,70 @@ function createClientSocket(initiallyConnected = false) {
   };
 }
 
+function createTypingScheduler() {
+  let nextId = 0;
+  let now = 0;
+  const tasks = new Map();
+  return {
+    tasks,
+    schedule(callback, delay) {
+      const id = ++nextId;
+      tasks.set(id, { callback, delay, dueAt: now + delay, cancelled: false, ran: false });
+      return id;
+    },
+    cancel(id) {
+      const task = tasks.get(id);
+      if (task) task.cancelled = true;
+    },
+    pending() {
+      return [...tasks.entries()].filter(([, task]) => !task.cancelled && !task.ran);
+    },
+    run(id, { includeCancelled = false } = {}) {
+      const task = tasks.get(id);
+      if (!task || task.ran || (task.cancelled && !includeCancelled)) return false;
+      task.ran = true;
+      task.callback();
+      return true;
+    },
+    advance(milliseconds) {
+      const target = now + milliseconds;
+      while (true) {
+        const next = [...tasks.entries()]
+          .filter(([, task]) => !task.cancelled && !task.ran && task.dueAt <= target)
+          .sort((left, right) => left[1].dueAt - right[1].dueAt)[0];
+        if (!next) break;
+        now = next[1].dueAt;
+        this.run(next[0]);
+      }
+      now = target;
+    }
+  };
+}
+
+function typingOwnerHarness() {
+  const helpers = loadHelpers();
+  const scheduler = createTypingScheduler();
+  const state = {
+    socket: createClientSocket(true),
+    context: Object.freeze({ serverCode: 'ROOMA1', clientContextId: 7 })
+  };
+  const owner = helpers.createTypingOwner({
+    schedule: scheduler.schedule,
+    cancel: scheduler.cancel,
+    getSocket: () => state.socket,
+    getContext: () => state.context,
+    isContextCurrent: candidate => Boolean(candidate &&
+      candidate.serverCode === state.context.serverCode &&
+      candidate.clientContextId === state.context.clientContextId),
+    idleMs: 1500
+  });
+  return { owner, scheduler, state };
+}
+
+function emittedPackets(socket) {
+  return socket.emitted.map(({ event, args }) => ({ event, payload: { ...args[0] } }));
+}
+
 function appearanceElements() {
   return {
     theme: { value: '' },
@@ -2333,6 +2397,205 @@ test('composition context binds sends to the visible room and invalidates revoke
   assert.equal(context.payload({ text: 'new draft' }).clientContextId, 3);
 });
 
+test('typing owner coalesces 100 rapid inputs into one start and one idle stop', () => {
+  const { owner, scheduler, state } = typingOwnerHarness();
+
+  for (let index = 0; index < 100; index += 1) {
+    owner.input();
+    if (index < 99) scheduler.advance(10);
+  }
+
+  assert.deepEqual(emittedPackets(state.socket), [{
+    event: 'typing',
+    payload: { serverCode: 'ROOMA1', clientContextId: 7, isTyping: true }
+  }]);
+  assert.equal(scheduler.pending().length, 1);
+  assert.equal(scheduler.pending()[0][1].delay, 1500);
+
+  scheduler.advance(1499);
+  assert.equal(state.socket.emitted.length, 1, 'idle is measured from the newest input');
+  scheduler.advance(1);
+  assert.deepEqual(emittedPackets(state.socket), [
+    {
+      event: 'typing',
+      payload: { serverCode: 'ROOMA1', clientContextId: 7, isTyping: true }
+    },
+    {
+      event: 'typing',
+      payload: { serverCode: 'ROOMA1', clientContextId: 7, isTyping: false }
+    }
+  ]);
+
+  owner.input();
+  assert.deepEqual(emittedPackets(state.socket).at(-1), {
+    event: 'typing',
+    payload: { serverCode: 'ROOMA1', clientContextId: 7, isTyping: true }
+  }, 'a completed idle cycle permits a new typing start');
+});
+
+test('accepted message submission emits the chat packet before the typing stop', () => {
+  const { owner, scheduler, state } = typingOwnerHarness();
+  owner.input();
+  const idleTimer = scheduler.pending()[0][0];
+  const acceptedMessage = {
+    text: 'hello', attachment: null, serverCode: 'ROOMA1', clientContextId: 7
+  };
+
+  state.socket.emit('chat_message', acceptedMessage);
+  owner.submit();
+
+  assert.deepEqual(emittedPackets(state.socket).slice(1), [
+    { event: 'chat_message', payload: acceptedMessage },
+    {
+      event: 'typing',
+      payload: { serverCode: 'ROOMA1', clientContextId: 7, isTyping: false }
+    }
+  ]);
+  scheduler.run(idleTimer, { includeCancelled: true });
+  assert.equal(state.socket.emitted.length, 3, 'the canceled idle callback cannot emit a second stop');
+});
+
+test('typing owner stops the room being exited and rejects old-room timer callbacks', () => {
+  const { owner, scheduler, state } = typingOwnerHarness();
+  owner.input();
+  const roomATimer = scheduler.pending()[0][0];
+
+  owner.exit();
+  state.context = Object.freeze({ serverCode: 'ROOMB2', clientContextId: 8 });
+  owner.input();
+  const roomBTimer = scheduler.pending()[0][0];
+  scheduler.run(roomATimer, { includeCancelled: true });
+
+  assert.deepEqual(emittedPackets(state.socket), [
+    {
+      event: 'typing',
+      payload: { serverCode: 'ROOMA1', clientContextId: 7, isTyping: true }
+    },
+    {
+      event: 'typing',
+      payload: { serverCode: 'ROOMA1', clientContextId: 7, isTyping: false }
+    },
+    {
+      event: 'typing',
+      payload: { serverCode: 'ROOMB2', clientContextId: 8, isTyping: true }
+    }
+  ]);
+
+  state.context = Object.freeze({ serverCode: 'ROOMC3', clientContextId: 9 });
+  scheduler.run(roomBTimer);
+  assert.equal(state.socket.emitted.length, 3, 'an old-room idle timer cannot emit in the new room');
+});
+
+test('typing owner clears logout disconnect and replacement state without stale emission', () => {
+  const { owner, scheduler, state } = typingOwnerHarness();
+  const logoutSocket = state.socket;
+  owner.input();
+  owner.exit();
+  assert.deepEqual(emittedPackets(logoutSocket), [
+    {
+      event: 'typing',
+      payload: { serverCode: 'ROOMA1', clientContextId: 7, isTyping: true }
+    },
+    {
+      event: 'typing',
+      payload: { serverCode: 'ROOMA1', clientContextId: 7, isTyping: false }
+    }
+  ], 'logout while connected explicitly clears the remote indicator');
+
+  const disconnectedSocket = createClientSocket(true);
+  state.socket = disconnectedSocket;
+  owner.input();
+  const disconnectedTimer = scheduler.pending()[0][0];
+  disconnectedSocket.connected = false;
+  owner.exit();
+  scheduler.run(disconnectedTimer, { includeCancelled: true });
+  assert.deepEqual(emittedPackets(disconnectedSocket), [{
+    event: 'typing',
+    payload: { serverCode: 'ROOMA1', clientContextId: 7, isTyping: true }
+  }], 'disconnect cleanup never emits through a disconnected socket');
+  owner.input();
+  assert.equal(disconnectedSocket.emitted.length, 1, 'input cannot start typing while disconnected');
+
+  const replacedSocket = createClientSocket(true);
+  state.socket = replacedSocket;
+  owner.input();
+  const replacedTimer = scheduler.pending()[0][0];
+  const newestSocket = createClientSocket(true);
+  state.socket = newestSocket;
+  scheduler.run(replacedTimer);
+  owner.exit();
+  assert.equal(replacedSocket.emitted.length, 1, 'a replaced socket receives no stale stop');
+  assert.equal(newestSocket.emitted.length, 0, 'a stale owner never redirects its stop to the new socket');
+
+  owner.input();
+  assert.deepEqual(emittedPackets(newestSocket), [{
+    event: 'typing',
+    payload: { serverCode: 'ROOMA1', clientContextId: 7, isTyping: true }
+  }]);
+});
+
+test('production typing lifecycle is wired through the owner at every exit boundary', () => {
+  const source = fs.readFileSync(chatPath, 'utf8');
+  assert.ok(/const typingOwner\s*=\s*ChatClientHelpers\.createTypingOwner\(\{/.test(source),
+    'production creates the tested typing owner');
+
+  const submitBlock = source.slice(
+    source.indexOf("document.getElementById('compose').addEventListener('submit'"),
+    source.indexOf("msgInput.addEventListener('input'")
+  );
+  assert.ok(/socket\.emit\('chat_message',[\s\S]*typingOwner\.submit\(\)/.test(submitBlock),
+    'accepted message send is followed by the owner stop');
+  assert.ok(/socket\.emit\('edit_message',[\s\S]*typingOwner\.submit\(\)/.test(submitBlock),
+    'accepted edit is followed by the owner stop');
+
+  const inputBlock = source.slice(
+    source.indexOf("msgInput.addEventListener('input'"),
+    source.indexOf('function initiateEdit')
+  );
+  assert.ok(/typingOwner\.input\(\)/.test(inputBlock), 'the input listener delegates to the owner');
+  assert.equal(/socket\.emit\('typing'/.test(inputBlock), false,
+    'the input listener cannot bypass owner coalescing and stale guards');
+
+  const switchBlock = source.slice(
+    source.indexOf('function handleSwitchResult'),
+    source.indexOf('async function leaveServer')
+  );
+  assert.ok(/typingOwner\.exit\(\)[\s\S]*compositionContextCoordinator\.activate\(targetServerCode\)/
+    .test(switchBlock),
+    'room exit stops typing before committing the next composition context');
+
+  const lobbyBlock = source.slice(source.indexOf('function enterLobby'), source.indexOf('function showError'));
+  assert.ok(/typingOwner\.exit\(\)[\s\S]*compositionContextCoordinator\.invalidate\(\)/.test(lobbyBlock),
+    'entering the lobby stops typing before invalidating composition');
+
+  const sanitizerBlock = source.slice(
+    source.indexOf('const unauthenticatedStateOwners'),
+    source.indexOf('const unauthenticatedStateSanitizer')
+  );
+  assert.ok(/resetTyping\(\)\s*\{[\s\S]*typingOwner\.exit\(\)/.test(sanitizerBlock),
+    'logout and disconnect sanitation use the same typing owner');
+
+  const logoutBlock = source.slice(source.indexOf('async function logoutApp'),
+    source.indexOf('// --- AUTHENTICATION ---'));
+  assert.ok(/enterSanitizedUnauthenticatedState\('logout'\)/.test(logoutBlock),
+    'logout reaches the typing-owning sanitizer');
+
+  const lifecycleBridgeBlock = source.slice(source.indexOf('const appearanceRuntimeBridge'),
+    source.indexOf('function applyAppearanceSnapshot'));
+  assert.ok(/enterSanitizedUnauthenticatedState/.test(lifecycleBridgeBlock),
+    'socket disconnects reach the typing-owning sanitizer');
+
+  const replacementBlock = source.slice(
+    source.indexOf('const previousSocket = socket'),
+    source.indexOf('appearanceRuntimeBridge.selectAuthCandidate')
+  );
+  assert.ok(/typingOwner\.exit\(\)[\s\S]*ChatClientHelpers\.replaceSocket\(/.test(replacementBlock),
+    'socket replacement stops the old typing owner before changing the active socket');
+  assert.ok(/enterSanitizedUnauthenticatedState\('socket-replacement'\)[\s\S]*sessionContextCoordinator\.replace\(socket\)/
+    .test(replacementBlock),
+    'socket replacement sanitizes typing before the active socket changes');
+});
+
 test('room rail disables kicked and unbanned nonmembers but preserves admin ghost rooms', () => {
   const client = loadHelpers();
   const ordinary = {
@@ -2380,7 +2643,7 @@ test('production client invalidates revoked access and sends every room mutation
   assert.match(source, /authenticatedEventTarget\.on\(['"]room_access_updated['"][\s\S]{0,500}closeModerationPrompt\(\)[\s\S]{0,200}closeReportPrompt\(\)[\s\S]{0,200}closeResolutionPrompt\(\)/);
   assert.match(source, /authenticatedEventTarget\.on\(['"]global_role_updated['"][\s\S]*invalidatePrivilegedAccess/);
   assert.match(source, /authenticatedEventTarget\.on\(['"]room_role_updated['"][\s\S]*invalidatePrivilegedAccess/);
-  for (const event of ['chat_message', 'edit_message', 'toggle_reaction', 'delete_message', 'typing']) {
+  for (const event of ['chat_message', 'edit_message', 'toggle_reaction', 'delete_message']) {
     assert.match(source, new RegExp(`compositionContextCoordinator\\.payload\\([\\s\\S]{0,240}socket\\.emit\\(['"]${event}['"]`), event);
   }
 });
@@ -3608,6 +3871,7 @@ test('production shortcut room transition closes and invalidates room-A message 
     closeReportPrompt: () => {},
     currentServerCodeSetter: () => {},
     compositionContextCoordinator: composition,
+    typingOwner: { exit() {} },
     myRoomRole: 'user',
     applyRestrictionState: () => {},
     renderServerAccess: () => {},

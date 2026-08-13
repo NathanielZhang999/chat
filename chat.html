@@ -1565,6 +1565,89 @@
             };
         },
 
+        createTypingOwner({
+            schedule = (callback, delay) => setTimeout(callback, delay),
+            cancel = timer => clearTimeout(timer),
+            getSocket = () => null,
+            getContext = () => null,
+            isContextCurrent = () => false,
+            idleMs = 1500
+        } = {}) {
+            let activeOwner = null;
+
+            const validContext = value => Boolean(value &&
+                typeof value.serverCode === 'string' && value.serverCode &&
+                Number.isSafeInteger(value.clientContextId) && value.clientContextId > 0);
+            const sameContext = (left, right) => Boolean(left && right &&
+                left.serverCode === right.serverCode &&
+                left.clientContextId === right.clientContextId);
+            const cancelOwnerTimer = owner => {
+                if (!owner || owner.timer === null) return;
+                try { cancel(owner.timer); } catch {}
+                owner.timer = null;
+            };
+            const canEmit = owner => Boolean(owner && owner.socketReference &&
+                owner.socketReference === getSocket() && owner.socketReference.connected &&
+                isContextCurrent(owner.context));
+            const emitState = (owner, isTyping) => {
+                if (!canEmit(owner)) return false;
+                owner.socketReference.emit('typing', {
+                    serverCode: owner.context.serverCode,
+                    clientContextId: owner.context.clientContextId,
+                    isTyping
+                });
+                return true;
+            };
+            const scheduleIdle = owner => {
+                cancelOwnerTimer(owner);
+                owner.timer = schedule(() => {
+                    if (activeOwner !== owner) return;
+                    activeOwner = null;
+                    owner.timer = null;
+                    emitState(owner, false);
+                }, idleMs);
+            };
+            const retire = ({ emit = true } = {}) => {
+                const owner = activeOwner;
+                if (!owner) return false;
+                activeOwner = null;
+                cancelOwnerTimer(owner);
+                return emit ? emitState(owner, false) : false;
+            };
+
+            return Object.freeze({
+                input() {
+                    const socketReference = getSocket();
+                    const contextValue = getContext();
+                    if (!socketReference || !socketReference.connected || !validContext(contextValue) ||
+                        !isContextCurrent(contextValue)) {
+                        retire({ emit: false });
+                        return false;
+                    }
+                    const context = Object.freeze({
+                        serverCode: contextValue.serverCode,
+                        clientContextId: contextValue.clientContextId
+                    });
+                    if (activeOwner && activeOwner.socketReference === socketReference &&
+                        sameContext(activeOwner.context, context) && canEmit(activeOwner)) {
+                        scheduleIdle(activeOwner);
+                        return true;
+                    }
+                    retire({ emit: false });
+                    const owner = { socketReference, context, timer: null };
+                    activeOwner = owner;
+                    if (!emitState(owner, true)) {
+                        activeOwner = null;
+                        return false;
+                    }
+                    scheduleIdle(owner);
+                    return true;
+                },
+                submit() { return retire(); },
+                exit() { return retire(); }
+            });
+        },
+
         createFocusRestoringModalOwner({ element, getActiveElement = () => null } = {}) {
             let priorFocus = null;
             return {
@@ -3244,9 +3327,20 @@
     let moderatorCenterTab = 'reports';
     const moderatorCenterCursors = { reports: null, restrictions: null, audit: null };
     const compositionContextCoordinator = ChatClientHelpers.createCompositionContextCoordinator();
+    const typingOwner = ChatClientHelpers.createTypingOwner({
+        getSocket: () => socket,
+        getContext() {
+            const context = compositionContextCoordinator.current();
+            return context.roomCode ? {
+                serverCode: context.roomCode,
+                clientContextId: context.clientContextId
+            } : null;
+        },
+        isContextCurrent: context => compositionContextCoordinator.matches(context),
+        idleMs: 1500
+    });
 
     let isLoginMode = true;
-    let typingTimeout;
     const typingUsers = new Map();
     
     let editingMsgId = null;
@@ -3493,7 +3587,7 @@
             myRoomRole = 'user';
         },
         resetTyping() {
-            clearTimeout(typingTimeout);
+            typingOwner.exit();
             typingUsers.clear();
             updateTypingUI();
         },
@@ -3641,11 +3735,11 @@
     }
 
     function enterLobby() {
+        typingOwner.exit();
         compositionContextCoordinator.invalidate();
         currentServerCode = null;
         myRoomRole = 'user';
         restrictionCoordinator.clear();
-        clearTimeout(typingTimeout);
         typingUsers.clear();
         updateTypingUI();
         chatWindow.textContent = '';
@@ -4451,6 +4545,7 @@
         authError.style.color = "var(--text)"; authError.textContent = "Connecting to server..."; authBtn.disabled = true;
 
         const previousSocket = socket;
+        if (socket && socketUrl !== url) typingOwner.exit();
         const replacement = ChatClientHelpers.replaceSocket(socket, socketUrl, url, io);
         socket = replacement.socket;
         socketUrl = replacement.socketUrl;
@@ -5102,6 +5197,7 @@
                 closeModerationPrompt();
                 closeReportPrompt();
                 closeMessageHistory();
+                typingOwner.exit();
                 currentServerCode = targetServerCode;
                 compositionContextCoordinator.activate(targetServerCode);
                 myRoomRole = response.roomRole || 'user';
@@ -5299,25 +5395,13 @@
             cancelAction();
         }
         
-        const stoppedTyping = compositionContextCoordinator.payload({ isTyping: false });
-        if (stoppedTyping) socket.emit('typing', stoppedTyping);
+        typingOwner.submit();
         msgInput.focus();
     });
 
     msgInput.addEventListener('input', () => {
         if (compositionDisabled || !currentServerCode) return;
-        const typingStarted = compositionContextCoordinator.payload({ isTyping: true });
-        if (!typingStarted) return;
-        socket.emit('typing', typingStarted);
-        clearTimeout(typingTimeout);
-        typingTimeout = setTimeout(() => {
-            if (!compositionContextCoordinator.matches(typingStarted)) return;
-            socket.emit('typing', {
-                serverCode: typingStarted.serverCode,
-                clientContextId: typingStarted.clientContextId,
-                isTyping: false
-            });
-        }, 1500);
+        typingOwner.input();
     });
 
     function initiateEdit(id, currentTextElement) {

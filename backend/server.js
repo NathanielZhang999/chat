@@ -5,11 +5,19 @@ const cors = require('cors');
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
 const { createHash, randomBytes } = require('node:crypto');
+const { isIP } = require('node:net');
 
 const DEFAULT_ALLOWED_ORIGINS = Object.freeze(['https://nathanielzhang999.github.io']);
+const MAX_FORWARDED_FOR_LENGTH = 1_024;
+
+function isTrustedRenderRuntime(environment = process.env) {
+  return Boolean(environment && environment.RENDER === 'true');
+}
 
 function normalizeConfiguredOrigin(value) {
   if (typeof value !== 'string' || value.trim() !== value || value.includes('*')) return null;
+  if (!/^https?:\/\/[^/?#\\]+\/?$/i.test(value) ||
+      /[\u0000-\u0020\u007f]/.test(value) || value.includes('@')) return null;
   try {
     const parsed = new URL(value);
     if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password ||
@@ -17,6 +25,19 @@ function normalizeConfiguredOrigin(value) {
     return parsed.origin;
   } catch {
     return null;
+  }
+}
+
+function isLoopbackOrigin(value) {
+  try {
+    let hostname = new URL(value).hostname.toLowerCase().replace(/\.$/, '');
+    if (hostname.startsWith('[') && hostname.endsWith(']')) hostname = hostname.slice(1, -1);
+    if (hostname === 'localhost' || hostname === '::1') return true;
+    const mappedIpv4 = /^::ffff:([0-9a-f]{1,4}):[0-9a-f]{1,4}$/.exec(hostname);
+    if (mappedIpv4 && (Number.parseInt(mappedIpv4[1], 16) & 0xff00) === 0x7f00) return true;
+    return /^127(?:\.\d{1,3}){3}$/.test(hostname);
+  } catch {
+    return false;
   }
 }
 
@@ -41,7 +62,7 @@ function createOriginPolicy({
   const origins = [];
   for (const value of configuredValues) {
     const normalized = normalizeConfiguredOrigin(value);
-    if (!normalized) {
+    if (!normalized || (production && isLoopbackOrigin(normalized))) {
       configurationError = new Error('ALLOWED_ORIGINS must contain exact browser origins.');
       continue;
     }
@@ -54,6 +75,7 @@ function createOriginPolicy({
 
     const normalized = normalizeConfiguredOrigin(origin);
     if (!normalized) return false;
+    if (production && isLoopbackOrigin(normalized)) return false;
     if (origins.includes(normalized)) return true;
 
     if (!production) {
@@ -85,18 +107,35 @@ function createOriginPolicy({
   };
 }
 
+function setSecurityHeaders(target, { production } = {}) {
+  const setHeader = target && typeof target.setHeader === 'function'
+    ? (name, value) => target.setHeader(name, value)
+    : (name, value) => { if (target && typeof target === 'object') target[name] = value; };
+  setHeader('X-Content-Type-Options', 'nosniff');
+  setHeader('Referrer-Policy', 'no-referrer');
+  setHeader('X-Frame-Options', 'DENY');
+  setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  setHeader('Cross-Origin-Resource-Policy', 'same-site');
+  if (production) {
+    setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  }
+  return target;
+}
+
 function createSecurityHeadersMiddleware({ production }) {
   return (_req, res, next) => {
-    res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.setHeader('Referrer-Policy', 'no-referrer');
-    res.setHeader('X-Frame-Options', 'DENY');
-    res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
-    res.setHeader('Cross-Origin-Resource-Policy', 'same-site');
-    if (production) {
-      res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
-    }
+    setSecurityHeaders(res, { production });
     next();
   };
+}
+
+function configureEngineSecurity({ ioInstance, production }) {
+  if (!ioInstance || !ioInstance.engine || typeof ioInstance.engine.on !== 'function') {
+    throw new TypeError('Socket.IO Engine is required.');
+  }
+  const applyHeaders = headers => setSecurityHeaders(headers, { production });
+  ioInstance.engine.on('initial_headers', applyHeaders);
+  ioInstance.engine.on('headers', applyHeaders);
 }
 
 function configureHttpSecurity({ appInstance, originPolicy: configuredOriginPolicy, production }) {
@@ -104,7 +143,8 @@ function configureHttpSecurity({ appInstance, originPolicy: configuredOriginPoli
   appInstance.use(cors({ origin: configuredOriginPolicy.corsOrigin }));
 }
 
-const isProduction = process.env.NODE_ENV === 'production' || Boolean(process.env.RENDER);
+const isRenderRuntime = isTrustedRenderRuntime(process.env);
+const isProduction = process.env.NODE_ENV === 'production' || isRenderRuntime;
 const originPolicy = createOriginPolicy({
   allowedOriginsValue: process.env.ALLOWED_ORIGINS,
   production: isProduction
@@ -118,6 +158,7 @@ const io = new Server(server, {
     allowRequest: originPolicy.allowSocketRequest,
     maxHttpBufferSize: 10_000_000
 });
+configureEngineSecurity({ ioInstance: io, production: isProduction });
 
 const MONGO_URI = process.env.MONGO_URI; 
 
@@ -195,10 +236,10 @@ const SOCKET_EVENT_POLICIES = Object.freeze({
   manage_role: objectPolicy(8_192, ['action', 'targetUser', 'serverCode'], 'sensitive_write', true),
   moderate_user: objectPolicy(8_192, ['serverCode', 'targetUser', 'action', 'reason', 'duration'], 'sensitive_write', true),
   report_moderation_target: objectPolicy(8_192, ['serverCode', 'targetUser', 'reason', 'messageId'], 'sensitive_write', true),
-  list_moderation_reports: objectPolicy(8_192, ['serverCode', 'status', 'limit', 'cursor'], 'moderation_read', true),
+  list_moderation_reports: objectPolicy(8_192, ['serverCode', 'status', 'limit', 'before'], 'moderation_read', true),
   resolve_moderation_report: objectPolicy(8_192, ['serverCode', 'reportId', 'status', 'resolution'], 'sensitive_write', true),
-  list_room_restrictions: objectPolicy(8_192, ['serverCode', 'targetUser', 'limit', 'cursor'], 'moderation_read', true),
-  get_moderation_audit: objectPolicy(8_192, ['serverCode', 'limit', 'cursor'], 'moderation_read', true),
+  list_room_restrictions: objectPolicy(8_192, ['serverCode', 'targetUser', 'limit', 'before'], 'moderation_read', true),
+  get_moderation_audit: objectPolicy(8_192, ['serverCode', 'limit', 'before'], 'moderation_read', true),
   get_automod: objectPolicy(8_192, ['serverCode'], 'moderation_read', true),
   update_automod: objectPolicy(8_192, ['serverCode', 'blockedKeywords', 'mentionLimit', 'repeatLimit', 'repeatWindowSeconds', 'messageLimit', 'messageWindowSeconds'], 'sensitive_write', true),
   create_server: scalarPolicy(8_192, 'sensitive_write', true),
@@ -671,9 +712,32 @@ async function findUserByUsername(UserModel, value, { session = null } = {}) {
 function normalizeTransportAddress(value) {
   let address = typeof value === 'string' ? value.trim().toLowerCase() : '';
   if (address.startsWith('[') && address.endsWith(']')) address = address.slice(1, -1);
-  if (address.startsWith('::ffff:')) address = address.slice(7);
+  if (address.startsWith('::ffff:') && isIP(address.slice(7)) === 4) address = address.slice(7);
   return (address || 'unknown').slice(0, 128);
 }
+
+function createClientAddressResolver({ trustProxy = false } = {}) {
+  return socket => {
+    const handshake = socket && socket.handshake;
+    const request = socket && socket.request;
+    const peerCandidate = handshake && handshake.address !== undefined
+      ? handshake.address
+      : request && request.socket && request.socket.remoteAddress;
+    const peerAddress = normalizeTransportAddress(peerCandidate);
+    if (!trustProxy) return peerAddress;
+
+    const headers = request && request.headers
+      ? request.headers
+      : handshake && handshake.headers;
+    const forwarded = headers && headers['x-forwarded-for'];
+    if (typeof forwarded !== 'string' || forwarded.length === 0 ||
+        forwarded.length > MAX_FORWARDED_FOR_LENGTH) return peerAddress;
+    const candidate = normalizeTransportAddress(forwarded.split(',', 1)[0]);
+    return isIP(candidate) ? candidate : peerAddress;
+  };
+}
+
+const directClientAddressResolver = createClientAddressResolver();
 
 function hashNetworkAddress(value, salt) {
   const normalizedAddress = normalizeTransportAddress(value);
@@ -807,7 +871,8 @@ function createConnectionAdmission({
   salt = randomBytes(32),
   maxAttemptsPerMinute = 60,
   maxConcurrentPerNetwork = 100,
-  maxEntries = MAX_RATE_LIMIT_KEYS
+  maxEntries = MAX_RATE_LIMIT_KEYS,
+  clientAddressResolver = directClientAddressResolver
 } = {}) {
   const statesByNetwork = new Map();
   const boundedMaxEntries = Number.isInteger(maxEntries) && maxEntries > 0
@@ -849,7 +914,7 @@ function createConnectionAdmission({
 
   function open(socket) {
     const currentTime = now();
-    const address = socket && socket.handshake && socket.handshake.address;
+    const address = clientAddressResolver(socket);
     const networkBucket = hashNetworkAddress(address, salt);
     const state = reserveNetwork(networkBucket, currentTime);
     if (!state || state.attempts.length >= maxAttemptsPerMinute) return rejection;
@@ -1005,7 +1070,8 @@ function applyQueryDeadline(query, milliseconds = 2_000) {
 function createSocketEventDispatcher({
   eventBudgetController,
   inFlightCoordinator,
-  securityLogger = console
+  securityLogger = console,
+  clientAddressResolver = directClientAddressResolver
 } = {}) {
   const networkSalt = randomBytes(32);
 
@@ -1024,7 +1090,7 @@ function createSocketEventDispatcher({
             event: typeof event === 'string' && event.length <= 64 ? event : 'unknown',
             category: validation.policy ? validation.policy.category : null,
             networkBucket: hashNetworkAddress(
-              socket && socket.handshake && socket.handshake.address,
+              clientAddressResolver(socket),
               networkSalt
             )
           });
@@ -1079,6 +1145,27 @@ function createSocketEventDispatcher({
   }
 
   return { dispatch, cancelSocket };
+}
+
+function createDeploymentNetworkSecurity({
+  environment = process.env,
+  eventBudgetController,
+  inFlightCoordinator,
+  createConnectionAdmissionFn = createConnectionAdmission,
+  createSocketEventDispatcherFn = createSocketEventDispatcher
+} = {}) {
+  const clientAddressResolver = createClientAddressResolver({
+    trustProxy: isTrustedRenderRuntime(environment)
+  });
+  return Object.freeze({
+    clientAddressResolver,
+    connectionAdmission: createConnectionAdmissionFn({ clientAddressResolver }),
+    socketEventDispatcher: createSocketEventDispatcherFn({
+      eventBudgetController,
+      inFlightCoordinator,
+      clientAddressResolver
+    })
+  });
 }
 
 function createLayeredAuthLimiter({
@@ -1233,9 +1320,9 @@ function createRateLimiter({
   };
 }
 
-function authRateLimitKey(socket, action, account) {
+function authRateLimitKey(socket, action, account, clientAddressResolver = directClientAddressResolver) {
   const networkBucket = hashNetworkAddress(
-    socket && socket.handshake && socket.handshake.address,
+    clientAddressResolver(socket),
     authNetworkSalt
   );
   const normalizedAccount = typeof account === 'string' && account
@@ -1410,10 +1497,10 @@ async function withRoomMutationLock(serverCode, operation) {
 
 const authNetworkSalt = randomBytes(32);
 const authRateLimiter = createLayeredAuthLimiter({ salt: authNetworkSalt });
-const serverConnectionAdmission = createConnectionAdmission();
 const serverEventBudgetController = createEventBudgetController();
 const serverInFlightCoordinator = createInFlightRequestCoordinator();
-const serverSocketEventDispatcher = createSocketEventDispatcher({
+const productionNetworkSecurity = createDeploymentNetworkSecurity({
+  environment: process.env,
   eventBudgetController: serverEventBudgetController,
   inFlightCoordinator: serverInFlightCoordinator
 });
@@ -1424,7 +1511,7 @@ const processDummyPasswordHashPromise = createDummyPasswordHash({
 });
 setInterval(() => {
   authRateLimiter.prune();
-  serverConnectionAdmission.prune();
+  productionNetworkSecurity.connectionAdmission.prune();
   serverEventBudgetController.prune();
   operationRateLimiter.prune();
 }, RATE_LIMIT_WINDOW_MS).unref();
@@ -1736,6 +1823,7 @@ function createConnectionHandler({
   logger = console,
   connectionAdmission,
   socketEventDispatcher,
+  clientAddressResolver = directClientAddressResolver,
   maxAuthenticatedSockets = 8
 } = {}) {
   return socket => {
@@ -2386,7 +2474,7 @@ function createConnectionHandler({
       const admission = authLimiter.attempt({
         action: 'register',
         account: cleanUser,
-        address: socket.handshake && socket.handshake.address
+        address: clientAddressResolver(socket)
       });
       if (!admission.allowed) return callback({ error: 'Too many requests. Try again later.' });
 
@@ -2428,7 +2516,7 @@ function createConnectionHandler({
       const admission = authLimiter.attempt({
         action: 'login',
         account: username,
-        address: socket.handshake && socket.handshake.address
+        address: clientAddressResolver(socket)
       });
       if (!admission.allowed) return callback({ error: 'Too many requests. Try again later.' });
 
@@ -2553,7 +2641,9 @@ function createConnectionHandler({
     if (!data || typeof data.oldPassword !== 'string' || typeof data.newPassword !== 'string') return callback({ error: 'Invalid input format.' });
 
     const authenticatedUsername = socket.username;
-    const rateKey = authRateLimitKey(socket, 'change_password', authenticatedUsername);
+    const rateKey = authRateLimitKey(
+      socket, 'change_password', authenticatedUsername, clientAddressResolver
+    );
     if (!rateLimiter.check(rateKey)) return callback({ error: 'Too many attempts. Try again later.' });
 
     try {
@@ -4436,8 +4526,9 @@ function installDefaultConnectionHandler() {
         authLimiter: authRateLimiter,
         dummyPasswordHash,
         passwordHashCost: PASSWORD_HASH_COST,
-        connectionAdmission: serverConnectionAdmission,
-        socketEventDispatcher: serverSocketEventDispatcher
+        connectionAdmission: productionNetworkSecurity.connectionAdmission,
+        socketEventDispatcher: productionNetworkSecurity.socketEventDispatcher,
+        clientAddressResolver: productionNetworkSecurity.clientAddressResolver
       }));
     });
   }
@@ -4481,9 +4572,13 @@ module.exports = {
   io,
   start,
   DEFAULT_ALLOWED_ORIGINS,
+  MAX_FORWARDED_FOR_LENGTH,
+  isTrustedRenderRuntime,
   normalizeConfiguredOrigin,
   createOriginPolicy,
+  setSecurityHeaders,
   createSecurityHeadersMiddleware,
+  configureEngineSecurity,
   configureHttpSecurity,
   originPolicy,
   seedSystem,
@@ -4497,6 +4592,7 @@ module.exports = {
   createInFlightRequestCoordinator,
   applyQueryDeadline,
   createSocketEventDispatcher,
+  createDeploymentNetworkSecurity,
   createConnectionHandler,
   withAccountTransitionLock,
   withAccountTransitionLocks,
@@ -4545,6 +4641,7 @@ module.exports = {
   decodeCursor,
   neutralizePingTokens,
   normalizeTransportAddress,
+  createClientAddressResolver,
   hashNetworkAddress,
   createLayeredAuthLimiter,
   bcryptCost,

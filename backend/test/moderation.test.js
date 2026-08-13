@@ -287,7 +287,9 @@ function connectAdditionalSocket(setup, {
   return live;
 }
 
-function reportingScenario({ reporter = 'Alice', room = 'ABC123', target = 'Bob' } = {}) {
+function reportingScenario({
+  reporter = 'Alice', room = 'ABC123', target = 'Bob', socketEventDispatcher
+} = {}) {
   const users = [
     userDocument({ username: reporter, displayName: reporter, servers: ['global', 'ABC123', 'XYZ789'] }),
     userDocument({ username: target, displayName: target, servers: ['global', 'ABC123', 'XYZ789'] }),
@@ -319,7 +321,8 @@ function reportingScenario({ reporter = 'Alice', room = 'ABC123', target = 'Bob'
     MessageModel,
     RoomRestrictionModel,
     ModerationAuditModel,
-    ModerationReportModel
+    ModerationReportModel,
+    socketEventDispatcher
   });
   Object.assign(setup.socket, {
     username: reporter,
@@ -1315,6 +1318,170 @@ test('report pagination uses descending createdAt and id keysets with an opaque 
     serverCode: 'ABC123', status: 'open', before: 'not-a-valid-cursor'
   }, invalidAck.callback);
   assert.equal(Boolean(invalidAck.value().error), true);
+});
+
+function trackedProductionDispatcher(trace) {
+  const productionDispatcher = createSocketEventDispatcher({
+    inFlightCoordinator: createInFlightRequestCoordinator(),
+    securityLogger: { warn() {} }
+  });
+  return {
+    dispatch(packet) {
+      return productionDispatcher.dispatch({
+        ...packet,
+        handler(...args) {
+          trace.handlerEntries += 1;
+          return packet.handler(...args);
+        }
+      });
+    },
+    cancelSocket(...args) {
+      return productionDispatcher.cancelSocket(...args);
+    }
+  };
+}
+
+function paginationRowsFor(event) {
+  const shared = [
+    ['507f1f77bcf86cd799439071', '2026-08-08T12:04:00.000Z'],
+    ['507f1f77bcf86cd799439072', '2026-08-08T12:03:00.000Z'],
+    ['507f1f77bcf86cd799439073', '2026-08-08T12:02:00.000Z'],
+    ['507f1f77bcf86cd799439074', '2026-08-08T12:01:00.000Z']
+  ];
+  if (event === 'list_moderation_reports') {
+    return shared.map(([_id, createdAt]) => ({
+      _id, createdAt: new Date(createdAt), serverCode: 'ABC123',
+      reporterUsername: 'Alice', targetUsername: 'Bob', messageId: null,
+      reason: `report-${_id}`, status: 'open'
+    }));
+  }
+  if (event === 'list_room_restrictions') {
+    return shared.map(([_id, createdAt], index) => restrictionDocument('ABC123', `target${index}`, {
+      _id, createdAt: new Date(createdAt), bannedAt: new Date(createdAt),
+      bannedBy: 'ExactMod', banReason: `restriction-${index}`
+    }));
+  }
+  return shared.map(([_id, createdAt], index) => ({
+    _id, createdAt: new Date(createdAt), correlationId: `audit-${index}`,
+    action: 'timeout', serverCode: 'ABC123', actorUsername: 'ExactMod',
+    actorRole: 'user', actorRoomRole: 'mod', targetUsername: 'Bob',
+    targetRole: 'user', targetRoomRole: 'user', reason: `audit-${index}`,
+    duration: '10m', expiresAt: null, messageId: null, reportId: null, metadata: null
+  }));
+}
+
+test('moderation second pages traverse the production dispatcher and registered keyset queries', async () => {
+  const rows = [
+    {
+      event: 'list_moderation_reports', model: 'ModerationReportModel',
+      payload: { serverCode: 'ABC123', status: 'open', limit: 2 }
+    },
+    {
+      event: 'list_room_restrictions', model: 'RoomRestrictionModel',
+      payload: { serverCode: 'ABC123', limit: 2 }
+    },
+    {
+      event: 'get_moderation_audit', model: 'ModerationAuditModel',
+      payload: { serverCode: 'ABC123', limit: 2 }
+    }
+  ];
+
+  for (const row of rows) {
+    const trace = { handlerEntries: 0, queries: [] };
+    const setup = reportingScenario({ socketEventDispatcher: trackedProductionDispatcher(trace) });
+    setup[row.model].rows.push(...paginationRowsFor(row.event));
+    const originalFind = setup[row.model].find.bind(setup[row.model]);
+    setup[row.model].find = query => {
+      trace.queries.push(query);
+      return originalFind(query);
+    };
+
+    const firstAck = acknowledge();
+    await setup.modSocket.trigger(row.event, row.payload, firstAck.callback);
+    assert.deepEqual(firstAck.value().items.map(item => item._id), [
+      '507f1f77bcf86cd799439071', '507f1f77bcf86cd799439072'
+    ], `${row.event} first page`);
+    assert.equal(typeof firstAck.value().nextCursor, 'string', `${row.event} cursor`);
+
+    const secondAck = acknowledge();
+    await setup.modSocket.trigger(row.event, {
+      ...row.payload,
+      before: firstAck.value().nextCursor
+    }, secondAck.callback);
+    assert.equal(
+      Array.isArray(secondAck.value() && secondAck.value().items),
+      true,
+      `${row.event} second-page acknowledgement ${JSON.stringify(secondAck.value())}`
+    );
+    assert.deepEqual(secondAck.value().items.map(item => item._id), [
+      '507f1f77bcf86cd799439073', '507f1f77bcf86cd799439074'
+    ], `${row.event} second page`);
+    assert.equal(secondAck.value().nextCursor, null, `${row.event} terminal cursor`);
+    assert.equal(trace.handlerEntries, 2, `${row.event} handler entries`);
+    assert.equal(trace.queries.length, 2, `${row.event} registered queries`);
+    const keyset = row.event === 'list_room_restrictions'
+      ? trace.queries[1].$and[1]
+      : { $or: trace.queries[1].$or };
+    assert.equal(Array.isArray(keyset.$or), true, `${row.event} second-page keyset`);
+    assert.equal(keyset.$or[0].createdAt.$lt instanceof Date, true, `${row.event} cursor date`);
+    assert.equal(keyset.$or[1]._id.$lt, '507f1f77bcf86cd799439072', `${row.event} cursor id`);
+  }
+});
+
+test('moderation cursor aliases are rejected by the production dispatcher before handler or model work', async () => {
+  const rows = [
+    ['list_moderation_reports', { serverCode: 'ABC123', status: 'open', limit: 2, cursor: 'alias' }],
+    ['list_room_restrictions', { serverCode: 'ABC123', limit: 2, cursor: 'alias' }],
+    ['get_moderation_audit', { serverCode: 'ABC123', limit: 2, cursor: 'alias' }]
+  ];
+
+  for (const [event, payload] of rows) {
+    const trace = { handlerEntries: 0, modelCalls: 0 };
+    const setup = reportingScenario({ socketEventDispatcher: trackedProductionDispatcher(trace) });
+    for (const model of Object.values(setup.models)) {
+      for (const method of ['find', 'findOne', 'findById', 'countDocuments']) {
+        if (typeof model[method] !== 'function') continue;
+        const original = model[method].bind(model);
+        model[method] = (...args) => {
+          trace.modelCalls += 1;
+          return original(...args);
+        };
+      }
+    }
+    const ack = acknowledge();
+    await setup.modSocket.trigger(event, payload, ack.callback);
+    assert.deepEqual(ack.value(), { error: 'Invalid input format.' }, event);
+    assert.equal(trace.handlerEntries, 0, `${event} handler work`);
+    assert.equal(trace.modelCalls, 0, `${event} model work`);
+  }
+});
+
+test('malformed before cursors reach registered validation but perform zero model work', async () => {
+  const rows = [
+    ['list_moderation_reports', { serverCode: 'ABC123', status: 'open', limit: 2, before: 'malformed' }],
+    ['list_room_restrictions', { serverCode: 'ABC123', limit: 2, before: 'malformed' }],
+    ['get_moderation_audit', { serverCode: 'ABC123', limit: 2, before: 'malformed' }]
+  ];
+
+  for (const [event, payload] of rows) {
+    const trace = { handlerEntries: 0, modelCalls: 0 };
+    const setup = reportingScenario({ socketEventDispatcher: trackedProductionDispatcher(trace) });
+    for (const model of Object.values(setup.models)) {
+      for (const method of ['find', 'findOne', 'findById', 'countDocuments']) {
+        if (typeof model[method] !== 'function') continue;
+        const original = model[method].bind(model);
+        model[method] = (...args) => {
+          trace.modelCalls += 1;
+          return original(...args);
+        };
+      }
+    }
+    const ack = acknowledge();
+    await setup.modSocket.trigger(event, payload, ack.callback);
+    assert.deepEqual(ack.value(), { error: 'Invalid input format.' }, event);
+    assert.equal(trace.handlerEntries, 1, `${event} handler validation`);
+    assert.equal(trace.modelCalls, 0, `${event} model work`);
+  }
 });
 
 test('audit pagination clamps the limit to fifty and projects explicit safe fields', async () => {
