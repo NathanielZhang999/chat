@@ -6,13 +6,117 @@ const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
 const { createHash } = require('node:crypto');
 
+const DEFAULT_ALLOWED_ORIGINS = Object.freeze(['https://nathanielzhang999.github.io']);
+
+function normalizeConfiguredOrigin(value) {
+  if (typeof value !== 'string' || value.trim() !== value || value.includes('*')) return null;
+  try {
+    const parsed = new URL(value);
+    if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password ||
+        parsed.pathname !== '/' || parsed.search || parsed.hash) return null;
+    return parsed.origin;
+  } catch {
+    return null;
+  }
+}
+
+function createOriginPolicy({
+  allowedOriginsValue,
+  production,
+  defaultOrigins = DEFAULT_ALLOWED_ORIGINS
+} = {}) {
+  let configurationError = null;
+  let configuredValues;
+
+  if (typeof allowedOriginsValue === 'undefined' || allowedOriginsValue === null ||
+      (typeof allowedOriginsValue === 'string' && allowedOriginsValue.trim() === '')) {
+    configuredValues = defaultOrigins;
+  } else if (typeof allowedOriginsValue === 'string') {
+    configuredValues = allowedOriginsValue.split(',').map(value => value.trim());
+  } else {
+    configuredValues = [];
+    configurationError = new Error('ALLOWED_ORIGINS must contain exact browser origins.');
+  }
+
+  const origins = [];
+  for (const value of configuredValues) {
+    const normalized = normalizeConfiguredOrigin(value);
+    if (!normalized) {
+      configurationError = new Error('ALLOWED_ORIGINS must contain exact browser origins.');
+      continue;
+    }
+    if (!origins.includes(normalized)) origins.push(normalized);
+  }
+
+  function allows(origin, { allowMissing = false } = {}) {
+    if (typeof origin === 'undefined') return allowMissing;
+    if (configurationError) return false;
+
+    const normalized = normalizeConfiguredOrigin(origin);
+    if (!normalized) return false;
+    if (origins.includes(normalized)) return true;
+
+    if (!production) {
+      const parsed = new URL(normalized);
+      return parsed.protocol === 'http:' &&
+        (parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1');
+    }
+    return false;
+  }
+
+  function assertValid() {
+    if (configurationError) throw configurationError;
+  }
+
+  return {
+    origins,
+    configurationError,
+    assertValid,
+    allows,
+    corsOrigin(origin, callback) {
+      const isMissing = typeof origin === 'undefined';
+      const allowed = allows(origin, { allowMissing: isMissing });
+      callback(null, isMissing ? false : allowed);
+    },
+    allowSocketRequest(request, callback) {
+      const origin = request && request.headers ? request.headers.origin : undefined;
+      callback(null, allows(origin));
+    }
+  };
+}
+
+function createSecurityHeadersMiddleware({ production }) {
+  return (_req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+    res.setHeader('Cross-Origin-Resource-Policy', 'same-site');
+    if (production) {
+      res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+    }
+    next();
+  };
+}
+
+function configureHttpSecurity({ appInstance, originPolicy: configuredOriginPolicy, production }) {
+  appInstance.use(createSecurityHeadersMiddleware({ production }));
+  appInstance.use(cors({ origin: configuredOriginPolicy.corsOrigin }));
+}
+
+const isProduction = process.env.NODE_ENV === 'production' || Boolean(process.env.RENDER);
+const originPolicy = createOriginPolicy({
+  allowedOriginsValue: process.env.ALLOWED_ORIGINS,
+  production: isProduction
+});
 const app = express();
-app.use(cors());
+configureHttpSecurity({ appInstance: app, originPolicy, production: isProduction });
 const server = http.createServer(app);
 
-const io = new Server(server, { 
-    cors: { origin: "*" },
-    maxHttpBufferSize: 1e7 
+const io = new Server(server, {
+    cors: { origin: originPolicy.corsOrigin },
+    allowRequest: originPolicy.allowSocketRequest,
+    maxHttpBufferSize: 10_000_000
 });
 
 const MONGO_URI = process.env.MONGO_URI; 
@@ -3632,9 +3736,11 @@ async function start({
   seedSystemFn = seedSystem,
   serverInstance = server,
   port = PORT,
-  logger = console
+  logger = console,
+  validateSecurityConfigurationFn = originPolicy.assertValid
 } = {}) {
   if (!mongoUri) throw new Error('MONGO_URI is required before server startup.');
+  validateSecurityConfigurationFn();
   await mongooseImpl.connect(mongoUri);
   await seedSystemFn();
   return new Promise(resolve => {
@@ -3655,7 +3761,14 @@ if (require.main === module) {
 module.exports = {
   app,
   server,
+  io,
   start,
+  DEFAULT_ALLOWED_ORIGINS,
+  normalizeConfiguredOrigin,
+  createOriginPolicy,
+  createSecurityHeadersMiddleware,
+  configureHttpSecurity,
+  originPolicy,
   seedSystem,
   createConnectionHandler,
   withAccountTransitionLock,

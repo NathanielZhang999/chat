@@ -128,6 +128,135 @@ test('history and reply snapshots derive bounded stored data', () => {
   });
 });
 
+test('origin policy accepts exact deployed and configured origins only', () => {
+  assert.equal(typeof security.normalizeConfiguredOrigin, 'function');
+  assert.equal(typeof security.createOriginPolicy, 'function');
+
+  const policy = security.createOriginPolicy({
+    allowedOriginsValue: 'https://nathanielzhang999.github.io, https://chat.example.com, https://chat.example.com/',
+    production: true
+  });
+
+  assert.deepEqual(policy.origins, [
+    'https://nathanielzhang999.github.io',
+    'https://chat.example.com'
+  ]);
+
+  for (const origin of ['https://nathanielzhang999.github.io', 'https://chat.example.com']) {
+    assert.equal(policy.allows(origin), true, origin);
+    const callbackValues = [];
+    policy.corsOrigin(origin, (...values) => callbackValues.push(values));
+    assert.deepEqual(callbackValues, [[null, true]], origin);
+  }
+
+  const rejectedOrigins = [
+    'https://nathanielzhang999.github.io.evil.example',
+    'https://user@example.com',
+    'https://example.com/path',
+    'https://*.example.com',
+    'file:///tmp/chat.html',
+    null,
+    'javascript:alert(1)',
+    'https://example.com?query=value',
+    'https://example.com#fragment',
+    'not a URL'
+  ];
+
+  for (const origin of rejectedOrigins) {
+    assert.equal(policy.allows(origin), false, String(origin));
+    const callbackValues = [];
+    policy.corsOrigin(origin, (...values) => callbackValues.push(values));
+    assert.deepEqual(callbackValues, [[null, false]], String(origin));
+  }
+});
+
+test('origin policy permits loopback only outside production and rejects missing socket origins', () => {
+  const productionPolicy = security.createOriginPolicy({ production: true });
+  const developmentPolicy = security.createOriginPolicy({ production: false });
+
+  assert.equal(productionPolicy.allows('http://localhost:3000'), false);
+  assert.equal(developmentPolicy.allows('http://localhost:3000'), true);
+  assert.equal(developmentPolicy.allows('http://127.0.0.1:5173'), true);
+  assert.equal(developmentPolicy.allows('https://localhost:3000'), false);
+  assert.equal(developmentPolicy.allows('http://localhost.evil.example'), false);
+  assert.equal(developmentPolicy.allows(undefined, { allowMissing: true }), true);
+  assert.equal(developmentPolicy.allows(undefined), false);
+
+  const expressCallbackValues = [];
+  developmentPolicy.corsOrigin(undefined, (...values) => expressCallbackValues.push(values));
+  assert.deepEqual(expressCallbackValues, [[null, false]]);
+
+  const socketCallbackValues = [];
+  developmentPolicy.allowSocketRequest({ headers: {} }, (...values) => socketCallbackValues.push(values));
+  assert.deepEqual(socketCallbackValues, [[null, false]]);
+});
+
+test('malformed origin configuration fails before Mongo connection and listen', async () => {
+  const policy = security.createOriginPolicy({
+    allowedOriginsValue: 'https://chat.example.com,,https://other.example.com',
+    production: true
+  });
+  const events = [];
+  const fakeServer = {
+    listen() { events.push('listen'); }
+  };
+
+  await assert.rejects(
+    security.start({
+      mongoUri: 'mongodb://database/chat',
+      mongooseImpl: { async connect() { events.push('connect'); } },
+      seedSystemFn: async () => { events.push('seed'); },
+      serverInstance: fakeServer,
+      validateSecurityConfigurationFn: policy.assertValid
+    }),
+    /ALLOWED_ORIGINS/i
+  );
+  assert.deepEqual(events, []);
+});
+
+test('Express and Socket.IO share one origin policy without a wildcard fallback', () => {
+  assert.equal(typeof security.configureHttpSecurity, 'function');
+  assert.equal(security.io.opts.cors.origin, security.originPolicy.corsOrigin);
+  assert.equal(security.io.opts.allowRequest, security.originPolicy.allowSocketRequest);
+  assert.notEqual(security.io.opts.cors.origin, '*');
+
+  const configuredMiddleware = [];
+  security.configureHttpSecurity({
+    appInstance: { use(middleware) { configuredMiddleware.push(middleware); } },
+    originPolicy: security.originPolicy,
+    production: false
+  });
+  assert.equal(configuredMiddleware.length, 2);
+  assert.equal(security.originPolicy.allows('https://nathanielzhang999.github.io'), true);
+  assert.equal(security.originPolicy.allows('https://nathanielzhang999.github.io.evil.example'), false);
+});
+
+test('security headers are exact and HSTS is production only', () => {
+  const developmentHeaders = {};
+  let developmentNextCalls = 0;
+  security.createSecurityHeadersMiddleware({ production: false })(
+    {},
+    { setHeader(name, value) { developmentHeaders[name] = value; } },
+    () => { developmentNextCalls += 1; }
+  );
+  assert.deepEqual(developmentHeaders, {
+    'X-Content-Type-Options': 'nosniff',
+    'Referrer-Policy': 'no-referrer',
+    'X-Frame-Options': 'DENY',
+    'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
+    'Cross-Origin-Resource-Policy': 'same-site'
+  });
+  assert.equal(developmentNextCalls, 1);
+
+  const productionHeaders = {};
+  security.createSecurityHeadersMiddleware({ production: true })(
+    {},
+    { setHeader(name, value) { productionHeaders[name] = value; } },
+    () => {}
+  );
+  assert.equal(productionHeaders['Strict-Transport-Security'], 'max-age=31536000; includeSubDomains');
+});
+
 test('start fails before listening when MONGO_URI is missing', async () => {
   const originalListen = security.server.listen;
   let listened = false;
