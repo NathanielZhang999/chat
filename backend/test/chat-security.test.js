@@ -170,6 +170,41 @@ test('origin policy accepts exact deployed and configured origins only', () => {
   }
 });
 
+test('origin policy does not reflect rejected origins to callbacks or logs', () => {
+  const policy = security.createOriginPolicy({ production: true });
+  const hostileOrigins = [
+    'https://nathanielzhang999.github.io.evil.example/REJECTED_ORIGIN_SENTINEL',
+    'javascript:REJECTED_ORIGIN_SENTINEL'
+  ];
+  const logs = [];
+  const originalConsole = {
+    log: console.log,
+    warn: console.warn,
+    error: console.error
+  };
+  const captureLog = (...values) => logs.push(values);
+  console.log = captureLog;
+  console.warn = captureLog;
+  console.error = captureLog;
+
+  try {
+    for (const origin of hostileOrigins) {
+      const corsCallbackValues = [];
+      policy.corsOrigin(origin, (...values) => corsCallbackValues.push(values));
+      assert.deepEqual(corsCallbackValues, [[null, false]], origin);
+
+      const socketCallbackValues = [];
+      policy.allowSocketRequest({ headers: { origin } }, (...values) => socketCallbackValues.push(values));
+      assert.deepEqual(socketCallbackValues, [[null, false]], origin);
+    }
+    assert.deepEqual(logs, []);
+  } finally {
+    console.log = originalConsole.log;
+    console.warn = originalConsole.warn;
+    console.error = originalConsole.error;
+  }
+});
+
 test('origin policy permits loopback only outside production and rejects missing socket origins', () => {
   const productionPolicy = security.createOriginPolicy({ production: true });
   const developmentPolicy = security.createOriginPolicy({ production: false });
