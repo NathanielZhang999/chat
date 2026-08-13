@@ -82,9 +82,9 @@ All state is bounded in process because deployment uses one Node process. Keys a
 
 Login and registration attempts consume these rolling-window buckets:
 
-- **Account:** 10 failed/admitted attempts per 15 minutes for login; 6 attempts per 15 minutes for registration.
+- **Account:** 30 failed/admitted attempts per 15 minutes for login; 20 attempts per 15 minutes for registration. This is an emergency distributed-attack ceiling, not the normal first line of defense.
 - **Account plus network:** 6 attempts per 15 minutes for either login or registration.
-- **Network aggregate:** 60 attempts per 15 minutes across all accounts.
+- **Network aggregate:** 300 attempts per 15 minutes across all accounts.
 
 The most restrictive exhausted bucket rejects the attempt. A successful login clears only that account's login bucket and its account-plus-network bucket. It does not clear the aggregate network history, which prevents one successful account from resetting an ongoing distributed guessing burst.
 
