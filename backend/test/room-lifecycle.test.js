@@ -2,6 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
   bcryptCost,
+  createConnectionAdmission,
   createConnectionHandler,
   createDummyPasswordHash,
   createLayeredAuthLimiter,
@@ -436,6 +437,112 @@ test('shared networks allow many valid accounts while isolating one attacked acc
     username: 'user41', password: 'valid-password'
   }, unaffectedAck.callback);
   assert.equal(unaffectedAck.value().success, true);
+});
+
+test('eight existing account sessions allow no ninth authenticated socket', async () => {
+  const address = '198.51.100.120';
+  const ioInstance = new FakeIo();
+  ioInstance.sockets = Array.from({ length: 8 }, (_, index) => {
+    const live = new FakeSocket();
+    live.id = `existing-alice-${index}`;
+    live.username = index % 2 === 0 ? 'Alice' : 'alice';
+    live.handshake.address = address;
+    return live;
+  });
+  const onlineUsersMap = new Map(ioInstance.sockets.map(live => [live.id, {
+    username: live.username,
+    serverCode: 'global',
+    joinedServers: ['global']
+  }]));
+  let roomReads = 0;
+  const user = {
+    username: 'Alice', displayName: 'Alice', password: '$2b$11$current-hash', role: 'user',
+    color: '', avatarUrl: '', servers: ['global']
+  };
+  const socket = registerAuthenticationSocket({
+    id: 'ninth-alice',
+    address,
+    ioInstance,
+    onlineUsersMap,
+    UserModel: { async findOne() { return user; } },
+    ChatServerModel: {
+      async find() { roomReads += 1; return [{ code: 'global', moderators: [] }]; },
+      async findOne() { return null; }
+    },
+    bcryptImpl: {
+      async compare() { return true; },
+      getRounds() { return 11; },
+      async hash() { throw new Error('must not hash'); }
+    }
+  });
+  const ack = acknowledge();
+
+  await socket.trigger('login', { username: 'alice', password: 'correct-password' }, ack.callback);
+
+  assert.deepEqual(ack.value(), { error: 'Too many active sessions.' });
+  assert.equal(socket.username, undefined);
+  assert.equal(socket.serverCode, null);
+  assert.deepEqual(socket.joinedServers, []);
+  assert.equal(socket.joinedRooms.size, 0);
+  assert.equal(onlineUsersMap.size, 8);
+  assert.equal(roomReads, 0);
+});
+
+test('distinct accounts on one network remain independent below the emergency ceiling', async () => {
+  const address = '198.51.100.121';
+  const connectionAdmission = createConnectionAdmission({ salt: 'shared-network-session-ceiling' });
+  const ioInstance = new FakeIo();
+  ioInstance.sockets = Array.from({ length: 8 }, (_, index) => {
+    const live = new FakeSocket();
+    live.id = `shared-network-alice-${index}`;
+    live.username = 'Alice';
+    live.handshake.address = address;
+    const admission = connectionAdmission.open(live);
+    assert.equal(admission.allowed, true);
+    return live;
+  });
+  const onlineUsersMap = new Map(ioInstance.sockets.map(live => [live.id, {
+    username: live.username,
+    serverCode: 'global',
+    joinedServers: ['global']
+  }]));
+  const bob = {
+    username: 'Bob', displayName: 'Bob', password: '$2b$11$current-hash', role: 'user',
+    color: '', avatarUrl: '', servers: ['global']
+  };
+  const socket = new FakeSocket();
+  socket.id = 'shared-network-bob';
+  socket.handshake.address = address;
+  createConnectionHandler({
+    connectionAdmission,
+    ioInstance,
+    onlineUsersMap,
+    UserModel: { async findOne() { return bob; } },
+    ChatServerModel: {
+      async find() { return [{ code: 'global', moderators: [] }]; },
+      async findOne() { return null; }
+    },
+    RoomRestrictionModel: { async findOne() { return null; }, async find() { return []; } },
+    broadcastOnlineUsersFn: async () => {},
+    getRoomRoleFn: async () => 'user',
+    resolvePingsFn: async text => text,
+    bcryptImpl: {
+      async compare() { return true; },
+      getRounds() { return 11; },
+      async hash() { throw new Error('must not hash'); }
+    }
+  })(socket);
+  const ack = acknowledge();
+
+  await socket.trigger('login', { username: 'bob', password: 'correct-password' }, ack.callback);
+
+  assert.equal(ack.value().success, true);
+  assert.equal(socket.username, 'Bob');
+  assert.equal(onlineUsersMap.size, 9);
+  assert.equal(
+    connectionAdmission.concurrent(hashNetworkAddress(address, 'shared-network-session-ceiling')),
+    9
+  );
 });
 
 test('one successful account does not reset aggregate network abuse state', async () => {

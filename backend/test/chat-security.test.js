@@ -1,7 +1,9 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
 
 const security = require('../server');
+const { FakeSocket, FakeIo } = require('./support/fakes');
 
 test('requiring server.js does not start the HTTP server', () => {
   assert.equal(typeof security.app, 'function');
@@ -218,6 +220,113 @@ test('network buckets are salted bounded and never expose raw addresses', () => 
     'account', 'accountKey', 'action', 'networkBucket', 'networkKey', 'pairKey'
   ]);
   assert.equal(JSON.stringify(admission.token).includes(rawAddress), false);
+});
+
+test('connection admission allows sixty attempts and one hundred shared-network sockets at exact boundaries', () => {
+  let now = 0;
+  const attempts = security.createConnectionAdmission({
+    now: () => now,
+    salt: 'connection-attempt-boundary'
+  });
+  for (let index = 0; index < 60; index += 1) {
+    const result = attempts.open({ handshake: { address: '203.0.113.50' } });
+    assert.equal(result.allowed, true, `attempt ${index + 1}`);
+    attempts.release(result.token);
+  }
+  const throttled = attempts.open({ handshake: { address: '203.0.113.50' } });
+  assert.deepEqual(throttled, { allowed: false, error: 'Connection unavailable.' });
+  assert.equal(Object.isFrozen(throttled), true);
+  now = 60_000;
+  const expired = attempts.open({ handshake: { address: '203.0.113.50' } });
+  assert.equal(expired.allowed, true);
+  attempts.release(expired.token);
+
+  let concurrentNow = 0;
+  const concurrent = security.createConnectionAdmission({
+    now: () => concurrentNow,
+    salt: 'connection-concurrency-boundary'
+  });
+  const tokens = [];
+  for (let index = 0; index < 100; index += 1) {
+    if (index === 60) concurrentNow = 60_000;
+    const result = concurrent.open({ handshake: { address: '198.51.100.75' } });
+    assert.equal(result.allowed, true, `concurrent socket ${index + 1}`);
+    tokens.push(result.token);
+  }
+  assert.equal(concurrent.concurrent(tokens[0].networkBucket), 100);
+  assert.deepEqual(concurrent.open({ handshake: { address: '198.51.100.75' } }), {
+    allowed: false,
+    error: 'Connection unavailable.'
+  });
+});
+
+test('connection admission releases counters on every disconnect path and bounds network keys', async () => {
+  const admission = security.createConnectionAdmission({
+    salt: 'disconnect-release-boundary',
+    maxEntries: 2
+  });
+  const ioInstance = new FakeIo();
+  const connectionHandler = security.createConnectionHandler({
+    connectionAdmission: admission,
+    ioInstance,
+    onlineUsersMap: new Map(),
+    broadcastOnlineUsersFn: () => {}
+  });
+  const anonymousSocket = new FakeSocket();
+  anonymousSocket.id = 'anonymous-disconnect';
+  anonymousSocket.handshake.address = '192.0.2.1';
+  const authenticatedSocket = new FakeSocket();
+  authenticatedSocket.id = 'authenticated-disconnect';
+  authenticatedSocket.handshake.address = '192.0.2.2';
+  authenticatedSocket.username = 'Alice';
+  authenticatedSocket.joinedServers = [];
+  connectionHandler(anonymousSocket);
+  connectionHandler(authenticatedSocket);
+
+  const anonymousBucket = security.hashNetworkAddress('192.0.2.1', 'disconnect-release-boundary');
+  const authenticatedBucket = security.hashNetworkAddress('192.0.2.2', 'disconnect-release-boundary');
+  assert.equal(admission.concurrent(anonymousBucket), 1);
+  assert.equal(admission.concurrent(authenticatedBucket), 1);
+  await anonymousSocket.trigger('disconnect');
+  await authenticatedSocket.trigger('disconnect');
+  await authenticatedSocket.trigger('disconnect');
+  assert.equal(admission.concurrent(anonymousBucket), 0);
+  assert.equal(admission.concurrent(authenticatedBucket), 0);
+
+  for (const address of ['192.0.2.3', '192.0.2.4', '192.0.2.5']) {
+    const result = admission.open({ handshake: { address } });
+    assert.equal(result.allowed, true, address);
+    admission.release(result.token);
+  }
+  assert.equal(admission.size(), 2);
+});
+
+test('socket event policy covers every registered client event exactly once', () => {
+  const source = fs.readFileSync(require.resolve('../server'), 'utf8');
+  const registeredEvents = [...source.matchAll(/(?:socket\.on|onProtected)\('([^']+)'/g)]
+    .map(match => match[1]);
+  const applicationEvents = registeredEvents.filter(event => event !== 'disconnect');
+
+  assert.equal(new Set(applicationEvents).size, applicationEvents.length);
+  assert.deepEqual(
+    [...applicationEvents].sort(),
+    Object.keys(security.SOCKET_EVENT_POLICIES).sort()
+  );
+  assert.deepEqual(registeredEvents.filter(event => event === 'disconnect'), ['disconnect']);
+});
+
+test('event byte budgets accept exact boundaries and reject one byte over', () => {
+  const exactUtf8 = 'é'.repeat(4_096);
+  assert.equal(security.measurePayloadBytes(exactUtf8, { maxBytes: 8_192 }), 8_192);
+  assert.equal(security.measurePayloadBytes(`${exactUtf8}é`, { maxBytes: 8_192 }), 8_193);
+  assert.equal(
+    security.validateSocketEventEnvelope('create_server', ['x'.repeat(8_192)], security.SOCKET_EVENT_POLICIES).allowed,
+    true
+  );
+  assert.equal(
+    security.validateSocketEventEnvelope('create_server', ['x'.repeat(8_193)], security.SOCKET_EVENT_POLICIES).allowed,
+    false
+  );
 });
 
 test('room access preserves global and administrator access only', () => {

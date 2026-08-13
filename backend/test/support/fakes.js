@@ -1,6 +1,7 @@
 class FakeSocket {
-  constructor() {
+  constructor({ dispatchPacket } = {}) {
     this.handlers = new Map();
+    this.dispatchPacket = dispatchPacket;
     this.joinedRooms = new Set();
     this.leftRooms = [];
     this.outbound = [];
@@ -22,7 +23,12 @@ class FakeSocket {
     } else if (event === 'typing' && (typeof args[0] !== 'object' || args[0] === null)) {
       args[0] = { isTyping: args[0], serverCode: this.serverCode, clientContextId: this.clientContextId };
     }
-    return this.handlers.get(event)(...args);
+    const handler = this.handlers.get(event);
+    if (typeof handler !== 'function') return undefined;
+    if (typeof this.dispatchPacket === 'function') {
+      return this.dispatchPacket({ socket: this, event, args, handler });
+    }
+    return handler(...args);
   }
   join(room) { this.joinedRooms.add(room); }
   leave(room) { this.joinedRooms.delete(room); this.leftRooms.push(room); }

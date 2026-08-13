@@ -1,10 +1,15 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { createAutoModTracker, createConnectionHandler } = require('../server');
+const {
+  createAutoModTracker,
+  createConnectionHandler,
+  createSocketEventDispatcher
+} = require('../server');
 const { FakeSocket, FakeIo, acknowledge, deferred } = require('./support/fakes');
 
 function registerMessages(overrides = {}) {
-  const socket = new FakeSocket();
+  const { dispatchPacket, ...handlerOverrides } = overrides;
+  const socket = new FakeSocket({ dispatchPacket });
   const ioInstance = new FakeIo();
   createConnectionHandler({
     ioInstance,
@@ -20,7 +25,7 @@ function registerMessages(overrides = {}) {
     getRoomRoleFn: async () => 'user',
     resolvePingsFn: async text => text,
     autoModTracker: createAutoModTracker(),
-    ...overrides
+    ...handlerOverrides
   })(socket);
   return { socket, ioInstance };
 }
@@ -32,6 +37,157 @@ function authenticate(socket, { serverCode = 'global', joinedServers = ['global'
   socket.serverCode = serverCode;
   socket.joinedServers = joinedServers;
 }
+
+test('FakeSocket dispatcher can reject a packet before its registered handler', async () => {
+  let handlerCalls = 0;
+  const socket = new FakeSocket({
+    dispatchPacket({ event }) {
+      return { allowed: false, event };
+    }
+  });
+  socket.on('protected_event', () => {
+    handlerCalls += 1;
+    return { allowed: true };
+  });
+
+  assert.deepEqual(await socket.trigger('protected_event', { secret: true }), {
+    allowed: false,
+    event: 'protected_event'
+  });
+  assert.equal(handlerCalls, 0);
+});
+
+test('socket envelopes reject unknown events extra fields cycles depth and item overflow before handlers', async () => {
+  const dispatcher = createSocketEventDispatcher({ securityLogger: { warn() {} } });
+  const socket = new FakeSocket({ dispatchPacket: dispatcher.dispatch });
+  let handlerCalls = 0;
+  const handler = () => { handlerCalls += 1; };
+  const results = [];
+  const callback = result => results.push(result);
+  const cyclic = {};
+  cyclic.self = cyclic;
+  const tooDeep = { a: { b: { c: { d: { e: true } } } } };
+
+  await dispatcher.dispatch({
+    socket,
+    event: 'unknown_event',
+    args: [{ value: true }, callback],
+    handler
+  });
+  for (const [event, payload] of [
+    ['login', { username: 'alice', password: 'correct-password', secret: 'private' }],
+    ['login', { username: cyclic, password: 'correct-password' }],
+    ['update_preferences', { preferences: tooDeep, expectedVersion: 0 }],
+    ['update_preferences', { preferences: Array.from({ length: 101 }, () => 0), expectedVersion: 0 }]
+  ]) {
+    socket.on(event, handler);
+    await socket.trigger(event, payload, callback);
+  }
+  socket.on('chat_message', handler);
+  await socket.trigger('chat_message', {
+    serverCode: 'global', clientContextId: 1, text: 'silent', unexpected: true
+  });
+
+  assert.equal(handlerCalls, 0);
+  assert.deepEqual(results, Array.from({ length: 5 }, () => ({ error: 'Invalid input format.' })));
+});
+
+test('maximum valid chat attachment still reaches existing validation while oversized control data does no work', async () => {
+  const dispatcher = createSocketEventDispatcher({ securityLogger: { warn() {} } });
+  const attachmentPrefix = 'data:image/png;base64,';
+  const attachment = attachmentPrefix + 'A'.repeat(8_000_000 - attachmentPrefix.length);
+  let creates = 0;
+  const { socket } = registerMessages({
+    dispatchPacket: dispatcher.dispatch,
+    MessageModel: {
+      async create(value) {
+        creates += 1;
+        return { ...value, _id: '507f1f77bcf86cd799439011', timestamp: new Date(0) };
+      }
+    }
+  });
+  authenticate(socket, { serverCode: 'ABC123', joinedServers: ['global', 'ABC123'] });
+
+  await socket.trigger('chat_message', { text: '', attachment });
+
+  assert.equal(creates, 1);
+
+  const validLoginUser = {
+    username: 'Alice', displayName: 'Alice', password: '$2b$11$current-hash', role: 'user',
+    color: '', avatarUrl: '', servers: ['global']
+  };
+  const { socket: loginSocket } = registerMessages({
+    dispatchPacket: dispatcher.dispatch,
+    UserModel: { async findOne() { return validLoginUser; } },
+    ChatServerModel: {
+      async find() { return [{ code: 'global', moderators: [] }]; },
+      async findOne() { return null; }
+    },
+    bcryptImpl: {
+      async compare() { return true; },
+      getRounds() { return 11; }
+    }
+  });
+  const loginAck = acknowledge();
+  await loginSocket.trigger('login', {
+    username: 'alice',
+    password: 'correct-password'
+  }, loginAck.callback);
+  assert.equal(loginAck.value().success, true);
+
+  let userReads = 0;
+  const { socket: controlSocket } = registerMessages({
+    dispatchPacket: dispatcher.dispatch,
+    UserModel: { async findOne() { userReads += 1; return null; } }
+  });
+  const ack = acknowledge();
+  await controlSocket.trigger('login', {
+    username: 'alice',
+    password: 'x'.repeat(8_193)
+  }, ack.callback);
+  assert.deepEqual(ack.value(), { error: 'Invalid input format.' });
+  assert.equal(userReads, 0);
+});
+
+test('payload rejection telemetry contains no payload username attachment or raw-address sentinel', async () => {
+  const logs = [];
+  const dispatcher = createSocketEventDispatcher({
+    securityLogger: { warn(...args) { logs.push(args); } }
+  });
+  const socket = new FakeSocket({ dispatchPacket: dispatcher.dispatch });
+  const usernameSentinel = 'PrivateUsernameSentinel';
+  const attachmentSentinel = 'PrivateAttachmentSentinel';
+  const addressSentinel = '203.0.113.199';
+  socket.username = usernameSentinel;
+  socket.handshake.address = addressSentinel;
+  let handlerCalls = 0;
+  socket.on('chat_message', () => { handlerCalls += 1; });
+
+  await socket.trigger('chat_message', {
+    serverCode: 'global',
+    clientContextId: 1,
+    text: 'private message payload',
+    attachment: `data:image/png;base64,${attachmentSentinel}`,
+    secret: 'unapproved'
+  });
+
+  assert.equal(handlerCalls, 0);
+  assert.equal(logs.length, 1);
+  assert.equal(logs[0][0], 'payload_rejected');
+  assert.deepEqual(Object.keys(logs[0][1]).sort(), ['category', 'event', 'networkBucket']);
+  assert.equal(logs[0][1].event, 'chat_message');
+  assert.equal(logs[0][1].category, null);
+  assert.match(logs[0][1].networkBucket, /^[0-9a-f]{16}$/);
+  const serialized = JSON.stringify(logs);
+  for (const sentinel of [
+    usernameSentinel,
+    attachmentSentinel,
+    addressSentinel,
+    'private message payload'
+  ]) {
+    assert.equal(serialized.includes(sentinel), false, sentinel);
+  }
+});
 
 test('rate-limited messages skip reply lookup, ping resolution, persistence, and broadcast', async () => {
   let currentTime = 1_000;

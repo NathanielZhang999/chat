@@ -161,6 +161,54 @@ const APPEARANCE_THEMES = new Set(['dark', 'light']);
 const APPEARANCE_TEXT_SCALES = new Set([100, 112.5, 125]);
 const APPEARANCE_MOTIONS = new Set(['system', 'reduce']);
 
+function objectPolicy(maxBytes, allowedKeys, category, inFlight = false) {
+  return Object.freeze({
+    kind: 'object',
+    maxBytes,
+    allowedKeys: Object.freeze([...allowedKeys]),
+    category,
+    inFlight: Boolean(inFlight)
+  });
+}
+
+function scalarPolicy(maxBytes, category, inFlight = false) {
+  return Object.freeze({ kind: 'scalar', maxBytes, category, inFlight: Boolean(inFlight) });
+}
+
+function noDataPolicy(category, inFlight = false) {
+  return Object.freeze({ kind: 'none', maxBytes: 0, category, inFlight: Boolean(inFlight) });
+}
+
+const SOCKET_EVENT_POLICIES = Object.freeze({
+  register: objectPolicy(8_192, ['username', 'displayName', 'password'], 'auth'),
+  login: objectPolicy(8_192, ['username', 'password'], 'auth'),
+  change_password: objectPolicy(8_192, ['oldPassword', 'newPassword'], 'sensitive_write', true),
+  update_preferences: objectPolicy(8_192, ['preferences', 'expectedVersion'], 'sensitive_write', true),
+  logout_all_devices: noDataPolicy('sensitive_write', true),
+  update_profile: objectPolicy(8_192, ['displayName', 'color', 'avatarUrl'], 'sensitive_write', true),
+  manage_role: objectPolicy(8_192, ['action', 'targetUser', 'serverCode'], 'sensitive_write', true),
+  moderate_user: objectPolicy(8_192, ['serverCode', 'targetUser', 'action', 'reason', 'duration'], 'sensitive_write', true),
+  report_moderation_target: objectPolicy(8_192, ['serverCode', 'targetUser', 'reason', 'messageId'], 'sensitive_write', true),
+  list_moderation_reports: objectPolicy(8_192, ['serverCode', 'status', 'limit', 'cursor'], 'moderation_read', true),
+  resolve_moderation_report: objectPolicy(8_192, ['serverCode', 'reportId', 'status', 'resolution'], 'sensitive_write', true),
+  list_room_restrictions: objectPolicy(8_192, ['serverCode', 'targetUser', 'limit', 'cursor'], 'moderation_read', true),
+  get_moderation_audit: objectPolicy(8_192, ['serverCode', 'limit', 'cursor'], 'moderation_read', true),
+  get_automod: objectPolicy(8_192, ['serverCode'], 'moderation_read', true),
+  update_automod: objectPolicy(8_192, ['serverCode', 'blockedKeywords', 'mentionLimit', 'repeatLimit', 'repeatWindowSeconds', 'messageLimit', 'messageWindowSeconds'], 'sensitive_write', true),
+  create_server: scalarPolicy(8_192, 'sensitive_write', true),
+  join_server: scalarPolicy(8_192, 'sensitive_write', true),
+  leave_server: scalarPolicy(8_192, 'sensitive_write', true),
+  delete_server: scalarPolicy(8_192, 'sensitive_write', true),
+  switch_server: scalarPolicy(8_192, 'heavy_read', true),
+  chat_message: objectPolicy(8_100_000, ['serverCode', 'clientContextId', 'text', 'attachment', 'replyTo'], null, false),
+  toggle_reaction: objectPolicy(16_384, ['id', 'emoji', 'serverCode', 'clientContextId'], 'light', false),
+  edit_message: objectPolicy(16_384, ['id', 'text', 'serverCode', 'clientContextId'], 'light', false),
+  delete_message: objectPolicy(16_384, ['id', 'serverCode', 'clientContextId'], 'light', false),
+  get_edit_history: scalarPolicy(8_192, 'heavy_read', true),
+  get_deleted_message: scalarPolicy(8_192, 'heavy_read', true),
+  typing: objectPolicy(8_192, ['serverCode', 'clientContextId', 'isTyping'], 'light', false)
+});
+
 function safeAck(callback) {
   return typeof callback === 'function' ? callback : () => {};
 }
@@ -621,6 +669,249 @@ function hashNetworkAddress(value, salt) {
     .slice(0, 16);
 }
 
+function measurePayloadBytes(value, { maxBytes, maxDepth = 4, maxItems = 100 } = {}) {
+  if (!Number.isInteger(maxBytes) || maxBytes < 0 ||
+      !Number.isInteger(maxDepth) || maxDepth < 0 ||
+      !Number.isInteger(maxItems) || maxItems < 0) return null;
+  const overflow = maxBytes + 1;
+  const activeObjects = new Set();
+  let items = 0;
+
+  function addBytes(total, count) {
+    if (!Number.isSafeInteger(count) || count < 0) return null;
+    return total >= overflow - count ? overflow : total + count;
+  }
+
+  function walk(candidate, depth) {
+    if (depth > maxDepth) return null;
+    if (typeof candidate === 'string') {
+      return Math.min(overflow, Buffer.byteLength(candidate, 'utf8'));
+    }
+    if (candidate === null) return Math.min(overflow, 4);
+    if (typeof candidate === 'boolean') return Math.min(overflow, candidate ? 4 : 5);
+    if (typeof candidate === 'number') {
+      return Number.isFinite(candidate)
+        ? Math.min(overflow, Buffer.byteLength(String(candidate), 'utf8'))
+        : null;
+    }
+    if (typeof candidate === 'undefined') return 0;
+    if (typeof candidate !== 'object') return null;
+
+    const isArray = Array.isArray(candidate);
+    const isPlainObject = !isArray &&
+      (Object.getPrototypeOf(candidate) === Object.prototype || Object.getPrototypeOf(candidate) === null);
+    if (!isArray && !isPlainObject) return null;
+    if (activeObjects.has(candidate)) return null;
+    activeObjects.add(candidate);
+    try {
+      const keys = isArray ? candidate.keys() : Reflect.ownKeys(candidate);
+      let total = 0;
+      for (const key of keys) {
+        if (!isArray && typeof key !== 'string') return null;
+        items += 1;
+        if (items > maxItems) return null;
+        if (!isArray) {
+          total = addBytes(total, Buffer.byteLength(key, 'utf8'));
+          if (total === null || total >= overflow) return total;
+        }
+        const descriptor = Object.getOwnPropertyDescriptor(candidate, key);
+        if (!descriptor || !Object.prototype.hasOwnProperty.call(descriptor, 'value')) return null;
+        const measured = walk(descriptor.value, depth + 1);
+        if (measured === null) return null;
+        total = addBytes(total, measured);
+        if (total === null || total >= overflow) return total;
+      }
+      return total;
+    } finally {
+      activeObjects.delete(candidate);
+    }
+  }
+
+  return walk(value, 0);
+}
+
+function validateSocketEventEnvelope(event, args, policies = SOCKET_EVENT_POLICIES) {
+  const suppliedArgs = Array.isArray(args) ? [...args] : [];
+  const callback = typeof suppliedArgs[suppliedArgs.length - 1] === 'function'
+    ? suppliedArgs.pop()
+    : null;
+  const policy = policies && Object.prototype.hasOwnProperty.call(policies, event)
+    ? policies[event]
+    : null;
+  const rejected = () => ({
+    allowed: false,
+    error: 'Invalid input format.',
+    policy: policy || null,
+    callback
+  });
+  if (!policy) return rejected();
+
+  if (policy.kind === 'none') {
+    return suppliedArgs.length === 0
+      ? { allowed: true, error: null, policy, callback }
+      : rejected();
+  }
+  if (suppliedArgs.length !== 1) return rejected();
+
+  const payload = suppliedArgs[0];
+  if (policy.kind === 'object') {
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload) ||
+        (Object.getPrototypeOf(payload) !== Object.prototype && Object.getPrototypeOf(payload) !== null)) {
+      return rejected();
+    }
+    const allowedKeys = new Set(policy.allowedKeys);
+    if (Reflect.ownKeys(payload).some(key => typeof key !== 'string' || !allowedKeys.has(key))) {
+      return rejected();
+    }
+  } else if (policy.kind === 'scalar') {
+    if ((typeof payload === 'object' && payload !== null) ||
+        ['function', 'symbol', 'bigint'].includes(typeof payload)) return rejected();
+  } else {
+    return rejected();
+  }
+
+  const measuredBytes = measurePayloadBytes(payload, { maxBytes: policy.maxBytes });
+  return measuredBytes !== null && measuredBytes <= policy.maxBytes
+    ? { allowed: true, error: null, policy, callback }
+    : rejected();
+}
+
+function createConnectionAdmission({
+  now = () => Date.now(),
+  salt = randomBytes(32),
+  maxAttemptsPerMinute = 60,
+  maxConcurrentPerNetwork = 100,
+  maxEntries = MAX_RATE_LIMIT_KEYS
+} = {}) {
+  const statesByNetwork = new Map();
+  const boundedMaxEntries = Number.isInteger(maxEntries) && maxEntries > 0
+    ? maxEntries
+    : MAX_RATE_LIMIT_KEYS;
+  const rejection = Object.freeze({ allowed: false, error: 'Connection unavailable.' });
+
+  function pruneState(networkBucket, currentTime) {
+    const state = statesByNetwork.get(networkBucket);
+    if (!state) return null;
+    state.attempts = state.attempts.filter(timestamp => currentTime - timestamp < 60_000);
+    if (state.attempts.length === 0 && state.tokens.size === 0) {
+      statesByNetwork.delete(networkBucket);
+      return null;
+    }
+    return state;
+  }
+
+  function prune(currentTime = now()) {
+    for (const networkBucket of [...statesByNetwork.keys()]) {
+      pruneState(networkBucket, currentTime);
+    }
+  }
+
+  function reserveNetwork(networkBucket, currentTime) {
+    let state = pruneState(networkBucket, currentTime);
+    if (state) return state;
+    prune(currentTime);
+    while (statesByNetwork.size >= boundedMaxEntries) {
+      const oldestIdle = [...statesByNetwork.entries()]
+        .find(([, candidate]) => candidate.tokens.size === 0);
+      if (!oldestIdle) return null;
+      statesByNetwork.delete(oldestIdle[0]);
+    }
+    state = { attempts: [], tokens: new Set() };
+    statesByNetwork.set(networkBucket, state);
+    return state;
+  }
+
+  function open(socket) {
+    const currentTime = now();
+    const address = socket && socket.handshake && socket.handshake.address;
+    const networkBucket = hashNetworkAddress(address, salt);
+    const state = reserveNetwork(networkBucket, currentTime);
+    if (!state || state.attempts.length >= maxAttemptsPerMinute) return rejection;
+    state.attempts.push(currentTime);
+    if (state.tokens.size >= maxConcurrentPerNetwork) return rejection;
+    const token = Object.freeze({ networkBucket });
+    state.tokens.add(token);
+    return Object.freeze({ allowed: true, token });
+  }
+
+  function release(token) {
+    if (!token || typeof token !== 'object') return;
+    const state = statesByNetwork.get(token.networkBucket);
+    if (!state || !state.tokens.delete(token)) return;
+    if (state.tokens.size === 0 && state.attempts.length === 0) {
+      statesByNetwork.delete(token.networkBucket);
+    }
+  }
+
+  return {
+    open,
+    release,
+    prune,
+    size() { return statesByNetwork.size; },
+    concurrent(networkBucket) {
+      const state = statesByNetwork.get(networkBucket);
+      return state ? state.tokens.size : 0;
+    }
+  };
+}
+
+function countAuthenticatedAccountSockets(sockets, username, excludedSocketId) {
+  const accountKey = normalizeAccountKey(username);
+  if (!accountKey) return 0;
+  return (Array.isArray(sockets) ? sockets : []).reduce((count, socket) => {
+    if (!socket || socket.id === excludedSocketId) return count;
+    return normalizeAccountKey(socket.username) === accountKey ? count + 1 : count;
+  }, 0);
+}
+
+function createSocketEventDispatcher({
+  eventBudgetController,
+  inFlightCoordinator,
+  securityLogger = console
+} = {}) {
+  const networkSalt = randomBytes(32);
+
+  async function dispatch({ socket, event, args, handler }) {
+    const validation = validateSocketEventEnvelope(event, args, SOCKET_EVENT_POLICIES);
+    if (!validation.allowed) {
+      if (securityLogger && typeof securityLogger.warn === 'function') {
+        try {
+          securityLogger.warn('payload_rejected', {
+            event: typeof event === 'string' && event.length <= 64 ? event : 'unknown',
+            category: validation.policy ? validation.policy.category : null,
+            networkBucket: hashNetworkAddress(
+              socket && socket.handshake && socket.handshake.address,
+              networkSalt
+            )
+          });
+        } catch {}
+      }
+      if (validation.callback) validation.callback({ error: validation.error });
+      return undefined;
+    }
+
+    const policy = validation.policy;
+    if (socket && socket.username && policy.category && policy.category !== 'auth' &&
+        eventBudgetController && typeof eventBudgetController.consume === 'function') {
+      const budgetResult = eventBudgetController.consume({
+        account: socket.username,
+        category: policy.category
+      });
+      if (budgetResult === false || (budgetResult && budgetResult.allowed === false)) {
+        if (validation.callback) {
+          validation.callback({ error: 'Too many requests. Try again later.' });
+        }
+        return undefined;
+      }
+    }
+
+    void inFlightCoordinator;
+    return handler(...args);
+  }
+
+  return { dispatch };
+}
+
 function createLayeredAuthLimiter({
   now = () => Date.now(),
   salt = randomBytes(32),
@@ -935,6 +1226,8 @@ async function withRoomMutationLock(serverCode, operation) {
 
 const authNetworkSalt = randomBytes(32);
 const authRateLimiter = createLayeredAuthLimiter({ salt: authNetworkSalt });
+const serverConnectionAdmission = createConnectionAdmission();
+const serverSocketEventDispatcher = createSocketEventDispatcher();
 const operationRateLimiter = createRateLimiter();
 const processDummyPasswordHashPromise = createDummyPasswordHash({
   bcryptImpl: bcrypt,
@@ -942,6 +1235,7 @@ const processDummyPasswordHashPromise = createDummyPasswordHash({
 });
 setInterval(() => {
   authRateLimiter.prune();
+  serverConnectionAdmission.prune();
   operationRateLimiter.prune();
 }, RATE_LIMIT_WINDOW_MS).unref();
 
@@ -1249,14 +1543,50 @@ function createConnectionHandler({
   rateLimiter = operationRateLimiter,
   autoModTracker = serverAutoModTracker,
   readRawPreferencesVersionFn = readRawPreferencesVersion,
-  logger = console
+  logger = console,
+  connectionAdmission,
+  socketEventDispatcher,
+  maxAuthenticatedSockets = 8
 } = {}) {
   return socket => {
-  socket.serverCode = null;
-  socket.joinedServers = [];
-  
+  let connectionAdmissionToken = null;
+  if (connectionAdmission && typeof connectionAdmission.open === 'function') {
+    const admission = connectionAdmission.open(socket);
+    if (!admission || !admission.allowed) {
+      try {
+        Promise.resolve(socket.disconnect(true)).catch(err => {
+          logUnexpectedError(logger, 'connection_admission_disconnect', err);
+        });
+      } catch (err) {
+        logUnexpectedError(logger, 'connection_admission_disconnect', err);
+      }
+      return;
+    }
+    connectionAdmissionToken = admission.token;
+  }
+
   let suppressDisconnectPresence = false;
   let terminallyClosed = false;
+  let connectionAdmissionReleased = false;
+
+  function releaseConnectionAdmission() {
+    if (connectionAdmissionReleased || !connectionAdmissionToken ||
+        !connectionAdmission || typeof connectionAdmission.release !== 'function') return;
+    connectionAdmissionReleased = true;
+    connectionAdmission.release(connectionAdmissionToken);
+  }
+
+  function onProtected(event, handler) {
+    if (!socketEventDispatcher || typeof socketEventDispatcher.dispatch !== 'function') {
+      socket.on(event, handler);
+      return;
+    }
+    socket.on(event, (...args) => socketEventDispatcher.dispatch({ socket, event, args, handler }));
+  }
+
+  socket.on('disconnect', handleDisconnect);
+  socket.serverCode = null;
+  socket.joinedServers = [];
 
   async function fetchLiveSockets() {
     const fetched = await ioInstance.fetchSockets();
@@ -1851,7 +2181,7 @@ function createConnectionHandler({
     }
   }
 
-  socket.on('register', async (data, callback) => {
+  onProtected('register', async (data, callback) => {
     callback = safeAck(callback);
     if (terminallyClosed) return callback({ error: 'Connection unavailable.' });
     try {
@@ -1893,7 +2223,7 @@ function createConnectionHandler({
     }
   });
 
-  socket.on('login', async (data, callback) => {
+  onProtected('login', async (data, callback) => {
     callback = safeAck(callback);
     if (terminallyClosed) return callback({ error: 'Connection unavailable.' });
     try {
@@ -1919,6 +2249,10 @@ function createConnectionHandler({
         if (!user) return { error: 'Invalid username or password.' };
         if (!(await bcryptImpl.compare(data.password, user.password))) {
           return { error: 'Invalid username or password.' };
+        }
+        const liveSockets = await fetchLiveSockets();
+        if (countAuthenticatedAccountSockets(liveSockets, user.username, socket.id) >= maxAuthenticatedSockets) {
+          return { error: 'Too many active sessions.' };
         }
 
         let needsSave = false;
@@ -2020,7 +2354,7 @@ function createConnectionHandler({
     }
   });
 
-  socket.on('change_password', async (data, callback) => {
+  onProtected('change_password', async (data, callback) => {
     callback = safeAck(callback);
     if (!socket.username) return callback({ error: 'Not authenticated.' });
     if (!data || typeof data.oldPassword !== 'string' || typeof data.newPassword !== 'string') return callback({ error: 'Invalid input format.' });
@@ -2052,7 +2386,7 @@ function createConnectionHandler({
     }
   });
 
-  socket.on('update_preferences', async (data, callback) => {
+  onProtected('update_preferences', async (data, callback) => {
     callback = safeAck(callback);
     if (terminallyClosed) return callback({ error: 'Connection unavailable.' });
     if (!socket.username) return callback({ error: 'Not authenticated.' });
@@ -2112,7 +2446,7 @@ function createConnectionHandler({
     }
   });
 
-  socket.on('logout_all_devices', async (callback) => {
+  onProtected('logout_all_devices', async (callback) => {
       callback = safeAck(callback);
       if (!socket.username) return callback({ error: 'Not authenticated.' });
       try {
@@ -2130,7 +2464,7 @@ function createConnectionHandler({
       }
   });
 
-  socket.on('update_profile', async (data, callback) => {
+  onProtected('update_profile', async (data, callback) => {
       callback = safeAck(callback);
       if (!socket.username) return callback({ error: 'Not authenticated.' });
       try {
@@ -2190,7 +2524,7 @@ function createConnectionHandler({
       }
   });
 
-  socket.on('manage_role', async (data, callback) => {
+  onProtected('manage_role', async (data, callback) => {
     callback = safeAck(callback);
     if (!socket.username) return callback({ error: 'Not authenticated.' });
     if (!data || typeof data !== 'object' || Array.isArray(data)) return callback({ error: 'Invalid input format.' });
@@ -2346,7 +2680,7 @@ function createConnectionHandler({
     }
   });
 
-  socket.on('moderate_user', async (data, callback) => {
+  onProtected('moderate_user', async (data, callback) => {
     callback = safeAck(callback);
     if (!socket.username) return callback({ error: 'Not authenticated.' });
     if (!data || typeof data !== 'object' || Array.isArray(data)) {
@@ -2655,7 +2989,7 @@ function createConnectionHandler({
     }
   });
 
-  socket.on('report_moderation_target', async (data, callback) => {
+  onProtected('report_moderation_target', async (data, callback) => {
     callback = safeAck(callback);
     if (!socket.username) return callback({ error: 'Not authenticated.' });
     if (!data || typeof data !== 'object' || Array.isArray(data)) {
@@ -2744,7 +3078,7 @@ function createConnectionHandler({
     }
   });
 
-  socket.on('list_moderation_reports', async (data, callback) => {
+  onProtected('list_moderation_reports', async (data, callback) => {
     callback = safeAck(callback);
     if (!socket.username) return callback({ error: 'Not authenticated.' });
     if (!data || typeof data !== 'object' || Array.isArray(data)) {
@@ -2782,7 +3116,7 @@ function createConnectionHandler({
     }
   });
 
-  socket.on('resolve_moderation_report', async (data, callback) => {
+  onProtected('resolve_moderation_report', async (data, callback) => {
     callback = safeAck(callback);
     if (!socket.username) return callback({ error: 'Not authenticated.' });
     if (!data || typeof data !== 'object' || Array.isArray(data)) {
@@ -2844,7 +3178,7 @@ function createConnectionHandler({
     }
   });
 
-  socket.on('list_room_restrictions', async (data, callback) => {
+  onProtected('list_room_restrictions', async (data, callback) => {
     callback = safeAck(callback);
     if (!socket.username) return callback({ error: 'Not authenticated.' });
     if (!data || typeof data !== 'object' || Array.isArray(data)) {
@@ -2898,7 +3232,7 @@ function createConnectionHandler({
     }
   });
 
-  socket.on('get_moderation_audit', async (data, callback) => {
+  onProtected('get_moderation_audit', async (data, callback) => {
     callback = safeAck(callback);
     if (!socket.username) return callback({ error: 'Not authenticated.' });
     if (!data || typeof data !== 'object' || Array.isArray(data)) {
@@ -2933,7 +3267,7 @@ function createConnectionHandler({
     }
   });
 
-  socket.on('get_automod', async (data, callback) => {
+  onProtected('get_automod', async (data, callback) => {
     callback = safeAck(callback);
     if (!socket.username) return callback({ error: 'Not authenticated.' });
     if (!data || typeof data !== 'object' || Array.isArray(data)) {
@@ -2953,7 +3287,7 @@ function createConnectionHandler({
     }
   });
 
-  socket.on('update_automod', async (data, callback) => {
+  onProtected('update_automod', async (data, callback) => {
     callback = safeAck(callback);
     if (!socket.username) return callback({ error: 'Not authenticated.' });
     if (!data || typeof data !== 'object' || Array.isArray(data)) {
@@ -3016,7 +3350,7 @@ function createConnectionHandler({
     }
   });
 
-  socket.on('create_server', async (name, callback) => {
+  onProtected('create_server', async (name, callback) => {
     callback = safeAck(callback);
     if (!socket.username) return callback({ error: 'Not authenticated.' });
     const cleanName = normalizeServerName(name);
@@ -3075,7 +3409,7 @@ function createConnectionHandler({
     }
   });
 
-  socket.on('join_server', async (code, callback) => {
+  onProtected('join_server', async (code, callback) => {
     callback = safeAck(callback);
     if (!socket.username) return callback({ error: 'Not authenticated.' });
     const serverCode = normalizeServerCode(code);
@@ -3127,7 +3461,7 @@ function createConnectionHandler({
     }
   });
 
-  socket.on('leave_server', async (code, callback) => {
+  onProtected('leave_server', async (code, callback) => {
     callback = safeAck(callback);
     if (!socket.username) return callback({ error: 'Not authenticated.' });
     const serverCode = normalizeServerCode(code);
@@ -3183,7 +3517,7 @@ function createConnectionHandler({
     }
   });
 
-  socket.on('delete_server', async (code, callback) => {
+  onProtected('delete_server', async (code, callback) => {
     callback = safeAck(callback);
     if (!socket.username) return callback({ error: 'Not authenticated.' });
     const serverCode = normalizeServerCode(code);
@@ -3403,7 +3737,7 @@ function createConnectionHandler({
     }
   });
 
-  socket.on('switch_server', async (code, callback) => {
+  onProtected('switch_server', async (code, callback) => {
     callback = safeAck(callback);
     if (!socket.username) return callback({ error: 'Not authenticated.' });
     const serverCode = normalizeServerCode(code);
@@ -3517,7 +3851,7 @@ function createConnectionHandler({
     });
   });
 
-  socket.on('chat_message', async (payload) => {
+  onProtected('chat_message', async (payload) => {
     try {
       const serverCode = socket.serverCode;
       const identity = { role: socket.role, joinedServers: socket.joinedServers || [] };
@@ -3621,7 +3955,7 @@ function createConnectionHandler({
     }
   });
 
-  socket.on('toggle_reaction', async (data) => {
+  onProtected('toggle_reaction', async (data) => {
       try {
           if (!socket.username || !data || typeof data !== 'object' || Array.isArray(data)) return;
           const { id, emoji } = data;
@@ -3673,7 +4007,7 @@ function createConnectionHandler({
       }
   });
 
-  socket.on('edit_message', async (data) => {
+  onProtected('edit_message', async (data) => {
     try {
       if (!socket.username || !data || typeof data !== 'object' || Array.isArray(data) ||
           !isValidObjectId(data.id) || typeof data.text !== 'string') return;
@@ -3745,7 +4079,7 @@ function createConnectionHandler({
     }
   });
 
-  socket.on('delete_message', async (data) => {
+  onProtected('delete_message', async (data) => {
     try {
       if (!socket.username || !data || typeof data !== 'object' || Array.isArray(data)) return;
       const msgId = data.id;
@@ -3779,7 +4113,7 @@ function createConnectionHandler({
     }
   });
 
-  socket.on('get_edit_history', async (msgId, callback) => {
+  onProtected('get_edit_history', async (msgId, callback) => {
     callback = safeAck(callback);
     if (!socket.username) return callback({ error: 'Not authenticated.' });
     try {
@@ -3803,7 +4137,7 @@ function createConnectionHandler({
     }
   });
 
-  socket.on('get_deleted_message', async (msgId, callback) => {
+  onProtected('get_deleted_message', async (msgId, callback) => {
     callback = safeAck(callback);
     if (!socket.username) return callback({ error: 'Not authenticated.' });
     try {
@@ -3827,7 +4161,7 @@ function createConnectionHandler({
     }
   });
 
-  socket.on('typing', async (data) => {
+  onProtected('typing', async (data) => {
     try {
       const serverCode = socket.serverCode;
       const identity = { role: socket.role, joinedServers: socket.joinedServers || [] };
@@ -3855,7 +4189,8 @@ function createConnectionHandler({
     }
   });
 
-  socket.on('disconnect', () => {
+  function handleDisconnect() {
+    releaseConnectionAdmission();
     if (suppressDisconnectPresence) {
       onlineUsersMap.delete(socket.id);
       return;
@@ -3881,7 +4216,7 @@ function createConnectionHandler({
         }
       }
     }
-  });
+  }
   };
 }
 
@@ -3892,7 +4227,9 @@ function installDefaultConnectionHandler() {
       io.on('connection', createConnectionHandler({
         authLimiter: authRateLimiter,
         dummyPasswordHash,
-        passwordHashCost: PASSWORD_HASH_COST
+        passwordHashCost: PASSWORD_HASH_COST,
+        connectionAdmission: serverConnectionAdmission,
+        socketEventDispatcher: serverSocketEventDispatcher
       }));
     });
   }
@@ -3942,6 +4279,12 @@ module.exports = {
   configureHttpSecurity,
   originPolicy,
   seedSystem,
+  SOCKET_EVENT_POLICIES,
+  measurePayloadBytes,
+  validateSocketEventEnvelope,
+  createConnectionAdmission,
+  countAuthenticatedAccountSockets,
+  createSocketEventDispatcher,
   createConnectionHandler,
   withAccountTransitionLock,
   withAccountTransitionLocks,
