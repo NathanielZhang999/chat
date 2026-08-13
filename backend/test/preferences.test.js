@@ -32,7 +32,11 @@ function connect(overrides = {}) {
     UserModel: { async findOne() { return null; }, async create(value) { return value; } },
     ChatServerModel: { async find() { return [{ code: 'global', name: 'Global Chat' }]; }, async findOne() { return null; } },
     RoomRestrictionModel: { async find() { return []; }, async findOne() { return null; } },
-    bcryptImpl: { async hash() { return 'hash'; }, async compare() { return true; } },
+    bcryptImpl: {
+      async hash() { return 'hash'; },
+      async compare() { return true; },
+      getRounds() { return 11; }
+    },
     onlineUsersMap,
     rateLimiter: preferenceRateLimiter(),
     logger: { error() {} },
@@ -260,7 +264,11 @@ function preferenceConnection({ rows = [preferenceUser()], ...overrides } = {}) 
     ioInstance, UserModel,
     ChatServerModel: { async find() { return []; }, async findOne() { return null; } },
     RoomRestrictionModel: { async find() { return []; }, async findOne() { return null; } },
-    bcryptImpl: { async hash() { return 'hash'; }, async compare() { return true; } },
+    bcryptImpl: {
+      async hash() { return 'hash'; },
+      async compare() { return true; },
+      getRounds() { return 11; }
+    },
     onlineUsersMap, rateLimiter: preferenceRateLimiter(), logger: { error() {} },
     ...overrides
   })(socket);

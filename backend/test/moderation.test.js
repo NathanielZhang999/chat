@@ -217,7 +217,11 @@ function registerWithModels(seed = {}) {
   }
   createConnectionHandler({
     ...setup,
-    bcryptImpl: { async compare() { return true; }, async hash(value) { return value; } },
+    bcryptImpl: {
+      async compare() { return true; },
+      getRounds() { return 11; },
+      async hash(value) { return value; }
+    },
     broadcastOnlineUsersFn: seed.broadcastOnlineUsersFn || (async () => {}),
     getRoomRoleFn: seed.getRoomRoleFn || (async () => 'user'),
     resolvePingsFn: seed.resolvePingsFn || (async text => text),
@@ -255,7 +259,11 @@ function connectAdditionalSocket(setup, {
   });
   createConnectionHandler({
     ...setup,
-    bcryptImpl: { async compare() { return true; }, async hash(value) { return value; } },
+    bcryptImpl: {
+      async compare() { return true; },
+      getRounds() { return 11; },
+      async hash(value) { return value; }
+    },
     broadcastOnlineUsersFn: async () => {},
     getRoomRoleFn: async () => 'user',
     resolvePingsFn: async text => text,

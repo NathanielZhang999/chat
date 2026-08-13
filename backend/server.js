@@ -4,7 +4,7 @@ const { Server } = require('socket.io');
 const cors = require('cors');
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
-const { createHash } = require('node:crypto');
+const { createHash, randomBytes } = require('node:crypto');
 
 const DEFAULT_ALLOWED_ORIGINS = Object.freeze(['https://nathanielzhang999.github.io']);
 
@@ -131,6 +131,11 @@ const ATTACHMENT_RE = /^data:image\/(?:jpeg|png|gif|webp);base64,[A-Za-z0-9+/=]+
 const REACTION_RE = /^(?:\p{Extended_Pictographic}|\p{Emoji_Modifier}|\uFE0F|\u200D)+$/u;
 const RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000;
 const MAX_RATE_LIMIT_KEYS = 10_000;
+const PASSWORD_HASH_COST = 11;
+const AUTH_POLICIES = Object.freeze({
+  login: Object.freeze({ account: 30, pair: 6, network: 300 }),
+  register: Object.freeze({ account: 20, pair: 6, network: 300 })
+});
 const MAX_REACTION_KEYS = 20;
 const MAX_REACTION_USERS = 200;
 const MAX_REACTIONS_PER_USER = 20;
@@ -605,6 +610,127 @@ function normalizeTransportAddress(value) {
   return (address || 'unknown').slice(0, 128);
 }
 
+function hashNetworkAddress(value, salt) {
+  const normalizedAddress = normalizeTransportAddress(value);
+  const normalizedSalt = Buffer.isBuffer(salt) ? salt : Buffer.from(String(salt || ''));
+  return createHash('sha256')
+    .update(normalizedSalt)
+    .update('\0')
+    .update(normalizedAddress)
+    .digest('hex')
+    .slice(0, 16);
+}
+
+function createLayeredAuthLimiter({
+  now = () => Date.now(),
+  salt = randomBytes(32),
+  maxEntries = MAX_RATE_LIMIT_KEYS,
+  policies = AUTH_POLICIES,
+  windowMs = RATE_LIMIT_WINDOW_MS
+} = {}) {
+  const attemptsByKey = new Map();
+  const boundedMaxEntries = Number.isInteger(maxEntries) && maxEntries > 0
+    ? maxEntries
+    : MAX_RATE_LIMIT_KEYS;
+
+  function pruneKey(key, currentTime) {
+    const attempts = attemptsByKey.get(key);
+    if (!attempts) return [];
+    const recent = attempts.filter(timestamp => currentTime - timestamp < windowMs);
+    if (recent.length === 0) attemptsByKey.delete(key);
+    else attemptsByKey.set(key, recent);
+    return recent;
+  }
+
+  function prune(currentTime = now()) {
+    for (const key of attemptsByKey.keys()) pruneKey(key, currentTime);
+  }
+
+  function reserveCandidateKeys(keys, currentTime) {
+    prune(currentTime);
+    const missingCount = keys.filter(key => !attemptsByKey.has(key)).length;
+    if (missingCount > boundedMaxEntries) return false;
+
+    const candidateKeys = new Set(keys);
+    while (attemptsByKey.size + missingCount > boundedMaxEntries) {
+      let oldestEvictable;
+      for (const key of attemptsByKey.keys()) {
+        if (!candidateKeys.has(key)) {
+          oldestEvictable = key;
+          break;
+        }
+      }
+      if (oldestEvictable === undefined) return false;
+      attemptsByKey.delete(oldestEvictable);
+    }
+    return true;
+  }
+
+  function append(key, currentTime) {
+    if (!attemptsByKey.has(key)) attemptsByKey.set(key, []);
+    attemptsByKey.get(key).push(currentTime);
+  }
+
+  function attempt({ action, account, address } = {}) {
+    const policy = policies && policies[action];
+    if (!policy) return Object.freeze({ allowed: false });
+
+    const currentTime = now();
+    const normalizedAccount = normalizeAccountKey(account);
+    const networkBucket = hashNetworkAddress(address, salt);
+    const accountKey = `${action}:account:${normalizedAccount}`;
+    const pairKey = `${action}:pair:${normalizedAccount}:${networkBucket}`;
+    const networkKey = `${action}:network:${networkBucket}`;
+    const keys = [accountKey, pairKey, networkKey];
+    const limits = [policy.account, policy.pair, policy.network];
+    const recent = keys.map(key => pruneKey(key, currentTime));
+
+    if (recent.some((timestamps, index) => timestamps.length >= limits[index])) {
+      return Object.freeze({ allowed: false });
+    }
+    if (!reserveCandidateKeys(keys, currentTime)) return Object.freeze({ allowed: false });
+
+    for (const key of keys) append(key, currentTime);
+    const token = Object.freeze({
+      action,
+      account: normalizedAccount,
+      networkBucket,
+      accountKey,
+      pairKey,
+      networkKey
+    });
+    return Object.freeze({ allowed: true, token });
+  }
+
+  function success(token) {
+    if (!token || typeof token !== 'object') return;
+    attemptsByKey.delete(token.accountKey);
+    attemptsByKey.delete(token.pairKey);
+  }
+
+  return {
+    attempt,
+    success,
+    prune,
+    size() { return attemptsByKey.size; },
+    count(key) { return (attemptsByKey.get(key) || []).length; }
+  };
+}
+
+function bcryptCost(value, bcryptImpl) {
+  if (!bcryptImpl || typeof bcryptImpl.getRounds !== 'function') return null;
+  try {
+    const cost = bcryptImpl.getRounds(value);
+    return Number.isInteger(cost) && cost >= 0 ? cost : null;
+  } catch {
+    return null;
+  }
+}
+
+async function createDummyPasswordHash({ bcryptImpl = bcrypt, cost = PASSWORD_HASH_COST } = {}) {
+  return bcryptImpl.hash(randomBytes(32).toString('hex'), cost);
+}
+
 function createRateLimiter({
   maxEntries = MAX_RATE_LIMIT_KEYS,
   maxAttempts = 10,
@@ -648,11 +774,14 @@ function createRateLimiter({
 }
 
 function authRateLimitKey(socket, action, account) {
-  const address = normalizeTransportAddress(socket && socket.handshake && socket.handshake.address);
+  const networkBucket = hashNetworkAddress(
+    socket && socket.handshake && socket.handshake.address,
+    authNetworkSalt
+  );
   const normalizedAccount = typeof account === 'string' && account
     ? account.toLowerCase().slice(0, 30)
     : '-';
-  return `${action}:${normalizedAccount}:${address}`;
+  return `${action}:${normalizedAccount}:${networkBucket}`;
 }
 
 function logUnexpectedError(logger, event, error) {
@@ -804,9 +933,16 @@ async function withRoomMutationLock(serverCode, operation) {
   }
 }
 
-const authRateLimiter = createRateLimiter();
+const authNetworkSalt = randomBytes(32);
+const authRateLimiter = createLayeredAuthLimiter({ salt: authNetworkSalt });
+const operationRateLimiter = createRateLimiter();
+const processDummyPasswordHashPromise = createDummyPasswordHash({
+  bcryptImpl: bcrypt,
+  cost: PASSWORD_HASH_COST
+});
 setInterval(() => {
   authRateLimiter.prune();
+  operationRateLimiter.prune();
 }, RATE_LIMIT_WINDOW_MS).unref();
 
 // --- DATABASE SCHEMAS ---
@@ -971,7 +1107,7 @@ async function seedSystem({
     await UserModel.create({
       username: 'NYZhang1',
       displayName: 'Bacon',
-      password: await bcryptImpl.hash(adminPassword, 10),
+      password: await bcryptImpl.hash(adminPassword, PASSWORD_HASH_COST),
       role: 'admin',
       servers: ['global']
     });
@@ -1107,7 +1243,10 @@ function createConnectionHandler({
   broadcastOnlineUsersFn = broadcastOnlineUsers,
   getRoomRoleFn = getRoomRole,
   resolvePingsFn = resolvePings,
-  rateLimiter = authRateLimiter,
+  authLimiter = authRateLimiter,
+  dummyPasswordHash = processDummyPasswordHashPromise,
+  passwordHashCost = PASSWORD_HASH_COST,
+  rateLimiter = operationRateLimiter,
   autoModTracker = serverAutoModTracker,
   readRawPreferencesVersionFn = readRawPreferencesVersion,
   logger = console
@@ -1721,8 +1860,12 @@ function createConnectionHandler({
       const cleanDisp = normalizeDisplayName(data.displayName || data.username);
       if (!cleanUser || !cleanDisp || !isValidPassword(data.password)) return callback({ error: 'Invalid input format.' });
       
-      const rateKey = authRateLimitKey(socket, 'register', cleanUser);
-      if (!rateLimiter.check(rateKey)) return callback({ error: 'Too many requests. Try again later.' });
+      const admission = authLimiter.attempt({
+        action: 'register',
+        account: cleanUser,
+        address: socket.handshake && socket.handshake.address
+      });
+      if (!admission.allowed) return callback({ error: 'Too many requests. Try again later.' });
 
       if (cleanUser.toLowerCase() === 'nyzhang1' || cleanDisp.toLowerCase() === 'nyzhang1') return callback({ error: 'Reserved name.' });
 
@@ -1735,14 +1878,14 @@ function createConnectionHandler({
         const existingDisp = await UserModel.findOne({ displayName: { $regex: new RegExp(`^${escapedDisp}$`, 'i') } });
         if (existingDisp) return { error: 'Display Name is already taken.' };
 
-        const hashedPassword = await bcryptImpl.hash(data.password, 10);
+        const hashedPassword = await bcryptImpl.hash(data.password, passwordHashCost);
         const createdUser = await UserModel.create({
           username: cleanUser, displayName: cleanDisp, password: hashedPassword, servers: ['global']
         });
         return { success: true, ...safePreferencesSnapshot(createdUser) };
       });
 
-      if (result.success) rateLimiter.clear(rateKey);
+      if (result.success) authLimiter.success(admission.token);
       callback(result);
     } catch (err) {
       logUnexpectedError(logger, 'register', err);
@@ -1759,20 +1902,32 @@ function createConnectionHandler({
       const username = normalizeUsername(data.username);
       if (!username || !isValidPassword(data.password)) return callback({ error: 'Invalid input format.' });
       
-      const rateKey = authRateLimitKey(socket, 'login', username);
-      if (!rateLimiter.check(rateKey)) return callback({ error: 'Too many login attempts. Try again later.' });
+      const admission = authLimiter.attempt({
+        action: 'login',
+        account: username,
+        address: socket.handshake && socket.handshake.address
+      });
+      if (!admission.allowed) return callback({ error: 'Too many requests. Try again later.' });
 
-      const escapedUser = escapeRegExp(username);
-      const initialUser = await UserModel.findOne({ username: { $regex: new RegExp(`^${escapedUser}$`, 'i') } });
-      if (!initialUser) return callback({ error: 'User not found.' });
-      if (!(await bcryptImpl.compare(data.password, initialUser.password))) return callback({ error: 'Incorrect password.' });
+      const initialUser = await findUserByUsername(UserModel, username);
+      const initialHash = initialUser ? initialUser.password : await Promise.resolve(dummyPasswordHash);
+      const initialMatch = await bcryptImpl.compare(data.password, initialHash);
+      if (!initialUser || !initialMatch) return callback({ error: 'Invalid username or password.' });
 
       const result = await withAccountTransitionLock(initialUser.username, async () => {
-        const user = await UserModel.findOne({ username: { $regex: new RegExp(`^${escapedUser}$`, 'i') } });
-        if (!user) return { error: 'User not found.' };
-        if (!(await bcryptImpl.compare(data.password, user.password))) return { error: 'Incorrect password.' };
+        const user = await findUserByUsername(UserModel, username);
+        if (!user) return { error: 'Invalid username or password.' };
+        if (!(await bcryptImpl.compare(data.password, user.password))) {
+          return { error: 'Invalid username or password.' };
+        }
 
         let needsSave = false;
+        const currentPasswordHashCost = bcryptCost(user.password, bcryptImpl);
+        if (currentPasswordHashCost === null) throw new Error('Invalid password hash cost.');
+        if (currentPasswordHashCost < passwordHashCost) {
+          user.password = await bcryptImpl.hash(data.password, passwordHashCost);
+          needsSave = true;
+        }
         if (!Array.isArray(user.servers) || user.servers.length === 0) {
           user.servers = ['global'];
           needsSave = true;
@@ -1857,7 +2012,7 @@ function createConnectionHandler({
         };
       });
 
-      if (result.success) rateLimiter.clear(rateKey);
+      if (result.success) authLimiter.success(admission.token);
       callback(result);
     } catch (err) {
       logUnexpectedError(logger, 'login', err);
@@ -1869,24 +2024,28 @@ function createConnectionHandler({
     callback = safeAck(callback);
     if (!socket.username) return callback({ error: 'Not authenticated.' });
     if (!data || typeof data.oldPassword !== 'string' || typeof data.newPassword !== 'string') return callback({ error: 'Invalid input format.' });
-    
-    const rateKey = authRateLimitKey(socket, 'change_password', socket.username);
+
+    const authenticatedUsername = socket.username;
+    const rateKey = authRateLimitKey(socket, 'change_password', authenticatedUsername);
     if (!rateLimiter.check(rateKey)) return callback({ error: 'Too many attempts. Try again later.' });
 
     try {
-      const user = await UserModel.findOne({ username: socket.username });
-      if (!user) return callback({ error: 'User not found.' });
+      const result = await withAccountTransitionLock(authenticatedUsername, async () => {
+        const user = await UserModel.findOne({ username: authenticatedUsername });
+        if (!user) return { error: 'User not found.' };
 
-      const isMatch = await bcryptImpl.compare(data.oldPassword, user.password);
-      if (!isMatch) return callback({ error: 'Incorrect current password.' });
+        const isMatch = await bcryptImpl.compare(data.oldPassword, user.password);
+        if (!isMatch) return { error: 'Incorrect current password.' };
 
-      if (!isValidPassword(data.newPassword)) return callback({ error: 'Invalid input format.' });
+        if (!isValidPassword(data.newPassword)) return { error: 'Invalid input format.' };
 
-      user.password = await bcryptImpl.hash(data.newPassword, 10);
-      await user.save();
-      
-      rateLimiter.clear(rateKey);
-      callback({ success: true });
+        user.password = await bcryptImpl.hash(data.newPassword, passwordHashCost);
+        await user.save();
+        return { success: true };
+      });
+
+      if (result.success) rateLimiter.clear(rateKey);
+      callback(result);
     } catch (err) {
       logUnexpectedError(logger, 'change_password', err);
       callback({ error: 'Failed to update password.' });
@@ -3726,7 +3885,19 @@ function createConnectionHandler({
   };
 }
 
-io.on('connection', createConnectionHandler());
+let defaultConnectionHandlerPromise;
+function installDefaultConnectionHandler() {
+  if (!defaultConnectionHandlerPromise) {
+    defaultConnectionHandlerPromise = processDummyPasswordHashPromise.then(dummyPasswordHash => {
+      io.on('connection', createConnectionHandler({
+        authLimiter: authRateLimiter,
+        dummyPasswordHash,
+        passwordHashCost: PASSWORD_HASH_COST
+      }));
+    });
+  }
+  return defaultConnectionHandlerPromise;
+}
 
 const PORT = process.env.PORT || 3000;
 
@@ -3741,6 +3912,7 @@ async function start({
 } = {}) {
   if (!mongoUri) throw new Error('MONGO_URI is required before server startup.');
   validateSecurityConfigurationFn();
+  await installDefaultConnectionHandler();
   await mongooseImpl.connect(mongoUri);
   await seedSystemFn();
   return new Promise(resolve => {
@@ -3818,6 +3990,10 @@ module.exports = {
   decodeCursor,
   neutralizePingTokens,
   normalizeTransportAddress,
+  hashNetworkAddress,
+  createLayeredAuthLimiter,
+  bcryptCost,
+  createDummyPasswordHash,
   createRateLimiter,
   canAccessRoom,
   appendBoundedHistory,

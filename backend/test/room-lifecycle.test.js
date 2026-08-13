@@ -1,6 +1,13 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { createConnectionHandler, seedSystem, withAccountTransitionLock } = require('../server');
+const {
+  bcryptCost,
+  createConnectionHandler,
+  createDummyPasswordHash,
+  createLayeredAuthLimiter,
+  seedSystem,
+  withAccountTransitionLock
+} = require('../server');
 const { FakeSocket, FakeIo, queryResult, acknowledge, deferred } = require('./support/fakes');
 
 function register(overrides = {}) {
@@ -67,6 +74,46 @@ function registerSharedSocket(overrides, id) {
   return socket;
 }
 
+function createAuthUserModel(records, events = []) {
+  let reads = 0;
+  return {
+    async findOne(query) {
+      const matcher = query && query.username && query.username.$regex;
+      const record = [...records.values()].find(candidate => matcher && matcher.test(candidate.username));
+      if (!record) return null;
+      reads += 1;
+      if (reads > 1) events.push('locked reload');
+      return {
+        ...record,
+        servers: [...record.servers],
+        async save() {
+          events.push('save');
+          records.set(record.username.toLowerCase(), {
+            ...record,
+            ...this,
+            servers: [...this.servers],
+            save: undefined
+          });
+        }
+      };
+    }
+  };
+}
+
+function registerAuthenticationSocket({
+  id = 'auth-socket',
+  address = '203.0.113.10',
+  authLimiter = createLayeredAuthLimiter({ salt: 'handler-test-salt' }),
+  dummyPasswordHash = '$2b$11$dummy-password-hash',
+  passwordHashCost = 11,
+  ...overrides
+} = {}) {
+  const socket = register({ authLimiter, dummyPasswordHash, passwordHashCost, ...overrides }).socket;
+  socket.id = id;
+  socket.handshake.address = address;
+  return socket;
+}
+
 test('account transition locks serialize one normalized account and release after failure', async () => {
   const firstGate = deferred();
   const events = [];
@@ -100,6 +147,415 @@ test('login rejects replacing an authenticated socket identity', async () => {
   await socket.trigger('login', { username: 'bob', password: '123456' }, ack.callback);
   assert.deepEqual(ack.value(), { error: 'Already authenticated.' });
   assert.equal(socket.username, 'alice');
+});
+
+test('unknown and wrong-password login share one error and one comparison boundary', async () => {
+  const comparisons = [];
+  const bcryptImpl = {
+    async compare(password, hash) {
+      comparisons.push([password, hash]);
+      return false;
+    },
+    getRounds() { return 11; },
+    async hash() { throw new Error('must not hash'); }
+  };
+  const authLimiter = createLayeredAuthLimiter({ salt: 'generic-login-test-salt' });
+  const records = new Map([['known', {
+    username: 'known', displayName: 'Known', password: '$2b$11$known-hash', role: 'user',
+    color: '', avatarUrl: '', servers: ['global']
+  }]]);
+  const UserModel = createAuthUserModel(records);
+  const unknown = registerAuthenticationSocket({
+    id: 'unknown-login', address: '203.0.113.11', authLimiter, UserModel, bcryptImpl
+  });
+  const wrong = registerAuthenticationSocket({
+    id: 'wrong-login', address: '203.0.113.12', authLimiter, UserModel, bcryptImpl
+  });
+  const unknownAck = acknowledge();
+  const wrongAck = acknowledge();
+
+  await unknown.trigger('login', { username: 'missing', password: 'secret-one' }, unknownAck.callback);
+  await wrong.trigger('login', { username: 'known', password: 'secret-two' }, wrongAck.callback);
+
+  assert.deepEqual(unknownAck.value(), { error: 'Invalid username or password.' });
+  assert.deepEqual(wrongAck.value(), { error: 'Invalid username or password.' });
+  assert.deepEqual(comparisons, [
+    ['secret-one', '$2b$11$dummy-password-hash'],
+    ['secret-two', '$2b$11$known-hash']
+  ]);
+});
+
+test('successful legacy bcrypt login upgrades to cost eleven before acknowledgement', async () => {
+  const events = [];
+  const records = new Map([['alice', {
+    username: 'Alice', displayName: 'Alice', password: '$2b$10$legacy-hash', role: 'user',
+    color: '', avatarUrl: '', servers: ['global']
+  }]]);
+  const UserModel = createAuthUserModel(records, events);
+  let comparisons = 0;
+  const bcryptImpl = {
+    async compare(password, hash) {
+      comparisons += 1;
+      events.push(comparisons === 1 ? 'compare' : 'locked compare');
+      return password === 'correct-password' && hash === '$2b$10$legacy-hash';
+    },
+    getRounds(hash) {
+      events.push('getRounds');
+      assert.equal(hash, '$2b$10$legacy-hash');
+      return 10;
+    },
+    async hash(password, cost) {
+      events.push(`hash(${cost})`);
+      assert.equal(password, 'correct-password');
+      return '$2b$11$upgraded-hash';
+    }
+  };
+  const onlineUsersMap = new Map();
+  const setSession = onlineUsersMap.set.bind(onlineUsersMap);
+  onlineUsersMap.set = (key, value) => {
+    events.push('session publication');
+    return setSession(key, value);
+  };
+  const socket = registerAuthenticationSocket({ UserModel, bcryptImpl, onlineUsersMap });
+  const ack = acknowledge();
+
+  await socket.trigger('login', { username: 'alice', password: 'correct-password' }, value => {
+    events.push('ack');
+    ack.callback(value);
+  });
+
+  assert.equal(ack.value().success, true);
+  assert.equal(records.get('alice').password, '$2b$11$upgraded-hash');
+  assert.deepEqual(events, [
+    'compare',
+    'locked reload',
+    'locked compare',
+    'getRounds',
+    'hash(11)',
+    'save',
+    'session publication',
+    'ack'
+  ]);
+});
+
+test('current and stronger bcrypt hashes are not rewritten', async () => {
+  for (const cost of [11, 12]) {
+    let hashCalls = 0;
+    let saveCalls = 0;
+    const user = {
+      username: `User${cost}`, displayName: `User ${cost}`, password: `$2b$${cost}$current-hash`,
+      role: 'user', color: '', avatarUrl: '', servers: ['global'],
+      async save() { saveCalls += 1; }
+    };
+    const UserModel = { async findOne() { return user; } };
+    const bcryptImpl = {
+      async compare() { return true; },
+      getRounds() { return cost; },
+      async hash() { hashCalls += 1; return 'unexpected'; }
+    };
+    const socket = registerAuthenticationSocket({
+      id: `cost-${cost}`, address: `203.0.113.${cost}`, UserModel, bcryptImpl
+    });
+    const ack = acknowledge();
+
+    await socket.trigger('login', {
+      username: `User${cost}`, password: 'correct-password'
+    }, ack.callback);
+
+    assert.equal(ack.value().success, true, `cost ${cost}`);
+    assert.equal(hashCalls, 0, `cost ${cost}`);
+    assert.equal(saveCalls, 0, `cost ${cost}`);
+    assert.equal(user.password, `$2b$${cost}$current-hash`, `cost ${cost}`);
+  }
+});
+
+test('bcrypt migration failure publishes no authenticated state', async () => {
+  for (const failure of ['cost', 'hash', 'save']) {
+    const onlineUsersMap = new Map();
+    const broadcasts = [];
+    const user = {
+      username: 'Alice', displayName: 'Alice', password: '$2b$10$legacy-hash', role: 'user',
+      color: '', avatarUrl: '', servers: ['global'],
+      async save() {
+        if (failure === 'save') throw new Error('migration save failed');
+      }
+    };
+    const bcryptImpl = {
+      async compare() { return true; },
+      getRounds() {
+        if (failure === 'cost') throw new Error('unreadable password hash');
+        return 10;
+      },
+      async hash() {
+        if (failure === 'hash') throw new Error('migration hash failed');
+        return '$2b$11$upgraded-hash';
+      }
+    };
+    const socket = registerAuthenticationSocket({
+      id: `migration-${failure}`,
+      address: failure === 'cost'
+        ? '203.0.113.20'
+        : (failure === 'hash' ? '203.0.113.21' : '203.0.113.22'),
+      UserModel: { async findOne() { return user; } },
+      bcryptImpl,
+      onlineUsersMap,
+      broadcastOnlineUsersFn: code => broadcasts.push(code),
+      logger: { error() {} }
+    });
+    const ack = acknowledge();
+
+    await socket.trigger('login', { username: 'alice', password: 'correct-password' }, ack.callback);
+
+    assert.deepEqual(ack.value(), { error: 'Login failed.' }, failure);
+    assert.equal(socket.username, undefined, failure);
+    assert.equal(socket.serverCode, null, failure);
+    assert.deepEqual(socket.joinedServers, [], failure);
+    assert.equal(socket.joinedRooms.size, 0, failure);
+    assert.equal(onlineUsersMap.size, 0, failure);
+    assert.deepEqual(broadcasts, [], failure);
+  }
+});
+
+test('password change cannot be overwritten by concurrent legacy bcrypt login migration', async () => {
+  const migrationHashStarted = deferred();
+  const releaseMigrationHash = deferred();
+  const persisted = {
+    username: 'Alice', displayName: 'Alice', password: '$2b$10$legacy-hash', role: 'user',
+    color: '', avatarUrl: '', servers: ['global']
+  };
+  const UserModel = {
+    async findOne(query) {
+      const matcher = query && query.username && query.username.$regex;
+      if (!(matcher ? matcher.test(persisted.username) : query.username === persisted.username)) return null;
+      return {
+        ...persisted,
+        servers: [...persisted.servers],
+        async save() {
+          Object.assign(persisted, this, { servers: [...this.servers], save: undefined });
+        }
+      };
+    }
+  };
+  const bcryptImpl = {
+    async compare(password, hash) {
+      if (password !== 'old-password') return false;
+      return hash === '$2b$10$legacy-hash' || hash === '$2b$11$upgraded-old-password';
+    },
+    getRounds(hash) {
+      return hash === '$2b$10$legacy-hash' ? 10 : 11;
+    },
+    async hash(password, cost) {
+      assert.equal(cost, 11);
+      if (password === 'old-password') {
+        migrationHashStarted.resolve();
+        await releaseMigrationHash.promise;
+        return '$2b$11$upgraded-old-password';
+      }
+      assert.equal(password, 'new-password');
+      return '$2b$11$new-password';
+    }
+  };
+  const loginSocket = registerAuthenticationSocket({
+    id: 'legacy-login', address: '203.0.113.23', UserModel, bcryptImpl
+  });
+  const passwordSocket = register({
+    UserModel,
+    bcryptImpl,
+    rateLimiter: { check() { return true; }, clear() {} }
+  }).socket;
+  passwordSocket.id = 'password-change';
+  passwordSocket.username = 'Alice';
+  const loginAck = acknowledge();
+  const passwordAck = acknowledge();
+
+  const loginPending = loginSocket.trigger('login', {
+    username: 'alice', password: 'old-password'
+  }, loginAck.callback);
+  await migrationHashStarted.promise;
+  const passwordPending = passwordSocket.trigger('change_password', {
+    oldPassword: 'old-password', newPassword: 'new-password'
+  }, passwordAck.callback);
+  await new Promise(resolve => setImmediate(resolve));
+  releaseMigrationHash.resolve();
+  await Promise.all([loginPending, passwordPending]);
+
+  assert.equal(loginAck.value().success, true);
+  assert.deepEqual(passwordAck.value(), { success: true });
+  assert.equal(persisted.password, '$2b$11$new-password');
+});
+
+test('shared networks allow many valid accounts while isolating one attacked account', async () => {
+  const authLimiter = createLayeredAuthLimiter({ salt: 'shared-network-test-salt' });
+  const records = new Map();
+  for (let index = 0; index < 42; index += 1) {
+    const username = `user${index}`;
+    records.set(username, {
+      username, displayName: `User ${index}`, password: `$2b$11$${username}-hash`, role: 'user',
+      color: '', avatarUrl: '', servers: ['global']
+    });
+  }
+  const UserModel = createAuthUserModel(records);
+  const bcryptImpl = {
+    async compare(password) { return password === 'valid-password'; },
+    getRounds() { return 11; },
+    async hash() { throw new Error('must not hash'); }
+  };
+  const address = '198.51.100.40';
+
+  for (let index = 0; index < 40; index += 1) {
+    const socket = registerAuthenticationSocket({
+      id: `shared-valid-${index}`, address, authLimiter, UserModel, bcryptImpl
+    });
+    const ack = acknowledge();
+    await socket.trigger('login', {
+      username: `user${index}`, password: 'valid-password'
+    }, ack.callback);
+    assert.equal(ack.value().success, true, `valid shared-network account ${index}`);
+  }
+
+  const attackedResults = [];
+  for (let attempt = 0; attempt < 7; attempt += 1) {
+    const socket = registerAuthenticationSocket({
+      id: `attacked-${attempt}`, address, authLimiter, UserModel, bcryptImpl
+    });
+    await socket.trigger('login', {
+      username: 'user40', password: 'wrong-password'
+    }, result => attackedResults.push(result));
+  }
+  assert.deepEqual(attackedResults.slice(0, 6), Array.from({ length: 6 }, () => ({
+    error: 'Invalid username or password.'
+  })));
+  assert.deepEqual(attackedResults[6], { error: 'Too many requests. Try again later.' });
+
+  const unaffected = registerAuthenticationSocket({
+    id: 'shared-unaffected', address, authLimiter, UserModel, bcryptImpl
+  });
+  const unaffectedAck = acknowledge();
+  await unaffected.trigger('login', {
+    username: 'user41', password: 'valid-password'
+  }, unaffectedAck.callback);
+  assert.equal(unaffectedAck.value().success, true);
+});
+
+test('one successful account does not reset aggregate network abuse state', async () => {
+  const authLimiter = createLayeredAuthLimiter({
+    salt: 'aggregate-network-test-salt',
+    policies: {
+      login: { account: 30, pair: 6, network: 3 },
+      register: { account: 20, pair: 6, network: 300 }
+    }
+  });
+  const records = new Map();
+  for (const username of ['first', 'second', 'successful', 'blocked']) {
+    records.set(username, {
+      username, displayName: username, password: `$2b$11$${username}-hash`, role: 'user',
+      color: '', avatarUrl: '', servers: ['global']
+    });
+  }
+  const UserModel = createAuthUserModel(records);
+  const bcryptImpl = {
+    async compare(password) { return password === 'valid-password'; },
+    getRounds() { return 11; },
+    async hash() { throw new Error('must not hash'); }
+  };
+  const address = '192.0.2.88';
+
+  for (const username of ['first', 'second']) {
+    const socket = registerAuthenticationSocket({ id: username, address, authLimiter, UserModel, bcryptImpl });
+    const ack = acknowledge();
+    await socket.trigger('login', { username, password: 'wrong-password' }, ack.callback);
+    assert.deepEqual(ack.value(), { error: 'Invalid username or password.' });
+  }
+
+  const successful = registerAuthenticationSocket({
+    id: 'successful', address, authLimiter, UserModel, bcryptImpl
+  });
+  const successfulAck = acknowledge();
+  await successful.trigger('login', {
+    username: 'successful', password: 'valid-password'
+  }, successfulAck.callback);
+  assert.equal(successfulAck.value().success, true);
+
+  const blocked = registerAuthenticationSocket({ id: 'blocked', address, authLimiter, UserModel, bcryptImpl });
+  const blockedAck = acknowledge();
+  await blocked.trigger('login', {
+    username: 'blocked', password: 'valid-password'
+  }, blockedAck.callback);
+  assert.deepEqual(blockedAck.value(), { error: 'Too many requests. Try again later.' });
+});
+
+test('authentication acknowledgements and logs redact passwords hashes and raw network addresses', async () => {
+  const password = 'password=AUTH_PASSWORD_SENTINEL';
+  const passwordHash = '$2b$10$AUTH_HASH_SENTINEL';
+  const address = '203.0.113.99';
+  const logged = [];
+  const user = {
+    username: 'Alice', displayName: 'Alice', password: passwordHash, role: 'user',
+    color: '', avatarUrl: '', servers: ['global'], async save() {}
+  };
+  const socket = registerAuthenticationSocket({
+    address,
+    UserModel: { async findOne() { return user; } },
+    bcryptImpl: {
+      async compare() { return true; },
+      getRounds() { return 10; },
+      async hash() { throw new Error(`${password} ${passwordHash} ${address}`); }
+    },
+    logger: { error(...args) { logged.push(args); } }
+  });
+  const ack = acknowledge();
+
+  await socket.trigger('login', { username: 'alice', password }, ack.callback);
+
+  assert.deepEqual(ack.value(), { error: 'Login failed.' });
+  const published = JSON.stringify({ acknowledgement: ack.value(), logged, outbound: socket.outbound });
+  for (const secret of [password, passwordHash, address]) {
+    assert.equal(published.includes(secret), false, secret);
+  }
+
+  let passwordChangeRateKey;
+  const passwordChangeSocket = register({
+    UserModel: { async findOne() { return { password: passwordHash, async save() {} }; } },
+    bcryptImpl: {
+      async compare() { return true; },
+      async hash() { return '$2b$11$changed-hash'; }
+    },
+    rateLimiter: {
+      check(key) { passwordChangeRateKey = key; return true; },
+      clear() {}
+    }
+  }).socket;
+  passwordChangeSocket.username = 'alice';
+  passwordChangeSocket.handshake.address = address;
+  const passwordChangeAck = acknowledge();
+  await passwordChangeSocket.trigger('change_password', {
+    oldPassword: password,
+    newPassword: 'replacement-password'
+  }, passwordChangeAck.callback);
+  assert.deepEqual(passwordChangeAck.value(), { success: true });
+  assert.equal(passwordChangeRateKey.includes(address), false);
+});
+
+test('bcrypt helpers validate costs and construct one requested-cost dummy hash', async () => {
+  assert.equal(bcryptCost('$2b$11$hash', { getRounds() { return 11; } }), 11);
+  assert.equal(bcryptCost('$2b$11$hash', { getRounds() { return -1; } }), null);
+  assert.equal(bcryptCost('$2b$11$hash', { getRounds() { throw new Error('bad hash'); } }), null);
+
+  const calls = [];
+  const dummyHash = await createDummyPasswordHash({
+    bcryptImpl: {
+      async hash(password, cost) {
+        calls.push([password, cost]);
+        return '$2b$11$dummy';
+      }
+    },
+    cost: 11
+  });
+  assert.equal(dummyHash, '$2b$11$dummy');
+  assert.equal(calls.length, 1);
+  assert.equal(typeof calls[0][0], 'string');
+  assert.equal(calls[0][0].length >= 32, true);
+  assert.equal(calls[0][1], 11);
 });
 
 test('a late login server query failure leaves socket, rooms, presence, and broadcasts unchanged', async () => {
@@ -164,7 +620,8 @@ test('login cannot publish membership removed by a concurrent leave', async () =
         await releaseCompare.promise;
       }
       return true;
-    }
+    },
+    getRounds() { return 11; }
   };
   const ioInstance = new FakeIo();
   const onlineUsersMap = new Map();
@@ -251,7 +708,8 @@ test('login cannot retain ghost access after concurrent global-admin demotion', 
         await releaseCompare.promise;
       }
       return true;
-    }
+    },
+    getRounds() { return 11; }
   };
   const ioInstance = new FakeIo();
   const onlineUsersMap = new Map();
@@ -350,7 +808,8 @@ test('login overlapping profile update publishes the final profile', async () =>
         await releaseCompare.promise;
       }
       return true;
-    }
+    },
+    getRounds() { return 11; }
   };
   const ioInstance = new FakeIo();
   const onlineUsersMap = new Map();
@@ -2403,17 +2862,19 @@ for (const scenario of [
 }
 
 test('spoofed forwarded addresses cannot rotate an authentication attempt budget', async () => {
-  const { socket } = register();
+  const { socket } = register({
+    authLimiter: createLayeredAuthLimiter({ salt: 'spoofed-forwarded-test-salt' })
+  });
   socket.handshake.address = '203.0.113.77';
   const results = [];
-  for (let attempt = 0; attempt < 11; attempt += 1) {
+  for (let attempt = 0; attempt < 7; attempt += 1) {
     socket.handshake.headers['x-forwarded-for'] = `198.51.100.${attempt}`;
     await socket.trigger('register', {
       username: 'NYZhang1', displayName: 'Owner', password: '123456'
     }, result => results.push(result));
   }
-  assert.deepEqual(results.slice(0, 10), Array(10).fill(null).map(() => ({ error: 'Reserved name.' })));
-  assert.deepEqual(results[10], { error: 'Too many requests. Try again later.' });
+  assert.deepEqual(results.slice(0, 6), Array(6).fill(null).map(() => ({ error: 'Reserved name.' })));
+  assert.deepEqual(results[6], { error: 'Too many requests. Try again later.' });
 });
 
 test('concurrent registrations allocate case-insensitive identity names only once', async () => {

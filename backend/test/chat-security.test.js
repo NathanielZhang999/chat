@@ -100,6 +100,121 @@ test('transport addresses are canonicalized and bounded independently of forward
   assert.equal(security.normalizeTransportAddress('x'.repeat(200)).length, 128);
 });
 
+test('layered authentication limits exact account pair and network boundaries without extending rejection', () => {
+  let now = 100;
+  const makeLimiter = () => security.createLayeredAuthLimiter({
+    now: () => now,
+    salt: 'fixed-auth-test-salt'
+  });
+
+  const pairLimiter = makeLimiter();
+  const pairResults = Array.from({ length: 7 }, () => pairLimiter.attempt({
+    action: 'login', account: 'Alice', address: '203.0.113.1'
+  }).allowed);
+  assert.deepEqual(pairResults, [true, true, true, true, true, true, false]);
+  now = 15 * 60 * 1000 + 100;
+  assert.equal(pairLimiter.attempt({
+    action: 'login', account: 'alice', address: '203.0.113.1'
+  }).allowed, true);
+
+  now = 100;
+  const loginAccountLimiter = makeLimiter();
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    assert.equal(loginAccountLimiter.attempt({
+      action: 'login', account: 'SharedAccount', address: `203.0.113.${attempt + 1}`
+    }).allowed, true, `login account attempt ${attempt + 1}`);
+  }
+  assert.equal(loginAccountLimiter.attempt({
+    action: 'login', account: 'sharedaccount', address: '198.51.100.250'
+  }).allowed, false);
+
+  const registerAccountLimiter = makeLimiter();
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    assert.equal(registerAccountLimiter.attempt({
+      action: 'register', account: 'SharedAccount', address: `198.51.100.${attempt + 1}`
+    }).allowed, true, `registration account attempt ${attempt + 1}`);
+  }
+  assert.equal(registerAccountLimiter.attempt({
+    action: 'register', account: 'sharedaccount', address: '192.0.2.250'
+  }).allowed, false);
+
+  const networkLimiter = makeLimiter();
+  for (let attempt = 0; attempt < 300; attempt += 1) {
+    assert.equal(networkLimiter.attempt({
+      action: 'login', account: `account-${attempt}`, address: '192.0.2.25'
+    }).allowed, true, `network attempt ${attempt + 1}`);
+  }
+  assert.equal(networkLimiter.attempt({
+    action: 'login', account: 'account-300', address: '192.0.2.25'
+  }).allowed, false);
+});
+
+test('layered authentication state bounds the union of all key types and evicts oldest deterministically', () => {
+  const limiter = security.createLayeredAuthLimiter({
+    now: () => 10,
+    salt: 'fixed-auth-test-salt',
+    maxEntries: 4
+  });
+  const first = limiter.attempt({ action: 'login', account: 'oldest', address: '203.0.113.10' });
+  const second = limiter.attempt({ action: 'login', account: 'newer', address: '203.0.113.10' });
+
+  assert.equal(first.allowed, true);
+  assert.equal(second.allowed, true);
+  assert.equal(limiter.size(), 4);
+  assert.equal(limiter.count(first.token.accountKey), 0);
+  assert.equal(limiter.count(first.token.pairKey), 1);
+  assert.equal(limiter.count(first.token.networkKey), 2);
+  assert.equal(limiter.count(second.token.accountKey), 1);
+  assert.equal(limiter.count(second.token.pairKey), 1);
+  const third = limiter.attempt({ action: 'login', account: 'newest', address: '203.0.113.10' });
+  assert.equal(third.allowed, true);
+  assert.equal(limiter.size(), 4);
+  assert.equal(limiter.count(third.token.networkKey), 3);
+
+  let now = 0;
+  const expiryAwareLimiter = security.createLayeredAuthLimiter({
+    now: () => now,
+    salt: 'expiry-aware-eviction-salt',
+    maxEntries: 6
+  });
+  const expired = expiryAwareLimiter.attempt({
+    action: 'login', account: 'expired', address: '192.0.2.1'
+  });
+  now = 15 * 60 * 1000 - 1;
+  expiryAwareLimiter.attempt({
+    action: 'login', account: 'live', address: '192.0.2.2'
+  });
+  now = 15 * 60 * 1000;
+  expiryAwareLimiter.attempt({
+    action: 'login', account: 'new', address: '192.0.2.2'
+  });
+  assert.equal(expiryAwareLimiter.size(), 5);
+  assert.equal(expiryAwareLimiter.count(expired.token.accountKey), 0);
+  assert.equal(expiryAwareLimiter.count(expired.token.pairKey), 0);
+  assert.equal(expiryAwareLimiter.count(expired.token.networkKey), 0);
+});
+
+test('network buckets are salted bounded and never expose raw addresses', () => {
+  const rawAddress = '203.0.113.77';
+  const first = security.hashNetworkAddress(rawAddress, 'salt-one');
+  const repeated = security.hashNetworkAddress(rawAddress, 'salt-one');
+  const differentlySalted = security.hashNetworkAddress(rawAddress, 'salt-two');
+
+  assert.match(first, /^[0-9a-f]{16}$/);
+  assert.equal(first, repeated);
+  assert.notEqual(first, differentlySalted);
+  assert.equal(first.includes(rawAddress), false);
+
+  const limiter = security.createLayeredAuthLimiter({ salt: 'salt-one' });
+  const admission = limiter.attempt({ action: 'login', account: 'Alice', address: rawAddress });
+  assert.equal(admission.allowed, true);
+  assert.equal(Object.isFrozen(admission.token), true);
+  assert.deepEqual(Object.keys(admission.token).sort(), [
+    'account', 'accountKey', 'action', 'networkBucket', 'networkKey', 'pairKey'
+  ]);
+  assert.equal(JSON.stringify(admission.token).includes(rawAddress), false);
+});
+
 test('room access preserves global and administrator access only', () => {
   assert.equal(security.canAccessRoom({ role: 'user', joinedServers: ['global'] }, 'global'), true);
   assert.equal(security.canAccessRoom({ role: 'user', joinedServers: ['global'] }, 'ABC123'), false);
