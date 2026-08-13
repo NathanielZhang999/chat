@@ -239,6 +239,39 @@ test('payload rejection telemetry contains no payload username attachment or raw
   }
 });
 
+test('AutoMod chat message rate remains authoritative without a duplicate generic charge', async () => {
+  let genericCharges = 0;
+  let creates = 0;
+  const dispatcher = createSocketEventDispatcher({
+    eventBudgetController: {
+      consume() {
+        genericCharges += 1;
+        return { allowed: false };
+      }
+    },
+    securityLogger: { warn() {} }
+  });
+  const { socket } = registerMessages({
+    dispatchPacket: dispatcher.dispatch,
+    MessageModel: {
+      async create(value) {
+        creates += 1;
+        return { ...value, _id: `507f1f77bcf86cd7994390${creates + 10}`, timestamp: new Date() };
+      }
+    },
+    ModerationAuditModel: { async create() {} }
+  });
+  authenticate(socket);
+
+  for (let index = 0; index < 6; index += 1) {
+    await socket.trigger('chat_message', { text: `unique message ${index}` });
+  }
+
+  assert.equal(genericCharges, 0);
+  assert.equal(creates, 5);
+  assert.equal(socket.outbound.some(record => record.event === 'message_blocked'), true);
+});
+
 test('rate-limited messages skip reply lookup, ping resolution, persistence, and broadcast', async () => {
   let currentTime = 1_000;
   let replyLookups = 0;

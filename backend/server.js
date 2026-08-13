@@ -136,6 +136,12 @@ const AUTH_POLICIES = Object.freeze({
   login: Object.freeze({ account: 30, pair: 6, network: 300 }),
   register: Object.freeze({ account: 20, pair: 6, network: 300 })
 });
+const EVENT_BUDGET_POLICIES = Object.freeze({
+  light: Object.freeze({ maxAttempts: 120, windowMs: 60_000 }),
+  heavy_read: Object.freeze({ maxAttempts: 30, windowMs: 60_000 }),
+  sensitive_write: Object.freeze({ maxAttempts: 10, windowMs: 15 * 60_000 }),
+  moderation_read: Object.freeze({ maxAttempts: 30, windowMs: 60_000 })
+});
 const MAX_REACTION_KEYS = 20;
 const MAX_REACTION_USERS = 200;
 const MAX_REACTIONS_PER_USER = 20;
@@ -210,7 +216,18 @@ const SOCKET_EVENT_POLICIES = Object.freeze({
 });
 
 function safeAck(callback) {
-  return typeof callback === 'function' ? callback : () => {};
+  let acknowledged = false;
+  return payload => {
+    if (acknowledged || typeof callback !== 'function') return undefined;
+    acknowledged = true;
+    try {
+      const result = callback(payload);
+      if (result && typeof result.catch === 'function') result.catch(() => {});
+      return result;
+    } catch {
+      return undefined;
+    }
+  };
 }
 
 function normalizeWith(value, pattern) {
@@ -873,6 +890,116 @@ function countAuthenticatedAccountSockets(sockets, username, excludedSocketId) {
   }, 0);
 }
 
+function createEventBudgetController({
+  now = () => Date.now(),
+  maxEntries = MAX_RATE_LIMIT_KEYS,
+  policies = EVENT_BUDGET_POLICIES
+} = {}) {
+  const attemptsByKey = new Map();
+  const boundedMaxEntries = Number.isInteger(maxEntries) && maxEntries > 0
+    ? maxEntries
+    : MAX_RATE_LIMIT_KEYS;
+  const allowed = Object.freeze({ allowed: true });
+  const rejected = Object.freeze({ allowed: false });
+
+  function pruneKey(key, currentTime, windowMs) {
+    const state = attemptsByKey.get(key);
+    if (!state) return [];
+    const recent = state.timestamps.filter(timestamp => currentTime - timestamp < windowMs);
+    if (recent.length === 0) attemptsByKey.delete(key);
+    else state.timestamps = recent;
+    return recent;
+  }
+
+  function prune(currentTime = now()) {
+    for (const [key, state] of [...attemptsByKey.entries()]) {
+      pruneKey(key, currentTime, state.windowMs);
+    }
+  }
+
+  function consume({ account, category } = {}) {
+    const normalizedAccount = normalizeAccountKey(account);
+    const policy = policies && Object.prototype.hasOwnProperty.call(policies, category)
+      ? policies[category]
+      : null;
+    if (!normalizedAccount || !policy || !Number.isInteger(policy.maxAttempts) ||
+        policy.maxAttempts <= 0 || !Number.isFinite(policy.windowMs) || policy.windowMs <= 0) {
+      return allowed;
+    }
+
+    const currentTime = now();
+    const key = `${category}\0${normalizedAccount}`;
+    const recent = pruneKey(key, currentTime, policy.windowMs);
+    if (recent.length >= policy.maxAttempts) return rejected;
+
+    if (!attemptsByKey.has(key) && attemptsByKey.size >= boundedMaxEntries) {
+      prune(currentTime);
+      while (attemptsByKey.size >= boundedMaxEntries) {
+        attemptsByKey.delete(attemptsByKey.keys().next().value);
+      }
+    }
+    recent.push(currentTime);
+    attemptsByKey.set(key, { timestamps: recent, windowMs: policy.windowMs });
+    return allowed;
+  }
+
+  return {
+    consume,
+    prune,
+    size() { return attemptsByKey.size; }
+  };
+}
+
+function createInFlightRequestCoordinator({
+  schedule = setTimeout,
+  clearSchedule = clearTimeout
+} = {}) {
+  const requestsByKey = new Map();
+
+  function finish(token) {
+    if (!token || typeof token !== 'object') return;
+    const entry = requestsByKey.get(token.key);
+    if (!entry || entry.token !== token) return;
+    requestsByKey.delete(token.key);
+    if (entry.timer !== null && entry.timer !== undefined) {
+      try { clearSchedule(entry.timer); } catch {}
+    }
+  }
+
+  function begin(socketId, event) {
+    const key = `${socketId}\0${event}`;
+    if (requestsByKey.has(key)) return null;
+    const token = Object.freeze({ key });
+    const entry = { socketId, token, timer: null };
+    requestsByKey.set(key, entry);
+    try {
+      entry.timer = schedule(() => finish(token), 10_000);
+      if (entry.timer && typeof entry.timer.unref === 'function') entry.timer.unref();
+    } catch {
+      requestsByKey.delete(key);
+      return null;
+    }
+    return token;
+  }
+
+  function cancelSocket(socketId) {
+    for (const entry of [...requestsByKey.values()]) {
+      if (entry.socketId === socketId) finish(entry.token);
+    }
+  }
+
+  return {
+    begin,
+    finish,
+    cancelSocket,
+    size() { return requestsByKey.size; }
+  };
+}
+
+function applyQueryDeadline(query, milliseconds = 2_000) {
+  return query && typeof query.maxTimeMS === 'function' ? query.maxTimeMS(milliseconds) : query;
+}
+
 function createSocketEventDispatcher({
   eventBudgetController,
   inFlightCoordinator,
@@ -880,8 +1007,14 @@ function createSocketEventDispatcher({
 } = {}) {
   const networkSalt = randomBytes(32);
 
+  function logSecurityEvent(message, event, category) {
+    if (!securityLogger || typeof securityLogger.warn !== 'function') return;
+    try { securityLogger.warn(message, { event, category }); } catch {}
+  }
+
   async function dispatch({ socket, event, args, handler }) {
     const validation = validateSocketEventEnvelope(event, args, SOCKET_EVENT_POLICIES);
+    const acknowledgement = validation.callback ? safeAck(validation.callback) : null;
     if (!validation.allowed) {
       if (securityLogger && typeof securityLogger.warn === 'function') {
         try {
@@ -895,7 +1028,7 @@ function createSocketEventDispatcher({
           });
         } catch {}
       }
-      if (validation.callback) validation.callback({ error: validation.error });
+      if (acknowledgement) acknowledgement({ error: validation.error });
       return undefined;
     }
 
@@ -907,18 +1040,42 @@ function createSocketEventDispatcher({
         category: policy.category
       });
       if (budgetResult === false || (budgetResult && budgetResult.allowed === false)) {
-        if (validation.callback) {
-          validation.callback({ error: 'Too many requests. Try again later.' });
-        }
+        logSecurityEvent('auth_throttled', event, policy.category);
+        if (acknowledgement) acknowledgement({ error: 'Too many requests. Try again later.' });
         return undefined;
       }
     }
 
-    void inFlightCoordinator;
-    return handler(...args);
+    let inFlightToken = null;
+    if (policy.inFlight && inFlightCoordinator &&
+        typeof inFlightCoordinator.begin === 'function') {
+      inFlightToken = inFlightCoordinator.begin(socket && socket.id, event);
+      if (!inFlightToken) {
+        logSecurityEvent('duplicate_request', event, policy.category);
+        if (acknowledgement) acknowledgement({ error: 'Request already in progress.' });
+        return undefined;
+      }
+    }
+
+    const handlerArgs = Array.isArray(args) ? [...args] : [];
+    if (acknowledgement) handlerArgs[handlerArgs.length - 1] = acknowledgement;
+    try {
+      return await handler(...handlerArgs);
+    } finally {
+      if (inFlightToken && inFlightCoordinator &&
+          typeof inFlightCoordinator.finish === 'function') {
+        inFlightCoordinator.finish(inFlightToken);
+      }
+    }
   }
 
-  return { dispatch };
+  function cancelSocket(socketId) {
+    if (inFlightCoordinator && typeof inFlightCoordinator.cancelSocket === 'function') {
+      inFlightCoordinator.cancelSocket(socketId);
+    }
+  }
+
+  return { dispatch, cancelSocket };
 }
 
 function createLayeredAuthLimiter({
@@ -1091,6 +1248,21 @@ function logUnexpectedError(logger, event, error) {
   logger.error('Chat operation failed.', { event, errorType });
 }
 
+function isMongoReadDeadlineError(error) {
+  if (!error || typeof error !== 'object') return false;
+  return error.code === 50 || error.codeName === 'MaxTimeMSExpired' ||
+    error.name === 'MongoOperationTimeoutError';
+}
+
+function logReadQueryError(logger, event, category, error) {
+  if (!isMongoReadDeadlineError(error)) {
+    logUnexpectedError(logger, event, error);
+    return;
+  }
+  if (!logger || typeof logger.warn !== 'function') return;
+  try { logger.warn('query_deadline', { event, category }); } catch {}
+}
+
 // Combined mutations lock in this order: identity allocation -> account transition -> room mutation; never reverse.
 let identityMutationTail = Promise.resolve();
 async function withIdentityMutationLock(operation) {
@@ -1236,7 +1408,12 @@ async function withRoomMutationLock(serverCode, operation) {
 const authNetworkSalt = randomBytes(32);
 const authRateLimiter = createLayeredAuthLimiter({ salt: authNetworkSalt });
 const serverConnectionAdmission = createConnectionAdmission();
-const serverSocketEventDispatcher = createSocketEventDispatcher();
+const serverEventBudgetController = createEventBudgetController();
+const serverInFlightCoordinator = createInFlightRequestCoordinator();
+const serverSocketEventDispatcher = createSocketEventDispatcher({
+  eventBudgetController: serverEventBudgetController,
+  inFlightCoordinator: serverInFlightCoordinator
+});
 const operationRateLimiter = createRateLimiter();
 const processDummyPasswordHashPromise = createDummyPasswordHash({
   bcryptImpl: bcrypt,
@@ -1245,6 +1422,7 @@ const processDummyPasswordHashPromise = createDummyPasswordHash({
 setInterval(() => {
   authRateLimiter.prune();
   serverConnectionAdmission.prune();
+  serverEventBudgetController.prune();
   operationRateLimiter.prune();
 }, RATE_LIMIT_WINDOW_MS).unref();
 
@@ -3112,15 +3290,17 @@ function createConnectionHandler({
             { createdAt: cursorResult.cursor.date, _id: { $lt: cursorResult.cursor.id } }
           ];
         }
-        const rows = await ModerationReportModel.find(query)
-          .sort({ createdAt: -1, _id: -1 })
-          .limit(limit + 1)
-          .select('_id serverCode reporterUsername targetUsername messageId reason status resolvedBy resolution resolvedAt createdAt');
+        const rows = await applyQueryDeadline(
+          ModerationReportModel.find(query)
+            .sort({ createdAt: -1, _id: -1 })
+            .limit(limit + 1)
+            .select('_id serverCode reporterUsername targetUsername messageId reason status resolvedBy resolution resolvedAt createdAt')
+        );
         const { page, nextCursor } = nextPage(rows, limit);
         return { items: page.map(safeReportRow), nextCursor };
       });
     } catch (err) {
-      logUnexpectedError(logger, 'list_moderation_reports', err);
+      logReadQueryError(logger, 'list_moderation_reports', 'moderation_read', err);
       callback({ error: 'Failed to list reports.' });
     }
   });
@@ -3224,10 +3404,12 @@ function createConnectionHandler({
           });
         }
         query.$and = clauses;
-        const rows = await RoomRestrictionModel.find(query)
-          .sort({ createdAt: -1, _id: -1 })
-          .limit(limit + 1)
-          .select('_id username bannedAt bannedBy banReason timeoutUntil timeoutBy timeoutReason createdAt');
+        const rows = await applyQueryDeadline(
+          RoomRestrictionModel.find(query)
+            .sort({ createdAt: -1, _id: -1 })
+            .limit(limit + 1)
+            .select('_id username bannedAt bannedBy banReason timeoutUntil timeoutBy timeoutReason createdAt')
+        );
         const activeRows = rows.filter(row => {
           const state = activeRestrictionState(row, now);
           return state.banned || state.timedOut;
@@ -3236,7 +3418,7 @@ function createConnectionHandler({
         return { items: page.map(row => safeRestrictionRow(row, now)), nextCursor };
       });
     } catch (err) {
-      logUnexpectedError(logger, 'list_room_restrictions', err);
+      logReadQueryError(logger, 'list_room_restrictions', 'moderation_read', err);
       callback({ error: 'Failed to list restrictions.' });
     }
   });
@@ -3263,15 +3445,17 @@ function createConnectionHandler({
             { createdAt: cursorResult.cursor.date, _id: { $lt: cursorResult.cursor.id } }
           ];
         }
-        const rows = await ModerationAuditModel.find(query)
-          .sort({ createdAt: -1, _id: -1 })
-          .limit(limit + 1)
-          .select('_id correlationId action serverCode actorUsername actorRole actorRoomRole targetUsername targetRole targetRoomRole reason duration expiresAt messageId reportId metadata createdAt');
+        const rows = await applyQueryDeadline(
+          ModerationAuditModel.find(query)
+            .sort({ createdAt: -1, _id: -1 })
+            .limit(limit + 1)
+            .select('_id correlationId action serverCode actorUsername actorRole actorRoomRole targetUsername targetRole targetRoomRole reason duration expiresAt messageId reportId metadata createdAt')
+        );
         const { page, nextCursor } = nextPage(rows, limit);
         return { items: page.map(safeAuditRow), nextCursor };
       });
     } catch (err) {
-      logUnexpectedError(logger, 'get_moderation_audit', err);
+      logReadQueryError(logger, 'get_moderation_audit', 'moderation_read', err);
       callback({ error: 'Failed to load audit.' });
     }
   });
@@ -3766,7 +3950,9 @@ function createConnectionHandler({
       if (serverCode === 'global') query = { $or: [{ serverCode: 'global' }, { serverCode: { $exists: false } }, { serverCode: null }] };
 
       roomRole = await getRoomRoleFn(serverCode, socket.username);
-      const history = await MessageModel.find(query).sort({ timestamp: -1 }).limit(100).lean();
+      const history = await applyQueryDeadline(
+        MessageModel.find(query).sort({ timestamp: -1 }).limit(100)
+      ).lean();
 
       safeHistory = history.map(storedMessage => {
           const msg = { ...storedMessage, attachment: sanitizeAttachment(storedMessage.attachment) };
@@ -3777,7 +3963,7 @@ function createConnectionHandler({
           return msg;
       }).reverse();
     } catch (err) {
-      logUnexpectedError(logger, 'switch_server_history', err);
+      logReadQueryError(logger, 'switch_server', 'heavy_read', err);
       return callback({ error: 'Failed to switch server.' });
     }
 
@@ -4127,7 +4313,7 @@ function createConnectionHandler({
     if (!socket.username) return callback({ error: 'Not authenticated.' });
     try {
       if (!isValidObjectId(msgId)) return callback({ error: 'Invalid input format.' });
-      const msg = await MessageModel.findById(msgId);
+      const msg = await applyQueryDeadline(MessageModel.findById(msgId));
       if (msg) {
         const identity = { role: socket.role, joinedServers: socket.joinedServers || [] };
         if (!canAccessRoom(identity, msg.serverCode)) return callback({ error: 'Permission denied.' });
@@ -4141,7 +4327,7 @@ function createConnectionHandler({
       }
       callback({ error: 'Permission denied.' });
     } catch (err) {
-      logUnexpectedError(logger, 'get_edit_history', err);
+      logReadQueryError(logger, 'get_edit_history', 'heavy_read', err);
       callback({ error: 'Failed to load history.' });
     }
   });
@@ -4151,7 +4337,7 @@ function createConnectionHandler({
     if (!socket.username) return callback({ error: 'Not authenticated.' });
     try {
       if (!isValidObjectId(msgId)) return callback({ error: 'Invalid input format.' });
-      const msg = await MessageModel.findById(msgId);
+      const msg = await applyQueryDeadline(MessageModel.findById(msgId));
       if (msg && msg.deleted) {
         const identity = { role: socket.role, joinedServers: socket.joinedServers || [] };
         if (!canAccessRoom(identity, msg.serverCode)) return callback({ error: 'Permission denied.' });
@@ -4165,7 +4351,7 @@ function createConnectionHandler({
       }
       callback({ error: 'Permission denied.' });
     } catch (err) {
-      logUnexpectedError(logger, 'get_deleted_message', err);
+      logReadQueryError(logger, 'get_deleted_message', 'heavy_read', err);
       callback({ error: 'Failed to load deleted message.' });
     }
   });
@@ -4200,6 +4386,13 @@ function createConnectionHandler({
 
   function handleDisconnect() {
     releaseConnectionAdmission();
+    if (socketEventDispatcher && typeof socketEventDispatcher.cancelSocket === 'function') {
+      try {
+        socketEventDispatcher.cancelSocket(socket.id);
+      } catch (err) {
+        logUnexpectedError(logger, 'in_flight_disconnect_cleanup', err);
+      }
+    }
     if (suppressDisconnectPresence) {
       onlineUsersMap.delete(socket.id);
       return;
@@ -4289,10 +4482,14 @@ module.exports = {
   originPolicy,
   seedSystem,
   SOCKET_EVENT_POLICIES,
+  EVENT_BUDGET_POLICIES,
   measurePayloadBytes,
   validateSocketEventEnvelope,
   createConnectionAdmission,
   countAuthenticatedAccountSockets,
+  createEventBudgetController,
+  createInFlightRequestCoordinator,
+  applyQueryDeadline,
   createSocketEventDispatcher,
   createConnectionHandler,
   withAccountTransitionLock,

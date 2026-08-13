@@ -61,6 +61,7 @@ function queryResult(value) {
     limit() { return this; },
     skip() { return this; },
     select() { return this; },
+    maxTimeMS(value) { this.maxTimeMSValue = value; return this; },
     then(resolve, reject) { return Promise.resolve(value).then(resolve, reject); }
   };
 }

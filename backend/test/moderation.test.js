@@ -18,9 +18,13 @@ const {
   applySessionAccessSnapshot,
   rejectAuditMutation,
   ModerationReport,
-  createConnectionHandler
+  createConnectionHandler,
+  createSocketEventDispatcher,
+  createInFlightRequestCoordinator
 } = require('../server');
-const { FakeSocket, FakeIo, createMemoryModel, acknowledge, deferred } = require('./support/fakes');
+const {
+  FakeSocket, FakeIo, queryResult, createMemoryModel, acknowledge, deferred
+} = require('./support/fakes');
 
 const VALID_MESSAGE_ID = '507f1f77bcf86cd799439011';
 
@@ -203,7 +207,8 @@ function registerWithModels(seed = {}) {
     RoomRestrictionModel: seed.RoomRestrictionModel || createMemoryModel(seed.restrictions || []),
     ModerationAuditModel: seed.ModerationAuditModel || createMemoryModel(seed.audits || []),
     ModerationReportModel: seed.ModerationReportModel || createMemoryModel(seed.reports || []),
-    autoModTracker: seed.autoModTracker || createAutoModTracker()
+    autoModTracker: seed.autoModTracker || createAutoModTracker(),
+    socketEventDispatcher: seed.socketEventDispatcher
   };
   for (const model of [setup.RoomRestrictionModel, setup.ModerationReportModel]) {
     if (typeof model.deleteMany === 'function' || !Array.isArray(model.rows)) continue;
@@ -495,6 +500,337 @@ function timedOutAuthenticatedSocket(serverCode, username) {
   setup.MessageModel.findById = async () => message;
   return { ...setup, message };
 }
+
+test('duplicate expensive requests execute once and release after success error throw and disconnect', async () => {
+  function authenticatedSetup(seed = {}) {
+    const inFlightCoordinator = createInFlightRequestCoordinator();
+    const socketEventDispatcher = createSocketEventDispatcher({
+      inFlightCoordinator,
+      securityLogger: { warn() {} }
+    });
+    const setup = registerWithModels({
+      users: [userDocument({
+        username: 'Alice', displayName: 'Alice', servers: ['global', 'ABC123']
+      })],
+      rooms: [roomDocument('global'), roomDocument('ABC123')],
+      ...seed,
+      socketEventDispatcher
+    });
+    Object.assign(setup.socket, {
+      username: 'Alice', displayName: 'Alice', role: 'user', serverCode: 'global',
+      joinedServers: ['global', 'ABC123'], bannedRooms: []
+    });
+    setup.onlineUsersMap.set(setup.socket.id, {
+      username: 'Alice', displayName: 'Alice', role: 'user', serverCode: 'global',
+      joinedServers: ['global', 'ABC123'], bannedRooms: []
+    });
+    return { ...setup, inFlightCoordinator };
+  }
+
+  function gatedQuery(started, release, value) {
+    const settle = () => {
+      started.resolve();
+      return release.promise.then(() => value);
+    };
+    return {
+      sort() { return this; },
+      limit() { return this; },
+      select() { return this; },
+      maxTimeMS() { return this; },
+      lean() { return settle(); },
+      then(resolve, reject) { return settle().then(resolve, reject); }
+    };
+  }
+
+  {
+    const setup = authenticatedSetup();
+    const started = deferred();
+    const release = deferred();
+    let historyReads = 0;
+    setup.MessageModel.find = () => {
+      historyReads += 1;
+      return historyReads === 1 ? gatedQuery(started, release, []) : queryResult([]);
+    };
+    const firstAck = acknowledge();
+    const first = setup.socket.trigger('switch_server', 'global', firstAck.callback);
+    await started.promise;
+    const duplicateAck = acknowledge();
+    await setup.socket.trigger('switch_server', 'global', duplicateAck.callback);
+    assert.equal(historyReads, 1);
+    assert.deepEqual(duplicateAck.value(), { error: 'Request already in progress.' });
+    release.resolve();
+    await first;
+    assert.equal(Array.isArray(firstAck.value().history), true);
+
+    const nextAck = acknowledge();
+    await setup.socket.trigger('switch_server', 'global', nextAck.callback);
+    assert.equal(historyReads, 2);
+    assert.equal(Array.isArray(nextAck.value().history), true);
+  }
+
+  {
+    const setup = authenticatedSetup();
+    const started = deferred();
+    const release = deferred();
+    let messageReads = 0;
+    setup.MessageModel.findById = () => {
+      messageReads += 1;
+      return messageReads === 1 ? gatedQuery(started, release, null) : queryResult(null);
+    };
+    const firstAck = acknowledge();
+    const first = setup.socket.trigger('get_edit_history', VALID_MESSAGE_ID, firstAck.callback);
+    await started.promise;
+    const duplicateAck = acknowledge();
+    await setup.socket.trigger('get_edit_history', VALID_MESSAGE_ID, duplicateAck.callback);
+    assert.equal(messageReads, 1);
+    assert.deepEqual(duplicateAck.value(), { error: 'Request already in progress.' });
+    release.resolve();
+    await first;
+    assert.deepEqual(firstAck.value(), { error: 'Permission denied.' });
+
+    const nextAck = acknowledge();
+    await setup.socket.trigger('get_edit_history', VALID_MESSAGE_ID, nextAck.callback);
+    assert.equal(messageReads, 2);
+    assert.deepEqual(nextAck.value(), { error: 'Permission denied.' });
+  }
+
+  {
+    const rejectLookup = deferred();
+    let userReads = 0;
+    const UserModel = {
+      findOne() {
+        userReads += 1;
+        return userReads === 1 ? rejectLookup.promise : Promise.resolve(null);
+      }
+    };
+    const setup = authenticatedSetup({ UserModel });
+    const payload = { displayName: 'Alice Next', color: '#123456', avatarUrl: '' };
+    const firstAck = acknowledge();
+    const first = setup.socket.trigger('update_profile', payload, firstAck.callback);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(userReads, 1);
+    const duplicateAck = acknowledge();
+    await setup.socket.trigger('update_profile', payload, duplicateAck.callback);
+    assert.equal(userReads, 1);
+    assert.deepEqual(duplicateAck.value(), { error: 'Request already in progress.' });
+    rejectLookup.reject(new Error('simulated profile lookup failure'));
+    await first;
+    assert.deepEqual(firstAck.value(), { error: 'Failed to update profile.' });
+
+    const nextAck = acknowledge();
+    await setup.socket.trigger('update_profile', payload, nextAck.callback);
+    assert.equal(userReads, 2);
+    assert.deepEqual(nextAck.value(), { error: 'User not found.' });
+  }
+
+  {
+    const auditStarted = deferred();
+    const releaseAudit = deferred();
+    let auditReads = 0;
+    const ModerationAuditModel = createMemoryModel([]);
+    ModerationAuditModel.find = () => {
+      auditReads += 1;
+      return auditReads === 1
+        ? gatedQuery(auditStarted, releaseAudit, [])
+        : queryResult([]);
+    };
+    const setup = authenticatedSetup({
+      rooms: [roomDocument('global'), roomDocument('ABC123', { moderators: ['Alice'] })],
+      ModerationAuditModel
+    });
+    let callbackCalls = 0;
+    const first = setup.socket.trigger('get_moderation_audit', { serverCode: 'ABC123' }, () => {
+      callbackCalls += 1;
+      throw new Error('simulated client acknowledgement failure');
+    });
+    await auditStarted.promise;
+    const duplicateAck = acknowledge();
+    await setup.socket.trigger('get_moderation_audit', { serverCode: 'ABC123' }, duplicateAck.callback);
+    assert.equal(auditReads, 1);
+    assert.deepEqual(duplicateAck.value(), { error: 'Request already in progress.' });
+    releaseAudit.resolve();
+    await assert.doesNotReject(first);
+    assert.equal(callbackCalls, 1);
+
+    const nextAck = acknowledge();
+    await setup.socket.trigger('get_moderation_audit', { serverCode: 'ABC123' }, nextAck.callback);
+    assert.equal(auditReads, 2);
+    assert.deepEqual(nextAck.value(), { items: [], nextCursor: null });
+  }
+
+  {
+    const setup = authenticatedSetup();
+    const firstStarted = deferred();
+    const releaseFirst = deferred();
+    const secondStarted = deferred();
+    const releaseSecond = deferred();
+    let historyReads = 0;
+    setup.MessageModel.find = () => {
+      historyReads += 1;
+      if (historyReads === 1) return gatedQuery(firstStarted, releaseFirst, []);
+      if (historyReads === 2) return gatedQuery(secondStarted, releaseSecond, []);
+      return queryResult([]);
+    };
+
+    const first = setup.socket.trigger('switch_server', 'global', () => {});
+    await firstStarted.promise;
+    await setup.socket.trigger('disconnect');
+    const second = setup.socket.trigger('switch_server', 'global', () => {});
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(historyReads, 2);
+    releaseFirst.resolve();
+    await first;
+    const duplicateAck = acknowledge();
+    await setup.socket.trigger('switch_server', 'global', duplicateAck.callback);
+    assert.equal(historyReads, 2);
+    assert.deepEqual(duplicateAck.value(), { error: 'Request already in progress.' });
+    releaseSecond.resolve();
+    await second;
+
+    const nextAck = acknowledge();
+    await setup.socket.trigger('switch_server', 'global', nextAck.callback);
+    assert.equal(historyReads, 3);
+    assert.equal(Array.isArray(nextAck.value().history), true);
+  }
+
+  {
+    const coordinator = createInFlightRequestCoordinator();
+    const dispatcher = createSocketEventDispatcher({
+      inFlightCoordinator: coordinator,
+      securityLogger: { warn() {} }
+    });
+    const socket = new FakeSocket({ dispatchPacket: dispatcher.dispatch });
+    socket.username = 'Alice';
+    let handlerCalls = 0;
+    socket.on('update_profile', async () => {
+      handlerCalls += 1;
+      throw new Error('uncaught handler failure');
+    });
+    const payload = { displayName: 'Alice', color: '#123456', avatarUrl: '' };
+    await assert.rejects(socket.trigger('update_profile', payload), /uncaught handler failure/);
+    socket.on('update_profile', async () => { handlerCalls += 1; });
+    await socket.trigger('update_profile', payload);
+    assert.equal(handlerCalls, 2);
+  }
+});
+
+test('read-heavy handlers apply a two-second Mongo deadline when supported', async () => {
+  const observed = [];
+  const track = (event, query) => {
+    const original = typeof query.maxTimeMS === 'function' ? query.maxTimeMS.bind(query) : null;
+    query.maxTimeMS = value => {
+      observed.push([event, value]);
+      return original ? original(value) : query;
+    };
+    return query;
+  };
+  const message = {
+    _id: VALID_MESSAGE_ID, serverCode: 'ABC123', username: 'ExactMod', text: 'deleted',
+    attachment: null, history: [], reactions: {}, deleted: true, timestamp: new Date()
+  };
+  const MessageModel = createMemoryModel([message]);
+  const messageFind = MessageModel.find.bind(MessageModel);
+  const messageFindById = MessageModel.findById.bind(MessageModel);
+  let messageLookup = 0;
+  MessageModel.find = query => track('switch_server', messageFind(query));
+  MessageModel.findById = id => {
+    messageLookup += 1;
+    return track(messageLookup === 1 ? 'get_edit_history' : 'get_deleted_message', messageFindById(id));
+  };
+
+  const ModerationReportModel = createMemoryModel([]);
+  const reportFind = ModerationReportModel.find.bind(ModerationReportModel);
+  ModerationReportModel.find = query => track('list_moderation_reports', reportFind(query));
+  const RoomRestrictionModel = createMemoryModel([]);
+  const restrictionFind = RoomRestrictionModel.find.bind(RoomRestrictionModel);
+  RoomRestrictionModel.find = query => track('list_room_restrictions', restrictionFind(query));
+  const ModerationAuditModel = createMemoryModel([]);
+  const auditFind = ModerationAuditModel.find.bind(ModerationAuditModel);
+  ModerationAuditModel.find = query => track('get_moderation_audit', auditFind(query));
+
+  const setup = registerWithModels({
+    UserModel: createMemoryModel([userDocument({
+      username: 'ExactMod', displayName: 'ExactMod', servers: ['global', 'ABC123']
+    })]),
+    ChatServerModel: createMemoryModel([
+      roomDocument('global'), roomDocument('ABC123', { moderators: ['ExactMod'] })
+    ]),
+    MessageModel,
+    RoomRestrictionModel,
+    ModerationReportModel,
+    ModerationAuditModel,
+    getRoomRoleFn: async () => 'mod'
+  });
+  Object.assign(setup.socket, {
+    username: 'ExactMod', displayName: 'ExactMod', role: 'user', serverCode: 'ABC123',
+    joinedServers: ['global', 'ABC123'], bannedRooms: []
+  });
+  setup.onlineUsersMap.set(setup.socket.id, {
+    username: 'ExactMod', displayName: 'ExactMod', role: 'user', serverCode: 'ABC123',
+    joinedServers: ['global', 'ABC123'], bannedRooms: []
+  });
+
+  await setup.socket.trigger('switch_server', 'ABC123', () => {});
+  await setup.socket.trigger('get_edit_history', VALID_MESSAGE_ID, () => {});
+  await setup.socket.trigger('get_deleted_message', VALID_MESSAGE_ID, () => {});
+  await setup.socket.trigger('list_moderation_reports', {
+    serverCode: 'ABC123', status: 'open'
+  }, () => {});
+  await setup.socket.trigger('list_room_restrictions', { serverCode: 'ABC123' }, () => {});
+  await setup.socket.trigger('get_moderation_audit', { serverCode: 'ABC123' }, () => {});
+
+  assert.deepEqual(observed, [
+    ['switch_server', 2_000],
+    ['get_edit_history', 2_000],
+    ['get_deleted_message', 2_000],
+    ['list_moderation_reports', 2_000],
+    ['list_room_restrictions', 2_000],
+    ['get_moderation_audit', 2_000]
+  ]);
+
+  const deadlineLogs = [];
+  const timeoutMessageModel = createMemoryModel([]);
+  let timeoutLookup = 0;
+  timeoutMessageModel.findById = () => ({
+    maxTimeMS() { return this; },
+    then(resolve, reject) {
+      timeoutLookup += 1;
+      const error = new Error(timeoutLookup === 1
+        ? 'private server timeout detail'
+        : 'MaxTimeMSExpired text alone is not authoritative');
+      if (timeoutLookup === 1) {
+        error.name = 'MongoServerError';
+        error.code = 50;
+      }
+      return Promise.reject(error).then(resolve, reject);
+    }
+  });
+  const timeoutSetup = registerWithModels({
+    users: [userDocument({ username: 'Alice', servers: ['global'] })],
+    rooms: [roomDocument('global')],
+    MessageModel: timeoutMessageModel,
+    logger: {
+      warn(...args) { deadlineLogs.push(['warn', ...args]); },
+      error(...args) { deadlineLogs.push(['error', ...args]); }
+    }
+  });
+  Object.assign(timeoutSetup.socket, {
+    username: 'Alice', role: 'user', serverCode: 'global', joinedServers: ['global']
+  });
+  const deadlineAck = acknowledge();
+  await timeoutSetup.socket.trigger('get_edit_history', VALID_MESSAGE_ID, deadlineAck.callback);
+  assert.deepEqual(deadlineAck.value(), { error: 'Failed to load history.' });
+  assert.deepEqual(deadlineLogs, [[
+    'warn', 'query_deadline', { event: 'get_edit_history', category: 'heavy_read' }
+  ]]);
+
+  const misleadingAck = acknowledge();
+  await timeoutSetup.socket.trigger('get_edit_history', VALID_MESSAGE_ID, misleadingAck.callback);
+  assert.deepEqual(misleadingAck.value(), { error: 'Failed to load history.' });
+  assert.equal(deadlineLogs.filter(([level]) => level === 'warn').length, 1);
+  assert.equal(deadlineLogs.filter(([level]) => level === 'error').length, 1);
+  assert.equal(JSON.stringify(deadlineLogs).includes('private server timeout detail'), false);
+});
 
 test('ordinary member can report only a target or message in an accessible room', async () => {
   const setup = reportingScenario({ reporter: 'Alice', room: 'ABC123', target: 'Bob' });

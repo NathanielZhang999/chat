@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 
 const security = require('../server');
-const { FakeSocket, FakeIo } = require('./support/fakes');
+const { FakeSocket, FakeIo, deferred } = require('./support/fakes');
 
 test('requiring server.js does not start the HTTP server', () => {
   assert.equal(typeof security.app, 'function');
@@ -411,6 +411,165 @@ test('event byte budgets accept exact boundaries and reject one byte over', () =
     }], security.SOCKET_EVENT_POLICIES).allowed,
     false
   );
+});
+
+test('event category budgets enforce exact independent account boundaries and expiry', () => {
+  let now = 0;
+  const controller = security.createEventBudgetController({ now: () => now });
+  const cases = [
+    ['light', 120, 60_000],
+    ['heavy_read', 30, 60_000],
+    ['sensitive_write', 10, 15 * 60_000],
+    ['moderation_read', 30, 60_000]
+  ];
+
+  for (const [category, limit] of cases) {
+    for (let attempt = 0; attempt < limit; attempt += 1) {
+      assert.equal(controller.consume({ account: `Alice-${category}`, category }).allowed, true);
+    }
+    assert.equal(controller.consume({ account: ` alice-${category} `, category }).allowed, false);
+    assert.equal(controller.consume({ account: `Bob-${category}`, category }).allowed, true);
+  }
+  assert.equal(controller.consume({ account: 'Alice-light', category: 'heavy_read' }).allowed, true);
+
+  now = 59_999;
+  assert.equal(controller.consume({ account: 'Alice-light', category: 'light' }).allowed, false);
+  now = 60_000;
+  for (const [category, , windowMs] of cases.filter(([, , windowMs]) => windowMs === 60_000)) {
+    assert.equal(controller.consume({ account: `Alice-${category}`, category }).allowed, true);
+  }
+  assert.equal(controller.consume({ account: 'Alice-sensitive_write', category: 'sensitive_write' }).allowed, false);
+  now = 15 * 60_000;
+  assert.equal(controller.consume({ account: 'Alice-sensitive_write', category: 'sensitive_write' }).allowed, true);
+
+  const bounded = security.createEventBudgetController({ maxEntries: 2, now: () => 0 });
+  bounded.consume({ account: 'oldest', category: 'light' });
+  bounded.consume({ account: 'newer', category: 'heavy_read' });
+  bounded.consume({ account: 'newest', category: 'moderation_read' });
+  assert.equal(bounded.size(), 2);
+});
+
+test('shared network accounts never share authenticated event budgets', async () => {
+  const controller = security.createEventBudgetController({
+    policies: { heavy_read: { maxAttempts: 1, windowMs: 60_000 } }
+  });
+  const dispatcher = security.createSocketEventDispatcher({
+    eventBudgetController: controller,
+    securityLogger: { warn() {} }
+  });
+  const alice = new FakeSocket({ dispatchPacket: dispatcher.dispatch });
+  const bob = new FakeSocket({ dispatchPacket: dispatcher.dispatch });
+  alice.id = 'alice-budget';
+  bob.id = 'bob-budget';
+  alice.username = 'Alice';
+  bob.username = 'Bob';
+  alice.handshake.address = '203.0.113.44';
+  bob.handshake.address = '203.0.113.44';
+  let aliceEntries = 0;
+  let bobEntries = 0;
+  alice.on('get_edit_history', () => { aliceEntries += 1; });
+  bob.on('get_edit_history', () => { bobEntries += 1; });
+  const rejected = [];
+
+  await alice.trigger('get_edit_history', '507f1f77bcf86cd799439011');
+  await alice.trigger('get_edit_history', '507f1f77bcf86cd799439011', value => rejected.push(value));
+  await bob.trigger('get_edit_history', '507f1f77bcf86cd799439011');
+
+  assert.equal(aliceEntries, 1);
+  assert.equal(bobEntries, 1);
+  assert.deepEqual(rejected, [{ error: 'Too many requests. Try again later.' }]);
+});
+
+test('a timed-out in-flight token cannot release a newer request token', () => {
+  const scheduled = [];
+  const cleared = [];
+  const coordinator = security.createInFlightRequestCoordinator({
+    schedule(callback, milliseconds) {
+      const timer = { callback, milliseconds, unrefCalled: false, unref() { this.unrefCalled = true; } };
+      scheduled.push(timer);
+      return timer;
+    },
+    clearSchedule(timer) { cleared.push(timer); }
+  });
+
+  const expired = coordinator.begin('socket-1', 'switch_server');
+  assert.equal(Object.isFrozen(expired), true);
+  assert.equal(scheduled[0].milliseconds, 10_000);
+  assert.equal(scheduled[0].unrefCalled, true);
+  scheduled[0].callback();
+  assert.equal(coordinator.size(), 0);
+
+  const current = coordinator.begin('socket-1', 'switch_server');
+  assert.notEqual(current, expired);
+  scheduled[0].callback();
+  coordinator.finish(expired);
+  assert.equal(coordinator.size(), 1);
+  assert.equal(coordinator.begin('socket-1', 'switch_server'), null);
+  coordinator.finish(current);
+  assert.equal(coordinator.size(), 0);
+  assert.deepEqual(cleared, [scheduled[0], scheduled[1]]);
+});
+
+test('query deadlines degrade safely for injected thenables without maxTimeMS', async () => {
+  const thenable = Promise.resolve({ ok: true });
+  assert.equal(security.applyQueryDeadline(thenable), thenable);
+  assert.deepEqual(await security.applyQueryDeadline(thenable), { ok: true });
+  assert.equal(security.applyQueryDeadline(null), null);
+});
+
+test('security budget and duplicate logs contain categories but no private payloads', async () => {
+  const logs = [];
+  const securityLogger = { warn(...args) { logs.push(args); } };
+  const budgetDispatcher = security.createSocketEventDispatcher({
+    eventBudgetController: security.createEventBudgetController({
+      policies: { sensitive_write: { maxAttempts: 1, windowMs: 60_000 } }
+    }),
+    securityLogger
+  });
+  const budgetSocket = new FakeSocket({ dispatchPacket: budgetDispatcher.dispatch });
+  budgetSocket.username = 'PrivateBudgetAccount';
+  budgetSocket.handshake.address = '203.0.113.211';
+  budgetSocket.on('update_profile', (_payload, callback) => callback({ success: true }));
+  const privateProfile = {
+    displayName: 'PrivateDisplaySentinel', color: '#123456',
+    avatarUrl: 'https://private.example/PrivateAvatarSentinel.png'
+  };
+  await budgetSocket.trigger('update_profile', privateProfile, () => {});
+  await budgetSocket.trigger('update_profile', privateProfile, () => {});
+
+  const coordinator = security.createInFlightRequestCoordinator();
+  const duplicateDispatcher = security.createSocketEventDispatcher({
+    inFlightCoordinator: coordinator,
+    securityLogger
+  });
+  const duplicateSocket = new FakeSocket({ dispatchPacket: duplicateDispatcher.dispatch });
+  duplicateSocket.username = 'PrivateDuplicateAccount';
+  duplicateSocket.handshake.address = '198.51.100.212';
+  const operationStarted = deferred();
+  const releaseOperation = deferred();
+  duplicateSocket.on('get_edit_history', async () => {
+    operationStarted.resolve();
+    await releaseOperation.promise;
+  });
+  const first = duplicateSocket.trigger('get_edit_history', '507f1f77bcf86cd799439011');
+  await operationStarted.promise;
+  await duplicateSocket.trigger('get_edit_history', '507f1f77bcf86cd799439011', () => {});
+  releaseOperation.resolve();
+  await first;
+
+  assert.deepEqual(logs.map(([, metadata]) => metadata.category), [
+    'sensitive_write', 'heavy_read'
+  ]);
+  for (const [, metadata] of logs) {
+    assert.deepEqual(Object.keys(metadata).sort(), ['category', 'event']);
+  }
+  const serialized = JSON.stringify(logs);
+  for (const sentinel of [
+    'PrivateBudgetAccount', 'PrivateDisplaySentinel', 'PrivateAvatarSentinel',
+    'PrivateDuplicateAccount', '203.0.113.211', '198.51.100.212'
+  ]) {
+    assert.equal(serialized.includes(sentinel), false, sentinel);
+  }
 });
 
 test('room access preserves global and administrator access only', () => {
